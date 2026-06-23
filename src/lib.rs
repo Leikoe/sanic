@@ -111,6 +111,22 @@ mod acceptance {
         check(&car, &items, &[reference]);
     }
 
+    // The derived FlashAttention carrier, rendered as math — the headline claim
+    // made legible and locked. This is the online-softmax rescaling combine and
+    // the deferred normalizer, constructed by the rules, not written by hand.
+    #[test]
+    fn renders_derived_flash_attention() {
+        let q = input("Q", &["sq", "d"]);
+        let k = input("K", &["k", "d"]);
+        let v = input("V", &["k", "e"]);
+        let car = carrier::derive(&attention(q, k, v, "d", "k"), "k").unwrap();
+        let r = car.render();
+        assert!(r.contains("into:    s0 = x0;  s1 = 1;  s2 = x1"));
+        assert!(r.contains("s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))"));
+        assert!(r.contains("s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))"));
+        assert!(r.contains("project: s2 / s1"));
+    }
+
     // ── §10: attention s_q FREE, k MONOIDAL, derives Acc=(m,s,o), proj=o/s ───
     #[test]
     fn attention_axis_tags_and_carrier() {
