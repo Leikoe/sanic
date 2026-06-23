@@ -74,6 +74,34 @@ pub fn gather(src: Node, index: Node, axis: Axis) -> Node {
     Rc::new(NodeKind::Gather { src, index, axis })
 }
 
+/// The axes of a node's *output* — its shape, by inference. Reductions drop the
+/// reduced axis; gathers drop the indexed axis and add the index's. This is what
+/// tells the carrier which free axes an accumulator slot spans.
+pub fn output_axes(node: &Node) -> Vec<Axis> {
+    let union = |mut acc: Vec<Axis>, more: Vec<Axis>| {
+        for a in more {
+            if !acc.contains(&a) {
+                acc.push(a);
+            }
+        }
+        acc
+    };
+    match node.as_ref() {
+        NodeKind::Input { axes, .. } => axes.clone(),
+        NodeKind::Map { inputs, .. } => inputs
+            .iter()
+            .fold(Vec::new(), |acc, i| union(acc, output_axes(i))),
+        NodeKind::Reduce { src, axis, .. } => {
+            output_axes(src).into_iter().filter(|a| a != axis).collect()
+        }
+        NodeKind::Scan { src, .. } => output_axes(src),
+        NodeKind::Gather { src, index, axis } => {
+            let kept = output_axes(src).into_iter().filter(|a| a != axis).collect();
+            union(kept, output_axes(index))
+        }
+    }
+}
+
 /// Every axis referenced anywhere in the graph (inputs, reductions, scans,
 /// gathers), in first-seen order. The set of axes the structure map classifies.
 pub fn all_axes(node: &Node) -> Vec<Axis> {

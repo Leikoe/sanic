@@ -11,6 +11,13 @@
 //! (steps 3–5: tile/partition/memory) is layered on top later; this slice is the
 //! foundation everything else trusts, plus just enough inner tile selection to
 //! make the headline acceptance call — *fuse when it pays, cut when it doesn't*.
+//!
+//! The accumulator size `|Acc|` in the SRAM constraint is **not** hard-coded: it
+//! comes from the carrier the algebraic engine derives for the streamed axis, via
+//! `Carrier::acc_scalars` — exactly the handoff the design doc prescribes.
+
+use crate::carrier;
+use crate::engine_ir::{attention, input};
 
 /// §1.3 — the device the scheduler is parameterized by. All hardware-specific
 /// numbers live here; the rest of the module is device-agnostic.
@@ -111,8 +118,9 @@ pub fn schedule_time(dev: &Device, kernels: &[Kernel]) -> Option<f64> {
 // ── attention scenario: the fuse-vs-cut decision (§8 acceptance) ─────────────
 //
 // Problem: `sq` queries attend over `k` keys with head dim `d`. The algebraic
-// engine derived the flash accumulator `(m, ℓ, o[d])` for the streamed `k` axis;
-// its per-query size is `(2 + d)` scalars — the `|Acc|` term below.
+// engine derives the flash accumulator `(m, ℓ, o[d])` for the streamed `k` axis,
+// and `Carrier::acc_scalars` reports its per-query size — the `|Acc|` term below
+// is read off that carrier, not written here.
 //
 //   Fused (flash): one kernel, streams k, never materializes the sq×k scores.
 //                  But Q-tile + Acc + K/V tile must co-reside in SRAM, so large d
@@ -129,11 +137,27 @@ const KT: f64 = 64.0; // K/V block streamed per step
 /// time (the inner tile search of §6.1, here a tiny power-of-two enumeration).
 pub fn fused_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Option<Kernel> {
     let b = dev.dtype_bytes;
+
+    // |Acc| comes from the engine, not a constant: derive the carrier for the
+    // streamed key axis and ask it how many scalars it holds per query. For
+    // FlashAttention that is m, ℓ (per query) + o (one per value-feature `e`),
+    // i.e. 2 + d — but the number is read off the derived `(m, ℓ, o)` carrier.
+    let attn = attention(
+        input("Q", &["sq", "d"]),
+        input("K", &["k", "d"]),
+        input("V", &["k", "e"]),
+        "d",
+        "k",
+    );
+    let acc_per_query = carrier::derive(&attn, "k")?.acc_scalars(|ax| match ax {
+        "e" => d, // the value-feature axis has extent d here
+        _ => 1.0, // m, ℓ are one scalar per query
+    });
+
     // working set per query-tile of size t:
-    //   Q tile (t·d) + Acc (t·(2+d): m,ℓ + o[d] per row) + K,V tiles (2·KT·d)
-    //   + the live scores block (t·KT)
+    //   Q tile (t·d) + Acc (t·acc_per_query) + K,V tiles (2·KT·d) + scores (t·KT)
     let constant = 2.0 * KT * d * b;
-    let per_tile = (d + (2.0 + d) + KT) * b;
+    let per_tile = (d + acc_per_query + KT) * b;
 
     let mut best: Option<Kernel> = None;
     let mut t = 1.0;

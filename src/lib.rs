@@ -173,6 +173,35 @@ mod acceptance {
         assert!(r.contains("fold (in a sub-expression)"));
     }
 
+    // The carrier knows its own accumulator size: each slot's free-axis span is
+    // derived from the graph's shapes, so |Acc| is exact (not a magic constant).
+    // For attention: m, ℓ are per-query {sq}; o additionally spans the value
+    // feature {sq, e}. Per query that is m + ℓ + o[d] = 2 + d scalars.
+    #[test]
+    fn carrier_knows_its_accumulator_size() {
+        use std::collections::BTreeSet;
+        let set = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+
+        let q = input("Q", &["sq", "d"]);
+        let k = input("K", &["k", "d"]);
+        let v = input("V", &["k", "e"]);
+        let attn = attention(q, k, v, "d", "k");
+
+        // output-shape inference: attention is indexed by query and value-feature.
+        let out: BTreeSet<_> = output_axes(&attn).iter().map(|s| s.to_string()).collect();
+        assert_eq!(out, set(&["sq", "e"]));
+
+        let car = carrier::derive(&attn, "k").unwrap();
+        let span = |i: usize| car.spans[i].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(span(0), set(&["sq"]), "m is per-query");
+        assert_eq!(span(1), set(&["sq"]), "ℓ is per-query");
+        assert_eq!(span(2), set(&["sq", "e"]), "o spans query × value-feature");
+
+        // exact |Acc| per query (sq → 1) with value-feature extent e = 64.
+        let acc = car.acc_scalars(|ax| if ax == "e" { 64.0 } else { 1.0 });
+        assert_eq!(acc, 2.0 + 64.0);
+    }
+
     // ── §10: attention s_q FREE, k MONOIDAL, derives Acc=(m,s,o), proj=o/s ───
     #[test]
     fn attention_axis_tags_and_carrier() {
