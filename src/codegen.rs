@@ -15,9 +15,10 @@ use crate::carrier::{Carrier, Expr};
 /// `streamed` the folded axis — recorded in the doc comment.
 pub fn rust_kernel(c: &Carrier, name: &str, streamed: &str, grid: &[&str]) -> String {
     let n = item_arity(c);
+    let names = Names { item: "x", acc: "acc", el: "el" };
     let join = |v: &[Expr]| {
         v.iter()
-            .map(rust)
+            .map(|e| rust(e, &names))
             .collect::<Vec<_>>()
             .join(",\n            ")
     };
@@ -29,7 +30,7 @@ pub fn rust_kernel(c: &Carrier, name: &str, streamed: &str, grid: &[&str]) -> St
         .join(", ");
 
     let (ret_ty, ret) = if c.project.len() == 1 {
-        ("f64".to_string(), rust(&c.project[0]))
+        ("f64".to_string(), rust(&c.project[0], &names))
     } else {
         (
             format!("[f64; {}]", c.project.len()),
@@ -51,6 +52,55 @@ pub fn rust_kernel(c: &Carrier, name: &str, streamed: &str, grid: &[&str]) -> St
         grid = grid.join(", "),
         slots = c.slots,
         into = join(&c.into),
+        combine = join(&c.combine),
+    )
+}
+
+/// Emit a *tiled* kernel: `tile` lanes are kept resident while the streamed axis
+/// is folded once, updating all of them per step. The resident state is
+/// `tile × |Acc|` scalars — exactly the SRAM term the scheduler sized when it
+/// chose `tile`. Only `project` differs per lane at the end.
+pub fn tiled_kernel(c: &Carrier, name: &str, streamed: &str, tile: usize) -> String {
+    let n = item_arity(c);
+    let names = Names { item: "x", acc: "a", el: "el" };
+    let join = |v: &[Expr]| {
+        v.iter()
+            .map(|e| rust(e, &names))
+            .collect::<Vec<_>>()
+            .join(",\n                ")
+    };
+    let identity = c
+        .identity
+        .iter()
+        .map(|v| lit(*v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let project = rust(&c.project[0], &names); // tiled emitter targets scalar-out folds
+
+    format!(
+        "/// Tiled fused kernel — {tile} lanes resident across the `{streamed}` stream\n\
+         /// ({tile} × {slots} = {resident} scalars in SRAM, the tile the scheduler chose).\n\
+         pub fn {name}(stream: impl IntoIterator<Item = [[f64; {n}]; {tile}]>) -> [f64; {tile}] {{\n\
+         \x20   const TILE: usize = {tile};\n\
+         \x20   let mut acc = [[{identity}]; TILE];\n\
+         \x20   for step in stream {{\n\
+         \x20       for lane in 0..TILE {{\n\
+         \x20           let x = step[lane];\n\
+         \x20           let el = [{into}];\n\
+         \x20           let a = acc[lane];\n\
+         \x20           acc[lane] = [\n                {combine},\n            ];\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   let mut out = [0.0f64; TILE];\n\
+         \x20   for lane in 0..TILE {{\n\
+         \x20       let a = acc[lane];\n\
+         \x20       out[lane] = {project};\n\
+         \x20   }}\n\
+         \x20   out\n\
+         }}",
+        slots = c.slots,
+        resident = tile * c.slots,
+        into = c.into.iter().map(|e| rust(e, &names)).collect::<Vec<_>>().join(", "),
         combine = join(&c.combine),
     )
 }
@@ -83,11 +133,18 @@ fn lit(v: f64) -> String {
     }
 }
 
+/// The Rust variable each field role reads from. `Item` is the loaded element,
+/// `A`/`F` the accumulator, `B` the lifted element.
+struct Names {
+    item: &'static str,
+    acc: &'static str,
+    el: &'static str,
+}
+
 /// Render one carrier expression as a Rust value, parenthesizing only where
-/// precedence requires it. `Item(i)` → `x[i]` (the loaded element); `A(i)`/`F(i)`
-/// → `acc[i]`; `B(i)` → `el[i]` (the lifted element).
-fn rust(e: &Expr) -> String {
-    render(e, 0)
+/// precedence requires it.
+fn rust(e: &Expr, n: &Names) -> String {
+    render(e, 0, n)
 }
 
 fn rust_prec(e: &Expr) -> u8 {
@@ -98,23 +155,23 @@ fn rust_prec(e: &Expr) -> u8 {
     }
 }
 
-fn render(e: &Expr, parent: u8) -> String {
+fn render(e: &Expr, parent: u8, n: &Names) -> String {
     let p = rust_prec(e);
     // a method-call receiver must be parenthesized if it is a bare binary op
-    let recv = |a: &Expr| render(a, 3);
+    let recv = |a: &Expr| render(a, 3, n);
     let s = match e {
         Expr::Const(v) => lit(*v),
-        Expr::Item(i) => format!("x[{i}]"),
-        Expr::A(i) | Expr::F(i) => format!("acc[{i}]"),
-        Expr::B(i) => format!("el[{i}]"),
+        Expr::Item(i) => format!("{}[{i}]", n.item),
+        Expr::A(i) | Expr::F(i) => format!("{}[{i}]", n.acc),
+        Expr::B(i) => format!("{}[{i}]", n.el),
         // left child at this precedence; right child one tighter so `-` / `/`
         // parenthesize their right operand correctly.
-        Expr::Add(a, b) => format!("{} + {}", render(a, p), render(b, p)),
-        Expr::Sub(a, b) => format!("{} - {}", render(a, p), render(b, p + 1)),
-        Expr::Mul(a, b) => format!("{} * {}", render(a, p), render(b, p)),
-        Expr::Div(a, b) => format!("{} / {}", render(a, p), render(b, p + 1)),
-        Expr::Max(a, b) => format!("{}.max({})", recv(a), render(b, 0)),
-        Expr::Min(a, b) => format!("{}.min({})", recv(a), render(b, 0)),
+        Expr::Add(a, b) => format!("{} + {}", render(a, p, n), render(b, p, n)),
+        Expr::Sub(a, b) => format!("{} - {}", render(a, p, n), render(b, p + 1, n)),
+        Expr::Mul(a, b) => format!("{} * {}", render(a, p, n), render(b, p, n)),
+        Expr::Div(a, b) => format!("{} / {}", render(a, p, n), render(b, p + 1, n)),
+        Expr::Max(a, b) => format!("{}.max({})", recv(a), render(b, 0, n)),
+        Expr::Min(a, b) => format!("{}.min({})", recv(a), render(b, 0, n)),
         Expr::Exp(a) => format!("{}.exp()", recv(a)),
         Expr::Log(a) => format!("{}.ln()", recv(a)),
     };
@@ -181,5 +238,69 @@ mod tests {
         let rows: Vec<Vec<f64>> = items.iter().map(|p| p.to_vec()).collect();
         let via_interp = c.fold(&rows)[0];
         assert!((via_kernel - via_interp).abs() < 1e-12);
+    }
+
+    // The verbatim output of `tiled_kernel(.., tile = 2)`: two query lanes kept
+    // resident across the key stream — 2 × 3 = 6 scalars in SRAM.
+    #[rustfmt::skip]
+    fn flash_attention_tiled(stream: impl IntoIterator<Item = [[f64; 2]; 2]>) -> [f64; 2] {
+        const TILE: usize = 2;
+        let mut acc = [[f64::NEG_INFINITY, 0.0f64, 0.0f64]; TILE];
+        for step in stream {
+            for lane in 0..TILE {
+                let x = step[lane];
+                let el = [x[0], 1.0f64, x[1]];
+                let a = acc[lane];
+                acc[lane] = [
+                    a[0].max(el[0]),
+                    a[1] * (a[0] - a[0].max(el[0])).exp() + el[1] * (el[0] - a[0].max(el[0])).exp(),
+                    a[2] * (a[0] - a[0].max(el[0])).exp() + el[2] * (el[0] - a[0].max(el[0])).exp(),
+                ];
+            }
+        }
+        let mut out = [0.0f64; TILE];
+        for lane in 0..TILE {
+            let a = acc[lane];
+            out[lane] = a[2] / a[1];
+        }
+        out
+    }
+
+    #[test]
+    fn emitted_tiled_kernel_is_real_and_correct() {
+        let attn = attention(
+            input("Q", &["sq", "d"]),
+            input("K", &["k", "d"]),
+            input("V", &["k", "e"]),
+            "d",
+            "k",
+        );
+        let c = carrier::derive(&attn, "k").unwrap();
+        let src = tiled_kernel(&c, "flash_attention_tiled", "k", 2);
+
+        // the generator still emits the function pasted above (key lines)
+        assert!(src.contains("const TILE: usize = 2;"));
+        assert!(src.contains("let mut acc = [[f64::NEG_INFINITY, 0.0f64, 0.0f64]; TILE];"));
+        assert!(src.contains("2 × 3 = 6 scalars in SRAM"));
+
+        // two lanes with independent key streams; each lane equals a single fold.
+        let mut s = 0x243f6a8885a308d3u64;
+        let mut rnd = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0
+        };
+        let lane0: Vec<[f64; 2]> = (0..32).map(|_| [rnd(), rnd()]).collect();
+        let lane1: Vec<[f64; 2]> = (0..32).map(|_| [rnd(), rnd()]).collect();
+        let stream: Vec<[[f64; 2]; 2]> = (0..32).map(|i| [lane0[i], lane1[i]]).collect();
+        let out = flash_attention_tiled(stream);
+
+        let fold = |xs: &[[f64; 2]]| {
+            let rows: Vec<Vec<f64>> = xs.iter().map(|p| p.to_vec()).collect();
+            c.fold(&rows)[0]
+        };
+        assert!((out[0] - fold(&lane0)).abs() < 1e-12);
+        assert!((out[1] - fold(&lane1)).abs() < 1e-12);
     }
 }

@@ -9,9 +9,10 @@
 //!     cargo run --example mha
 
 use sanic::carrier;
-use sanic::codegen::rust_kernel;
+use sanic::codegen::{rust_kernel, tiled_kernel};
 use sanic::engine::analyze_all;
 use sanic::engine_ir::*;
+use sanic::schedule::{Decision, Device, schedule_attention};
 use sanic::stage1::Parallelism;
 
 fn main() {
@@ -70,4 +71,19 @@ fn main() {
         .collect();
     println!("emitted kernel:\n");
     println!("{}", rust_kernel(&flash, "flash_attention", "k", &grid));
+
+    // Now let the scheduler size it for a device. It costs fuse-vs-cut and, when
+    // fusing, picks the query-tile that fits SRAM — and codegen blocks the kernel
+    // by exactly that tile (tile × |Acc| resident).
+    let dev = Device::toy();
+    let (sq, keys, dim) = (2048.0, 4096.0, 64.0);
+    let v = schedule_attention(&dev, sq, keys, dim);
+    println!(
+        "\nscheduler (sq={sq}, k={keys}, d={dim}): {:?}, query-tile = {:?}",
+        v.decision, v.tile
+    );
+    if let (Decision::Fuse, Some(tile)) = (&v.decision, v.tile) {
+        println!("\nemitted TILED kernel (scheduler chose tile = {tile}):\n");
+        println!("{}", tiled_kernel(&flash, "flash_attention_tiled", "k", tile));
+    }
 }

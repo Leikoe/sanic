@@ -47,7 +47,8 @@ certificate (fold left-to-right, O(1) state) and the parallelism certificate
   accumulator attached to the foldable ones. `analyze_all` discovers the axes for
   you.
 - **`codegen`** — emit the fused streaming kernel as Rust source: the grid/stream
-  loop nest from the structure map, the body from the derived carrier.
+  loop nest from the structure map, the body from the derived carrier, blocked by
+  the query-tile the scheduler chose (`tile × |Acc|` resident).
 
 ```rust
 let attn = attention(q, k, v, "d", "k");  // softmax(QKᵀ)·V
@@ -117,8 +118,11 @@ pub fn flash_attention(elements: impl IntoIterator<Item = [f64; 2]>) -> f64 {
 }
 ```
 
-(`codegen` emits a CPU scalar kernel — a 1:1 transcription of the verified fold.
-Backend lowering, tiling from the scheduler, and GPU targets are downstream.)
+The scheduler then sizes it: it costs fuse-vs-cut, and when it fuses it picks the
+query-tile that fits SRAM (here `tile = 64`, amortizing the K/V reads). `codegen`
+emits the **blocked** kernel for that tile — `tile × |Acc|` accumulators resident
+across the key stream. (Still a CPU scalar kernel; GPU/backend lowering is
+downstream.)
 
 The example shows the engine classifying attention and reconstructing
 FlashAttention from the graph — no formula is written by hand:
