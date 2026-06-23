@@ -4,9 +4,10 @@
 //!
 //!     cargo run --example derive
 
-use sanic::carrier;
+use sanic::engine::analyze;
 use sanic::engine_ir::*;
 use sanic::op::{BinOp, Monoid};
+use sanic::carrier;
 
 fn add() -> BinOp {
     BinOp::Monoid(Monoid::Add)
@@ -37,13 +38,16 @@ fn main() {
     let lse = map(ADD_F, vec![map(LOG, vec![reduce(e, "a", add())]), m]);
     show("logsumexp", &lse, "a");
 
-    // attention = softmax(QKᵀ)·V  →  the FlashAttention (m, ℓ, o) accumulator,
-    // derived: online-softmax coupling (R4) + deferred normalizer (R5).
+    // attention = softmax(QKᵀ)·V — the whole structure map in one call: the
+    // query axis is a grid, the key axis folds into the FlashAttention
+    // (m, ℓ, o) accumulator (online-softmax coupling R4 + deferred normalizer R5).
     let q = input("Q", &["sq", "d"]);
     let k = input("K", &["k", "d"]);
     let v = input("V", &["k", "e"]);
     let attn = attention(q, k, v, "d", "k");
-    show("FlashAttention", &attn, "k");
+    println!("── attention: softmax(QKᵀ)·V ──");
+    print!("{}", analyze(&attn, &["sq", "k"]).render());
+    println!();
 
     // the time axis of a tanh-RNN: a non-associative recurrence → refused.
     let rnn = tanh_rnn(input("H", &["t", "h"]), "t");

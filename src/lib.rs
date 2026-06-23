@@ -14,6 +14,7 @@
 //! (legality) and `scheduler_engine.md` (profitability) for the full design.
 
 pub mod carrier;
+pub mod engine;
 pub mod engine_ir;
 pub mod op;
 pub mod schedule;
@@ -27,6 +28,7 @@ mod acceptance {
     //! composition rules — not a stored template — is the primary criterion.
 
     use crate::carrier::{self, Carrier};
+    use crate::engine::analyze;
     use crate::engine_ir::*;
     use crate::op::{BinOp, Monoid};
     use crate::stage1::{Parallelism, streamable, structure};
@@ -125,6 +127,28 @@ mod acceptance {
         assert!(r.contains("s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))"));
         assert!(r.contains("s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))"));
         assert!(r.contains("project: s2 / s1"));
+    }
+
+    // The structure map (the engine's named output): one call classifies every
+    // axis and attaches the derived accumulator to the foldable ones.
+    #[test]
+    fn structure_map_for_attention() {
+        let q = input("Q", &["sq", "d"]);
+        let k = input("K", &["k", "d"]);
+        let v = input("V", &["k", "e"]);
+        let report = analyze(&attention(q, k, v, "d", "k"), &["sq", "k"]);
+
+        let sq = &report.axes[0];
+        assert_eq!(sq.structure.level, Parallelism::Free);
+        assert!(sq.carrier.is_none(), "a grid axis has nothing to fold");
+
+        let kk = &report.axes[1];
+        assert_eq!(kk.structure.level, Parallelism::Monoidal);
+        assert_eq!(kk.carrier.as_ref().unwrap().slots, 3, "(m, ℓ, o) attached to k");
+
+        let r = report.render();
+        assert!(r.contains("sq   FREE") && r.contains("grid"));
+        assert!(r.contains("k    MONOIDAL") && r.contains("project: s2 / s1"));
     }
 
     // ── §10: attention s_q FREE, k MONOIDAL, derives Acc=(m,s,o), proj=o/s ───
