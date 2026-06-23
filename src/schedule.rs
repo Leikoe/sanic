@@ -7,17 +7,14 @@
 //! layer, and an analytic **cost model** that *ranks* candidate schedules.
 //!
 //! The defining property (§ intro): every schedule here is already legal, so the
-//! cost model only has to *order* candidates, never validate them. The search
-//! (steps 3–5: tile/partition/memory) is layered on top later; this slice is the
-//! foundation everything else trusts, plus just enough inner tile selection to
-//! make the headline acceptance call — *fuse when it pays, cut when it doesn't*.
+//! cost model only has to *order* candidates, never validate them.
 //!
-//! The accumulator size `|Acc|` in the SRAM constraint is **not** hard-coded: it
-//! comes from the carrier the algebraic engine derives for the streamed axis, via
-//! `Carrier::acc_scalars` — exactly the handoff the design doc prescribes.
-
-use crate::carrier;
-use crate::engine_ir::{attention, input};
+//! Scope: the cost functions below are the **attention worked-example** of §8 —
+//! the flops/HBM/cut formulas are attention-specific. What is *not* baked in is
+//! the accumulator size: `acc_per_lane` is passed in by the caller, who derives
+//! it from the real graph (`Carrier::acc_scalars`). That is the genuine handoff
+//! the design doc prescribes — this module never reaches back into the engine.
+//! A general graph-partition scheduler (step 4) is future work.
 
 /// §1.3 — the device the scheduler is parameterized by. All hardware-specific
 /// numbers live here; the rest of the module is device-agnostic.
@@ -135,29 +132,23 @@ const KT: f64 = 64.0; // K/V block streamed per step
 
 /// Best feasible fused-attention kernel and its query-tile, choosing the sq-tile
 /// that minimizes time (the inner tile search of §6.1, a power-of-two scan).
-pub fn fused_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Option<(Kernel, usize)> {
+///
+/// `acc_per_lane` is the engine-supplied `|Acc|`: the accumulator scalars per
+/// query, from `Carrier::acc_scalars` on the real graph. The scheduler trusts it
+/// rather than re-deriving (or hard-coding) it.
+pub fn fused_attention(
+    dev: &Device,
+    sq: f64,
+    k: f64,
+    d: f64,
+    acc_per_lane: f64,
+) -> Option<(Kernel, usize)> {
     let b = dev.dtype_bytes;
 
-    // |Acc| comes from the engine, not a constant: derive the carrier for the
-    // streamed key axis and ask it how many scalars it holds per query. For
-    // FlashAttention that is m, ℓ (per query) + o (one per value-feature `e`),
-    // i.e. 2 + d — but the number is read off the derived `(m, ℓ, o)` carrier.
-    let attn = attention(
-        input("Q", &["sq", "d"]),
-        input("K", &["k", "d"]),
-        input("V", &["k", "e"]),
-        "d",
-        "k",
-    );
-    let acc_per_query = carrier::derive(&attn, "k")?.acc_scalars(|ax| match ax {
-        "e" => d, // the value-feature axis has extent d here
-        _ => 1.0, // m, ℓ are one scalar per query
-    });
-
     // working set per query-tile of size t:
-    //   Q tile (t·d) + Acc (t·acc_per_query) + K,V tiles (2·KT·d) + scores (t·KT)
+    //   Q tile (t·d) + Acc (t·acc_per_lane) + K,V tiles (2·KT·d) + scores (t·KT)
     let constant = 2.0 * KT * d * b;
-    let per_tile = (d + acc_per_query + KT) * b;
+    let per_tile = (d + acc_per_lane + KT) * b;
 
     let mut best: Option<(Kernel, usize)> = None;
     let mut t = 1.0;
@@ -231,10 +222,11 @@ pub struct Verdict {
     pub tile: Option<usize>,
 }
 
-/// Choose the cheaper feasible plan. If the fused kernel is infeasible at this
-/// shape, the engine is *forced* to cut — and that is still a correct program.
-pub fn schedule_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Verdict {
-    let fused = fused_attention(dev, sq, k, d);
+/// Choose the cheaper feasible plan. `acc_per_lane` is the engine-supplied `|Acc|`
+/// (see `fused_attention`). If the fused kernel is infeasible at this shape, the
+/// engine is *forced* to cut — and that is still a correct program.
+pub fn schedule_attention(dev: &Device, sq: f64, k: f64, d: f64, acc_per_lane: f64) -> Verdict {
+    let fused = fused_attention(dev, sq, k, d, acc_per_lane);
     let fused_time = fused.as_ref().map(|(kern, _)| kernel_time(dev, kern));
     let cut_time = schedule_time(dev, &cut_attention(dev, sq, k, d)).unwrap();
     let decision = match fused_time {
@@ -253,13 +245,31 @@ pub fn schedule_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Verdict {
 mod tests {
     use super::*;
 
+    // The engine-supplied |Acc|: derive the attention carrier from the real graph
+    // and read its per-query accumulator size (m, ℓ + o[e=d]). The scheduler is
+    // fed this; it never reconstructs it.
+    fn acc_per_lane(d: f64) -> f64 {
+        use crate::carrier;
+        use crate::engine_ir::*;
+        let attn = attention(
+            input("Q", &["sq", "d"]),
+            input("K", &["k", "d"]),
+            input("V", &["k", "e"]),
+            "d",
+            "k",
+        );
+        carrier::derive(&attn, "k")
+            .unwrap()
+            .acc_scalars(|ax| if ax == "e" { d } else { 1.0 })
+    }
+
     // §8: reproduce flash attention — at a typical head dim the scheduler fuses,
     // streaming k and keeping the (m, ℓ, o) accumulator in SRAM, derived from the
     // cost model rather than a stored template.
     #[test]
     fn reproduces_flash_at_typical_shape() {
         let dev = Device::toy();
-        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0);
+        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0, acc_per_lane(64.0));
         assert_eq!(v.decision, Decision::Fuse);
         assert!(v.fused_time.unwrap() < v.cut_time);
     }
@@ -270,8 +280,14 @@ mod tests {
     #[test]
     fn cuts_when_fusion_does_not_pay() {
         let dev = Device::toy();
-        assert_eq!(schedule_attention(&dev, 2048.0, 2048.0, 32.0).decision, Decision::Fuse);
-        assert_eq!(schedule_attention(&dev, 2048.0, 2048.0, 512.0).decision, Decision::Cut);
+        assert_eq!(
+            schedule_attention(&dev, 2048.0, 2048.0, 32.0, acc_per_lane(32.0)).decision,
+            Decision::Fuse
+        );
+        assert_eq!(
+            schedule_attention(&dev, 2048.0, 2048.0, 512.0, acc_per_lane(512.0)).decision,
+            Decision::Cut
+        );
     }
 
     // The crossover is monotone: there is a single d below which we fuse and above
@@ -282,7 +298,7 @@ mod tests {
         let ds = [16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0];
         let decisions: Vec<_> = ds
             .iter()
-            .map(|&d| schedule_attention(&dev, 2048.0, 2048.0, d).decision)
+            .map(|&d| schedule_attention(&dev, 2048.0, 2048.0, d, acc_per_lane(d)).decision)
             .collect();
         let first_cut = decisions.iter().position(|x| *x == Decision::Cut).unwrap();
         assert!(first_cut > 0, "must fuse at the smallest d");
@@ -296,8 +312,8 @@ mod tests {
     #[test]
     fn infeasible_fusion_forces_cut() {
         let dev = Device::toy();
-        assert!(fused_attention(&dev, 2048.0, 2048.0, 2048.0).is_none());
-        let v = schedule_attention(&dev, 2048.0, 2048.0, 2048.0);
+        assert!(fused_attention(&dev, 2048.0, 2048.0, 2048.0, acc_per_lane(2048.0)).is_none());
+        let v = schedule_attention(&dev, 2048.0, 2048.0, 2048.0, acc_per_lane(2048.0));
         assert_eq!(v.decision, Decision::Cut);
         assert!(v.fused_time.is_none());
         assert!(v.cut_time.is_finite());
@@ -320,7 +336,7 @@ mod tests {
     #[test]
     fn fusion_chooses_a_real_query_tile() {
         let dev = Device::toy();
-        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0);
+        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0, acc_per_lane(64.0));
         assert_eq!(v.decision, Decision::Fuse);
         assert!(v.tile.unwrap() > 1, "tiling amortizes K/V reads → tile > 1");
     }
