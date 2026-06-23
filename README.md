@@ -78,23 +78,27 @@ exp-shifted-sum slot.
 ## Legality, then profitability
 
 The algebra above decides **legality** (what *can* fuse, and the exact
-accumulator). `schedule` adds the other half — **profitability**: against a
-device model it costs the fused flash kernel (streams `k`, keeps `(m, ℓ, o)` in
-SRAM) versus the cut two-matmul plan (materializes the scores), and picks the
-cheaper feasible one. The accumulator size in the SRAM constraint is read off the
-**derived carrier** (`Carrier::acc_scalars`, using per-slot axis spans), not a
-magic constant — exactly the `|Acc|` handoff the design doc prescribes. Because
-legality is already proven, the cost model only *ranks* — it can pick a slow
-plan, never a wrong one. It fuses at small head dims, **cuts when fusion stops
-paying** (SRAM pressure collapses occupancy past the materialization it avoids),
-and falls back to cut when fusion is infeasible.
+accumulator). `schedule` adds the other half — **profitability** — and it is
+*workload-agnostic*: it knows only `Device`s and `Kernel`s, providing the
+feasibility test, the roofline cost model, and the two generic searches
+(`best_tile` inner, `cheapest` outer). It never mentions attention.
+
+The FlashAttention fuse-vs-cut decision is then a *client* of those primitives
+(`tests/attention_scheduling.rs`): it builds the fused kernel (streams `k`, keeps
+`(m, ℓ, o)` in SRAM — `|Acc|` read off the derived carrier via
+`Carrier::acc_scalars`) and the cut two-matmul plan (materializes the scores),
+and asks the library which is cheaper. Because legality is already proven, the
+cost model only *ranks* — it can pick a slow plan, never a wrong one. It fuses at
+small head dims, **cuts when fusion stops paying** (SRAM pressure collapses
+occupancy past the materialization it avoids), and falls back to cut when fusion
+is infeasible.
 
 ## Run it
 
 ```
 cargo run --example derive   # print the structure map + derived carriers
 cargo run --example mha       # naive multi-head attention → FlashAttention kernel
-cargo test                   # 27 tests
+cargo test                   # 32 tests
 ```
 
 `cargo run --example mha` builds *naive* multi-head attention as an AST, derives
@@ -118,11 +122,12 @@ pub fn flash_attention(elements: impl IntoIterator<Item = [f64; 2]>) -> f64 {
 }
 ```
 
-The scheduler then sizes it: it costs fuse-vs-cut, and when it fuses it picks the
-query-tile that fits SRAM (here `tile = 64`, amortizing the K/V reads). `codegen`
-emits the **blocked** kernel for that tile — `tile × |Acc|` accumulators resident
-across the key stream. (Still a CPU scalar kernel; GPU/backend lowering is
-downstream.)
+The scheduler then sizes it: feeding the carrier's `|Acc|` into the feasibility
+primitive picks a query-tile that fits SRAM, and `codegen` emits the **blocked**
+kernel for that tile — `tile × |Acc|` accumulators resident across the key
+stream. (The full cost-based fuse-vs-cut decision is in
+`tests/attention_scheduling.rs`. Still a CPU scalar kernel; GPU/backend lowering
+is downstream.)
 
 The example shows the engine classifying attention and reconstructing
 FlashAttention from the graph — no formula is written by hand:

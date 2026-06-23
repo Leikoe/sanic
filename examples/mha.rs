@@ -12,7 +12,7 @@ use sanic::carrier;
 use sanic::codegen::{rust_kernel, tiled_kernel};
 use sanic::engine::analyze_all;
 use sanic::engine_ir::*;
-use sanic::schedule::{Decision, Device, schedule_attention};
+use sanic::schedule::{Device, max_tile};
 use sanic::stage1::Parallelism;
 
 fn main() {
@@ -72,20 +72,16 @@ fn main() {
     println!("emitted kernel:\n");
     println!("{}", rust_kernel(&flash, "flash_attention", "k", &grid));
 
-    // Now let the scheduler size it for a device. It costs fuse-vs-cut and, when
-    // fusing, picks the query-tile that fits SRAM — and codegen blocks the kernel
-    // by exactly that tile (tile × |Acc| resident).
+    // Now size it for a device. The accumulator we just derived gives |Acc|;
+    // the scheduler's feasibility primitive picks the largest query-tile that
+    // fits SRAM, and codegen blocks the kernel by it (tile × |Acc| resident).
+    // (The full cost-based fuse-vs-cut decision lives in tests/attention_scheduling.rs.)
     let dev = Device::toy();
-    let (sq, keys, dim) = (2048.0, 4096.0, 64.0);
-    // |Acc| comes from the carrier we derived above — supplied to the scheduler.
-    let acc_per_lane = flash.acc_scalars(|ax| if ax == "e" { dim } else { 1.0 });
-    let v = schedule_attention(&dev, sq, keys, dim, acc_per_lane);
-    println!(
-        "\nscheduler (sq={sq}, k={keys}, d={dim}): {:?}, query-tile = {:?}",
-        v.decision, v.tile
-    );
-    if let (Decision::Fuse, Some(tile)) = (&v.decision, v.tile) {
-        println!("\nemitted TILED kernel (scheduler chose tile = {tile}):\n");
-        println!("{}", tiled_kernel(&flash, "flash_attention_tiled", "k", tile));
-    }
+    let (sq, dim, b) = (2048.0, 64.0, dev.dtype_bytes);
+    let acc = flash.acc_scalars(|ax| if ax == "e" { dim } else { 1.0 }); // |Acc| per query
+    let constant = 2.0 * 64.0 * dim * b; // K/V tiles
+    let per_tile = (dim + acc + 64.0) * b; // Q tile + |Acc| + scores block
+    let tile = max_tile(&dev, constant, per_tile).clamp(1, sq as i64) as usize;
+    println!("\nlargest query-tile that fits SRAM: {tile} ({tile} × {} = {} scalars resident)\n", flash.slots, tile * flash.slots);
+    println!("{}", tiled_kernel(&flash, "flash_attention_tiled", "k", tile));
 }

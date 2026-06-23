@@ -2,19 +2,18 @@
 //!
 //! The algebraic engine (`stage1` + `carrier`) solved **legality**: every axis
 //! is classified and every foldable axis has a correct-by-construction
-//! accumulator of *known size* `|Acc|`. This module solves the first half of
-//! **profitability**: a synthetic device model, a hard-constraint **feasibility**
-//! layer, and an analytic **cost model** that *ranks* candidate schedules.
+//! accumulator of *known size* `|Acc|`. This module is the **profitability**
+//! core: a device model, a hard-constraint feasibility layer, an analytic cost
+//! model, and the two generic searches (inner over a tile, outer over a fusion
+//! partition).
 //!
-//! The defining property (§ intro): every schedule here is already legal, so the
-//! cost model only has to *order* candidates, never validate them.
+//! It is *workload-agnostic*: it knows only `Device`s and `Kernel`s. How a given
+//! computation decomposes into candidate kernels (their flops, traffic, working
+//! set) is the caller's business — see `tests/attention_scheduling.rs` for the
+//! FlashAttention fuse-vs-cut worked example built on top of these primitives.
 //!
-//! Scope: the cost functions below are the **attention worked-example** of §8 —
-//! the flops/HBM/cut formulas are attention-specific. What is *not* baked in is
-//! the accumulator size: `acc_per_lane` is passed in by the caller, who derives
-//! it from the real graph (`Carrier::acc_scalars`). That is the genuine handoff
-//! the design doc prescribes — this module never reaches back into the engine.
-//! A general graph-partition scheduler (step 4) is future work.
+//! The defining property (§ intro): every schedule the caller hands in is already
+//! legal, so the cost model only has to *order* candidates, never validate them.
 
 /// §1.3 — the device the scheduler is parameterized by. All hardware-specific
 /// numbers live here; the rest of the module is device-agnostic.
@@ -54,11 +53,11 @@ impl Device {
 pub struct Kernel {
     pub name: String,
     pub flops: f64,
-    /// Total global-memory traffic (reads + writes). A cut materializes its
-    /// intermediate here — the extra write+read is the economic case for fusion.
+    /// Total global-memory traffic (reads + writes). Materializing an
+    /// intermediate (a fusion cut) shows up here as extra write+read.
     pub hbm_bytes: f64,
-    /// Working set that must stay resident per block — *includes the `|Acc|`
-    /// term* supplied by the algebraic engine. This is the SRAM constraint.
+    /// Working set that must stay resident per block — includes the `|Acc|` term
+    /// the algebraic engine supplies. This is the SRAM constraint.
     pub sram_per_block: f64,
     pub regs_per_block: f64,
     /// Count of independent blocks of work (the available parallelism).
@@ -112,243 +111,48 @@ pub fn schedule_time(dev: &Device, kernels: &[Kernel]) -> Option<f64> {
     }
 }
 
-// ── attention scenario: the fuse-vs-cut decision (§8 acceptance) ─────────────
-//
-// Problem: `sq` queries attend over `k` keys with head dim `d`. The algebraic
-// engine derives the flash accumulator `(m, ℓ, o[d])` for the streamed `k` axis,
-// and `Carrier::acc_scalars` reports its per-query size — the `|Acc|` term below
-// is read off that carrier, not written here.
-//
-//   Fused (flash): one kernel, streams k, never materializes the sq×k scores.
-//                  But Q-tile + Acc + K/V tile must co-reside in SRAM, so large d
-//                  shrinks the feasible tile → occupancy collapses.
-//   Cut:           two matmuls with the sq×k scores materialized to HBM. Each is
-//                  a dense, high-occupancy matmul, paying extra traffic + a launch.
-//
-// Small d → fuse (avoids scores, plenty of occupancy). Large d → the fused
-// kernel's SRAM/occupancy penalty exceeds the materialization it avoids → cut.
+// ── §6: the two generic searches ─────────────────────────────────────────────
 
-const KT: f64 = 64.0; // K/V block streamed per step
-
-/// Best feasible fused-attention kernel and its query-tile, choosing the sq-tile
-/// that minimizes time (the inner tile search of §6.1, a power-of-two scan).
-///
-/// `acc_per_lane` is the engine-supplied `|Acc|`: the accumulator scalars per
-/// query, from `Carrier::acc_scalars` on the real graph. The scheduler trusts it
-/// rather than re-deriving (or hard-coding) it.
-pub fn fused_attention(
-    dev: &Device,
-    sq: f64,
-    k: f64,
-    d: f64,
-    acc_per_lane: f64,
-) -> Option<(Kernel, usize)> {
-    let b = dev.dtype_bytes;
-
-    // working set per query-tile of size t:
-    //   Q tile (t·d) + Acc (t·acc_per_lane) + K,V tiles (2·KT·d) + scores (t·KT)
-    let constant = 2.0 * KT * d * b;
-    let per_tile = (d + acc_per_lane + KT) * b;
-
-    let mut best: Option<(Kernel, usize)> = None;
-    let mut t = 1.0;
-    while t <= sq {
-        let sram = constant + per_tile * t;
-        if sram <= dev.sram_bytes {
-            // K and V are re-read once per query block, so a bigger tile amortizes
-            // them — this is *why* you tile queries. Q in / O out are read once.
-            let blocks = (sq / t).ceil();
-            let kern = Kernel {
-                name: format!("flash(sq_tile={})", t as u64),
-                flops: 4.0 * sq * k * d, // QKᵀ + AV
-                hbm_bytes: (2.0 * sq * d + blocks * 2.0 * k * d) * b, // Q,O once; K,V per block
-                sram_per_block: sram,
-                regs_per_block: per_tile * t,
-                parallel_blocks: blocks,
-            };
-            let better = match &best {
-                None => true,
-                Some((bk, _)) => kernel_time(dev, &kern) < kernel_time(dev, bk),
-            };
-            if better {
-                best = Some((kern, t as usize));
-            }
-        }
-        t *= 2.0;
-    }
-    best
+/// §6.1 inner search — pick the cheapest feasible kernel from a family of
+/// candidates (typically one per tile size). Returns the candidate and its cost.
+pub fn best_tile<T>(dev: &Device, candidates: impl IntoIterator<Item = (T, Kernel)>) -> Option<(T, Kernel)> {
+    candidates
+        .into_iter()
+        .filter(|(_, k)| feasible(dev, k))
+        .min_by(|a, b| kernel_time(dev, &a.1).total_cmp(&kernel_time(dev, &b.1)))
 }
 
-/// The two-kernel cut: materialize scores, then softmax+AV. Standard dense
-/// matmuls with modest, near-constant SRAM → high occupancy.
-pub fn cut_attention(dev: &Device, sq: f64, k: f64, d: f64) -> [Kernel; 2] {
-    let b = dev.dtype_bytes;
-    // a 64×64 matmul tile with 32-deep inner accumulation (operands + C tile)
-    let mm_sram = (64.0 * 32.0 + 32.0 * 64.0 + 64.0 * 64.0) * b;
-
-    let scores = Kernel {
-        name: "scores = QKᵀ".into(),
-        flops: 2.0 * sq * k * d,
-        hbm_bytes: (sq * d + k * d + sq * k) * b, // read Q,K; write S
-        sram_per_block: mm_sram,
-        regs_per_block: mm_sram,
-        parallel_blocks: (sq / 64.0).ceil() * (k / 64.0).ceil(),
-    };
-    let av = Kernel {
-        name: "out = softmax(S)·V".into(),
-        flops: 2.0 * sq * k * d + sq * k, // matmul + cheap softmax
-        hbm_bytes: (sq * k + k * d + sq * d) * b, // read S,V; write O
-        sram_per_block: mm_sram,
-        regs_per_block: mm_sram,
-        parallel_blocks: (sq / 64.0).ceil() * (d / 64.0).ceil(),
-    };
-    [scores, av]
-}
-
-/// The scheduler's fuse-vs-cut verdict for an attention problem.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decision {
-    Fuse,
-    Cut,
-}
-
-#[derive(Debug, Clone)]
-pub struct Verdict {
-    pub decision: Decision,
-    pub fused_time: Option<f64>,
-    pub cut_time: f64,
-    /// The query-tile the fused plan would use (its resident lanes) — what
-    /// codegen blocks the kernel by. `None` when fusion is infeasible.
-    pub tile: Option<usize>,
-}
-
-/// Choose the cheaper feasible plan. `acc_per_lane` is the engine-supplied `|Acc|`
-/// (see `fused_attention`). If the fused kernel is infeasible at this shape, the
-/// engine is *forced* to cut — and that is still a correct program.
-pub fn schedule_attention(dev: &Device, sq: f64, k: f64, d: f64, acc_per_lane: f64) -> Verdict {
-    let fused = fused_attention(dev, sq, k, d, acc_per_lane);
-    let fused_time = fused.as_ref().map(|(kern, _)| kernel_time(dev, kern));
-    let cut_time = schedule_time(dev, &cut_attention(dev, sq, k, d)).unwrap();
-    let decision = match fused_time {
-        Some(ft) if ft <= cut_time => Decision::Fuse,
-        _ => Decision::Cut,
-    };
-    Verdict {
-        decision,
-        fused_time,
-        cut_time,
-        tile: fused.map(|(_, t)| t),
-    }
+/// §6.2 outer search — pick the cheapest feasible schedule (fusion partition)
+/// among candidate plans. Returns its index and total cost; `None` if none fit.
+pub fn cheapest(dev: &Device, plans: &[&[Kernel]]) -> Option<(usize, f64)> {
+    plans
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| schedule_time(dev, p).map(|t| (i, t)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The engine-supplied |Acc|: derive the attention carrier from the real graph
-    // and read its per-query accumulator size (m, ℓ + o[e=d]). The scheduler is
-    // fed this; it never reconstructs it.
-    fn acc_per_lane(d: f64) -> f64 {
-        use crate::carrier;
-        use crate::engine_ir::*;
-        let attn = attention(
-            input("Q", &["sq", "d"]),
-            input("K", &["k", "d"]),
-            input("V", &["k", "e"]),
-            "d",
-            "k",
-        );
-        carrier::derive(&attn, "k")
-            .unwrap()
-            .acc_scalars(|ax| if ax == "e" { d } else { 1.0 })
+    fn kernel(flops: f64, hbm: f64, sram: f64, blocks: f64) -> Kernel {
+        Kernel {
+            name: "k".into(),
+            flops,
+            hbm_bytes: hbm,
+            sram_per_block: sram,
+            regs_per_block: sram,
+            parallel_blocks: blocks,
+        }
     }
 
-    // §8: reproduce flash attention — at a typical head dim the scheduler fuses,
-    // streaming k and keeping the (m, ℓ, o) accumulator in SRAM, derived from the
-    // cost model rather than a stored template.
-    #[test]
-    fn reproduces_flash_at_typical_shape() {
-        let dev = Device::toy();
-        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0, acc_per_lane(64.0));
-        assert_eq!(v.decision, Decision::Fuse);
-        assert!(v.fused_time.unwrap() < v.cut_time);
-    }
-
-    // §8: the real test — make the right cut/fuse call where fusion does NOT pay.
-    // As d grows, the fused kernel's SRAM pressure collapses occupancy until the
-    // occupancy penalty exceeds the scores materialization it avoids → cut.
-    #[test]
-    fn cuts_when_fusion_does_not_pay() {
-        let dev = Device::toy();
-        assert_eq!(
-            schedule_attention(&dev, 2048.0, 2048.0, 32.0, acc_per_lane(32.0)).decision,
-            Decision::Fuse
-        );
-        assert_eq!(
-            schedule_attention(&dev, 2048.0, 2048.0, 512.0, acc_per_lane(512.0)).decision,
-            Decision::Cut
-        );
-    }
-
-    // The crossover is monotone: there is a single d below which we fuse and above
-    // which we cut (no flip-flopping) — a sane, rankable cost surface.
-    #[test]
-    fn fuse_cut_crossover_is_monotone() {
-        let dev = Device::toy();
-        let ds = [16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0];
-        let decisions: Vec<_> = ds
-            .iter()
-            .map(|&d| schedule_attention(&dev, 2048.0, 2048.0, d, acc_per_lane(d)).decision)
-            .collect();
-        let first_cut = decisions.iter().position(|x| *x == Decision::Cut).unwrap();
-        assert!(first_cut > 0, "must fuse at the smallest d");
-        // once it cuts, it never goes back to fusing
-        assert!(decisions[first_cut..].iter().all(|x| *x == Decision::Cut));
-    }
-
-    // Feasibility forces a correct fallback: at a huge head dim the fused kernel
-    // cannot fit SRAM even at tile=1, so the engine is *forced* to cut — and that
-    // is still a legal program (the whole point: it can only be slow, not wrong).
-    #[test]
-    fn infeasible_fusion_forces_cut() {
-        let dev = Device::toy();
-        assert!(fused_attention(&dev, 2048.0, 2048.0, 2048.0, acc_per_lane(2048.0)).is_none());
-        let v = schedule_attention(&dev, 2048.0, 2048.0, 2048.0, acc_per_lane(2048.0));
-        assert_eq!(v.decision, Decision::Cut);
-        assert!(v.fused_time.is_none());
-        assert!(v.cut_time.is_finite());
-    }
-
-    // The economic case for fusion: the cut pays to round-trip the sq×k scores
-    // through HBM — exactly the traffic fusion avoids by never materializing them.
-    #[test]
-    fn cut_pays_for_materializing_the_scores() {
-        let dev = Device::toy();
-        let (sq, k, d) = (2048.0, 4096.0, 64.0);
-        let cut_total: f64 = cut_attention(&dev, sq, k, d).iter().map(|c| c.hbm_bytes).sum();
-        let essential = (2.0 * sq * d + 2.0 * k * d) * dev.dtype_bytes; // inputs once + output once
-        let scores_roundtrip = 2.0 * sq * k * dev.dtype_bytes;
-        assert!((cut_total - essential - scores_roundtrip).abs() < 1.0);
-    }
-
-    // Query-tiling exists to amortize K/V reads, so the inner search picks a real
-    // tile > 1 — the number codegen then blocks the kernel by.
-    #[test]
-    fn fusion_chooses_a_real_query_tile() {
-        let dev = Device::toy();
-        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0, acc_per_lane(64.0));
-        assert_eq!(v.decision, Decision::Fuse);
-        assert!(v.tile.unwrap() > 1, "tiling amortizes K/V reads → tile > 1");
-    }
-
-    // The analytic max_tile (§4) matches a brute-force feasible-tile search — the
-    // seed the inner search relies on is exact.
+    // The analytic max_tile (§4) matches a brute-force feasible-tile search.
     #[test]
     fn analytic_max_tile_matches_search() {
         let dev = Device::toy();
         let (constant, per_tile) = (40_000.0, 900.0);
         let analytic = max_tile(&dev, constant, per_tile);
-        // brute force the largest t with constant + per_tile·t ≤ sram
         let mut brute = 0i64;
         let mut t = 1i64;
         while constant + per_tile * t as f64 <= dev.sram_bytes {
@@ -362,17 +166,44 @@ mod tests {
     #[test]
     fn occupancy_is_bounded_and_monotone() {
         let dev = Device::toy();
-        let mk = |sram: f64| Kernel {
-            name: "k".into(),
-            flops: 1e9,
-            hbm_bytes: 1e6,
-            sram_per_block: sram,
-            regs_per_block: sram,
-            parallel_blocks: 1e6,
-        };
-        let small = occupancy(&dev, &mk(8_000.0));
-        let big = occupancy(&dev, &mk(80_000.0));
+        let small = occupancy(&dev, &kernel(1e9, 1e6, 8_000.0, 1e6));
+        let big = occupancy(&dev, &kernel(1e9, 1e6, 80_000.0, 1e6));
         assert!(small > 0.0 && small <= 1.0);
         assert!(big <= small, "more SRAM per block ⇒ no higher occupancy");
+    }
+
+    // schedule_time sums feasible kernels and rejects an infeasible one.
+    #[test]
+    fn schedule_time_rejects_infeasible() {
+        let dev = Device::toy();
+        let ok = kernel(1e9, 1e6, 16_000.0, 1e4);
+        let too_big = kernel(1e9, 1e6, dev.sram_bytes + 1.0, 1e4);
+        assert!(schedule_time(&dev, &[ok.clone(), ok.clone()]).is_some());
+        assert!(schedule_time(&dev, &[ok, too_big]).is_none());
+    }
+
+    // best_tile picks the minimum-time feasible candidate, skipping infeasible.
+    #[test]
+    fn best_tile_picks_cheapest_feasible() {
+        let dev = Device::toy();
+        // tile 4 is cheapest but infeasible; among feasible, more parallelism wins
+        let cands = vec![
+            (1usize, kernel(1e10, 1e6, 16_000.0, 1.0)),
+            (2usize, kernel(1e10, 1e6, 16_000.0, 64.0)),
+            (4usize, kernel(1e10, 1e6, dev.sram_bytes + 1.0, 1e6)),
+        ];
+        let (t, _) = best_tile(&dev, cands).unwrap();
+        assert_eq!(t, 2);
+    }
+
+    // cheapest picks the lower-cost feasible plan and ignores infeasible ones.
+    #[test]
+    fn cheapest_plan_wins() {
+        let dev = Device::toy();
+        let cheap = vec![kernel(1e9, 1e6, 16_000.0, 1e4)];
+        let dear = vec![kernel(1e12, 1e6, 16_000.0, 1e4)];
+        let dead = vec![kernel(1e6, 1e6, dev.sram_bytes + 1.0, 1e4)];
+        let (i, _) = cheapest(&dev, &[&dear, &cheap, &dead]).unwrap();
+        assert_eq!(i, 1);
     }
 }
