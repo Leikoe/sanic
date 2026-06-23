@@ -74,6 +74,43 @@ pub fn gather(src: Node, index: Node, axis: Axis) -> Node {
     Rc::new(NodeKind::Gather { src, index, axis })
 }
 
+/// Every axis referenced anywhere in the graph (inputs, reductions, scans,
+/// gathers), in first-seen order. The set of axes the structure map classifies.
+pub fn all_axes(node: &Node) -> Vec<Axis> {
+    let mut out = Vec::new();
+    collect_axes(node, &mut out);
+    out
+}
+
+fn collect_axes(node: &Node, out: &mut Vec<Axis>) {
+    let push = |a: Axis, out: &mut Vec<Axis>| {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    };
+    match node.as_ref() {
+        NodeKind::Input { axes, .. } => {
+            for &a in axes {
+                push(a, out);
+            }
+        }
+        NodeKind::Map { inputs, .. } => {
+            for i in inputs {
+                collect_axes(i, out);
+            }
+        }
+        NodeKind::Reduce { src, axis, .. } | NodeKind::Scan { src, axis, .. } => {
+            push(axis, out);
+            collect_axes(src, out);
+        }
+        NodeKind::Gather { src, index, axis } => {
+            push(axis, out);
+            collect_axes(src, out);
+            collect_axes(index, out);
+        }
+    }
+}
+
 // ── named map functions (used by the Stage 2A recognizer) ────────────────────
 
 pub const MUL: MapFn = MapFn::new("mul", true);

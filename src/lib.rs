@@ -28,7 +28,7 @@ mod acceptance {
     //! composition rules — not a stored template — is the primary criterion.
 
     use crate::carrier::{self, Carrier};
-    use crate::engine::analyze;
+    use crate::engine::{analyze, analyze_all};
     use crate::engine_ir::*;
     use crate::op::{BinOp, Monoid};
     use crate::stage1::{Parallelism, streamable, structure};
@@ -145,10 +145,32 @@ mod acceptance {
         let kk = &report.axes[1];
         assert_eq!(kk.structure.level, Parallelism::Monoidal);
         assert_eq!(kk.carrier.as_ref().unwrap().slots, 3, "(m, ℓ, o) attached to k");
+    }
+
+    // Zero-config: the engine discovers every axis itself and classifies it. For
+    // attention that is the fusion axis k (folds, carrier), the contraction d
+    // (folds one level down — no carrier here), and the grid axes sq, e.
+    #[test]
+    fn structure_map_auto_discovers_axes() {
+        let q = input("Q", &["sq", "d"]);
+        let k = input("K", &["k", "d"]);
+        let v = input("V", &["k", "e"]);
+        let attn = attention(q, k, v, "d", "k");
+
+        let discovered: std::collections::BTreeSet<_> = all_axes(&attn).into_iter().collect();
+        assert_eq!(discovered, ["d", "e", "k", "sq"].into_iter().collect());
+
+        let report = analyze_all(&attn);
+        let by = |name: &str| report.axes.iter().find(|a| a.axis == name).unwrap();
+        assert_eq!(by("k").carrier.as_ref().unwrap().slots, 3); // the fusion axis
+        assert_eq!(by("d").structure.level, Parallelism::Monoidal);
+        assert!(by("d").carrier.is_none(), "the contraction folds deeper, not here");
+        assert_eq!(by("sq").structure.level, Parallelism::Free);
+        assert_eq!(by("e").structure.level, Parallelism::Free);
 
         let r = report.render();
-        assert!(r.contains("sq   FREE") && r.contains("grid"));
-        assert!(r.contains("k    MONOIDAL") && r.contains("project: s2 / s1"));
+        assert!(r.contains("project: s2 / s1"));
+        assert!(r.contains("fold (in a sub-expression)"));
     }
 
     // ── §10: attention s_q FREE, k MONOIDAL, derives Acc=(m,s,o), proj=o/s ───

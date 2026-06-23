@@ -4,10 +4,10 @@
 //!
 //!     cargo run --example derive
 
-use sanic::engine::analyze;
+use sanic::carrier;
+use sanic::engine::analyze_all;
 use sanic::engine_ir::*;
 use sanic::op::{BinOp, Monoid};
-use sanic::carrier;
 
 fn add() -> BinOp {
     BinOp::Monoid(Monoid::Add)
@@ -45,8 +45,8 @@ fn main() {
     let k = input("K", &["k", "d"]);
     let v = input("V", &["k", "e"]);
     let attn = attention(q, k, v, "d", "k");
-    println!("── attention: softmax(QKᵀ)·V ──");
-    print!("{}", analyze(&attn, &["sq", "k"]).render());
+    println!("── attention: softmax(QKᵀ)·V (every axis, auto-discovered) ──");
+    print!("{}", analyze_all(&attn).render());
     println!();
 
     // the time axis of a tanh-RNN: a non-associative recurrence → refused.
