@@ -302,10 +302,9 @@ pub fn derive(node: &Node, axis: &str) -> Option<Carrier> {
         op: BinOp::AffineCompose,
         ..
     } = node.as_ref()
+        && *sc == axis
     {
-        if *sc == axis {
-            return Some(affine_scan_carrier());
-        }
+        return Some(affine_scan_carrier());
     }
 
     let mut ctx = Ctx {
