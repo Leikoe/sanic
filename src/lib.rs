@@ -202,6 +202,40 @@ mod acceptance {
         assert_eq!(acc, 2.0 + 64.0);
     }
 
+    // Naive multi-head attention derives into the *same* FlashAttention kernel as
+    // single-head — fully generically. Batch and head are just extra free axes;
+    // the combine / into / project are byte-identical, only the accumulator's
+    // spans grow to carry them.
+    #[test]
+    fn multi_head_attention_derives_identically_to_single_head() {
+        let mha = attention(
+            input("Q", &["b", "h", "sq", "d"]),
+            input("K", &["b", "h", "k", "d"]),
+            input("V", &["b", "h", "k", "e"]),
+            "d",
+            "k",
+        );
+        let sha = attention(
+            input("Q", &["sq", "d"]),
+            input("K", &["k", "d"]),
+            input("V", &["k", "e"]),
+            "d",
+            "k",
+        );
+        let cm = carrier::derive(&mha, "k").unwrap();
+        let cs = carrier::derive(&sha, "k").unwrap();
+
+        // the derived kernel is the same — no MHA special-casing
+        assert_eq!(format!("{:?}", cm.into), format!("{:?}", cs.into));
+        assert_eq!(format!("{:?}", cm.combine), format!("{:?}", cs.combine));
+        assert_eq!(format!("{:?}", cm.project), format!("{:?}", cs.project));
+        assert_eq!(cm.slots, 3);
+
+        // only the spans differ: MHA's output slot carries the batch & head axes
+        let o_span: std::collections::BTreeSet<_> = cm.spans[2].iter().copied().collect();
+        assert!(o_span.contains("b") && o_span.contains("h") && o_span.contains("e"));
+    }
+
     // ── §10: attention s_q FREE, k MONOIDAL, derives Acc=(m,s,o), proj=o/s ───
     #[test]
     fn attention_axis_tags_and_carrier() {

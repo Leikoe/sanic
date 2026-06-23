@@ -90,8 +90,14 @@ and falls back to cut when fusion is infeasible.
 
 ```
 cargo run --example derive   # print the structure map + derived carriers
-cargo test                   # 23 tests
+cargo run --example mha       # naive multi-head attention → FlashAttention
+cargo test                   # 26 tests
 ```
+
+`cargo run --example mha` builds *naive* multi-head attention as an AST and
+derives FlashAttention from it with no MHA-specific code — batch and head are
+just extra free axes, and the derived kernel is byte-identical to the
+single-head one.
 
 The example shows the engine classifying attention and reconstructing
 FlashAttention from the graph — no formula is written by hand:
