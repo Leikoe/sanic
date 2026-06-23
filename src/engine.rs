@@ -6,7 +6,7 @@
 //! axis, and Stage 2A to derive a carrier wherever the axis folds.
 
 use crate::carrier::{self, Carrier};
-use crate::engine_ir::Node;
+use crate::engine_ir::{self, Node};
 use crate::stage1::{self, Parallelism, Structure};
 
 /// The verdict for one axis of a graph.
@@ -44,18 +44,33 @@ pub fn analyze(node: &Node, axes: &[&str]) -> Report {
     Report { axes }
 }
 
+/// Classify *every* axis the graph touches — the zero-config front door. The
+/// engine discovers the axes itself, so the caller needn't name them.
+pub fn analyze_all(node: &Node) -> Report {
+    analyze(node, &engine_ir::all_axes(node))
+}
+
 impl Report {
     /// Render the whole map: one line per axis with its tag and what it licenses,
     /// followed by the derived accumulator for the foldable ones.
     pub fn render(&self) -> String {
         let mut out = String::from("structure map\n");
         for a in &self.axes {
-            let (tag, action) = match a.structure.level {
-                Parallelism::Free => ("FREE", "grid (DOALL)"),
-                Parallelism::Monoidal if a.structure.linear => ("MONOIDAL (linear)", "fold"),
-                Parallelism::Monoidal => ("MONOIDAL", "fold"),
-                Parallelism::Opaque => ("OPAQUE", "runtime gather"),
-                Parallelism::Sequential => ("SEQUENTIAL", "serial — no fold"),
+            let tag = match a.structure.level {
+                Parallelism::Free => "FREE",
+                Parallelism::Monoidal if a.structure.linear => "MONOIDAL (linear)",
+                Parallelism::Monoidal => "MONOIDAL",
+                Parallelism::Opaque => "OPAQUE",
+                Parallelism::Sequential => "SEQUENTIAL",
+            };
+            let action = match a.structure.level {
+                Parallelism::Free => "grid (DOALL)",
+                // MONOIDAL with no carrier here folds in a sub-expression (e.g. a
+                // contraction reduced one level down) — a cross-axis producer.
+                Parallelism::Monoidal if a.carrier.is_some() => "fold",
+                Parallelism::Monoidal => "fold (in a sub-expression)",
+                Parallelism::Opaque => "runtime gather",
+                Parallelism::Sequential => "serial — no fold",
             };
             out += &format!("  {:<4} {:<18} → {}\n", a.axis, tag, action);
             if let Some(c) = &a.carrier {

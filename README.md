@@ -44,12 +44,13 @@ certificate (fold left-to-right, O(1) state) and the parallelism certificate
   `variance`, `logsumexp`, and FlashAttention alike.
 - **`engine::analyze`** — the front door: one call returns the **structure map**,
   the artifact both design docs name — every axis classified, with the derived
-  accumulator attached to the foldable ones.
+  accumulator attached to the foldable ones. `analyze_all` discovers the axes for
+  you.
 
 ```rust
-let attn = attention(q, k, v, "d", "k");      // softmax(QKᵀ)·V
-let map  = analyze(&attn, &["sq", "k"]);       // classify + derive in one call
-// sq → FREE (grid); k → MONOIDAL with the derived (m, ℓ, o) accumulator
+let attn = attention(q, k, v, "d", "k");  // softmax(QKᵀ)·V
+let map  = analyze_all(&attn);             // classify every axis + derive, zero-config
+// k → MONOIDAL with the derived (m, ℓ, o) accumulator; sq, e → grid; d → contraction
 ```
 
 ## Why "derived, not matched" matters
@@ -94,7 +95,6 @@ FlashAttention from the graph — no formula is written by hand:
 
 ```
 structure map
-  sq   FREE               → grid (DOALL)
   k    MONOIDAL           → fold
          carrier (3 slots) [R1, R3, R4, R5]
            into:    s0 = x0;  s1 = 1;  s2 = x1
@@ -102,6 +102,9 @@ structure map
                     s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))
                     s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))
            project: s2 / s1
+  d    MONOIDAL           → fold (in a sub-expression)
+  sq   FREE               → grid (DOALL)
+  e    FREE               → grid (DOALL)
 ```
 
 The tests cover the acceptance oracle, the battle-tests above, and the
