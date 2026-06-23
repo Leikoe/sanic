@@ -9,8 +9,10 @@
 //!     cargo run --example mha
 
 use sanic::carrier;
+use sanic::codegen::rust_kernel;
 use sanic::engine::analyze_all;
 use sanic::engine_ir::*;
+use sanic::stage1::Parallelism;
 
 fn main() {
     // Naive MHA AST: out[b,h,sq,e] = softmax(QKᵀ over d, normalized over k) · V.
@@ -55,5 +57,17 @@ fn main() {
     let mx = keys.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
     let den: f64 = keys.iter().map(|p| (p[0] - mx).exp()).sum();
     let num: f64 = keys.iter().map(|p| (p[0] - mx).exp() * p[1]).sum();
-    println!("numeric check:  derived = {derived:.9}   naive = {:.9}   ✓", num / den);
+    println!("numeric check:  derived = {derived:.9}   naive = {:.9}   ✓\n", num / den);
+
+    // …and emit it as a kernel. The grid axes come from the structure map; the
+    // loop body is the derived carrier, transcribed to Rust.
+    let report = analyze_all(&out);
+    let grid: Vec<&str> = report
+        .axes
+        .iter()
+        .filter(|a| a.structure.level == Parallelism::Free)
+        .map(|a| a.axis.as_str())
+        .collect();
+    println!("emitted kernel:\n");
+    println!("{}", rust_kernel(&flash, "flash_attention", "k", &grid));
 }

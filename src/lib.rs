@@ -14,6 +14,7 @@
 //! (legality) and `scheduler_engine.md` (profitability) for the full design.
 
 pub mod carrier;
+pub mod codegen;
 pub mod engine;
 pub mod engine_ir;
 pub mod op;
