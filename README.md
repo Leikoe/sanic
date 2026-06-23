@@ -82,11 +82,25 @@ the materialization it avoids), and falls back to cut when fusion is infeasible.
 ## Run it
 
 ```
-cargo test
+cargo run --example derive   # print derived carriers as readable math
+cargo test                   # 22 tests
 ```
 
-21 tests: the acceptance oracle, the battle-tests above, and the scheduler's
-fuse-vs-cut crossover.
+`cargo run --example derive` shows the engine reconstructing FlashAttention from
+the graph — no formula is written by hand:
+
+```
+── FlashAttention (fold over `k`) ──
+carrier (3 slots) [R1, R3, R4, R5]
+  into:    s0 = x0;  s1 = 1;  s2 = x1
+  combine: s0 = max(a0, b0)
+           s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))
+           s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))
+  project: s2 / s1
+```
+
+The tests cover the acceptance oracle, the battle-tests above, and the
+scheduler's fuse-vs-cut crossover.
 
 ## Design docs
 

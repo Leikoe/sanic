@@ -85,13 +85,16 @@ fn padd(a: Expr, b: Expr) -> Expr {
 }
 fn pmul(a: Expr, b: Expr) -> Expr {
     if is0(&a) || is0(&b) {
-        cst(0.0)
-    } else if is1(&a) {
-        b
-    } else if is1(&b) {
-        a
-    } else {
-        Expr::Mul(Box::new(a), Box::new(b))
+        return cst(0.0);
+    }
+    // Push multiplication through division so a deferred normalizer stays a
+    // single fraction: (n/d)·c becomes (n·c)/d, i.e. (1/ℓ)·o renders as o/ℓ.
+    match (a, b) {
+        (Expr::Div(n, d), b) => pdiv(pmul(*n, b), *d),
+        (a, Expr::Div(n, d)) => pdiv(pmul(a, *n), *d),
+        (a, b) if is1(&a) => b,
+        (a, b) if is1(&b) => a,
+        (a, b) => Expr::Mul(Box::new(a), Box::new(b)),
     }
 }
 fn pdiv(a: Expr, b: Expr) -> Expr {
@@ -217,6 +220,74 @@ impl Carrier {
         };
         self.project.iter().map(|e| eval(e, &env)).collect()
     }
+
+    /// Render the derived carrier as readable math — so the *result* of a
+    /// derivation can be inspected, not just trusted. (`xᵢ` = element field,
+    /// `aᵢ`/`bᵢ` = the two accumulators, `sᵢ` = a state slot.)
+    pub fn render(&self) -> String {
+        let row = |v: &[Expr]| -> String {
+            v.iter()
+                .enumerate()
+                .map(|(i, e)| format!("s{i} = {}", render_expr(e, 0)))
+                .collect::<Vec<_>>()
+                .join(";  ")
+        };
+        format!(
+            "carrier ({} slots) [{}]\n  into:    {}\n  combine: {}\n  project: {}",
+            self.slots,
+            self.rules.join(", "),
+            row(&self.into),
+            row(&self.combine),
+            self.project
+                .iter()
+                .map(|e| render_expr(e, 0))
+                .collect::<Vec<_>>()
+                .join(";  "),
+        )
+    }
+}
+
+// ── readable rendering of carrier expressions ────────────────────────────────
+
+fn precedence(e: &Expr) -> u8 {
+    match e {
+        Expr::Add(..) | Expr::Sub(..) => 2,
+        Expr::Mul(..) | Expr::Div(..) => 3,
+        _ => 4, // atoms and function calls (max/min/exp/log) bind tightest
+    }
+}
+
+/// Infix rendering with minimal parentheses. `parent` is the precedence of the
+/// enclosing operator; we parenthesize only when this node binds more loosely.
+fn render_expr(e: &Expr, parent: u8) -> String {
+    let p = precedence(e);
+    let num = |v: f64| {
+        if v == f64::NEG_INFINITY {
+            "-∞".to_string()
+        } else if v == v.trunc() && v.abs() < 1e15 {
+            format!("{}", v as i64)
+        } else {
+            format!("{v}")
+        }
+    };
+    let s = match e {
+        Expr::Const(v) => num(*v),
+        Expr::Item(i) => format!("x{i}"),
+        Expr::A(i) => format!("a{i}"),
+        Expr::B(i) => format!("b{i}"),
+        Expr::F(i) => format!("s{i}"),
+        // left child at this precedence, right child one tighter so that the
+        // non-associative `-` / `/` parenthesize their right operand correctly.
+        Expr::Add(a, b) => format!("{} + {}", render_expr(a, p), render_expr(b, p)),
+        Expr::Sub(a, b) => format!("{} - {}", render_expr(a, p), render_expr(b, p + 1)),
+        Expr::Mul(a, b) => format!("{}·{}", render_expr(a, p), render_expr(b, p)),
+        Expr::Div(a, b) => format!("{} / {}", render_expr(a, p), render_expr(b, p + 1)),
+        Expr::Max(a, b) => format!("max({}, {})", render_expr(a, 0), render_expr(b, 0)),
+        Expr::Min(a, b) => format!("min({}, {})", render_expr(a, 0), render_expr(b, 0)),
+        Expr::Exp(a) => format!("exp({})", render_expr(a, 0)),
+        Expr::Log(a) => format!("log({})", render_expr(a, 0)),
+    };
+    if p < parent { format!("({s})") } else { s }
 }
 
 // ── the compositional deriver ────────────────────────────────────────────────
