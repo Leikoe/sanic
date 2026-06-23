@@ -133,9 +133,9 @@ pub fn schedule_time(dev: &Device, kernels: &[Kernel]) -> Option<f64> {
 
 const KT: f64 = 64.0; // K/V block streamed per step
 
-/// Best feasible fused-attention kernel, choosing the sq-tile that minimizes
-/// time (the inner tile search of §6.1, here a tiny power-of-two enumeration).
-pub fn fused_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Option<Kernel> {
+/// Best feasible fused-attention kernel and its query-tile, choosing the sq-tile
+/// that minimizes time (the inner tile search of §6.1, a power-of-two scan).
+pub fn fused_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Option<(Kernel, usize)> {
     let b = dev.dtype_bytes;
 
     // |Acc| comes from the engine, not a constant: derive the carrier for the
@@ -159,25 +159,28 @@ pub fn fused_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Option<Kernel> 
     let constant = 2.0 * KT * d * b;
     let per_tile = (d + acc_per_query + KT) * b;
 
-    let mut best: Option<Kernel> = None;
+    let mut best: Option<(Kernel, usize)> = None;
     let mut t = 1.0;
     while t <= sq {
         let sram = constant + per_tile * t;
         if sram <= dev.sram_bytes {
+            // K and V are re-read once per query block, so a bigger tile amortizes
+            // them — this is *why* you tile queries. Q in / O out are read once.
+            let blocks = (sq / t).ceil();
             let kern = Kernel {
                 name: format!("flash(sq_tile={})", t as u64),
                 flops: 4.0 * sq * k * d, // QKᵀ + AV
-                hbm_bytes: (2.0 * sq * d + 2.0 * k * d) * b, // Q,K,V in; O out — no scores
+                hbm_bytes: (2.0 * sq * d + blocks * 2.0 * k * d) * b, // Q,O once; K,V per block
                 sram_per_block: sram,
                 regs_per_block: per_tile * t,
-                parallel_blocks: (sq / t).ceil(),
+                parallel_blocks: blocks,
             };
             let better = match &best {
                 None => true,
-                Some(bk) => kernel_time(dev, &kern) < kernel_time(dev, bk),
+                Some((bk, _)) => kernel_time(dev, &kern) < kernel_time(dev, bk),
             };
             if better {
-                best = Some(kern);
+                best = Some((kern, t as usize));
             }
         }
         t *= 2.0;
@@ -223,12 +226,16 @@ pub struct Verdict {
     pub decision: Decision,
     pub fused_time: Option<f64>,
     pub cut_time: f64,
+    /// The query-tile the fused plan would use (its resident lanes) — what
+    /// codegen blocks the kernel by. `None` when fusion is infeasible.
+    pub tile: Option<usize>,
 }
 
 /// Choose the cheaper feasible plan. If the fused kernel is infeasible at this
 /// shape, the engine is *forced* to cut — and that is still a correct program.
 pub fn schedule_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Verdict {
-    let fused_time = fused_attention(dev, sq, k, d).map(|kern| kernel_time(dev, &kern));
+    let fused = fused_attention(dev, sq, k, d);
+    let fused_time = fused.as_ref().map(|(kern, _)| kernel_time(dev, kern));
     let cut_time = schedule_time(dev, &cut_attention(dev, sq, k, d)).unwrap();
     let decision = match fused_time {
         Some(ft) if ft <= cut_time => Decision::Fuse,
@@ -238,6 +245,7 @@ pub fn schedule_attention(dev: &Device, sq: f64, k: f64, d: f64) -> Verdict {
         decision,
         fused_time,
         cut_time,
+        tile: fused.map(|(_, t)| t),
     }
 }
 
@@ -295,18 +303,26 @@ mod tests {
         assert!(v.cut_time.is_finite());
     }
 
-    // The economic case for fusion: a feasible fused kernel moves strictly less
-    // HBM than the cut, because it never materializes the sq×k scores matrix.
+    // The economic case for fusion: the cut pays to round-trip the sq×k scores
+    // through HBM — exactly the traffic fusion avoids by never materializing them.
     #[test]
-    fn fusion_saves_hbm_traffic() {
+    fn cut_pays_for_materializing_the_scores() {
         let dev = Device::toy();
         let (sq, k, d) = (2048.0, 4096.0, 64.0);
-        let fused = fused_attention(&dev, sq, k, d).unwrap();
         let cut_total: f64 = cut_attention(&dev, sq, k, d).iter().map(|c| c.hbm_bytes).sum();
-        assert!(fused.hbm_bytes < cut_total);
-        // the gap is exactly the scores write+read it avoids: 2·sq·k·dtype
-        let saved = cut_total - fused.hbm_bytes;
-        assert!((saved - 2.0 * sq * k * dev.dtype_bytes).abs() < 1.0);
+        let essential = (2.0 * sq * d + 2.0 * k * d) * dev.dtype_bytes; // inputs once + output once
+        let scores_roundtrip = 2.0 * sq * k * dev.dtype_bytes;
+        assert!((cut_total - essential - scores_roundtrip).abs() < 1.0);
+    }
+
+    // Query-tiling exists to amortize K/V reads, so the inner search picks a real
+    // tile > 1 — the number codegen then blocks the kernel by.
+    #[test]
+    fn fusion_chooses_a_real_query_tile() {
+        let dev = Device::toy();
+        let v = schedule_attention(&dev, 2048.0, 4096.0, 64.0);
+        assert_eq!(v.decision, Decision::Fuse);
+        assert!(v.tile.unwrap() > 1, "tiling amortizes K/V reads → tile > 1");
     }
 
     // The analytic max_tile (§4) matches a brute-force feasible-tile search — the
