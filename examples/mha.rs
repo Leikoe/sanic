@@ -77,7 +77,9 @@ fn main() {
     // by exactly that tile (tile × |Acc| resident).
     let dev = Device::toy();
     let (sq, keys, dim) = (2048.0, 4096.0, 64.0);
-    let v = schedule_attention(&dev, sq, keys, dim);
+    // |Acc| comes from the carrier we derived above — supplied to the scheduler.
+    let acc_per_lane = flash.acc_scalars(|ax| if ax == "e" { dim } else { 1.0 });
+    let v = schedule_attention(&dev, sq, keys, dim, acc_per_lane);
     println!(
         "\nscheduler (sq={sq}, k={keys}, d={dim}): {:?}, query-tile = {:?}",
         v.decision, v.tile
