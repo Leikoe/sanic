@@ -46,6 +46,8 @@ certificate (fold left-to-right, O(1) state) and the parallelism certificate
   the artifact both design docs name — every axis classified, with the derived
   accumulator attached to the foldable ones. `analyze_all` discovers the axes for
   you.
+- **`codegen`** — emit the fused streaming kernel as Rust source: the grid/stream
+  loop nest from the structure map, the body from the derived carrier.
 
 ```rust
 let attn = attention(q, k, v, "d", "k");  // softmax(QKᵀ)·V
@@ -90,14 +92,33 @@ and falls back to cut when fusion is infeasible.
 
 ```
 cargo run --example derive   # print the structure map + derived carriers
-cargo run --example mha       # naive multi-head attention → FlashAttention
-cargo test                   # 26 tests
+cargo run --example mha       # naive multi-head attention → FlashAttention kernel
+cargo test                   # 27 tests
 ```
 
-`cargo run --example mha` builds *naive* multi-head attention as an AST and
-derives FlashAttention from it with no MHA-specific code — batch and head are
-just extra free axes, and the derived kernel is byte-identical to the
-single-head one.
+`cargo run --example mha` builds *naive* multi-head attention as an AST, derives
+FlashAttention from it with no MHA-specific code (batch and head are just extra
+free axes), and **emits the fused kernel as Rust source** — the grid/stream loop
+nest from the structure map, the body from the derived carrier:
+
+```rust
+/// Fused streaming kernel — grid over {b, h, sq, e}, stream over `k`.
+pub fn flash_attention(elements: impl IntoIterator<Item = [f64; 2]>) -> f64 {
+    let mut acc = [f64::NEG_INFINITY, 0.0f64, 0.0f64];
+    for x in elements {
+        let el = [x[0], 1.0f64, x[1]];
+        acc = [
+            acc[0].max(el[0]),
+            acc[1] * (acc[0] - acc[0].max(el[0])).exp() + el[1] * (el[0] - acc[0].max(el[0])).exp(),
+            acc[2] * (acc[0] - acc[0].max(el[0])).exp() + el[2] * (el[0] - acc[0].max(el[0])).exp(),
+        ];
+    }
+    acc[2] / acc[1]
+}
+```
+
+(`codegen` emits a CPU scalar kernel — a 1:1 transcription of the verified fold.
+Backend lowering, tiling from the scheduler, and GPU targets are downstream.)
 
 The example shows the engine classifying attention and reconstructing
 FlashAttention from the graph — no formula is written by hand:
