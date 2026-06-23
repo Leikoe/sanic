@@ -454,14 +454,13 @@ fn map(name: &str, inputs: &[Node], axis: &str, ctx: &mut Ctx) -> Option<S> {
         }),
 
         // exp(x − m), where `m` is a MAX reduction over the same axis. This is
-        // the coupling site (R4): the result rides the exp domain of `m`.
+        // the coupling site (R4): the result rides the exp domain of `m`. The
+        // element's own score is its local max, so the unit contribution is
+        // `exp(score − score) = 1`.
         ("exp_sub", 2) => {
-            let x = go(&inputs[0], axis, ctx)?;
+            go(&inputs[0], axis, ctx)?; // the score x — validate/register the leaf
             let m = go(&inputs[1], axis, ctx)?;
             let max_slot = coupled_max_slot(&m, ctx)?;
-            // The element's own score becomes the slot's local max, so the unit
-            // contribution `exp(score − score) = 1`.
-            let _ = x;
             Some(S::Pe {
                 raw: cst(1.0),
                 shift: Some(max_slot),
