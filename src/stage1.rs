@@ -117,13 +117,3 @@ pub fn streamable(node: &NodeKind, axis: &str) -> bool {
         Parallelism::Free | Parallelism::Monoidal
     )
 }
-
-/// Refinement of OPAQUE by index structure (§6): distinguishes coalesced,
-/// schedulable gathers from scattered bandwidth-bound ones. Exposed so the
-/// scheduler can tell them apart; not used by the algebraic stages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpaqueKind {
-    Permutation,
-    Sorted,
-    Arbitrary,
-}

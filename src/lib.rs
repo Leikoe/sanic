@@ -1,23 +1,23 @@
 //! An algebraic engine for deriving streaming kernels.
 //!
-//! Implements the buildable core of `streamability_engine.md`:
-//!   * §3   the IR (primitive basis + derived operators)            → `engine_ir`
-//!   * §3.2 operator algebra metadata                               → `op`
-//!   * §4   Stage 1: structure classification                       → `stage1`
-//!   * §5   Stage 2A: carrier derivation by composition (R1–R5)     → `carrier`
+//! One theorem — *a computation streams iff it is a monoid homomorphism along
+//! that axis* — applied by structural recursion. The engine:
 //!
-//! Stage 2B (SMT carrier synthesis, §7) is the research frontier and is left
-//! unimplemented by design.
+//!   * `op`        — the algebra each operator obeys (associativity, identity, …)
+//!   * `engine_ir` — a five-operator IR; matmul / softmax / attention are derived
+//!   * `stage1`    — classify every (node, axis): FREE / MONOIDAL / OPAQUE / SEQUENTIAL
+//!   * `carrier`   — derive the streaming accumulator for the foldable axes
+//!   * `schedule`  — given the legal skeleton, choose fuse-vs-cut for a device
+//!
+//! The headline: it reconstructs the FlashAttention `(m, ℓ, o)` accumulator from
+//! composition rules, never a stored template. See `streamability_engine.md`
+//! (legality) and `scheduler_engine.md` (profitability) for the full design.
 
 pub mod carrier;
 pub mod engine_ir;
 pub mod op;
+pub mod schedule;
 pub mod stage1;
-
-// Legacy sketch modules kept for reference.
-pub mod experimental;
-pub mod hir;
-pub mod mir;
 
 #[cfg(test)]
 mod acceptance {
