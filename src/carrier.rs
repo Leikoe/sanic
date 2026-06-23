@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::engine_ir::{Node, NodeKind};
+use crate::engine_ir::{Axis, Node, NodeKind, output_axes};
 use crate::op::{BinOp, Monoid};
 use crate::stage1::{Parallelism, structure};
 
@@ -143,6 +143,9 @@ pub struct Carrier {
     pub combine: Vec<Expr>,
     pub identity: Vec<f64>,
     pub project: Vec<Expr>,
+    /// The free axes each slot spans (the streamed axis excluded). The exact
+    /// `|Acc|` for a tile is `Σ_slots Π extents[span]` — see `acc_scalars`.
+    pub spans: Vec<Vec<Axis>>,
     /// The rules that fired while building this carrier (deduped, for §10).
     pub rules: Vec<&'static str>,
 }
@@ -221,6 +224,16 @@ impl Carrier {
         self.project.iter().map(|e| eval(e, &env)).collect()
     }
 
+    /// The exact accumulator size (scalar count) for given axis extents — the
+    /// `|Acc|` the scheduler feeds into its SRAM constraint. A slot spanning no
+    /// free axes is one scalar; a slot spanning `{sq, e}` is `extent(sq)·extent(e)`.
+    pub fn acc_scalars(&self, extent: impl Fn(&str) -> f64) -> f64 {
+        self.spans
+            .iter()
+            .map(|span| span.iter().map(|a| extent(a)).product::<f64>())
+            .sum()
+    }
+
     /// Render the derived carrier as readable math — so the *result* of a
     /// derivation can be inspected, not just trusted. (`xᵢ` = element field,
     /// `aᵢ`/`bᵢ` = the two accumulators, `sᵢ` = a state slot.)
@@ -295,7 +308,8 @@ fn render_expr(e: &Expr, parent: u8) -> String {
 /// One accumulator slot under construction.
 struct Slot {
     kind: SlotKind,
-    into: Expr, // per-element contribution, an Expr over `Item`
+    into: Expr,       // per-element contribution, an Expr over `Item`
+    span: Vec<Axis>,  // free axes this slot ranges over (streamed axis excluded)
 }
 
 #[derive(Clone, Copy)]
@@ -327,8 +341,8 @@ enum S {
 
 struct Ctx {
     slots: Vec<Slot>,
-    /// Maps a FREE-along-axis leaf node to its `Item` field index.
-    leaves: Vec<*const NodeKind>,
+    /// Each FREE-along-axis leaf node and the free axes it ranges over.
+    leaves: Vec<(*const NodeKind, Vec<Axis>)>,
     /// Memoizes `go` per node so shared sub-expressions (the IR is a DAG) map to
     /// the same slots instead of registering duplicates.
     memo: Vec<(*const NodeKind, S)>,
@@ -336,12 +350,12 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn leaf(&mut self, node: &Node) -> usize {
+    fn leaf(&mut self, node: &Node, free: Vec<Axis>) -> usize {
         let ptr = Rc::as_ptr(node);
-        if let Some(i) = self.leaves.iter().position(|p| *p == ptr) {
+        if let Some(i) = self.leaves.iter().position(|(p, _)| *p == ptr) {
             i
         } else {
-            self.leaves.push(ptr);
+            self.leaves.push((ptr, free));
             self.leaves.len() - 1
         }
     }
@@ -353,12 +367,52 @@ impl Ctx {
             self.rules.insert("R2");
         }
         self.rules.insert("R1");
-        self.slots.push(Slot { kind, into });
+        // A slot spans the free axes of every leaf it reads, plus — for a
+        // coupled (exp-shifted) slot — the axes of the max slot it rides.
+        let mut span: Vec<Axis> = Vec::new();
+        for i in items_of(&into) {
+            for &a in &self.leaves[i].1 {
+                if !span.contains(&a) {
+                    span.push(a);
+                }
+            }
+        }
+        if let SlotKind::ExpShifted { max_slot } = kind {
+            for &a in &self.slots[max_slot].span {
+                if !span.contains(&a) {
+                    span.push(a);
+                }
+            }
+        }
+        self.slots.push(Slot { kind, into, span });
         if self.slots.len() > 1 {
             self.rules.insert("R3"); // a product carrier
         }
         self.slots.len() - 1
     }
+}
+
+/// The `Item` field indices an expression reads.
+fn items_of(e: &Expr) -> Vec<usize> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<usize>) {
+        match e {
+            Expr::Item(i) => out.push(*i),
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Max(a, b)
+            | Expr::Min(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Exp(a) | Expr::Log(a) => walk(a, out),
+            _ => {}
+        }
+    }
+    walk(e, &mut out);
+    out
 }
 
 /// Derive the streaming carrier for folding `node` over `axis`, by a single
@@ -395,12 +449,14 @@ pub fn derive(node: &Node, axis: &str) -> Option<Carrier> {
     };
 
     let (into, combine, identity) = assemble(&ctx.slots);
+    let spans = ctx.slots.iter().map(|s| s.span.clone()).collect();
     Some(Carrier {
         slots: ctx.slots.len(),
         into,
         combine,
         identity,
         project,
+        spans,
         rules: ctx.rules.into_iter().collect(),
     })
 }
@@ -425,8 +481,10 @@ fn go_uncached(node: &Node, axis: &str, ctx: &mut Ctx) -> Option<S> {
     if !matches!(node.as_ref(), NodeKind::Map { .. })
         && structure(node, axis).level == Parallelism::Free
     {
+        // The leaf's free axes are its output shape minus the streamed axis.
+        let free = output_axes(node).into_iter().filter(|a| *a != axis).collect();
         return Some(S::Pe {
-            raw: Expr::Item(ctx.leaf(node)),
+            raw: Expr::Item(ctx.leaf(node, free)),
             shift: None,
             post: cst(1.0),
         });
@@ -677,6 +735,7 @@ fn affine_scan_carrier() -> Carrier {
         ],
         identity: vec![1.0, 0.0], // identity affine map
         project: vec![Expr::F(1)],
+        spans: vec![vec![], vec![]], // scalar affine state, no free axes
         rules: vec!["affine-compose"],
     }
 }

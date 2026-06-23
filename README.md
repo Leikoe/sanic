@@ -78,10 +78,13 @@ The algebra above decides **legality** (what *can* fuse, and the exact
 accumulator). `schedule` adds the other half — **profitability**: against a
 device model it costs the fused flash kernel (streams `k`, keeps `(m, ℓ, o)` in
 SRAM) versus the cut two-matmul plan (materializes the scores), and picks the
-cheaper feasible one. Because legality is already proven, the cost model only
-*ranks* — it can pick a slow plan, never a wrong one. It fuses at small head
-dims, **cuts when fusion stops paying** (SRAM pressure collapses occupancy past
-the materialization it avoids), and falls back to cut when fusion is infeasible.
+cheaper feasible one. The accumulator size in the SRAM constraint is read off the
+**derived carrier** (`Carrier::acc_scalars`, using per-slot axis spans), not a
+magic constant — exactly the `|Acc|` handoff the design doc prescribes. Because
+legality is already proven, the cost model only *ranks* — it can pick a slow
+plan, never a wrong one. It fuses at small head dims, **cuts when fusion stops
+paying** (SRAM pressure collapses occupancy past the materialization it avoids),
+and falls back to cut when fusion is infeasible.
 
 ## Run it
 
