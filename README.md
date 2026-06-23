@@ -42,11 +42,14 @@ certificate (fold left-to-right, O(1) state) and the parallelism certificate
   coupling (the online-softmax rescaling, R4) and normalizer deferral (R5) are
   detected by *data dependence*, so the same code derives `sum`, `mean`,
   `variance`, `logsumexp`, and FlashAttention alike.
+- **`engine::analyze`** — the front door: one call returns the **structure map**,
+  the artifact both design docs name — every axis classified, with the derived
+  accumulator attached to the foldable ones.
 
 ```rust
-let attn = attention(q, k, v, "d", "k");        // softmax(QKᵀ)·V
-let acc  = carrier::derive(&attn, "k").unwrap(); // fold over the key axis
-assert_eq!(acc.slots, 3);                        // (m, ℓ, o) — derived, not written
+let attn = attention(q, k, v, "d", "k");      // softmax(QKᵀ)·V
+let map  = analyze(&attn, &["sq", "k"]);       // classify + derive in one call
+// sq → FREE (grid); k → MONOIDAL with the derived (m, ℓ, o) accumulator
 ```
 
 ## Why "derived, not matched" matters
@@ -82,21 +85,23 @@ the materialization it avoids), and falls back to cut when fusion is infeasible.
 ## Run it
 
 ```
-cargo run --example derive   # print derived carriers as readable math
-cargo test                   # 22 tests
+cargo run --example derive   # print the structure map + derived carriers
+cargo test                   # 23 tests
 ```
 
-`cargo run --example derive` shows the engine reconstructing FlashAttention from
-the graph — no formula is written by hand:
+The example shows the engine classifying attention and reconstructing
+FlashAttention from the graph — no formula is written by hand:
 
 ```
-── FlashAttention (fold over `k`) ──
-carrier (3 slots) [R1, R3, R4, R5]
-  into:    s0 = x0;  s1 = 1;  s2 = x1
-  combine: s0 = max(a0, b0)
-           s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))
-           s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))
-  project: s2 / s1
+structure map
+  sq   FREE               → grid (DOALL)
+  k    MONOIDAL           → fold
+         carrier (3 slots) [R1, R3, R4, R5]
+           into:    s0 = x0;  s1 = 1;  s2 = x1
+           combine: s0 = max(a0, b0)
+                    s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))
+                    s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))
+           project: s2 / s1
 ```
 
 The tests cover the acceptance oracle, the battle-tests above, and the
