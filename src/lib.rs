@@ -13,12 +13,15 @@
 //! composition rules, never a stored template. See `streamability_engine.md`
 //! (legality) and `scheduler_engine.md` (profitability) for the full design.
 
+pub mod auto_schedule;
 pub mod carrier;
 pub mod codegen;
+pub mod codegen_cutile;
 pub mod engine;
 pub mod engine_ir;
 pub mod op;
 pub mod schedule;
+pub mod schedule_graph;
 pub mod stage1;
 
 #[cfg(test)]

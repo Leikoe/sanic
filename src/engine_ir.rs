@@ -102,6 +102,55 @@ pub fn output_axes(node: &Node) -> Vec<Axis> {
     }
 }
 
+/// Every leaf `Input` node's name, in first-seen order.
+pub fn leaf_names(node: &Node) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    collect_leaf_names(node, &mut out);
+    out
+}
+
+fn collect_leaf_names(node: &Node, out: &mut Vec<&'static str>) {
+    match node.as_ref() {
+        NodeKind::Input { name, .. } => {
+            if !out.contains(name) { out.push(name); }
+        }
+        NodeKind::Map { inputs, .. } => {
+            for i in inputs { collect_leaf_names(i, out); }
+        }
+        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
+            collect_leaf_names(src, out);
+        }
+        NodeKind::Gather { src, index, .. } => {
+            collect_leaf_names(src, out);
+            collect_leaf_names(index, out);
+        }
+    }
+}
+
+/// Every leaf `Input` node and its axes, in first-seen order (may have duplicates
+/// if the same node is referenced multiple times — callers deduplicate as needed).
+pub fn input_axes(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
+    let mut out = Vec::new();
+    collect_input_axes(node, &mut out);
+    out
+}
+
+fn collect_input_axes(node: &Node, out: &mut Vec<(&'static str, Vec<Axis>)>) {
+    match node.as_ref() {
+        NodeKind::Input { name, axes } => out.push((name, axes.clone())),
+        NodeKind::Map { inputs, .. } => {
+            for i in inputs { collect_input_axes(i, out); }
+        }
+        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
+            collect_input_axes(src, out);
+        }
+        NodeKind::Gather { src, index, .. } => {
+            collect_input_axes(src, out);
+            collect_input_axes(index, out);
+        }
+    }
+}
+
 /// Every axis referenced anywhere in the graph (inputs, reductions, scans,
 /// gathers), in first-seen order. The set of axes the structure map classifies.
 pub fn all_axes(node: &Node) -> Vec<Axis> {

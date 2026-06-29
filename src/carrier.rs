@@ -148,6 +148,9 @@ pub struct Carrier {
     pub spans: Vec<Vec<Axis>>,
     /// The rules that fired while building this carrier (deduped, for §10).
     pub rules: Vec<&'static str>,
+    /// The reduction kind of each slot. Codegen uses this to derive intra-tile
+    /// operations without pattern-matching on the computation being compiled.
+    pub kinds: Vec<SlotKind>,
 }
 
 impl Carrier {
@@ -312,14 +315,17 @@ struct Slot {
     span: Vec<Axis>,  // free axes this slot ranges over (streamed axis excluded)
 }
 
-#[derive(Clone, Copy)]
-enum SlotKind {
+#[derive(Debug, Clone, Copy)]
+pub enum SlotKind {
     /// Combine by a monoid directly: `A ⊕ B`.
     Plain(Monoid),
     /// The exp-domain ADD slot of the online-softmax monoid (R4): this slot is
     /// accumulated as `Σ exp(score − running_max)·raw`, where `max` is slot
     /// `max_slot`. On merge it telescopes: rescale by `exp(m − M_new)`.
     ExpShifted { max_slot: usize },
+    /// Affine-map composition step (the SSM carrier, §5.4). Not expressible as
+    /// a simple monoid slot; codegen must handle separately.
+    AffineStep,
 }
 
 /// The result of streaming a sub-expression over the axis.
@@ -450,6 +456,7 @@ pub fn derive(node: &Node, axis: &str) -> Option<Carrier> {
 
     let (into, combine, identity) = assemble(&ctx.slots);
     let spans = ctx.slots.iter().map(|s| s.span.clone()).collect();
+    let kinds = ctx.slots.iter().map(|s| s.kind).collect();
     Some(Carrier {
         slots: ctx.slots.len(),
         into,
@@ -458,6 +465,7 @@ pub fn derive(node: &Node, axis: &str) -> Option<Carrier> {
         project,
         spans,
         rules: ctx.rules.into_iter().collect(),
+        kinds,
     })
 }
 
@@ -706,6 +714,7 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
                 let rb = exp(sub(Expr::B(mx), big));
                 padd(pmul(Expr::A(i), ra), pmul(Expr::B(i), rb))
             }
+            SlotKind::AffineStep => unreachable!("AffineStep slots are built directly, not via assemble"),
         })
         .collect();
     let identity = slots
@@ -713,6 +722,7 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
         .map(|s| match s.kind {
             SlotKind::Plain(m) => m.identity().unwrap(),
             SlotKind::ExpShifted { .. } => 0.0,
+            SlotKind::AffineStep => unreachable!("AffineStep slots are built directly, not via assemble"),
         })
         .collect();
     (into, combine, identity)
@@ -737,5 +747,6 @@ fn affine_scan_carrier() -> Carrier {
         project: vec![Expr::F(1)],
         spans: vec![vec![], vec![]], // scalar affine state, no free axes
         rules: vec!["affine-compose"],
+        kinds: vec![SlotKind::AffineStep, SlotKind::AffineStep],
     }
 }
