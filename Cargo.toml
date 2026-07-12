@@ -2,5 +2,28 @@
 name = "sanic"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+# Description grounded in todo.md's "Where we are" — every capability named
+# here is a verified item there (derived and run on interp / rustc / GPU).
+description = "Derives streaming ML kernels — FlashAttention, RoPE, convolution, quantized matmul, KV-cache decode, backward passes — from naive dataflow graphs by algebra, not templates, then lowers whole schedules to compilable Rust and to Metal for the GPU."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Leikoe/fusion-engine"
+documentation = "https://docs.rs/sanic"
+readme = "README.md"
+keywords = ["compiler", "gpu", "flashattention", "kernel", "ml"]
+categories = ["compilers", "mathematics", "science"]
+authors = ["Léo Paillé"]
+# The vendored tinygrad reference is for study only — never published.
+exclude = ["references/"]
 
 [dependencies]
+
+[profile.release]
+opt-level = 3
+
+# The Metal runtime (src/metal.rs) — sanic ships a real device layer on
+# macOS; other platforms build without it.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"

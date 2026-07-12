@@ -1,33 +1,35 @@
-//! The FlashAttention fuse-vs-cut decision (`scheduler_engine.md` §8), built as a
-//! *client* of the generic scheduler. Attention-specific knowledge — the flops,
-//! the traffic, the cut decomposition — lives here, not in the library. The
-//! library contributes only the device model, feasibility, the cost model, and
-//! the two generic searches (`best_tile`, `cheapest`).
+//! The FlashAttention fuse-vs-cut decision, built as a *client* of the
+//! generic cost model. Attention-specific knowledge — the flops, the traffic,
+//! the cut decomposition — lives here, not in the library. The library
+//! contributes the device model, feasibility, the roofline, and the two
+//! searches (`best_tile`, `cheapest`). Because legality is already settled by
+//! the derivation, the cost model only ranks — it can pick a slow plan, never
+//! a wrong one.
 
-use sanic::carrier;
-use sanic::engine_ir::*;
-use sanic::schedule::*;
+use sanic::cost::*;
+use sanic::ir::*;
 
 const KT: f64 = 64.0; // K/V block streamed per step
 
-/// The engine-supplied `|Acc|`: derive the attention carrier and read its
-/// per-query accumulator size (m, ℓ + o[e=d]).
+/// The engine-supplied accumulator size: derive the attention carrier and
+/// read off its per-query scalar count (m, ℓ, plus o over the value dim).
 fn acc_per_lane(d: f64) -> f64 {
+    let (sq, k, dd, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
     let attn = attention(
-        input("Q", &["sq", "d"]),
-        input("K", &["k", "d"]),
-        input("V", &["k", "e"]),
-        "d",
-        "k",
+        input("Q", &[sq, dd]),
+        input("K", &[k, dd]),
+        input("V", &[k, e]),
+        dd,
+        k,
     );
-    carrier::derive(&attn, "k")
+    sanic::derive(&attn, k)
         .unwrap()
-        .acc_scalars(|ax| if ax == "e" { d } else { 1.0 })
+        .acc_scalars(|ax| if ax == e { d } else { 1.0 })
 }
 
-/// The fused flash kernel and its query-tile: the inner search (`best_tile`) over
-/// power-of-two tiles. Larger tiles amortize the per-block K/V re-reads against
-/// SRAM/occupancy pressure.
+/// The fused flash kernel and its query tile: the inner search over
+/// power-of-two tiles. Larger tiles amortize the per-block K/V re-reads
+/// against SRAM / occupancy pressure.
 fn fused(dev: &Device, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)> {
     let b = dev.dtype_bytes;
     let constant = 2.0 * KT * d * b; // K/V tiles
@@ -46,6 +48,7 @@ fn fused(dev: &Device, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)> {
                 sram_per_block: constant + per_tile * t,
                 regs_per_block: per_tile * t,
                 parallel_blocks: blocks,
+                lanes_per_block: t * d, // t query rows × d value outputs
             },
         ));
         t *= 2.0;
@@ -65,6 +68,7 @@ fn cut(dev: &Device, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
             sram_per_block: mm_sram,
             regs_per_block: mm_sram,
             parallel_blocks: (sq / 64.0).ceil() * (k / 64.0).ceil(),
+            lanes_per_block: 64.0 * 64.0, // one lane per output point of the tile
         },
         Kernel {
             name: "out = softmax(S)·V".into(),
@@ -73,12 +77,12 @@ fn cut(dev: &Device, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
             sram_per_block: mm_sram,
             regs_per_block: mm_sram,
             parallel_blocks: (sq / 64.0).ceil() * (d / 64.0).ceil(),
+            lanes_per_block: 64.0 * 64.0,
         },
     ]
 }
 
-/// Does the scheduler fuse? Uses the generic outer search `cheapest` over the two
-/// candidate plans (fused = one kernel; cut = two).
+/// Does the scheduler fuse? The outer search over the two candidate plans.
 fn fuses(dev: &Device, sq: f64, k: f64, d: f64) -> bool {
     let cut_plan = cut(dev, sq, k, d);
     match fused(dev, sq, k, d) {
@@ -90,14 +94,14 @@ fn fuses(dev: &Device, sq: f64, k: f64, d: f64) -> bool {
     }
 }
 
-// §8: reproduce flash attention — at a typical head dim, fusing wins.
+// reproduce flash attention: at a typical head dim, fusing wins.
 #[test]
 fn reproduces_flash_at_typical_shape() {
     let dev = Device::toy();
     assert!(fuses(&dev, 2048.0, 4096.0, 64.0));
 }
 
-// §8 the real test: cut when fusion doesn't pay (large d collapses occupancy).
+// the real test: cut when fusion doesn't pay (large d collapses occupancy).
 #[test]
 fn cuts_when_fusion_does_not_pay() {
     let dev = Device::toy();
@@ -113,7 +117,10 @@ fn fuse_cut_crossover_is_monotone() {
     let decisions: Vec<bool> = ds.iter().map(|&d| fuses(&dev, 2048.0, 2048.0, d)).collect();
     let first_cut = decisions.iter().position(|f| !f).unwrap();
     assert!(first_cut > 0, "must fuse at the smallest d");
-    assert!(decisions[first_cut..].iter().all(|f| !f), "no flip back to fuse");
+    assert!(
+        decisions[first_cut..].iter().all(|f| !f),
+        "no flip back to fuse"
+    );
 }
 
 // feasibility forces a correct fallback: huge d can't fuse at any tile → cut.
@@ -124,7 +131,7 @@ fn infeasible_fusion_forces_cut() {
     assert!(!fuses(&dev, 2048.0, 2048.0, 2048.0));
 }
 
-// query-tiling amortizes K/V reads, so the inner search picks a real tile > 1.
+// query-tiling amortizes K/V reads, so the inner search picks a real tile.
 #[test]
 fn fusion_chooses_a_real_query_tile() {
     let dev = Device::toy();
@@ -132,8 +139,8 @@ fn fusion_chooses_a_real_query_tile() {
     assert!(tile > 1, "tiling amortizes K/V reads → tile > 1");
 }
 
-// the economic case: the cut round-trips the sq×k scores through HBM — exactly
-// the traffic fusion avoids by never materializing them.
+// the economic case: the cut round-trips the sq×k scores through HBM —
+// exactly the traffic fusion avoids by never materializing them.
 #[test]
 fn cut_pays_for_materializing_the_scores() {
     let dev = Device::toy();

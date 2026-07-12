@@ -1,0 +1,146 @@
+//! M9 — split reductions (GROUP), the two-stage fold.
+//!
+//! Re-associating a fold into per-chunk partials + a combine stage is legal
+//! by the monoid law the carrier already certifies — these tests make that
+//! numeric: `run_carrier_split(blocks) == eval` for awkward block counts
+//! (remainders, more blocks than elements), for the coupled online-softmax
+//! carrier where the merge does real work (rescaling by `exp(m − M)`), not
+//! just for plain sums. Then the scheduling half: the roofline picks a split
+//! exactly for occupancy-starved folds (matvec, giant softmax) and leaves
+//! well-parallelized kernels alone.
+//!
+//! The same re-association is the data-parallel story: each device folds its
+//! shard, the allreduce is stage 2's merge. One mechanism, three uses.
+
+use std::collections::HashMap;
+
+use sanic::cost::Device;
+use sanic::derive::derive;
+use sanic::interp::{Env, Extents, Tensor, eval, run_carrier_split};
+use sanic::ir::*;
+use sanic::plan::split_factor;
+
+struct Lcg(u64);
+impl Lcg {
+    fn f(&mut self) -> f64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+}
+fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
+    Tensor::from_fn(axes, ext, |_| rng.f())
+}
+
+fn assert_close(x: &Tensor, y: &Tensor) {
+    let y = y.permuted_to(&x.axes);
+    assert_eq!(x.shape, y.shape);
+    for (a, b) in x.data.iter().zip(&y.data) {
+        let tol = 1e-9 * (1.0 + a.abs().max(b.abs()));
+        assert!((a - b).abs() <= tol, "{a} vs {b}");
+    }
+}
+
+// ── the oracle: split == one-pass == eval, even for coupled carriers ─────────
+#[test]
+fn split_flash_equals_eval_for_any_block_count() {
+    let (s, k, d, e) = (axis("s"), axis("k"), axis("d"), axis("e"));
+    let ext: Extents = [(s, 4), (k, 9), (d, 5), (e, 4)].into_iter().collect();
+    let mut rng = Lcg(0x6408);
+    let env: Env = [
+        ("Q", rand_tensor(&[s, d], &ext, &mut rng)),
+        ("K", rand_tensor(&[k, d], &ext, &mut rng)),
+        ("V", rand_tensor(&[k, e], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let attn = attention(
+        input("Q", &[s, d]),
+        input("K", &[k, d]),
+        input("V", &[k, e]),
+        d,
+        k,
+    );
+    let reference = eval(&attn, &env, &ext);
+    let carrier = derive(&attn, k).unwrap();
+
+    // 1 = the plain kernel; 2/3/7 leave uneven remainders; 9 = one element
+    // per chunk, so stage 2's merge does ALL the softmax coupling work.
+    for blocks in [1usize, 2, 3, 7, 9] {
+        let got = run_carrier_split(&attn, k, &carrier, blocks, &env, &ext);
+        assert_close(&got, &reference);
+    }
+}
+
+// The merge is doing real algebra here: an all-masked leading chunk carries
+// m = −∞ partials that the rescale must absorb without NaNs.
+#[test]
+fn split_causal_flash_handles_identity_partials() {
+    let (s, t, dk, dv) = (axis("s"), axis("t"), axis("dk"), axis("dv"));
+    let ext: Extents = [(s, 6), (t, 6), (dk, 4), (dv, 3)].into_iter().collect();
+    let mut rng = Lcg(0x640C);
+    let env: Env = [
+        ("Q", rand_tensor(&[s, dk], &ext, &mut rng)),
+        ("K", rand_tensor(&[t, dk], &ext, &mut rng)),
+        ("V", rand_tensor(&[t, dv], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let scores = matmul(input("Q", &[s, dk]), input("K", &[t, dk]), dk);
+    let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
+    let attn = matmul(softmax(masked, t), input("V", &[t, dv]), t);
+
+    let reference = eval(&attn, &env, &ext);
+    let carrier = derive(&attn, t).unwrap();
+    for blocks in [2usize, 3, 6] {
+        let got = run_carrier_split(&attn, t, &carrier, blocks, &env, &ext);
+        assert_close(&got, &reference);
+    }
+}
+
+// ── the scheduler: split exactly when the one-pass kernel starves ────────────
+#[test]
+fn occupancy_starved_matvec_wants_a_split() {
+    let (m, k) = (axis("m"), axis("k"));
+    // grid of 4, a million-element contraction: one pass = 4 resident blocks
+    // on a device that wants 8 — latency-bound. The roofline must split.
+    let w = input("W", &[m, k]);
+    let x = input("x", &[k]);
+    let y = matmul(w, x, k);
+    let extents: HashMap<Axis, f64> = [(m, 4.0), (k, 1_048_576.0)].into_iter().collect();
+    let carrier = derive(&y, k).unwrap();
+
+    let factor = split_factor(&y, k, &carrier, &Device::toy(), &extents);
+    assert!(
+        factor.is_some_and(|b| b >= 2),
+        "a 4-row matvec over 2^20 must split; got {factor:?}"
+    );
+}
+
+#[test]
+fn well_parallelized_attention_keeps_one_pass() {
+    let (s, k, d, e) = (axis("s"), axis("k"), axis("d"), axis("e"));
+    let attn = attention(
+        input("Q", &[s, d]),
+        input("K", &[k, d]),
+        input("V", &[k, e]),
+        d,
+        k,
+    );
+    let extents: HashMap<Axis, f64> = [(s, 1024.0), (k, 1024.0), (d, 64.0), (e, 64.0)]
+        .into_iter()
+        .collect();
+    let carrier = derive(&attn, k).unwrap();
+
+    let factor = split_factor(&attn, k, &carrier, &Device::toy(), &extents);
+    assert_eq!(
+        factor, None,
+        "a 1024-row flash kernel already fills the device; splitting only \
+         adds a round trip"
+    );
+}

@@ -1,0 +1,622 @@
+//! Planning: pick the axis to stream, the axes to grid, and a block that fits.
+//!
+//! Nothing here knows what computation it is scheduling. Every decision is
+//! read off information the other layers already expose: the carrier's slot
+//! spans say which axes are candidates for each block role; the IR says which
+//! inputs carry the streamed axis; the cost model ranks the candidates.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::analyze::{Parallelism, analyze_all};
+use crate::cost::{Device, Kernel, feasible, kernel_time, schedule_time};
+use crate::derive::Carrier;
+use crate::ir::{Axis, Node, NodeKind, all_axes, input_axes, input_dtypes, leaf_names, output_axes};
+
+/// Elements streamed per step along the folded axis.
+pub const TILE_N: usize = 64;
+
+/// A fully-resolved kernel: everything an emitter needs.
+#[derive(Debug, Clone)]
+pub struct KernelSpec {
+    pub name: String,
+    /// The axis this kernel folds over.
+    pub streaming_axis: Axis,
+    /// Axes contracted internally (in the inputs, but neither streamed nor in
+    /// the output).
+    pub contract_axes: Vec<Axis>,
+    /// The axis tiled across SRAM rows per block. `None` means the output is
+    /// scalar-ish — the row tile is always 1.
+    pub row_axis: Option<Axis>,
+    /// Axes spanned only by some accumulator slots (e.g. the value head dim).
+    pub col_axes: Vec<Axis>,
+    /// Axes handled as grid-level parallelism, not tiled in SRAM.
+    pub batch_axes: Vec<Axis>,
+    pub carrier: Carrier,
+    pub tile_m: usize,
+    pub tile_n: usize,
+    /// A second tiled block dimension, when the planner chose one (the 2D
+    /// GEMM block). `None` / 1 when the block is one-dimensional.
+    pub col_tile_axis: Option<Axis>,
+    pub tile_c: usize,
+    pub input_names: Vec<&'static str>,
+    pub output_name: String,
+    pub cost: f64,
+    /// The winning roofline instance behind `cost` — what the block structure
+    /// actually costs in flops/traffic/SRAM/parallelism. Downstream searches
+    /// (the split-reduction factor) reprice variations of THIS kernel instead
+    /// of inventing a second, incomparable model.
+    pub roofline: Kernel,
+}
+
+/// A schedule: kernels in execution order, with a total cost. Currently the
+/// planner always produces a single fused kernel; splitting into pipelines is
+/// a natural extension, not a done one.
+pub struct Plan {
+    pub kernels: Vec<KernelSpec>,
+    pub total_cost: f64,
+}
+
+/// Plan the whole graph: try every axis that folds, keep the cheapest kernel.
+pub fn plan(node: &Node, dev: &Device, extents: &HashMap<Axis, f64>) -> Option<Plan> {
+    let report = analyze_all(node);
+
+    let mut best: Option<KernelSpec> = None;
+    for axis_report in &report.axes {
+        if axis_report.structure.level != Parallelism::Monoidal {
+            continue;
+        }
+        let Some(ref carrier) = axis_report.carrier else {
+            continue;
+        };
+        let Some(spec) = plan_axis(node, axis_report.axis, carrier, dev, extents) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|b| spec.cost < b.cost) {
+            best = Some(spec);
+        }
+    }
+
+    let spec = best?;
+    let cost = spec.cost;
+    Some(Plan {
+        kernels: vec![spec],
+        total_cost: cost,
+    })
+}
+
+/// Choose the cheapest feasible block structure for streaming `node` over one
+/// axis. `None` if nothing fits the device.
+pub fn plan_axis(
+    node: &Node,
+    streaming_axis: Axis,
+    carrier: &Carrier,
+    dev: &Device,
+    extents: &HashMap<Axis, f64>,
+) -> Option<KernelSpec> {
+    let b_bytes = dev.dtype_bytes;
+    let tn = TILE_N as f64;
+
+    // ── axis roles, read off the carrier and the IR ──────────────────────────
+    let out_axes = output_axes(node);
+    let out_set: HashSet<Axis> = out_axes.iter().copied().collect();
+
+    // Contract axes: in the graph, but neither streamed nor in the output.
+    let contract_axes: Vec<Axis> = all_axes(node)
+        .into_iter()
+        .filter(|&ax| ax != streaming_axis && !out_set.contains(&ax))
+        .collect();
+
+    // Each slot spans some free axes per output point. Axes shared by every
+    // slot are row/batch/col-tile candidates; axes on only some slots are
+    // per-slot columns (attention: m, ℓ span {sq}; o spans {sq, e} → shared
+    // sq, column e).
+    let span_union: HashSet<Axis> = carrier
+        .spans
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .collect();
+    let span_intersection: HashSet<Axis> = {
+        let mut inter: HashSet<Axis> = span_union.clone();
+        for s in &carrier.spans {
+            let s_set: HashSet<Axis> = s.iter().copied().collect();
+            inter.retain(|ax| s_set.contains(ax));
+        }
+        inter
+    };
+    let col_axes: Vec<Axis> = {
+        let mut v: Vec<Axis> = span_union
+            .iter()
+            .filter(|ax| !span_intersection.contains(ax))
+            .copied()
+            .collect();
+        v.sort();
+        v
+    };
+    let span_shared: Vec<Axis> = {
+        let mut v: Vec<Axis> = span_intersection.iter().copied().collect();
+        v.sort();
+        v
+    };
+
+    // ── classify inputs ──────────────────────────────────────────────────────
+    // Dedup by name: a DAG can reach the same tensor along several paths
+    // (softmax forks its scores), but it is physically one tensor. Consts and
+    // iotas never appear here — they cost nothing to read.
+    let inputs: Vec<(&'static str, Vec<Axis>)> = {
+        let mut seen = HashSet::new();
+        input_axes(node)
+            .into_iter()
+            .filter(|(n, _)| seen.insert(*n))
+            .collect()
+    };
+    // Per-input storage bytes: a declared dtype (int-quantized weights)
+    // prices its true width; everything else moves at the device's compute
+    // dtype. This is where int8/int4 weights earn their bandwidth win.
+    let declared: HashMap<&'static str, f64> = input_dtypes(node)
+        .into_iter()
+        .map(|(n, d)| (n, d.bytes()))
+        .collect();
+    let in_bytes = |name: &'static str| declared.get(name).copied().unwrap_or(b_bytes);
+
+    // An inner contraction (matmul inside the fold) keeps a scores-like
+    // intermediate tile resident (tile_m × tile_c × TILE_N).
+    let has_inner_contraction = has_contraction(node, streaming_axis, &out_set);
+
+    let output_vol: f64 = out_axes
+        .iter()
+        .map(|ax| extents.get(ax).copied().unwrap_or(1.0))
+        .product();
+    let total_flops = count_flops(node, extents);
+
+    // ── structure choice: no heuristics — price every assignment ────────────
+    // Each shared-span axis plays one of four roles, and each has a real
+    // consequence the model can price:
+    //   row      — tiled in SRAM (tile_m); inputs lacking it are re-read
+    //              once per row block (the FlashAttention K/V trade);
+    //   col      — a second tiled dimension (tile_c); with `row` this is the
+    //              classic 2D GEMM block, trading the two re-read factors;
+    //   batch    — a grid dimension; inputs lacking it are re-read per
+    //              instance (a mask per head);
+    //   resident — held whole in the block; costs SRAM instead of traffic.
+    // The space is tiny (a handful of axes × ~10 tile sizes each), so
+    // enumerate everything and let the roofline rank. Iteration order breaks
+    // cost ties toward simple structures: large row axes first, no col tile
+    // first, most batching first.
+    let ext = |ax: Axis| extents.get(&ax).copied().unwrap_or(1.0);
+    let pows = |limit: f64| {
+        let mut v = Vec::new();
+        let mut t = 1.0f64;
+        while t <= limit {
+            v.push(t);
+            t *= 2.0;
+        }
+        v
+    };
+    let mut by_extent: Vec<Axis> = span_shared.clone();
+    by_extent.sort_by(|&a, &b| ext(b).total_cmp(&ext(a)));
+
+    struct Best {
+        row: Option<Axis>,
+        col: Option<Axis>,
+        batch: Vec<Axis>,
+        tile_m: usize,
+        tile_c: usize,
+        cost: f64,
+        kernel: Kernel,
+    }
+    let mut best: Option<Best> = None;
+
+    let row_options: Vec<Option<Axis>> = by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
+    for &row in &row_options {
+        if let Some(r) = row
+            && !extents.contains_key(&r)
+        {
+            continue;
+        }
+        let col_options: Vec<Option<Axis>> = [None]
+            .into_iter()
+            .chain(
+                by_extent
+                    .iter()
+                    .filter(|&&a| Some(a) != row)
+                    .map(|&a| Some(a)),
+            )
+            .collect();
+        for &col in &col_options {
+            if let Some(c) = col
+                && !extents.contains_key(&c)
+            {
+                continue;
+            }
+            let rest: Vec<Axis> = span_shared
+                .iter()
+                .copied()
+                .filter(|&a| Some(a) != row && Some(a) != col)
+                .collect();
+            // descending bit patterns: all-batch first
+            for bits in (0..(1u32 << rest.len().min(8))).rev() {
+                let batch: Vec<Axis> = rest
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| bits >> i & 1 == 1)
+                    .map(|(_, a)| *a)
+                    .collect();
+                // (everything in `rest` not chosen as batch stays resident)
+                let batch_volume: f64 = batch.iter().map(|&ax| ext(ax)).product();
+
+                // What one block holds of a tensor spanning `axes`, given the
+                // tile sizes: the streamed axis contributes a TILE_N slab, the
+                // row/col axes their tiles, batch axes nothing, and resident
+                // axes their full extent.
+                let per_block = |axes: &[Axis], tm: f64, tc: f64| -> f64 {
+                    axes.iter()
+                        .map(|&ax| {
+                            if ax == streaming_axis {
+                                tn
+                            } else if Some(ax) == row {
+                                tm
+                            } else if Some(ax) == col {
+                                tc
+                            } else if batch.contains(&ax) {
+                                1.0
+                            } else {
+                                ext(ax)
+                            }
+                        })
+                        .product()
+                };
+
+                let tms = pows(row.map_or(1.0, ext));
+                let tcs = pows(col.map_or(1.0, ext));
+                for &tm in &tms {
+                    for &tc in &tcs {
+                        // SRAM: input slabs (at their storage width) + the
+                        // accumulator + the inner-contraction intermediate.
+                        let mut sram = 0.0f64;
+                        for (nm, axes) in &inputs {
+                            sram += per_block(axes, tm, tc) * in_bytes(nm);
+                        }
+                        sram += carrier.acc_scalars(|ax| {
+                            if Some(ax) == row {
+                                tm
+                            } else if Some(ax) == col {
+                                tc
+                            } else if batch.contains(&ax) {
+                                1.0
+                            } else {
+                                ext(ax)
+                            }
+                        }) * b_bytes;
+                        if has_inner_contraction {
+                            sram += tm * tc * tn * b_bytes;
+                        }
+
+                        // HBM: every input is re-read once per grid instance
+                        // it does not carry — row blocks, col blocks, batch —
+                        // each moving its own storage width.
+                        let row_blocks = row.map_or(1.0, |r| (ext(r) / tm).ceil());
+                        let col_blocks = col.map_or(1.0, |c| (ext(c) / tc).ceil());
+                        let mut hbm = output_vol * b_bytes;
+                        for (nm, axes) in &inputs {
+                            let vol: f64 = axes.iter().map(|&ax| ext(ax)).product();
+                            let mut factor = 1.0;
+                            if let Some(r) = row
+                                && !axes.contains(&r)
+                            {
+                                factor *= row_blocks;
+                            }
+                            if let Some(c) = col
+                                && !axes.contains(&c)
+                            {
+                                factor *= col_blocks;
+                            }
+                            for &b in &batch {
+                                if !axes.contains(&b) {
+                                    factor *= ext(b);
+                                }
+                            }
+                            hbm += vol * factor * in_bytes(nm);
+                        }
+
+                        // one lane per output point of the block: the tile
+                        // area times the col span held resident in it
+                        let resident_cols: f64 = col_axes
+                            .iter()
+                            .filter(|&&ax| Some(ax) != col)
+                            .map(|&ax| ext(ax))
+                            .product();
+                        let k = Kernel {
+                            name: format!("fused(tile={tm}x{tc})"),
+                            flops: total_flops,
+                            hbm_bytes: hbm,
+                            sram_per_block: sram,
+                            // Registers are not modeled separately; reuse SRAM.
+                            regs_per_block: sram,
+                            parallel_blocks: batch_volume * row_blocks * col_blocks,
+                            lanes_per_block: tm * tc * resident_cols,
+                        };
+                        if !feasible(dev, &k) {
+                            continue;
+                        }
+                        let cost = kernel_time(dev, &k);
+                        if best.as_ref().is_none_or(|b| cost < b.cost) {
+                            best = Some(Best {
+                                row,
+                                col,
+                                batch: batch.clone(),
+                                tile_m: tm as usize,
+                                tile_c: tc as usize,
+                                cost,
+                                kernel: k,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Best {
+        row: row_axis,
+        col: col_tile_axis,
+        batch: batch_axes,
+        tile_m,
+        tile_c,
+        cost,
+        kernel,
+    } = best?;
+
+    Some(KernelSpec {
+        name: "fused".to_string(),
+        streaming_axis,
+        contract_axes,
+        row_axis,
+        col_axes,
+        batch_axes,
+        carrier: carrier.clone(),
+        tile_m,
+        tile_n: TILE_N,
+        col_tile_axis,
+        tile_c,
+        input_names: leaf_names(node),
+        output_name: "Out".to_string(),
+        cost,
+        roofline: kernel,
+    })
+}
+
+/// Should this fold run as a TWO-STAGE split reduction (GROUP), and in how
+/// many blocks? Price every factor with the same roofline that ranks tiles:
+/// stage 1 folds `blocks` chunks in parallel and writes `grid·blocks·slots`
+/// raw partials; stage 2 reads them back, merges, projects. Splitting wins
+/// exactly when the one-pass kernel cannot occupy the device — a matvec's
+/// grid of 1 or a giant softmax denominator leaves it latency-bound, and
+/// re-associating the fold (legal by the monoid law) buys `blocks`-way
+/// parallelism for the price of one small round trip. Returns the winning
+/// factor, or `None` when one pass is already cheapest.
+pub fn split_factor(
+    node: &Node,
+    streaming_axis: Axis,
+    carrier: &Carrier,
+    dev: &Device,
+    extents: &HashMap<Axis, f64>,
+) -> Option<usize> {
+    let spec = plan_axis(node, streaming_axis, carrier, dev, extents)?;
+    let single = spec.cost;
+    let bytes = dev.dtype_bytes;
+    let grid_vol: f64 = output_axes(node)
+        .iter()
+        .map(|ax| extents.get(ax).copied().unwrap_or(1.0))
+        .product();
+    let slots = carrier.slots as f64;
+    let n = extents.get(&streaming_axis).copied()?;
+
+    let mut best: Option<(usize, f64)> = None;
+    let mut b = 2usize;
+    while (b as f64) <= n && b <= 4096 {
+        let bf = b as f64;
+        let partials = grid_vol * bf * slots;
+        // Stage 1 is THE SAME kernel the single-pass plan chose — same tiles,
+        // same traffic, same working set — with two differences the split
+        // buys/pays for: `b`-way more block parallelism, and the partials
+        // written out instead of projected in registers.
+        let mut stage1 = spec.roofline.clone();
+        stage1.name = format!("partial(×{b})");
+        stage1.parallel_blocks *= bf;
+        stage1.hbm_bytes += partials * bytes;
+        // Stage 2 reads the partials back and merges them per output point.
+        let stage2 = Kernel {
+            name: "combine".to_string(),
+            flops: partials,
+            hbm_bytes: (partials + grid_vol) * bytes,
+            sram_per_block: slots * bytes,
+            regs_per_block: slots * bytes,
+            parallel_blocks: grid_vol,
+            lanes_per_block: 1.0,
+        };
+        if let Some(t) = schedule_time(dev, &[stage1, stage2])
+            && best.as_ref().is_none_or(|(_, bt)| t < *bt)
+        {
+            best = Some((b, t));
+        }
+        b *= 2;
+    }
+    best.filter(|(_, t)| *t < single).map(|(b, _)| b)
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// True when the IR reduces an axis that is neither streamed nor in the output
+/// — an inner contraction (the `d` of a matmul), whose intermediate must sit
+/// in SRAM.
+fn has_contraction(node: &Node, streaming: Axis, out_set: &HashSet<Axis>) -> bool {
+    match node.as_ref() {
+        NodeKind::Reduce { axis, src, .. } => {
+            (*axis != streaming && !out_set.contains(axis))
+                || has_contraction(src, streaming, out_set)
+        }
+        NodeKind::Map { inputs, .. } => inputs
+            .iter()
+            .any(|i| has_contraction(i, streaming, out_set)),
+        NodeKind::Scan { src, .. } => has_contraction(src, streaming, out_set),
+        NodeKind::Gather { src, index, .. } => {
+            has_contraction(src, streaming, out_set) || has_contraction(index, streaming, out_set)
+        }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+            has_contraction(src, streaming, out_set)
+        }
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
+    }
+}
+
+/// Rough flop count: one op per Map output element, one per Reduce/Scan source
+/// element. Good enough to rank on the roofline.
+fn count_flops(node: &Node, extents: &HashMap<Axis, f64>) -> f64 {
+    let vol = |n: &Node| -> f64 {
+        output_axes(n)
+            .iter()
+            .map(|ax| extents.get(ax).copied().unwrap_or(1.0))
+            .product()
+    };
+    match node.as_ref() {
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => 0.0,
+        NodeKind::Map { inputs, .. } => {
+            let child: f64 = inputs.iter().map(|i| count_flops(i, extents)).sum();
+            child + vol(node)
+        }
+        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
+            count_flops(src, extents) + vol(src)
+        }
+        NodeKind::Gather { src, index, .. } => {
+            count_flops(src, extents) + count_flops(index, extents)
+        }
+        // Reindexing costs nothing.
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => count_flops(src, extents),
+    }
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::Device;
+    use crate::derive::derive;
+    use crate::ir::*;
+
+    fn ext(pairs: &[(Axis, f64)]) -> HashMap<Axis, f64> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn attention_selects_row_axis_sq() {
+        let (b, h, sq, k, d, e) = (
+            axis("b"),
+            axis("h"),
+            axis("sq"),
+            axis("k"),
+            axis("d"),
+            axis("e"),
+        );
+        let attn = attention(
+            input("Q", &[b, h, sq, d]),
+            input("K", &[b, h, k, d]),
+            input("V", &[b, h, k, e]),
+            d,
+            k,
+        );
+        let c = derive(&attn, k).unwrap();
+        let dev = Device::toy();
+        let extents = ext(&[
+            (b, 1.0),
+            (h, 8.0),
+            (sq, 1024.0),
+            (k, 1024.0),
+            (d, 64.0),
+            (e, 64.0),
+        ]);
+        let spec = plan_axis(&attn, k, &c, &dev, &extents).unwrap();
+
+        assert_eq!(
+            spec.row_axis,
+            Some(sq),
+            "row axis must be sq, not a batch dim"
+        );
+        assert_eq!(spec.col_axes, vec![e], "col axis is the value head dim");
+        assert!(spec.batch_axes.contains(&b));
+        assert!(spec.batch_axes.contains(&h));
+        assert!(spec.tile_m > 1, "a non-trivial tile should be chosen");
+        assert!(spec.cost > 0.0);
+    }
+
+    #[test]
+    fn sum_schedules_with_tile_1() {
+        // Reduce(X[n], n, Add) → scalar output; no row axis.
+        let n = axis("n");
+        let x = input("X", &[n]);
+        let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
+        let c = derive(&s, n).unwrap();
+        let dev = Device::toy();
+        let extents = ext(&[(n, 4096.0)]);
+        let spec = plan_axis(&s, n, &c, &dev, &extents).unwrap();
+
+        assert_eq!(spec.tile_m, 1, "scalar output → row tile must be 1");
+        assert_eq!(spec.row_axis, None);
+        assert!(spec.cost > 0.0);
+    }
+
+    #[test]
+    fn attention_plans_to_single_kernel() {
+        let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+        let attn = attention(
+            input("Q", &[sq, d]),
+            input("K", &[k, d]),
+            input("V", &[k, e]),
+            d,
+            k,
+        );
+        let dev = Device::toy();
+        let extents = ext(&[(sq, 1024.0), (k, 1024.0), (d, 64.0), (e, 64.0)]);
+
+        let plan = plan(&attn, &dev, &extents).expect("must find a feasible kernel");
+        assert_eq!(plan.kernels.len(), 1);
+        assert_eq!(plan.kernels[0].streaming_axis, k);
+        assert!(plan.total_cost > 0.0);
+    }
+
+    #[test]
+    fn sum_plans_to_single_kernel() {
+        let n = axis("n");
+        let x = input("X", &[n]);
+        let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
+        let dev = Device::toy();
+        let extents = ext(&[(n, 65536.0)]);
+
+        // Sum has a carrier, so planning succeeds even though the CuTile
+        // emitter declines it (no row tile, no contraction).
+        let plan = plan(&s, &dev, &extents);
+        assert!(plan.is_some(), "sum should have a feasible kernel");
+        assert_eq!(plan.unwrap().kernels.len(), 1);
+    }
+
+    // Declared storage dtypes change the bandwidth bill: the same
+    // memory-bound GEMV prices strictly cheaper with int8 weights, and
+    // cheaper again with int4 — the quantization win, visible to the ranker.
+    #[test]
+    fn quantized_weights_price_less_bandwidth() {
+        let (s, d, f) = (axis("s"), axis("d"), axis("f"));
+        let extents = ext(&[(s, 4.0), (d, 4096.0), (f, 4096.0)]);
+        let dev = Device::toy();
+
+        let cost_of = |w: Node| {
+            let g = matmul(input("X", &[s, d]), w, d);
+            let c = derive(&g, d).unwrap();
+            plan_axis(&g, d, &c, &dev, &extents).unwrap().cost
+        };
+        let full = cost_of(input("W", &[f, d]));
+        let int8 = cost_of(input_dt("W8", &[f, d], Dtype::I8));
+        let int4 = cost_of(input_dt("W4", &[f, d], Dtype::I4));
+        assert!(int8 < full, "int8 weights must price below f16: {int8} vs {full}");
+        assert!(int4 < int8, "int4 must price below int8: {int4} vs {int8}");
+    }
+}

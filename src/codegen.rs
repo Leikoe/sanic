@@ -1,306 +1,363 @@
-//! Emit the fused streaming kernel as compilable Rust source.
+//! Shared code-generation core: one node→code emitter, one carrier renderer,
+//! parameterized by a target language.
 //!
-//! Everything the kernel needs is already derived: the structure map says which
-//! axes are a grid and which one streams, and the carrier is the loop body —
-//! `identity` to seed the accumulator, `into` to lift each element, `combine` to
-//! fold, `project` at the end. This is a direct, 1:1 transcription of what
-//! `Carrier::fold` already executes and the tests verify, so the emitted kernel
-//! is correct by construction. Backend-specific lowering (tiling, CUDA) is the
-//! scheduler's job downstream; the *algebra* of the kernel is generated here.
+//! The Rust ([`crate::rustgen`]) and Metal ([`crate::emit_metal`]) backends are
+//! the *same* recursion over the IR — the codegen twin of [`crate::interp`] —
+//! differing only in leaf syntax (`.exp()` vs `exp()`, `let mut` vs `float`,
+//! Rust `for` vs C `for`). That difference is captured by the [`Lang`] trait;
+//! everything structural — [`value`], [`carrier_expr`], [`offset`],
+//! [`buffers`] — lives here once, so a new op or a fix lands in a single
+//! place and both backends stay in lock-step. Per-backend files keep only the
+//! genuinely different parts: the kernel wrapper (nested grid loops vs one
+//! GPU thread) and the host/runtime glue.
 
-use crate::carrier::{Carrier, Expr};
+use std::collections::HashMap;
 
-/// Emit a CPU scalar kernel: a function that folds the stream of elements at one
-/// grid point into the answer. `grid` names the parallel (FREE) axes and
-/// `streamed` the folded axis — recorded in the doc comment.
-pub fn rust_kernel(c: &Carrier, name: &str, streamed: &str, grid: &[&str]) -> String {
-    let n = item_arity(c);
-    let names = Names { item: "x", acc: "acc", el: "el" };
-    let join = |v: &[Expr]| {
-        v.iter()
-            .map(|e| rust(e, &names))
-            .collect::<Vec<_>>()
-            .join(",\n            ")
-    };
-    let identity = c
-        .identity
-        .iter()
-        .map(|v| lit(*v))
-        .collect::<Vec<_>>()
-        .join(", ");
+use crate::derive::Expr;
+use crate::interp::Extents;
+use crate::ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node, NodeKind, output_axes};
 
-    let (ret_ty, ret) = if c.project.len() == 1 {
-        ("f64".to_string(), rust(&c.project[0], &names))
-    } else {
-        (
-            format!("[f64; {}]", c.project.len()),
-            format!("[{}]", join(&c.project)),
-        )
-    };
+// ── fresh names ──────────────────────────────────────────────────────────────
 
-    format!(
-        "/// Fused streaming kernel — grid over {{{grid}}}, stream over `{streamed}`.\n\
-         /// Acc = {slots} scalars; generated from the derived carrier.\n\
-         pub fn {name}(elements: impl IntoIterator<Item = [f64; {n}]>) -> {ret_ty} {{\n\
-         \x20   let mut acc = [{identity}];\n\
-         \x20   for x in elements {{\n\
-         \x20       let el = [\n            {into},\n        ];\n\
-         \x20       acc = [\n            {combine},\n        ];\n\
-         \x20   }}\n\
-         \x20   {ret}\n\
-         }}",
-        grid = grid.join(", "),
-        slots = c.slots,
-        into = join(&c.into),
-        combine = join(&c.combine),
-    )
+pub struct Gen {
+    pub n: usize,
+    /// Storage dtypes of the inputs in scope (from [`crate::ir::input_dtypes`]):
+    /// a name found here loads through [`Lang::buffer_load`] with its declared
+    /// width — packed int4 nibbles, halfs — instead of the default float read.
+    pub dtypes: HashMap<&'static str, Dtype>,
 }
-
-/// Emit a *tiled* kernel: `tile` lanes are kept resident while the streamed axis
-/// is folded once, updating all of them per step. The resident state is
-/// `tile × |Acc|` scalars — exactly the SRAM term the scheduler sized when it
-/// chose `tile`. Only `project` differs per lane at the end.
-pub fn tiled_kernel(c: &Carrier, name: &str, streamed: &str, tile: usize) -> String {
-    let n = item_arity(c);
-    let names = Names { item: "x", acc: "a", el: "el" };
-    let join = |v: &[Expr]| {
-        v.iter()
-            .map(|e| rust(e, &names))
-            .collect::<Vec<_>>()
-            .join(",\n                ")
-    };
-    let identity = c
-        .identity
-        .iter()
-        .map(|v| lit(*v))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let project = rust(&c.project[0], &names); // tiled emitter targets scalar-out folds
-
-    format!(
-        "/// Tiled fused kernel — {tile} lanes resident across the `{streamed}` stream\n\
-         /// ({tile} × {slots} = {resident} scalars in SRAM, the tile the scheduler chose).\n\
-         pub fn {name}(stream: impl IntoIterator<Item = [[f64; {n}]; {tile}]>) -> [f64; {tile}] {{\n\
-         \x20   const TILE: usize = {tile};\n\
-         \x20   let mut acc = [[{identity}]; TILE];\n\
-         \x20   for step in stream {{\n\
-         \x20       for lane in 0..TILE {{\n\
-         \x20           let x = step[lane];\n\
-         \x20           let el = [{into}];\n\
-         \x20           let a = acc[lane];\n\
-         \x20           acc[lane] = [\n                {combine},\n            ];\n\
-         \x20       }}\n\
-         \x20   }}\n\
-         \x20   let mut out = [0.0f64; TILE];\n\
-         \x20   for lane in 0..TILE {{\n\
-         \x20       let a = acc[lane];\n\
-         \x20       out[lane] = {project};\n\
-         \x20   }}\n\
-         \x20   out\n\
-         }}",
-        slots = c.slots,
-        resident = tile * c.slots,
-        into = c.into.iter().map(|e| rust(e, &names)).collect::<Vec<_>>().join(", "),
-        combine = join(&c.combine),
-    )
-}
-
-/// How many fields each streamed element carries (highest `Item` index + 1).
-fn item_arity(c: &Carrier) -> usize {
-    fn max_item(e: &Expr, acc: usize) -> usize {
-        match e {
-            Expr::Item(i) => acc.max(i + 1),
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Max(a, b)
-            | Expr::Min(a, b) => max_item(a, max_item(b, acc)),
-            Expr::Exp(a) | Expr::Log(a) => max_item(a, acc),
-            _ => acc,
+impl Gen {
+    pub fn new() -> Self {
+        Gen {
+            n: 0,
+            dtypes: HashMap::new(),
         }
     }
-    c.into.iter().fold(0, |a, e| max_item(e, a))
+    pub fn fresh(&mut self, tag: &str) -> String {
+        self.n += 1;
+        format!("{tag}{}", self.n)
+    }
 }
-
-fn lit(v: f64) -> String {
-    if v == f64::NEG_INFINITY {
-        "f64::NEG_INFINITY".into()
-    } else if v == f64::INFINITY {
-        "f64::INFINITY".into()
-    } else {
-        format!("{v:?}f64")
+impl Default for Gen {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// The Rust variable each field role reads from. `Item` is the loaded element,
-/// `A`/`F` the accumulator, `B` the lifted element.
-struct Names {
-    item: &'static str,
-    acc: &'static str,
-    el: &'static str,
+/// A buffer name made Rust/C-identifier-safe and prefixed so it can never be a
+/// keyword or start with a digit.
+pub fn san(name: &str) -> String {
+    let body: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("b_{body}")
 }
 
-/// Render one carrier expression as a Rust value, parenthesizing only where
-/// precedence requires it.
-fn rust(e: &Expr, n: &Names) -> String {
-    render(e, 0, n)
-}
-
-fn rust_prec(e: &Expr) -> u8 {
-    match e {
-        Expr::Add(..) | Expr::Sub(..) => 1,
-        Expr::Mul(..) | Expr::Div(..) => 2,
-        _ => 3, // atoms, and method calls (.max/.exp/...) which are postfix
-    }
-}
-
-fn render(e: &Expr, parent: u8, n: &Names) -> String {
-    let p = rust_prec(e);
-    // a method-call receiver must be parenthesized if it is a bare binary op
-    let recv = |a: &Expr| render(a, 3, n);
-    let s = match e {
-        Expr::Const(v) => lit(*v),
-        Expr::Item(i) => format!("{}[{i}]", n.item),
-        Expr::A(i) | Expr::F(i) => format!("{}[{i}]", n.acc),
-        Expr::B(i) => format!("{}[{i}]", n.el),
-        // left child at this precedence; right child one tighter so `-` / `/`
-        // parenthesize their right operand correctly.
-        Expr::Add(a, b) => format!("{} + {}", render(a, p, n), render(b, p, n)),
-        Expr::Sub(a, b) => format!("{} - {}", render(a, p, n), render(b, p + 1, n)),
-        Expr::Mul(a, b) => format!("{} * {}", render(a, p, n), render(b, p, n)),
-        Expr::Div(a, b) => format!("{} / {}", render(a, p, n), render(b, p + 1, n)),
-        Expr::Max(a, b) => format!("{}.max({})", recv(a), render(b, 0, n)),
-        Expr::Min(a, b) => format!("{}.min({})", recv(a), render(b, 0, n)),
-        Expr::Exp(a) => format!("{}.exp()", recv(a)),
-        Expr::Log(a) => format!("{}.ln()", recv(a)),
-    };
-    if p < parent { format!("({s})") } else { s }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::carrier;
-    use crate::engine_ir::*;
-
-    // The verbatim output of `rust_kernel` for FlashAttention. That it lives here
-    // and compiles is the point: the emitted kernel is real Rust. The test below
-    // both checks the generator still produces this *and* runs it against the
-    // interpreter, so the generated code is proven correct.
-    #[rustfmt::skip]
-    fn flash_attention(elements: impl IntoIterator<Item = [f64; 2]>) -> f64 {
-        let mut acc = [f64::NEG_INFINITY, 0.0f64, 0.0f64];
-        for x in elements {
-            let el = [x[0], 1.0f64, x[1]];
-            acc = [
-                acc[0].max(el[0]),
-                acc[1] * (acc[0] - acc[0].max(el[0])).exp() + el[1] * (el[0] - acc[0].max(el[0])).exp(),
-                acc[2] * (acc[0] - acc[0].max(el[0])).exp() + el[2] * (el[0] - acc[0].max(el[0])).exp(),
-            ];
-        }
-        acc[2] / acc[1]
-    }
-
-    #[test]
-    fn emitted_flash_kernel_is_real_and_correct() {
-        let attn = attention(
-            input("Q", &["sq", "d"]),
-            input("K", &["k", "d"]),
-            input("V", &["k", "e"]),
-            "d",
-            "k",
-        );
-        let c = carrier::derive(&attn, "k").unwrap();
-        let src = rust_kernel(&c, "flash_attention", "k", &["sq", "e"]);
-
-        // the generator still emits the function pasted above (key lines)
-        assert!(src.contains(
-            "pub fn flash_attention(elements: impl IntoIterator<Item = [f64; 2]>) -> f64"
-        ));
-        assert!(src.contains("let mut acc = [f64::NEG_INFINITY, 0.0f64, 0.0f64];"));
-        assert!(src.contains(
-            "acc[1] * (acc[0] - acc[0].max(el[0])).exp() + el[1] * (el[0] - acc[0].max(el[0])).exp()"
-        ));
-        assert!(src.trim_end().ends_with("acc[2] / acc[1]\n}"));
-        assert!(src.contains("stream over `k`"));
-
-        // …and that emitted function computes exactly what the interpreter does.
-        let mut s = 0xda3e39cb94b95bdbu64;
-        let mut rnd = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0
-        };
-        let items: Vec<[f64; 2]> = (0..50).map(|_| [rnd(), rnd()]).collect();
-        let via_kernel = flash_attention(items.iter().copied());
-        let rows: Vec<Vec<f64>> = items.iter().map(|p| p.to_vec()).collect();
-        let via_interp = c.fold(&rows)[0];
-        assert!((via_kernel - via_interp).abs() < 1e-12);
-    }
-
-    // The verbatim output of `tiled_kernel(.., tile = 2)`: two query lanes kept
-    // resident across the key stream — 2 × 3 = 6 scalars in SRAM.
-    #[rustfmt::skip]
-    fn flash_attention_tiled(stream: impl IntoIterator<Item = [[f64; 2]; 2]>) -> [f64; 2] {
-        const TILE: usize = 2;
-        let mut acc = [[f64::NEG_INFINITY, 0.0f64, 0.0f64]; TILE];
-        for step in stream {
-            for lane in 0..TILE {
-                let x = step[lane];
-                let el = [x[0], 1.0f64, x[1]];
-                let a = acc[lane];
-                acc[lane] = [
-                    a[0].max(el[0]),
-                    a[1] * (a[0] - a[0].max(el[0])).exp() + el[1] * (el[0] - a[0].max(el[0])).exp(),
-                    a[2] * (a[0] - a[0].max(el[0])).exp() + el[2] * (el[0] - a[0].max(el[0])).exp(),
-                ];
+/// Every `Input` leaf and its *declared* axes (its buffer's storage layout),
+/// deduped by name in first-seen order. The declared axes are what `offset`
+/// strides over; `View` handling in [`value`] remaps coordinates to read the
+/// buffer under them.
+pub fn buffers(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
+    fn go(n: &Node, out: &mut Vec<(&'static str, Vec<Axis>)>) {
+        match n.as_ref() {
+            NodeKind::Input { name, axes, .. } => {
+                if !out.iter().any(|(nm, _)| nm == name) {
+                    out.push((name, axes.clone()));
+                }
+            }
+            NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+            NodeKind::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out)),
+            NodeKind::Reduce { src, .. }
+            | NodeKind::Scan { src, .. }
+            | NodeKind::View { src, .. }
+            | NodeKind::Reindex { src, .. } => go(src, out),
+            NodeKind::Gather { src, index, .. } => {
+                go(src, out);
+                go(index, out);
             }
         }
-        let mut out = [0.0f64; TILE];
-        for lane in 0..TILE {
-            let a = acc[lane];
-            out[lane] = a[2] / a[1];
+    }
+    let mut out = Vec::new();
+    go(node, &mut out);
+    out
+}
+
+/// The row-major flat offset of `axes` at the loop-variable coordinate, with
+/// concrete extents baked in as literals. Language-agnostic (integer index
+/// arithmetic is the same in Rust and MSL).
+pub fn offset(axes: &[Axis], coord: &HashMap<Axis, String>, ext: &Extents) -> String {
+    if axes.is_empty() {
+        return "0".into();
+    }
+    let mut terms = Vec::new();
+    for (k, a) in axes.iter().enumerate() {
+        let stride: usize = axes[k + 1..].iter().map(|x| ext[x]).product();
+        let iv = &coord[a];
+        if stride == 1 {
+            terms.push(iv.clone());
+        } else {
+            terms.push(format!("{iv}*{stride}"));
         }
-        out
     }
+    terms.join(" + ")
+}
 
-    #[test]
-    fn emitted_tiled_kernel_is_real_and_correct() {
-        let attn = attention(
-            input("Q", &["sq", "d"]),
-            input("K", &["k", "d"]),
-            input("V", &["k", "e"]),
-            "d",
-            "k",
-        );
-        let c = carrier::derive(&attn, "k").unwrap();
-        let src = tiled_kernel(&c, "flash_attention_tiled", "k", 2);
+// ── the target-language seam ─────────────────────────────────────────────────
 
-        // the generator still emits the function pasted above (key lines)
-        assert!(src.contains("const TILE: usize = 2;"));
-        assert!(src.contains("let mut acc = [[f64::NEG_INFINITY, 0.0f64, 0.0f64]; TILE];"));
-        assert!(src.contains("2 × 3 = 6 scalars in SRAM"));
-
-        // two lanes with independent key streams; each lane equals a single fold.
-        let mut s = 0x243f6a8885a308d3u64;
-        let mut rnd = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0
-        };
-        let lane0: Vec<[f64; 2]> = (0..32).map(|_| [rnd(), rnd()]).collect();
-        let lane1: Vec<[f64; 2]> = (0..32).map(|_| [rnd(), rnd()]).collect();
-        let stream: Vec<[[f64; 2]; 2]> = (0..32).map(|i| [lane0[i], lane1[i]]).collect();
-        let out = flash_attention_tiled(stream);
-
-        let fold = |xs: &[[f64; 2]]| {
-            let rows: Vec<Vec<f64>> = xs.iter().map(|p| p.to_vec()).collect();
-            c.fold(&rows)[0]
-        };
-        assert!((out[0] - fold(&lane0)).abs() < 1e-12);
-        assert!((out[1] - fold(&lane1)).abs() < 1e-12);
+/// The syntactic primitives that differ between code-gen targets. Everything
+/// structural is written once against this trait.
+pub trait Lang {
+    /// A floating literal (handling ±∞).
+    fn lit(&self, v: f64) -> String;
+    /// Turn a `usize` loop variable into a float value (for `Iota`).
+    fn iota_val(&self, ivar: &str) -> String;
+    /// Declare a mutable scalar accumulator: `let mut n = init;` / `float n = init;`.
+    fn scalar_decl(&self, name: &str, init: &str) -> String;
+    /// Open a `0..count` loop over `var`; the close is always `}`.
+    fn for_open(&self, var: &str, count: usize) -> String;
+    /// Declare an integer index from a rounded float value (for `Gather`).
+    fn round_index(&self, name: &str, val: &str) -> String;
+    /// Declare an integer index (mutable iff it will be updated, as flatten's
+    /// running remainder is).
+    fn index_decl(&self, name: &str, val: &str, mutable: bool) -> String;
+    /// Declare a SIGNED index — movement-op arithmetic (`Reindex`) can go
+    /// negative before its bounds check.
+    fn signed_index_decl(&self, name: &str, val: &str) -> String;
+    /// An unsigned loop variable as a signed value.
+    fn to_signed(&self, expr: &str) -> String;
+    /// Declare an unsigned index from a signed value known to be in range.
+    fn index_from_signed(&self, name: &str, val: &str) -> String;
+    /// Declare an unsigned index from a signed value, clamped to `[0, n)` so
+    /// a padded read stays in bounds (the loaded value is discarded by the
+    /// select when the raw index was out of range).
+    fn clamped_index_decl(&self, name: &str, val: &str, n: usize) -> String;
+    /// `cond ? a : b` over a BOOLEAN condition string (not a float).
+    fn select_bool(&self, cond: &str, a: &str, b: &str) -> String;
+    /// Apply an elementwise [`MapOp`] to already-rendered arguments.
+    fn map_op(&self, op: MapOp, a: &[String]) -> String;
+    /// The scalar monoid combine `acc ⊕ ev`.
+    fn monoid(&self, m: Monoid, acc: &str, ev: &str) -> String;
+    /// Read element `off` of input buffer `name` stored at `dtype` width,
+    /// as a float expression. `None` is the target's native float buffer.
+    /// The Metal target reads halfs and unpacks int4 nibbles here; a target
+    /// without typed storage must decline loudly rather than mis-read.
+    fn buffer_load(&self, name: &str, off: &str, dtype: Option<Dtype>) -> String {
+        match dtype {
+            None => format!("{}[{off}]", san(name)),
+            Some(d) => panic!("this backend has no {d:?} storage support"),
+        }
     }
+}
+
+/// `name = val;` — identical across targets.
+pub fn assign(name: &str, val: &str) -> String {
+    format!("{name} = {val};")
+}
+
+// ── the shared recursion ─────────────────────────────────────────────────────
+
+/// Emit code for the scalar value of `node` at `coord` (a map from each
+/// in-scope axis to the loop variable holding its index). Statements that need
+/// their own scope — a reduction loop, a gather index — are pushed to `out` in
+/// order; the return is a pure expression reading whatever `out` set up. This
+/// is [`crate::interp`]'s `eval_node`, targeting code.
+pub fn value<L: Lang>(
+    lang: &L,
+    node: &Node,
+    coord: &HashMap<Axis, String>,
+    ext: &Extents,
+    g: &mut Gen,
+    out: &mut Vec<String>,
+) -> String {
+    match node.as_ref() {
+        NodeKind::Const { v } => lang.lit(*v),
+        NodeKind::Iota { axis } => lang.iota_val(&coord[axis]),
+        NodeKind::Input { name, axes, .. } => {
+            let dt = g.dtypes.get(name).copied();
+            lang.buffer_load(name, &offset(axes, coord, ext), dt)
+        }
+        NodeKind::Map { op, inputs } => {
+            let a: Vec<String> = inputs
+                .iter()
+                .map(|i| value(lang, i, coord, ext, g, out))
+                .collect();
+            lang.map_op(*op, &a)
+        }
+        NodeKind::Reduce { src, axis, op } => {
+            let m = match op {
+                BinOp::Monoid(m) => *m,
+                other => panic!("codegen: reduce with {other:?} is not a monoid"),
+            };
+            let acc = g.fresh("acc");
+            out.push(lang.scalar_decl(&acc, &lang.lit(m.identity())));
+            let lv = g.fresh("r");
+            let mut coord2 = coord.clone();
+            coord2.insert(*axis, lv.clone());
+            let mut body = Vec::new();
+            let ev = value(lang, src, &coord2, ext, g, &mut body);
+            out.push(lang.for_open(&lv, ext[axis]));
+            out.extend(body);
+            out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
+            out.push("}".into());
+            acc
+        }
+        NodeKind::Gather { src, index, axis } => {
+            let ie = value(lang, index, coord, ext, g, out);
+            let gi = g.fresh("gi");
+            out.push(lang.round_index(&gi, &ie));
+            let mut coord2 = coord.clone();
+            coord2.insert(*axis, gi);
+            value(lang, src, &coord2, ext, g, out)
+        }
+        NodeKind::View { src, groups } => {
+            let mut coord2 = coord.clone();
+            for (members, to) in groups {
+                if members.len() == 1 {
+                    // rename: the source axis takes the output axis's index.
+                    coord2.insert(members[0], coord[to].clone());
+                } else {
+                    // flatten: split the merged index (first member most
+                    // significant, so the last runs fastest).
+                    let rem = g.fresh("rem");
+                    out.push(lang.index_decl(&rem, &coord[to], true));
+                    for m in members.iter().rev() {
+                        let iv = g.fresh("m");
+                        out.push(lang.index_decl(&iv, &format!("{rem} % {}", ext[m]), false));
+                        out.push(format!("{rem} /= {};", ext[m]));
+                        coord2.insert(*m, iv);
+                    }
+                }
+            }
+            value(lang, src, &coord2, ext, g, out)
+        }
+        // Affine reindexing: compute each mapped source axis's signed index;
+        // padded reads clamp the index (so any setup statements below stay in
+        // bounds) and select 0.0 when the raw index was out of range. The
+        // codegen twin of the interpreter's `Reindex` arm.
+        NodeKind::Reindex { src, map, padded } => {
+            let mut coord2 = coord.clone();
+            let mut guards: Vec<String> = Vec::new();
+            for (m, terms, off) in map {
+                let mut parts: Vec<String> = terms
+                    .iter()
+                    .map(|(coef, a)| {
+                        let iv = lang.to_signed(&coord[a]);
+                        if *coef == 1 {
+                            iv
+                        } else {
+                            format!("{coef}*{iv}")
+                        }
+                    })
+                    .collect();
+                if *off != 0 {
+                    parts.push(format!("({off})"));
+                }
+                let val = if parts.is_empty() {
+                    "0".to_string()
+                } else {
+                    parts.join(" + ")
+                };
+                let ri = g.fresh("ri");
+                out.push(lang.signed_index_decl(&ri, &val));
+                let n = ext[m];
+                let ci = g.fresh("ci");
+                if *padded {
+                    guards.push(format!("{ri} >= 0 && {ri} < {n}"));
+                    out.push(lang.clamped_index_decl(&ci, &ri, n));
+                } else {
+                    out.push(lang.index_from_signed(&ci, &ri));
+                }
+                coord2.insert(*m, ci);
+            }
+            let v = value(lang, src, &coord2, ext, g, out);
+            if guards.is_empty() {
+                v
+            } else {
+                lang.select_bool(&guards.join(" && "), &v, &lang.lit(0.0))
+            }
+        }
+
+        NodeKind::Scan { .. } => panic!("codegen: Scan is not implemented (sequential recurrence)"),
+    }
+}
+
+/// Render a derived carrier [`Expr`]: `Item(i)` → `x[i]`, `A(i)`/`F(i)` →
+/// `acc[i]`, `B(i)` → `el[i]` (identical in both targets); operators route
+/// through the language's [`Lang::map_op`].
+pub fn carrier_expr<L: Lang>(lang: &L, e: &Expr) -> String {
+    let bin = |op: MapOp, a: &Expr, b: &Expr| {
+        lang.map_op(op, &[carrier_expr(lang, a), carrier_expr(lang, b)])
+    };
+    let un = |op: MapOp, a: &Expr| lang.map_op(op, &[carrier_expr(lang, a)]);
+    match e {
+        Expr::Const(v) => lang.lit(*v),
+        Expr::Item(i) => format!("x[{i}]"),
+        Expr::A(i) | Expr::F(i) => format!("acc[{i}]"),
+        Expr::B(i) => format!("el[{i}]"),
+        Expr::Add(a, b) => bin(MapOp::Add, a, b),
+        Expr::Sub(a, b) => bin(MapOp::Sub, a, b),
+        Expr::Mul(a, b) => bin(MapOp::Mul, a, b),
+        Expr::Div(a, b) => bin(MapOp::Div, a, b),
+        Expr::Max(a, b) => bin(MapOp::Max, a, b),
+        Expr::Min(a, b) => bin(MapOp::Min, a, b),
+        Expr::Lt(a, b) => bin(MapOp::Lt, a, b),
+        Expr::Exp(a) => un(MapOp::Exp, a),
+        Expr::Log(a) => un(MapOp::Log, a),
+        Expr::Sqrt(a) => un(MapOp::Sqrt, a),
+        Expr::Sin(a) => un(MapOp::Sin, a),
+        Expr::Cos(a) => un(MapOp::Cos, a),
+        Expr::Where(c, a, b) => lang.map_op(
+            MapOp::Where,
+            &[
+                carrier_expr(lang, c),
+                carrier_expr(lang, a),
+                carrier_expr(lang, b),
+            ],
+        ),
+    }
+}
+
+/// Grid decode shared by kernels that run one thread per output point (the
+/// GPU shape): produce `let i_ax = (gid / stride) % extent;` for each grid
+/// axis and return the coordinate map.
+pub fn thread_grid_decode<L: Lang>(
+    lang: &L,
+    grid: &[Axis],
+    ext: &Extents,
+    g: &mut Gen,
+    out: &mut Vec<String>,
+) -> HashMap<Axis, String> {
+    thread_grid_decode_from(lang, "gid", grid, ext, g, out)
+}
+
+/// [`thread_grid_decode`] against an arbitrary index variable — a split-
+/// reduction partial kernel decodes the grid from `gid / blocks`.
+pub fn thread_grid_decode_from<L: Lang>(
+    _lang: &L,
+    gid_var: &str,
+    grid: &[Axis],
+    ext: &Extents,
+    g: &mut Gen,
+    out: &mut Vec<String>,
+) -> HashMap<Axis, String> {
+    let mut coord = HashMap::new();
+    for (k, &a) in grid.iter().enumerate() {
+        let stride: usize = grid[k + 1..].iter().map(|x| ext[x]).product();
+        let iv = format!("i_{}", g.fresh("g"));
+        if stride == 1 {
+            out.push(format!("uint {iv} = {gid_var} % {};", ext[&a]));
+        } else {
+            out.push(format!("uint {iv} = ({gid_var} / {stride}) % {};", ext[&a]));
+        }
+        coord.insert(a, iv);
+    }
+    coord
+}
+
+/// The output grid (free axes) and its flattened size for a kernel node.
+pub fn grid_of(node: &Node, ext: &Extents) -> (Vec<Axis>, usize) {
+    let grid = output_axes(node);
+    let size = grid.iter().map(|a| ext[a]).product::<usize>().max(1);
+    (grid, size)
 }

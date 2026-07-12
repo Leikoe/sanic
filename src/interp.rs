@@ -1,0 +1,768 @@
+//! A dense reference interpreter for the IR — the correctness oracle.
+//!
+//! Everything else in this crate is *clever*: `derive` strengthens a fold into
+//! a streaming accumulator, `partition` cuts a graph into kernels, the
+//! emitters transcribe carriers to code. This module is deliberately *dumb*.
+//! It evaluates a [`Node`] the naive way — materialize every intermediate,
+//! reduce with a plain loop, no fusion, no rescaling, no deferral — and
+//! returns a dense [`Tensor`]. Because it is the definition of what the IR
+//! *means*, it is the ground truth every derived kernel must reproduce.
+//!
+//! Two entry points:
+//!
+//! * [`eval`] — the semantics of the graph. `eval(attention) ` computes
+//!   `softmax(QKᵀ)·V` by literally building the scores, softmaxing, and
+//!   contracting. Slow and obvious on purpose.
+//! * [`run_carrier`] — drives a *derived* carrier the way a real kernel would:
+//!   grid over the free axes, stream the folded axis, lift/combine/project
+//!   each element from real tensor data. Where [`eval`] says what the answer
+//!   is, this says what the generated kernel computes.
+//!
+//! Holding `run_carrier == eval` on random tensors is the end-to-end
+//! correctness certificate: not "the carrier folds consistently with itself"
+//! (which [`crate::derive`]'s law tests already show), but "the derived
+//! kernel computes the real math on real data." That is the guarantee a
+//! compiler owes its users, and the foundation everything downstream
+//! (dtypes, GPU backends, autodiff) is validated against.
+//!
+//! Scope: the elementwise · reduce · gather · view · iota core — i.e. the
+//! whole attention / transformer vocabulary. Monoidal `Scan` (prefix folds)
+//! is evaluated too; the affine-compose and non-associative recurrences are
+//! rejected with a clear message rather than guessed at, so the oracle never
+//! lies about a computation it does not actually implement.
+
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use crate::derive::Carrier;
+use crate::ir::{Axis, BinOp, MapOp, Monoid, Node, NodeKind, output_axes};
+
+/// The extent (size) of every axis in the graph.
+pub type Extents = HashMap<Axis, usize>;
+/// Input tensors by leaf name.
+pub type Env = HashMap<&'static str, Tensor>;
+
+// ── dense tensors ────────────────────────────────────────────────────────────
+
+/// A dense, row-major tensor tagged with the axis each dimension ranges over.
+/// Axes are the semantic identity; the position in `axes` is just the storage
+/// order. Two tensors with the same axes in different orders denote the same
+/// mathematical object (see [`Tensor::permuted_to`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tensor {
+    pub axes: Vec<Axis>,
+    pub shape: Vec<usize>,
+    pub data: Vec<f64>,
+}
+
+impl Tensor {
+    /// A 0-dimensional tensor (a scalar) — no axes.
+    pub fn scalar(v: f64) -> Tensor {
+        Tensor {
+            axes: Vec::new(),
+            shape: Vec::new(),
+            data: vec![v],
+        }
+    }
+
+    /// A tensor of the given axes/extents, filled by a closure over the
+    /// per-axis coordinate (a map from each axis to its index).
+    pub fn from_fn(
+        axes: &[Axis],
+        extents: &Extents,
+        mut f: impl FnMut(&HashMap<Axis, usize>) -> f64,
+    ) -> Tensor {
+        let shape: Vec<usize> = axes.iter().map(|a| extent(extents, *a)).collect();
+        let total: usize = shape.iter().product();
+        let mut data = Vec::with_capacity(total);
+        let mut coord = Coord::new(axes, &shape);
+        for _ in 0..total {
+            data.push(f(coord.map()));
+            coord.step();
+        }
+        Tensor {
+            axes: axes.to_vec(),
+            shape,
+            data,
+        }
+    }
+
+    /// Row-major strides for `self.axes`.
+    fn strides(&self) -> Vec<usize> {
+        let mut s = vec![1usize; self.shape.len()];
+        for i in (0..self.shape.len().saturating_sub(1)).rev() {
+            s[i] = s[i + 1] * self.shape[i + 1];
+        }
+        s
+    }
+
+    /// Read the element at an assignment that covers (at least) `self.axes`.
+    /// Axes of `self` absent from `assign` are a programming error — the
+    /// caller must supply a full coordinate for this tensor's axes.
+    pub fn at(&self, assign: &HashMap<Axis, usize>) -> f64 {
+        let strides = self.strides();
+        let mut off = 0;
+        for (k, &a) in self.axes.iter().enumerate() {
+            let i = *assign
+                .get(&a)
+                .unwrap_or_else(|| panic!("coordinate missing axis {a} for tensor read"));
+            debug_assert!(i < self.shape[k], "index {i} out of bounds for axis {a}");
+            off += strides[k] * i;
+        }
+        self.data[off]
+    }
+
+    /// The same tensor with its dimensions reordered to `target` (a permutation
+    /// of `self.axes`). Used to bring a user-supplied input into the axis order
+    /// a node declares.
+    pub fn permuted_to(&self, target: &[Axis]) -> Tensor {
+        debug_assert_eq!(self.axes.len(), target.len(), "permute arity");
+        if self.axes == target {
+            return self.clone();
+        }
+        let extents: Extents = self
+            .axes
+            .iter()
+            .zip(&self.shape)
+            .map(|(&a, &n)| (a, n))
+            .collect();
+        Tensor::from_fn(target, &extents, |c| self.at(c))
+    }
+}
+
+/// Extent of `axis`, or a clear panic naming the missing axis.
+fn extent(extents: &Extents, axis: Axis) -> usize {
+    *extents
+        .get(&axis)
+        .unwrap_or_else(|| panic!("no extent provided for axis {axis}"))
+}
+
+// ── coordinate iteration ─────────────────────────────────────────────────────
+
+/// A mixed-radix counter over a set of axes: enumerates every coordinate of a
+/// shape in row-major order, exposing the current index of each axis.
+struct Coord<'a> {
+    axes: &'a [Axis],
+    shape: &'a [usize],
+    idx: Vec<usize>,
+    map: HashMap<Axis, usize>,
+}
+
+impl<'a> Coord<'a> {
+    fn new(axes: &'a [Axis], shape: &'a [usize]) -> Self {
+        let map = axes.iter().map(|&a| (a, 0usize)).collect();
+        Coord {
+            axes,
+            shape,
+            idx: vec![0; axes.len()],
+            map,
+        }
+    }
+
+    fn map(&self) -> &HashMap<Axis, usize> {
+        &self.map
+    }
+
+    /// Advance to the next coordinate (row-major: last axis fastest).
+    fn step(&mut self) {
+        for k in (0..self.axes.len()).rev() {
+            self.idx[k] += 1;
+            if self.idx[k] < self.shape[k] {
+                self.map.insert(self.axes[k], self.idx[k]);
+                return;
+            }
+            self.idx[k] = 0;
+            self.map.insert(self.axes[k], 0);
+        }
+        // wrapped around fully — leaves all-zero, which callers don't observe
+        // because they step exactly `product(shape)` times.
+    }
+}
+
+// ── the evaluator ────────────────────────────────────────────────────────────
+
+/// Evaluate `node` to a dense tensor under the given inputs and extents.
+///
+/// This is the reference semantics of the IR. Shared sub-graphs are memoized
+/// (by node identity), so a DAG with residuals and a reused normalizer costs
+/// what its distinct nodes cost, not its unfolded tree.
+pub fn eval(node: &Node, env: &Env, extents: &Extents) -> Tensor {
+    let mut cache: HashMap<*const NodeKind, Rc<Tensor>> = HashMap::new();
+    (*eval_rc(node, env, extents, &mut cache)).clone()
+}
+
+fn eval_rc(
+    node: &Node,
+    env: &Env,
+    extents: &Extents,
+    cache: &mut HashMap<*const NodeKind, Rc<Tensor>>,
+) -> Rc<Tensor> {
+    let ptr = Rc::as_ptr(node);
+    if let Some(t) = cache.get(&ptr) {
+        return t.clone();
+    }
+    let t = Rc::new(eval_node(node, env, extents, cache));
+    cache.insert(ptr, t.clone());
+    t
+}
+
+fn eval_node(
+    node: &Node,
+    env: &Env,
+    extents: &Extents,
+    cache: &mut HashMap<*const NodeKind, Rc<Tensor>>,
+) -> Tensor {
+    match node.as_ref() {
+        NodeKind::Input { name, axes, .. } => {
+            let t = env
+                .get(name)
+                .unwrap_or_else(|| panic!("no input tensor provided for `{name}`"));
+            if sorted(&t.axes) == sorted(axes) {
+                // same labels, maybe reordered — bring into declared order.
+                t.permuted_to(axes)
+            } else {
+                // Different labels over the same storage: the "one buffer, two
+                // index spaces" aliasing (a normalized tensor read at both
+                // query and key positions). Rebind the buffer to the declared
+                // axes *positionally* — renames preserve dimension order, so
+                // this is a pure relabel, valid exactly when the extents line
+                // up position-for-position.
+                let want: Vec<usize> = axes.iter().map(|a| extent(extents, *a)).collect();
+                assert_eq!(
+                    t.shape, want,
+                    "input `{name}`: buffer shape {:?} cannot be rebound to axes {axes:?}",
+                    t.shape
+                );
+                Tensor {
+                    axes: axes.clone(),
+                    shape: t.shape.clone(),
+                    data: t.data.clone(),
+                }
+            }
+        }
+
+        NodeKind::Const { v } => Tensor::scalar(*v),
+
+        NodeKind::Iota { axis } => Tensor::from_fn(&[*axis], extents, |c| c[axis] as f64),
+
+        NodeKind::Map { op, inputs } => {
+            let ins: Vec<Rc<Tensor>> = inputs
+                .iter()
+                .map(|n| eval_rc(n, env, extents, cache))
+                .collect();
+            let oaxes = output_axes(node);
+            Tensor::from_fn(&oaxes, extents, |c| {
+                let args: Vec<f64> = ins.iter().map(|t| t.at(c)).collect();
+                apply_map(*op, &args)
+            })
+        }
+
+        NodeKind::Reduce { src, axis, op } => {
+            let s = eval_rc(src, env, extents, cache);
+            let oaxes: Vec<Axis> = s.axes.iter().copied().filter(|a| a != axis).collect();
+            let n = extent(extents, *axis);
+            Tensor::from_fn(&oaxes, extents, |c| {
+                let mut coord = c.clone();
+                let mut acc = binop_identity(*op);
+                for i in 0..n {
+                    coord.insert(*axis, i);
+                    acc = binop_combine(*op, acc, s.at(&coord));
+                }
+                acc
+            })
+        }
+
+        NodeKind::Scan { src, axis, op } => eval_scan(src, *axis, *op, env, extents, cache),
+
+        NodeKind::Gather { src, index, axis } => {
+            let s = eval_rc(src, env, extents, cache);
+            let idx = eval_rc(index, env, extents, cache);
+            let oaxes = output_axes(node);
+            let bound = extent(extents, *axis);
+            Tensor::from_fn(&oaxes, extents, |c| {
+                let i = idx.at(c).round() as usize;
+                assert!(i < bound, "gather index {i} out of bounds for axis {axis}");
+                let mut coord = c.clone();
+                coord.insert(*axis, i);
+                s.at(&coord)
+            })
+        }
+
+        NodeKind::View { src, groups } => {
+            let s = eval_rc(src, env, extents, cache);
+            eval_view(&s, groups, node, extents)
+        }
+
+        // Affine reindexing: each output coordinate computes the (signed)
+        // source index of every mapped axis; out-of-range is 0.0 when padded,
+        // an error otherwise. Pure index arithmetic — the definition the
+        // emitters must reproduce.
+        NodeKind::Reindex { src, map, padded } => {
+            let s = eval_rc(src, env, extents, cache);
+            let oaxes = output_axes(node);
+            Tensor::from_fn(&oaxes, extents, |c| {
+                let mut coord = c.clone();
+                for (m, terms, off) in map {
+                    let mut idx: i64 = *off;
+                    for (coef, a) in terms {
+                        idx += coef * c[a] as i64;
+                    }
+                    let n = src_extent(&s, *m, extents) as i64;
+                    if idx < 0 || idx >= n {
+                        assert!(
+                            padded,
+                            "reindex: index {idx} out of bounds for axis {m} (extent {n}) \
+                             and the node is not padded"
+                        );
+                        return 0.0;
+                    }
+                    coord.insert(*m, idx as usize);
+                }
+                s.at(&coord)
+            })
+        }
+    }
+}
+
+/// A prefix scan. Monoidal steps fold as a running accumulator (output shares
+/// the source's shape). The affine and non-associative recurrences are not
+/// implemented here on purpose: the oracle must not fabricate semantics it
+/// cannot state exactly, so it refuses rather than guesses.
+fn eval_scan(
+    src: &Node,
+    axis: Axis,
+    op: BinOp,
+    env: &Env,
+    extents: &Extents,
+    cache: &mut HashMap<*const NodeKind, Rc<Tensor>>,
+) -> Tensor {
+    let BinOp::Monoid(m) = op else {
+        panic!(
+            "interp: {op:?} scan is not implemented in the reference oracle \
+             (only monoidal prefix scans are); extend before relying on it"
+        );
+    };
+    let s = eval_rc(src, env, extents, cache);
+    let n = extent(extents, axis);
+    Tensor::from_fn(&s.axes.clone(), extents, |c| {
+        // prefix fold up to and including this coordinate's position on `axis`
+        let upto = c[&axis];
+        let mut coord = c.clone();
+        let mut acc = m.identity();
+        for i in 0..=upto {
+            coord.insert(axis, i);
+            acc = monoid_combine(m, acc, s.at(&coord));
+        }
+        let _ = n;
+        acc
+    })
+}
+
+/// Evaluate a `View`: relabel (rename) or merge (flatten) index spaces with no
+/// computation. Each source coordinate maps to exactly one output coordinate,
+/// so this is a pure data reshuffle.
+fn eval_view(s: &Tensor, groups: &[(Vec<Axis>, Axis)], node: &Node, extents: &Extents) -> Tensor {
+    let oaxes = output_axes(node);
+    // Extent of each output axis: a plain pass-through keeps its extent; a
+    // flattened group's extent is the product of its members'.
+    let ext_of = |a: Axis| -> usize {
+        if let Some((members, _)) = groups.iter().find(|(_, to)| *to == a) {
+            members.iter().map(|m| src_extent(s, *m, extents)).product()
+        } else {
+            src_extent(s, a, extents)
+        }
+    };
+    let out_shape: Vec<usize> = oaxes.iter().map(|&a| ext_of(a)).collect();
+    // Cross-check against caller-provided extents for the merged axis, if any.
+    for (i, &a) in oaxes.iter().enumerate() {
+        if let Some(&declared) = extents.get(&a) {
+            assert_eq!(declared, out_shape[i], "view output extent mismatch on {a}");
+        }
+    }
+
+    let mut out = Tensor {
+        axes: oaxes.clone(),
+        shape: out_shape.clone(),
+        data: vec![0.0; out_shape.iter().product()],
+    };
+    let out_strides = out.strides();
+
+    // Walk every source coordinate, scatter its value to the mapped output cell.
+    let total: usize = s.shape.iter().product();
+    let mut coord = Coord::new(&s.axes, &s.shape);
+    for _ in 0..total {
+        let a = coord.map();
+        let mut off = 0usize;
+        for (k, &oax) in oaxes.iter().enumerate() {
+            let coordinate = if let Some((members, _)) = groups.iter().find(|(_, to)| *to == oax) {
+                // row-major merge: first member most significant.
+                let mut c = 0usize;
+                for &m in members {
+                    c = c * src_extent(s, m, extents) + a[&m];
+                }
+                c
+            } else {
+                a[&oax]
+            };
+            off += out_strides[k] * coordinate;
+        }
+        out.data[off] = s.at(a);
+        coord.step();
+    }
+    out
+}
+
+/// Extent of `axis` as seen at the source of a view: prefer the source
+/// tensor's own shape, fall back to the extents table.
+fn src_extent(s: &Tensor, axis: Axis, extents: &Extents) -> usize {
+    s.axes
+        .iter()
+        .position(|a| *a == axis)
+        .map(|k| s.shape[k])
+        .unwrap_or_else(|| extent(extents, axis))
+}
+
+fn sorted(axes: &[Axis]) -> Vec<Axis> {
+    let mut v = axes.to_vec();
+    v.sort();
+    v
+}
+
+// ── scalar semantics ─────────────────────────────────────────────────────────
+
+/// The scalar meaning of each [`MapOp`], matching `ir::MapOp` exactly.
+fn apply_map(op: MapOp, a: &[f64]) -> f64 {
+    match op {
+        MapOp::Add => a[0] + a[1],
+        MapOp::Sub => a[0] - a[1],
+        MapOp::Mul => a[0] * a[1],
+        MapOp::Div => a[0] / a[1],
+        MapOp::Max => a[0].max(a[1]),
+        MapOp::Min => a[0].min(a[1]),
+        MapOp::Lt => (a[0] < a[1]) as u8 as f64,
+        MapOp::Neg => -a[0],
+        MapOp::Recip => 1.0 / a[0],
+        MapOp::Exp => a[0].exp(),
+        MapOp::Log => a[0].ln(),
+        MapOp::Sqrt => a[0].sqrt(),
+        MapOp::Tanh => a[0].tanh(),
+        MapOp::Sin => a[0].sin(),
+        MapOp::Cos => a[0].cos(),
+        MapOp::Where => {
+            if a[0] != 0.0 {
+                a[1]
+            } else {
+                a[2]
+            }
+        }
+    }
+}
+
+fn monoid_combine(m: Monoid, a: f64, b: f64) -> f64 {
+    match m {
+        Monoid::Add => a + b,
+        Monoid::Mul => a * b,
+        Monoid::Max => a.max(b),
+        Monoid::Min => a.min(b),
+        // numerically-stable log(exp(a) + exp(b)); identity is −∞.
+        Monoid::LogSumExp => {
+            if a == f64::NEG_INFINITY {
+                b
+            } else if b == f64::NEG_INFINITY {
+                a
+            } else {
+                let m = a.max(b);
+                m + ((a - m).exp() + (b - m).exp()).ln()
+            }
+        }
+    }
+}
+
+fn binop_identity(op: BinOp) -> f64 {
+    match op {
+        BinOp::Monoid(m) => m.identity(),
+        other => panic!("interp: reduce with {other:?} is not a monoid"),
+    }
+}
+
+fn binop_combine(op: BinOp, a: f64, b: f64) -> f64 {
+    match op {
+        BinOp::Monoid(m) => monoid_combine(m, a, b),
+        other => panic!("interp: reduce with {other:?} is not a monoid"),
+    }
+}
+
+// ── driving a derived kernel on real tensors ─────────────────────────────────
+
+/// Run a derived `carrier` over real input tensors, exactly as a generated
+/// kernel would: for each point of the output grid (the free axes), stream the
+/// folded `axis`, lifting each element from the carrier's leaves and combining.
+///
+/// The carrier's leaves are graph nodes free along `axis` (a raw input, an
+/// index, or a contraction like FlashAttention's QKᵀ). Evaluating them with
+/// [`eval`] and folding with the carrier's own `lift`/`merge`/`project` is the
+/// same arithmetic the emitted kernel performs — so agreement with
+/// `eval(node)` certifies the kernel computes the real math.
+///
+/// Requires a scalar-projecting carrier (`project.len() == 1`), which covers
+/// attention, matmul, softmax-weighted sums, RMS/variance, and logsumexp.
+pub fn run_carrier(
+    node: &Node,
+    axis: Axis,
+    carrier: &Carrier,
+    env: &Env,
+    extents: &Extents,
+) -> Tensor {
+    run_carrier_split(node, axis, carrier, 1, env, extents)
+}
+
+/// Run a derived carrier as a TWO-STAGE split reduction (the GROUP schedule):
+/// partition the streamed axis into `blocks` contiguous chunks, fold each
+/// chunk into a raw accumulator (stage 1 — the parallel partials), then merge
+/// the partials with the carrier's own associative `combine` and project
+/// (stage 2). Equal to the one-pass fold *by the monoid law* — this function
+/// is the oracle a split-reduction backend is checked against, and with
+/// `blocks = 1` it is exactly [`run_carrier`].
+///
+/// The same re-association is what data parallelism is: each "device" folds
+/// its shard of the axis, and the allreduce is stage 2's merge.
+///
+/// `blocks` may not exceed the axis extent: an empty chunk's partial is the
+/// carrier identity, and merging an identity-valued *accumulator* puts the
+/// online-softmax rescale at `exp(−∞ − −∞)` — the same −∞ edge
+/// [`crate::ir::causal_mask`] documents. Keeping every chunk non-empty keeps
+/// the whole computation in the finite domain, exactly as real split-K flash
+/// kernels do.
+pub fn run_carrier_split(
+    node: &Node,
+    axis: Axis,
+    carrier: &Carrier,
+    blocks: usize,
+    env: &Env,
+    extents: &Extents,
+) -> Tensor {
+    assert_eq!(
+        carrier.project.len(),
+        1,
+        "run_carrier supports scalar-projecting carriers; got {} outputs",
+        carrier.project.len()
+    );
+
+    let grid = output_axes(node); // the free axes — the kernel's parallel grid
+    let n = extent(extents, axis);
+    assert!(
+        blocks >= 1 && blocks <= n,
+        "blocks must be in [1, extent({axis}) = {n}]; an empty chunk's identity \
+         partial would hit the −∞ rescale edge"
+    );
+
+    // Evaluate every leaf once, over its full shape (including `axis` where the
+    // leaf depends on it), through one shared cache.
+    let mut cache: HashMap<*const NodeKind, Rc<Tensor>> = HashMap::new();
+    let leaves: Vec<Rc<Tensor>> = carrier
+        .leaves
+        .iter()
+        .map(|l| {
+            let t = eval_rc(l, env, extents, &mut cache);
+            for &a in &t.axes {
+                assert!(
+                    a == axis || grid.contains(&a),
+                    "leaf exposes axis {a} outside grid ∪ {{stream}} — \
+                     not a valid per-element input"
+                );
+            }
+            t
+        })
+        .collect();
+
+    Tensor::from_fn(&grid, extents, |gc| {
+        let mut coord = gc.clone();
+        // stage 1: one raw accumulator per chunk (identity-valued when the
+        // chunk is empty — blocks may exceed n and the law still holds)
+        let mut partials: Vec<Vec<f64>> = Vec::with_capacity(blocks);
+        for b in 0..blocks {
+            let (lo, hi) = (b * n / blocks, (b + 1) * n / blocks);
+            let mut acc = carrier.identity.clone();
+            for i in lo..hi {
+                coord.insert(axis, i);
+                let item: Vec<f64> = leaves.iter().map(|t| t.at(&coord)).collect();
+                let el = carrier.lift(&item);
+                acc = carrier.merge(&acc, &el);
+            }
+            partials.push(acc);
+        }
+        // stage 2: merge the partials, project once
+        let mut acc = carrier.identity.clone();
+        for p in &partials {
+            acc = carrier.merge(&acc, p);
+        }
+        carrier.project(&acc)[0]
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derive::derive;
+    use crate::ir::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn f(&mut self) -> f64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    fn rand_tensor(name_axes: &[Axis], extents: &Extents, rng: &mut Lcg) -> Tensor {
+        Tensor::from_fn(name_axes, extents, |_| rng.f())
+    }
+
+    fn approx(a: f64, b: f64) {
+        let tol = 1e-9 * (1.0 + a.abs().max(b.abs()));
+        assert!((a - b).abs() <= tol, "{a} vs {b}");
+    }
+
+    fn assert_tensors_eq(x: &Tensor, y: &Tensor) {
+        let y = y.permuted_to(&x.axes);
+        assert_eq!(x.shape, y.shape, "shape");
+        for (a, b) in x.data.iter().zip(&y.data) {
+            approx(*a, *b);
+        }
+    }
+
+    // eval computes an honest matmul.
+    #[test]
+    fn eval_matmul_matches_naive() {
+        let (i, j, k) = (axis("i"), axis("j"), axis("k"));
+        let ext: Extents = [(i, 3), (j, 4), (k, 5)].into_iter().collect();
+        let mut rng = Lcg(1);
+        let a = rand_tensor(&[i, k], &ext, &mut rng);
+        let b = rand_tensor(&[k, j], &ext, &mut rng);
+        let env: Env = [("A", a.clone()), ("B", b.clone())].into_iter().collect();
+
+        let mm = matmul(input("A", &[i, k]), input("B", &[k, j]), k);
+        let got = eval(&mm, &env, &ext);
+
+        let want = Tensor::from_fn(&[i, j], &ext, |c| {
+            (0..5)
+                .map(|kk| a.data[c[&i] * 5 + kk] * b.data[kk * 4 + c[&j]])
+                .sum()
+        });
+        assert_tensors_eq(&got, &want);
+    }
+
+    // softmax rows are non-negative and sum to one.
+    #[test]
+    fn eval_softmax_normalizes() {
+        let (r, k) = (axis("r"), axis("k"));
+        let ext: Extents = [(r, 4), (k, 7)].into_iter().collect();
+        let mut rng = Lcg(9);
+        let x = rand_tensor(&[r, k], &ext, &mut rng);
+        let env: Env = [("X", x)].into_iter().collect();
+        let sm = eval(&softmax(input("X", &[r, k]), k), &env, &ext);
+        for r_i in 0..4 {
+            let mut s = 0.0;
+            for k_i in 0..7 {
+                let v = sm.data[r_i * 7 + k_i];
+                assert!(v >= 0.0);
+                s += v;
+            }
+            approx(s, 1.0);
+        }
+    }
+
+    // THE headline: the derived FlashAttention carrier, driven on real Q/K/V,
+    // computes exactly what the naive attention graph evaluates to.
+    #[test]
+    fn derived_flash_kernel_equals_naive_attention() {
+        let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+        let ext: Extents = [(sq, 6), (k, 9), (d, 8), (e, 5)].into_iter().collect();
+        let mut rng = Lcg(0xF1A5);
+        let q = rand_tensor(&[sq, d], &ext, &mut rng);
+        let kk = rand_tensor(&[k, d], &ext, &mut rng);
+        let v = rand_tensor(&[k, e], &ext, &mut rng);
+        let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
+
+        let attn = attention(
+            input("Q", &[sq, d]),
+            input("K", &[k, d]),
+            input("V", &[k, e]),
+            d,
+            k,
+        );
+        let reference = eval(&attn, &env, &ext);
+
+        let carrier = derive(&attn, k).unwrap();
+        let via_kernel = run_carrier(&attn, k, &carrier, &env, &ext);
+
+        assert_tensors_eq(&via_kernel, &reference);
+    }
+
+    // The same, with the computed causal mask and score scaling fused into the
+    // lift — the kernel must match a naive masked-softmax reference.
+    #[test]
+    fn derived_causal_flash_equals_naive() {
+        let (s, t, dk, dv) = (axis("s"), axis("t"), axis("dk"), axis("dv"));
+        let ext: Extents = [(s, 7), (t, 7), (dk, 8), (dv, 6)].into_iter().collect();
+        let mut rng = Lcg(0xC0FFEE);
+        let q = rand_tensor(&[s, dk], &ext, &mut rng);
+        let kk = rand_tensor(&[t, dk], &ext, &mut rng);
+        let v = rand_tensor(&[t, dv], &ext, &mut rng);
+        let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
+
+        let scores = matmul(input("Q", &[s, dk]), input("K", &[t, dk]), dk);
+        let scaled = map(MapOp::Mul, vec![scores, konst(0.125)]);
+        let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
+        let attn = matmul(softmax(masked, t), input("V", &[t, dv]), t);
+
+        let reference = eval(&attn, &env, &ext);
+        let carrier = derive(&attn, t).unwrap();
+        let via_kernel = run_carrier(&attn, t, &carrier, &env, &ext);
+        assert_tensors_eq(&via_kernel, &reference);
+    }
+
+    // Embedding lookup: a gather along the vocabulary axis reads the right rows.
+    #[test]
+    fn eval_embedding_gather() {
+        let (v, dm, s) = (axis("v"), axis("dm"), axis("s"));
+        let ext: Extents = [(v, 10), (dm, 4), (s, 3)].into_iter().collect();
+        let mut rng = Lcg(7);
+        let table = rand_tensor(&[v, dm], &ext, &mut rng);
+        let ids = Tensor::from_fn(&[s], &ext, |c| [2.0, 7.0, 0.0][c[&s]]);
+        let env: Env = [("E", table.clone()), ("ids", ids)].into_iter().collect();
+
+        let emb = embedding(input("E", &[v, dm]), input("ids", &[s]), v);
+        let got = eval(&emb, &env, &ext);
+        // read by coordinate, not raw offset — gather's output axis order is
+        // (kept ∪ index) = [dm, s], and `at` is layout-agnostic.
+        for (row, &id) in [2usize, 7, 0].iter().enumerate() {
+            for dd in 0..4 {
+                let got_c = HashMap::from([(s, row), (dm, dd)]);
+                let tab_c = HashMap::from([(v, id), (dm, dd)]);
+                approx(got.at(&got_c), table.at(&tab_c));
+            }
+        }
+    }
+
+    // A flatten view merges two axes row-major (first member most significant).
+    #[test]
+    fn eval_view_flatten_is_row_major() {
+        let (h, dv, dmv) = (axis("h"), axis("dv"), axis("dmv"));
+        let ext: Extents = [(h, 2), (dv, 3), (dmv, 6)].into_iter().collect();
+        let mut rng = Lcg(3);
+        let x = rand_tensor(&[h, dv], &ext, &mut rng);
+        let env: Env = [("X", x.clone())].into_iter().collect();
+        let flat = eval(&flatten(input("X", &[h, dv]), &[h, dv], dmv), &env, &ext);
+        assert_eq!(flat.axes, vec![dmv]);
+        for hh in 0..2 {
+            for dd in 0..3 {
+                approx(flat.data[hh * 3 + dd], x.data[hh * 3 + dd]);
+            }
+        }
+    }
+}
