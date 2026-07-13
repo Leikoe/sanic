@@ -35,7 +35,7 @@ use std::rc::Rc;
 
 use crate::interp::Extents;
 use crate::ir::{
-    Axis, BinOp, MapOp, Monoid, Node, NodeKind, konst, map, output_axes, reduce, reindex,
+    Axis, BinOp, MapOp, Monoid, Node, NodeKind, iota, konst, map, output_axes, reduce, reindex,
     scatter_add, view,
 };
 
@@ -270,9 +270,38 @@ fn transpose_axis_map(
             *a1,
             BinOp::Monoid(Monoid::Add),
         ),
+        // strided AND dilated (or offset) window: the inverse needs a
+        // modular division, which no affine reindex expresses — so scatter
+        // DENSELY through a one-hot contraction instead, exactly like
+        // `scatter_add` (gather's adjoint):
+        //   grad[m] = Σ_{a1,a2} g[a1,a2] · [m = c1·a1 + c2·a2 + off]
+        // O(|g|·|m|) as a graph; the partitioner folds it like any
+        // contraction, and out-of-range forward positions match no m, so a
+        // padded read's dropped cotangent falls out for free.
+        [(c1, a1), (c2, a2)] => {
+            let target = map(
+                MapOp::Add,
+                vec![
+                    map(
+                        MapOp::Add,
+                        vec![
+                            map(MapOp::Mul, vec![konst(*c1 as f64), iota(*a1)]),
+                            map(MapOp::Mul, vec![konst(*c2 as f64), iota(*a2)]),
+                        ],
+                    ),
+                    konst(off as f64),
+                ],
+            );
+            let sel = crate::ir::one_hot(m, target);
+            reduce(
+                reduce(map(MapOp::Mul, vec![g, sel]), *a2, BinOp::Monoid(Monoid::Add)),
+                *a1,
+                BinOp::Monoid(Monoid::Add),
+            )
+        }
         _ => panic!(
-            "grad: no affine transpose for reindex terms {terms:?} (strided AND \
-             dilated windows need the split/pad decomposition)"
+            "grad: no transpose for reindex terms {terms:?} (more than two \
+             driving axes; decompose the index map first)"
         ),
     }
 }

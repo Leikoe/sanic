@@ -386,3 +386,30 @@ fn cumsum_backward_is_the_reversed_cumsum() {
     );
     check_grads(&loss, &env, &ext, &["X", "W"]);
 }
+
+// ── strided AND dilated conv backward: the dense one-hot scatter ──────────────
+// No affine inverse exists (the transpose needs a modular division); the
+// rule scatters through a one-hot contraction, held to finite differences.
+#[test]
+fn strided_dilated_conv_backward() {
+    let (w0, o, kk) = (axis("w0"), axis("o"), axis("k"));
+    // stride 2, dilation 2: input width 2·(o−1) + 2·(k−1) + 1 ≤ 11
+    let ext: Extents = [(w0, 11), (o, 4), (kk, 3)].into_iter().collect();
+    let mut rng = Lcg(0x5D5D);
+    let env: Env = [
+        ("X", rand_tensor(&[w0], &ext, &mut rng)),
+        ("W", rand_tensor(&[kk], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let xw = window(input("X", &[w0]), w0, o, kk, 2, 2); // [o, k]
+    let conv = reduce(
+        map(MapOp::Mul, vec![xw, input("W", &[kk])]),
+        kk,
+        add_r(),
+    ); // [o]
+    let sq = map(MapOp::Mul, vec![conv.clone(), conv]);
+    let loss = reduce(sq, o, add_r());
+    check_grads(&loss, &env, &ext, &["X", "W"]);
+}
