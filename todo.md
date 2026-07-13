@@ -110,6 +110,16 @@ page is substrate we need so the moat is usable on real workloads.
   clone = the swap-commit primitive), `Pipelines`, `Dispatch`,
   `program_dispatches`. Tests and examples all run through it; objc2-metal
   is a macOS-gated real dependency.
+- **Graph execution** *(new)* — `MetalDevice::capture` freezes a dispatch
+  list into an `MTLIndirectCommandBuffer` (nonuniform grids via indirect
+  `dispatchThreads`; hazard-aware barriers, so independent stages still
+  overlap); `run_graph` replays it with ONE encoder and one
+  `executeCommandsInBuffer` per step — the graph submission tinygrad/MLX
+  use. Swap commits flip bindings with period two, so the decode loops
+  keep one graph per step parity: after two captured steps, a Trinity
+  token is two Metal calls instead of 1,856 encoder round-trips. Trinity
+  236 → 200 ms/tok, GPT-2 numerics/latency unchanged, replay-stability
+  GPU test (`graph_replay_matches_oracle`).
 
 **Exists but narrow / unproven:**
 
@@ -342,7 +352,7 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   | Trinity 5.5B | kernels/step | latency |
   |---|---|---|
   | nanoinfer megakernel (int4/fp8) | **1 dispatch** (hand-written) | ~15 ms/tok (67.5 tok/s) |
-  | **sanic int4** | **1,856 derived kernels — fewest of any framework** | 236 ms/tok (4.2 tok/s) |
+  | **sanic int4** | **1,856 derived kernels — fewest of any framework** | 200 ms/tok (5.0 tok/s) |
   | mlx-lm 8-bit (upstream afmoe) | ~2,733 (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
   | tinygrad (afmoe port, f16 dequant) | 3,493 kernels in 7 jit graphs (3,438 scheduler kernels; **72,134 without a realize per layer**) | — (count-only: shrunk dims, no W4A16 path) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |

@@ -1073,3 +1073,73 @@ fn topk_kbest_folds_run_on_gpu() {
         }
     }
 }
+
+/// Graph execution: the same schedule captured into an indirect command
+/// buffer and REPLAYED — twice, to prove the capture is stable — must match
+/// the oracle. The schedule is a dependent chain (norm folds feeding GEMMs
+/// feeding a flash fold), and the grid sizes are non-round, so this
+/// exercises the hazard barriers and the nonuniform indirect dispatch.
+#[test]
+fn graph_replay_matches_oracle() {
+    use sanic::metal::MetalGraph;
+    let (s, dm, v) = (axis("s"), axis("dm"), axis("v"));
+    let ext: Extents = [(s, 7), (dm, 19), (v, 53)].into_iter().collect();
+    let mut rng = Lcg(0x6EA9);
+    let env: Env = [
+        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
+        ("G", rand_tensor(&[dm], &ext, &mut rng)),
+        ("W", rand_tensor(&[v, dm], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    // rmsnorm(X)·Wᵀ then a softmax-weighted reduction back over v — a chain
+    // with real read-after-write hazards at every stage
+    let x = input("X", &[s, dm]);
+    let ms = reduce(
+        map(MapOp::Mul, vec![x.clone(), x.clone()]),
+        dm,
+        BinOp::Monoid(Monoid::Add),
+    );
+    let inv = map(
+        MapOp::Recip,
+        vec![map(MapOp::Sqrt, vec![map(MapOp::Add, vec![ms, konst(1e-5)])])],
+    );
+    let xn = map(
+        MapOp::Mul,
+        vec![map(MapOp::Mul, vec![x, input("G", &[dm])]), inv],
+    );
+    let logits = matmul(xn, input("W", &[v, dm]), dm); // [s, v]
+    let out = reduce(logits, v, BinOp::Monoid(Monoid::LogSumExp)); // [s]
+
+    let sched = partition(&out, &Device::toy(), &as_f64(&ext));
+    let program = emit_schedule_metal(&sched, &ext);
+    let reference = eval(&out, &env, &ext).permuted_to(&program.output_axes);
+
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let pipes = dev.compile(&program.msl);
+    let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
+    for (n, axes) in &program.inputs {
+        bufs.insert(n.to_string(), dev.from_f64(&env[n].permuted_to(axes).data));
+    }
+    for (n, size) in &program.buffers {
+        bufs.insert(n.clone(), dev.alloc_f32(*size));
+    }
+    let graph: MetalGraph = dev.capture(&program_dispatches(&program, &bufs, &pipes));
+    for replay in 0..2 {
+        dev.run_graph(&graph);
+        let got = dev.read_f32(&bufs[&program.output_name], reference.data.len());
+        let maxrel = max_rel_err(&got, &reference.data);
+        assert!(
+            maxrel < 3e-3,
+            "GRAPH MISMATCH on replay {replay}: {maxrel:e}"
+        );
+    }
+    eprintln!(
+        "graph replay on GPU: {} kernels in one indirect command buffer, two replays match",
+        program.stages.len()
+    );
+}

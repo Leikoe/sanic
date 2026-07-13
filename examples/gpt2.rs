@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use sanic::cost::Device;
 #[cfg(target_os = "macos")]
-use sanic::metal::{MetalBuf, MetalDevice, program_dispatches};
+use sanic::metal::{MetalBuf, MetalDevice, MetalGraph, program_dispatches};
 use sanic::interp::{Env, Extents, Tensor};
 use sanic::ir::*;
 use sanic::partition::{Schedule, partition_many};
@@ -729,11 +729,19 @@ fn main() {
         // one decode step: feed (id, pos), dispatch, commit the cache updates
         // by swapping buffers (the Session discipline, on device), return the
         // next-token logits
+        let graphs: std::cell::RefCell<[Option<MetalGraph>; 2]> = Default::default();
         let step = |bufs: &mut HashMap<String, MetalBuf>, id: usize, pos: usize| {
             g.write_f64(&bufs["id"], &[id as f64]);
             g.write_f64(&bufs["pos"], &[pos as f64]);
-            // dispatches re-resolve names each step so swapped caches bind
-            g.run(&program_dispatches(&program, bufs, &pipes));
+            // graph replay: swap commits flip bindings with period two, so
+            // one captured graph per step parity covers every step — encode
+            // twice, then it's one executeCommandsInBuffer per token
+            let mut gr = graphs.borrow_mut();
+            let slot = &mut gr[pos % 2];
+            if slot.is_none() {
+                *slot = Some(g.capture(&program_dispatches(&program, bufs, &pipes)));
+            }
+            g.run_graph(slot.as_ref().unwrap());
             for l in 0..N_LAYER {
                 for (upd, cache) in [
                     (format!("ckN_{l}"), format!("cache_k_{l}")),

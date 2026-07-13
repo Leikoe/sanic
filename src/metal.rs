@@ -21,16 +21,24 @@
 //! [`program_dispatches`] resolves a whole emitted [`MetalProgram`] against a
 //! name→buffer map — rebuilt per step when a runtime swaps buffers (the
 //! KV-cache commit), since dispatches bind by name at build time.
+//!
+//! * **Graphs** — [`MetalDevice::capture`] freezes a dispatch list into an
+//!   `MTLIndirectCommandBuffer`; [`MetalDevice::run_graph`] replays it with
+//!   one encoder and one execute call per step. Swap commits flip bindings
+//!   with period two, so decode loops keep one graph per step parity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
+    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption,
+    MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 use crate::emit_metal::MetalProgram;
@@ -99,13 +107,24 @@ impl MetalDevice {
             let f = lib
                 .newFunctionWithName(&NSString::from_str(&name))
                 .unwrap_or_else(|| panic!("kernel `{name}` missing after compile"));
-            let p = self
-                .dev
-                .newComputePipelineStateWithFunction_error(&f)
-                .unwrap_or_else(|e| panic!("pipeline `{name}`: {e}"));
-            map.insert(name, p);
+            map.insert(name.clone(), self.pipeline(&f, &name));
         }
         Pipelines { map }
+    }
+
+    /// Every pipeline opts into indirect command buffers, so any dispatch
+    /// list can be captured into a [`MetalGraph`]; free for direct dispatch.
+    fn pipeline(&self, f: &ProtocolObject<dyn MTLFunction>, name: &str) -> Pipeline {
+        let desc = MTLComputePipelineDescriptor::new();
+        desc.setComputeFunction(Some(f));
+        desc.setSupportIndirectCommandBuffers(true);
+        self.dev
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &desc,
+                MTLPipelineOption::empty(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("pipeline `{name}`: {e}"))
     }
 
     /// Compile a large program in chunks of `chunk` kernels, each prefixed
@@ -137,11 +156,7 @@ impl MetalDevice {
                 let f = lib
                     .newFunctionWithName(&NSString::from_str(&name))
                     .unwrap_or_else(|| panic!("kernel `{name}` missing"));
-                let p = self
-                    .dev
-                    .newComputePipelineStateWithFunction_error(&f)
-                    .unwrap_or_else(|e| panic!("pipeline `{name}`: {e}"));
-                map.insert(name, p);
+                map.insert(name.clone(), self.pipeline(&f, &name));
             }
             if progress && ci % 8 == 0 {
                 eprint!(
@@ -253,6 +268,120 @@ impl MetalDevice {
             );
             enc.endEncoding();
         }
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+}
+
+/// A captured dispatch sequence in an `MTLIndirectCommandBuffer`: encode
+/// once, replay per step with ONE encoder and one `executeCommandsInBuffer`
+/// — the graph execution tinygrad and MLX use, without re-encoding a
+/// thousand encoders per token on the CPU.
+///
+/// Buffer BINDINGS are frozen at capture. A session's swap commits flip
+/// bindings with period two, so a decode loop keeps one graph per step
+/// parity and replays the matching one.
+///
+/// Hazards: commands in an ICB run concurrently; a barrier is set on each
+/// command that touches a buffer written since the last barrier, so
+/// independent stages still overlap while dependent ones order correctly.
+pub struct MetalGraph {
+    icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
+    /// Every distinct buffer the commands touch — declared resident at
+    /// replay (`useResource`) and retained so the ICB never dangles.
+    resources: Vec<MetalBuf>,
+    len: usize,
+}
+
+impl MetalDevice {
+    /// Freeze a dispatch list into a replayable graph.
+    pub fn capture(&self, dispatches: &[Dispatch]) -> MetalGraph {
+        let desc = MTLIndirectCommandBufferDescriptor::new();
+        desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatchThreads);
+        desc.setInheritPipelineState(false);
+        desc.setInheritBuffers(false);
+        let max_bufs = dispatches
+            .iter()
+            .map(|d| d.inputs.len() + 1)
+            .max()
+            .unwrap_or(1);
+        desc.setMaxKernelBufferBindCount(max_bufs);
+        let icb = unsafe {
+            self.dev
+                .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
+                    &desc,
+                    dispatches.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+        }
+        .expect("indirect command buffer");
+
+        let mut resources: Vec<MetalBuf> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        // buffers written since the last barrier: touching one forces a
+        // barrier on the toucher (which fences everything before it)
+        let mut written: HashSet<usize> = HashSet::new();
+        for (i, d) in dispatches.iter().enumerate() {
+            let cmd = unsafe { icb.indirectComputeCommandAtIndex(i) };
+            cmd.setComputePipelineState(&d.pipe);
+            for (bi, b) in d.inputs.iter().enumerate() {
+                unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, 0, bi) };
+                if seen.insert(Retained::as_ptr(&b.0) as usize) {
+                    resources.push(b.clone());
+                }
+            }
+            unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, 0, d.inputs.len()) };
+            if seen.insert(Retained::as_ptr(&d.output.0) as usize) {
+                resources.push(d.output.clone());
+            }
+            let hazard = d
+                .inputs
+                .iter()
+                .chain(std::iter::once(&d.output))
+                .any(|b| written.contains(&(Retained::as_ptr(&b.0) as usize)));
+            if hazard {
+                cmd.setBarrier();
+                written.clear();
+            }
+            written.insert(Retained::as_ptr(&d.output.0) as usize);
+            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
+            cmd.concurrentDispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: d.grid,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: tg,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        MetalGraph {
+            icb,
+            resources,
+            len: dispatches.len(),
+        }
+    }
+
+    /// Replay a captured graph and wait: one command buffer, one encoder,
+    /// one execute call.
+    pub fn run_graph(&self, g: &MetalGraph) {
+        let cb = self.queue.commandBuffer().expect("command buffer");
+        let enc = cb.computeCommandEncoder().expect("compute encoder");
+        for b in &g.resources {
+            let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
+            enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        }
+        // objc2-metal 0.3 has no binding for the compute encoder's
+        // `executeCommandsInBuffer:withRange:` (macOS 11+); raw message.
+        let range = NSRange {
+            location: 0,
+            length: g.len,
+        };
+        let _: () = unsafe { msg_send![&*enc, executeCommandsInBuffer: &*g.icb, withRange: range] };
+        enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
     }
