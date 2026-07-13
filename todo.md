@@ -492,10 +492,13 @@ sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
 partition speed at 10k-kernel scale, and the rest of the ladder, each
 measured in `vs_mlx.md`: one-fold-per-layer top-k (432 rank kernels,
 4.9 ms), vectorized packed loads + row batching per simdgroup (the
-2.6×/1.8× proto gap on int4/flash), f16 attention weights (−2.6 ms),
-honest-window streaming (skip the masked tail = fold the identity),
-elementwise-cone fusion, kernel dedup across isomorphic layers,
-autotuning, multi-device. CLIMBED (2026-07-13): MoE-down leaf placement —
+2.6×/1.8× proto gap on int4/flash), honest-window streaming (skip the
+masked tail = fold the identity), elementwise-cone fusion, kernel dedup
+across isomorphic layers, autotuning, multi-device. CLIMBED: f16
+attention weights (2026-07-13) — the five projections upload bf16→f16
+through the existing typed-load path, −413 MB, 23.3 → **20.3 ms/step
+(~21 ms/token)**, and the 0.010 near-tie flips the other way: Trinity now
+greedy-matches the HF reference token-for-token (SEQUENCE MATCH). CLIMBED (2026-07-13): MoE-down leaf placement —
 `leaf_cuts` translates the streamed axis at every structural boundary
 (flatten/split/gather, exactly as `entanglers` does) and lifts the cut to
 the top of an offending elementwise cone when that materializes no more

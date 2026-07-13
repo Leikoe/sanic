@@ -230,6 +230,16 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**f16 attention weights (2026-07-13): 23.3 → 20.3 ms/step, ~21 ms/token
+wall (~46 tok/s).** The self-inflicted f32 doubling undone: the five
+attention projections (q/k/v/gate/o) now upload the checkpoint's bf16 as
+f16 (`input_dt(…, Dtype::F16)` + the existing typed-load path; bf16→f16
+is exact in f16's normal range). −413 MB resident, projection classes
+each halve their bytes/step. And the 0.010 near-tie at token 1 flips the
+OTHER way under f16 rounding: Trinity now emits a **full greedy SEQUENCE
+MATCH vs the HF reference** (argmax MATCH, per-position Δ unchanged in
+the bf16-noise band, max Δ 0.63).
+
 **Cut placement (2026-07-13): 26.0 → 23.3 ms/step, ~23 ms/token wall.**
 The MoE-down rung, and it took two corrections to land honestly. The
 partitioner's leaf cuts now translate the streamed axis through structural

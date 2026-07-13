@@ -229,9 +229,9 @@ fn build() -> Model {
         let xn = rms(x.clone(), nm("ln_in"), dm, DM);
 
         // ── attention: GQA as axis structure, QK-norm, RoPE-or-NoPE ──
-        let q = matmul(xn.clone(), input(nm("wq"), &[hk, qg, j2, rr, dm]), dm);
-        let k = matmul(xn.clone(), input(nm("wk"), &[hk, j2, rr, dm]), dm);
-        let v = matmul(xn.clone(), input(nm("wv"), &[hk, rv, dm]), dm);
+        let q = matmul(xn.clone(), input_dt(nm("wq"), &[hk, qg, j2, rr, dm], Dtype::F16), dm);
+        let k = matmul(xn.clone(), input_dt(nm("wk"), &[hk, j2, rr, dm], Dtype::F16), dm);
+        let v = matmul(xn.clone(), input_dt(nm("wv"), &[hk, rv, dm], Dtype::F16), dm);
         let mut qn = rms_head(q, nm("qn"), j2, rr, hq); // [hk, qg, j2, rr]
         let mut kn = rms_head(k, nm("kn"), j2, rr, hkn); // [hk, j2, rr]
         if is_sliding {
@@ -272,10 +272,10 @@ fn build() -> Model {
             ],
         );
         let ctx = matmul(softmax(masked, t), cv, t); // [hk, qg, rv]
-        let gate = matmul(xn, input(nm("wg"), &[hk, qg, rv, dm]), dm);
+        let gate = matmul(xn, input_dt(nm("wg"), &[hk, qg, rv, dm], Dtype::F16), dm);
         let gated = map(MapOp::Mul, vec![ctx, sigmoid(gate)]);
         let flat = flatten(gated, &[hk, qg, rv], dmv);
-        let attn_out = matmul(flat, input(nm("wo"), &[dm, dmv]), dmv); // [dm]
+        let attn_out = matmul(flat, input_dt(nm("wo"), &[dm, dmv], Dtype::F16), dmv); // [dm]
         let x1 = map(MapOp::Add, vec![x, rms(attn_out, nm("ln_pa"), dm, DM)]);
 
         // ── MLP: dense SwiGLU (l<2) or 128-expert MoE, all weights int4 ──
@@ -528,11 +528,13 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
         "ln_pmlp" => Payload::F32(st.f32(&lp("post_mlp_layernorm.weight"))),
         "qn" => Payload::F32(st.f32(&lp("self_attn.q_norm.weight"))),
         "kn" => Payload::F32(st.f32(&lp("self_attn.k_norm.weight"))),
-        "wq" => Payload::F32(st.f32(&lp("self_attn.q_proj.weight"))),
-        "wk" => Payload::F32(st.f32(&lp("self_attn.k_proj.weight"))),
-        "wv" => Payload::F32(st.f32(&lp("self_attn.v_proj.weight"))),
-        "wg" => Payload::F32(st.f32(&lp("self_attn.gate_proj.weight"))),
-        "wo" => Payload::F32(st.f32(&lp("self_attn.o_proj.weight"))),
+        // the checkpoint stores these bf16; f16 on device halves their
+        // bytes/step (bf16→f16 is exact in f16's normal range)
+        "wq" => f16_of(&lp("self_attn.q_proj.weight")),
+        "wk" => f16_of(&lp("self_attn.k_proj.weight")),
+        "wv" => f16_of(&lp("self_attn.v_proj.weight")),
+        "wg" => f16_of(&lp("self_attn.gate_proj.weight")),
+        "wo" => f16_of(&lp("self_attn.o_proj.weight")),
         "router" => Payload::F32(st.f32(&lp("mlp.router.gate.weight"))),
         "ebias" => Payload::F32(st.f32(&lp("mlp.expert_bias"))),
         "wgate" => Payload::Bytes(st.raw(&lp("mlp.gate_proj.weight_packed")).to_vec()),
