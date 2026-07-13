@@ -324,18 +324,23 @@ compressed-tensors checkpoint **stays packed on device end to end**:
 - **Same machine, same models — the measured ladder** (batch-1 KV decode,
   M1 Pro 16 GB):
 
-  | GPT-2 124M | per step | latency |
+  | GPT-2 124M | kernels/step | latency |
   |---|---|---|
-  | MLX | (tuned lib kernels) | **5.3 ms/tok** (190 tok/s) |
+  | MLX | **~164** (494 primitives − 330 views; sdpa fused, GELU mx.compile'd) | **5.3 ms/tok** (190 tok/s) |
   | torch eager MPS | 1,250 aten ops | 5.9 ms/tok (169 tok/s) |
   | sanic | 271 derived kernels | 29 ms/tok (35 tok/s) |
 
-  | Trinity 5.5B | per step | latency |
+  | Trinity 5.5B | kernels/step | latency |
   |---|---|---|
   | nanoinfer megakernel (int4/fp8) | **1 dispatch** | ~15 ms/tok (67.5 tok/s) |
-  | mlx-lm 8-bit (afmoe upstream: gather_qmm grouped experts) | (tuned lib kernels) | 16.1 ms/tok (62 tok/s) |
+  | mlx-lm 8-bit (upstream afmoe) | **~2,733** (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
   | sanic int4 | 3,947 derived kernels | 252 ms/tok (4 tok/s) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |
+
+  MLX launches ~2.7k kernels per Trinity token — the same order as sanic —
+  and is 15× faster: kernel count is settled as NOT the story. The gap is
+  per-kernel quality (simdgroup-cooperative qmv at ~89% of bandwidth
+  ceiling, fused sdpa/rms_norm) plus async pipelining of the step.
 
   All four GPT-2 rows emit the same greedy text. Lessons: sanic already
   dispatches FEWER kernels than eager torch (the per-expert Python loop
