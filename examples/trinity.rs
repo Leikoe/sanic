@@ -87,17 +87,15 @@ fn rms(x: Node, w: &'static str, dm: Axis, n: usize) -> Node {
 }
 
 /// Per-head QK RMSNorm: the head dim is the (j2, rr) pair; weight [j2, rr].
-fn rms_head(x: Node, w: &'static str, j2: Axis, rr: Axis) -> Node {
+/// The mean-square folds the FLATTENED pair in one kernel — nested reduces
+/// would cost a kernel per axis.
+fn rms_head(x: Node, w: &'static str, j2: Axis, rr: Axis, hd: Axis) -> Node {
     let ms = map(
         MapOp::Mul,
         vec![
             reduce(
-                reduce(
-                    map(MapOp::Mul, vec![x.clone(), x.clone()]),
-                    rr,
-                    BinOp::Monoid(Monoid::Add),
-                ),
-                j2,
+                flatten(map(MapOp::Mul, vec![x.clone(), x.clone()]), &[j2, rr], hd),
+                hd,
                 BinOp::Monoid(Monoid::Add),
             ),
             konst(1.0 / HD as f64),
@@ -113,28 +111,25 @@ fn rms_head(x: Node, w: &'static str, j2: Axis, rr: Axis) -> Node {
     )
 }
 
-/// GPT-NeoX RoPE via a computed 2×2 half-flip: `x·cos + rotate_half(x)·sin`,
+/// GPT-NeoX RoPE via a computed half-flip: `x·cos + rotate_half(x)·sin`,
 /// with cos/sin synthesized from `pos` and iota over the frequency axis —
-/// no tables in memory.
-fn rope(x: Node, pos: Node, j2: Axis, j2p: Axis, rr: Axis) -> Node {
+/// no tables in memory, and NO fold: `rotate_half` is a `Reindex`
+/// (`src j2 = 1 − out j2`) times a computed sign, pure index arithmetic
+/// that fuses into whatever consumes it.
+fn rope(x: Node, pos: Node, j2: Axis, rr: Axis) -> Node {
     let c = -(ROPE_THETA.ln()) / RR as f64; // inv_freq[r] = exp(r·c)
     let freq = map(MapOp::Exp, vec![map(MapOp::Mul, vec![iota(rr), konst(c)])]);
     let ang = map(MapOp::Mul, vec![pos, freq]); // [rr]
     let cosv = map(MapOp::Cos, vec![ang.clone()]);
     let sinv = map(MapOp::Sin, vec![ang]);
-    // M[j2, j2p]: [[0, -1], [1, 0]] from two index comparisons
-    let m = map(
+    // rotate_half = cat(−x₂, x₁): read the OTHER half, negate the FIRST —
+    // sign[j2] = 2·j2 − 1 (−1 on half 0, +1 on half 1)
+    let flipped = reindex(x.clone(), vec![(j2, vec![(-1, j2)], 1)], false);
+    let sign = map(
         MapOp::Sub,
-        vec![
-            map(MapOp::Lt, vec![iota(j2p), iota(j2)]),
-            map(MapOp::Lt, vec![iota(j2), iota(j2p)]),
-        ],
+        vec![map(MapOp::Mul, vec![konst(2.0), iota(j2)]), konst(1.0)],
     );
-    let rot = reduce(
-        map(MapOp::Mul, vec![m, rename(x.clone(), j2, j2p)]),
-        j2p,
-        BinOp::Monoid(Monoid::Add),
-    );
+    let rot = map(MapOp::Mul, vec![sign, flipped]);
     map(
         MapOp::Add,
         vec![
@@ -203,27 +198,29 @@ fn build() -> Model {
     for l in 0..N_LAYER {
         let nm = |p: &str| leak(format!("{p}_{l}"));
         let is_sliding = l % 4 != 3;
-        let (t, hk, qg, j2, j2p, rr, rv, dq, dmv) = (
+        let (t, hk, qg, j2, rr, rv, dq, dmv, hq, hkn) = (
             axis("t"),
             axis("hk"),
             axis("qg"),
             axis("j2"),
-            axis("j2p"),
             axis("rr"),
             axis("rv"),
             axis("dq"),
             axis("dmv"),
+            axis("hq"),
+            axis("hkn"),
         );
         for (a, n) in [
             (t, T_MAX),
             (hk, HK),
             (qg, QG),
             (j2, J2),
-            (j2p, J2),
             (rr, RR),
             (rv, RV),
             (dq, HD),
             (dmv, DM),
+            (hq, HD),
+            (hkn, HD),
         ] {
             ext.insert(a, n);
         }
@@ -235,13 +232,11 @@ fn build() -> Model {
         let q = matmul(xn.clone(), input(nm("wq"), &[hk, qg, j2, rr, dm]), dm);
         let k = matmul(xn.clone(), input(nm("wk"), &[hk, j2, rr, dm]), dm);
         let v = matmul(xn.clone(), input(nm("wv"), &[hk, rv, dm]), dm);
-        let mut qn = rms_head(q, nm("qn"), j2, rr); // [hk, qg, j2, rr]
-        let mut kn = rms_head(k, nm("kn"), j2, rr); // [hk, j2, rr]
+        let mut qn = rms_head(q, nm("qn"), j2, rr, hq); // [hk, qg, j2, rr]
+        let mut kn = rms_head(k, nm("kn"), j2, rr, hkn); // [hk, j2, rr]
         if is_sliding {
-            let j2q = axis("j2q");
-            ext.insert(j2q, J2);
-            qn = rope(qn, pos.clone(), j2, j2p, rr);
-            kn = rope(kn, pos.clone(), j2, j2q, rr);
+            qn = rope(qn, pos.clone(), j2, rr);
+            kn = rope(kn, pos.clone(), j2, rr);
         }
         let ck = map(
             MapOp::Where,

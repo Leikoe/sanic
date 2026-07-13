@@ -313,12 +313,25 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   fold per projection.
 - QK-RMSNorm, sigmoid-gated attention, RoPE on sliding layers only (NoPE
   every 4th), μP embed scaling — all plain basis compositions.
-- **4,143 kernels per decode step** (attention ~27, top-8 routing ~27, the
+- **3,947 kernels per decode step** (attention ~27, top-8 routing ~27, the
   MoE itself ~10 — a router fold plus GROUPED gate/up/down folds over a
   9-slot axis (8 routed + the shared expert as stacked index 128), one
   vector-indexed gather selecting every expert's packed weights at once);
   chunked MSL compile ~15 s cold / <1 s cached; 4.7 GB resident;
-  **~4 tok/s streaming at 248 ms/token**.
+  **~4 tok/s streaming at ~250 ms/token**. QK-norms fold their flattened
+  head pair in one kernel, and rotate-half RoPE is a pure `Reindex`
+  (src `j2 = 1 − j2`) — no fold at all.
+- **Same machine, same models, vs torch** (batch-1 KV-cache decode):
+  GPT-2 — torch eager MPS dispatches **1,250 aten ops/step at 5.9 ms/tok**;
+  sanic dispatches 271 kernels at 29 ms/tok. Trinity — torch eager
+  dispatches **93,228 ops/step at 1,180 ms/tok on CPU** (its per-expert
+  Python loop probes all 128 experts × 54 layers; and bf16 at 11 GB cannot
+  fit this machine's MPS working set at all, while sanic's int4 path runs
+  the model on the GPU at 252 ms/tok). Lesson: sanic already dispatches
+  FEWER kernels than eager torch on both models — the 5× gpt2 latency gap
+  is per-kernel quality (MPS's hand-tuned GEMM/SDPA vs our
+  one-thread-per-output folds), which is the tiling/threadgroup-memory
+  work, not the kernel count.
 - The kernel-count postmortem drove three partitioner improvements, all
   oracle-guarded: fold leaves keep CHEAP per-element arithmetic in-body
   (dequantization, masks, gathers — packed int4 never spills; 342M
