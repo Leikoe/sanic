@@ -750,7 +750,8 @@ fn main() {
         return;
     }
     let t0 = std::time::Instant::now();
-    let program = sanic::emit_metal::emit_schedule_metal(&model.sched, &model.ext);
+    let program =
+        sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &model.sched, &model.ext);
     println!(
         "emitted {} kernels, {:.1} MB MSL in {:.1}s",
         program.stages.len(),
@@ -829,6 +830,399 @@ inline float w4(device const uchar* p, uint i) {\n\
             }
         }
     };
+
+    // ── --bench: GPU-timestamped per-kernel-class profile of one step ──
+    // Wall clocks per dispatch drown µs kernels in the ~0.3 ms sync floor;
+    // command-buffer GPU timestamps don't. Each stage is timed as R
+    // back-to-back repeats in ONE command buffer (hazard tracking on the
+    // shared output serializes them), then classified by which weight it
+    // reads. Caveat: repeats keep a small weight hot in the SLC, so tiny
+    // stages read as lower bounds — the full-step replay time is ground
+    // truth, and the sum-of-stages line shows the residual.
+    if args.iter().any(|a| a == "--bench") {
+        g.write_f64(&bufs["id"], &[prompt_ids[0] as f64]);
+        g.write_f64(&bufs["pos"], &[0.0]);
+        let ds = program_dispatches(&program, &bufs, &pipes);
+        g.run(&ds); // warmup: pages every weight in
+        let full_enc = (0..5).map(|_| g.run_timed(&ds)).fold(f64::MAX, f64::min);
+        let graph = g.capture(&ds);
+        g.run_graph(&graph);
+        let full_graph = (0..5)
+            .map(|_| g.run_graph_timed(&graph))
+            .fold(f64::MAX, f64::min);
+        println!(
+            "full step GPU time: {:.1} ms encoder-per-dispatch, {:.1} ms graph replay",
+            full_enc * 1e3,
+            full_graph * 1e3
+        );
+
+        // classify a stage by the weight it reads (falling back to output)
+        let classify = |st: &sanic::emit_metal::MetalStageInfo| -> &'static str {
+            let has = |p: &str| st.inputs.iter().any(|n| n.starts_with(p));
+            if has("lm_head") {
+                "lm_head matvec f16 [1024->200192]"
+            } else if st.inputs.iter().any(|n| n == "embed") {
+                "embed gather"
+            } else if has("fnorm") {
+                "final norm"
+            } else if has("wq_") {
+                "attn q proj f32 [1024->1024] (rms fused)"
+            } else if has("wk_") {
+                "attn k proj f32 [1024->256] (rms fused)"
+            } else if has("wv_") {
+                "attn v proj f32 [1024->256] (rms fused)"
+            } else if has("wg_") {
+                "attn gate proj f32 [1024->1024] (rms fused)"
+            } else if has("wo_") {
+                "attn o proj f32 [1024->1024]"
+            } else if has("weg_") {
+                "moe gate grouped int4 9x[1024->256]"
+            } else if has("weu_") {
+                "moe up grouped int4 9x[1024->256]"
+            } else if has("wed_") {
+                "moe down grouped int4 9x[256->1024]"
+            } else if has("wgate_") || has("wup_") {
+                "dense gate/up int4 [1024->3072]"
+            } else if has("wdown_") {
+                "dense down int4 [3072->1024]"
+            } else if has("router_") {
+                "router score fold [1024->128]"
+            } else if st.output.starts_with("idxall") || st.output.starts_with("coef") {
+                "route combine maps"
+            } else if st.output.starts_with("idx") {
+                "topk rank folds (8/layer)"
+            } else if st.output.starts_with("ckN") || st.output.starts_with("cvN") {
+                "kv cache write [256 rows]"
+            } else if has("ckN_") || has("cvN_") || has("cache_k") || has("cache_v") {
+                "attention core (flash fold, T=256)"
+            } else if st.output.starts_with("xd") {
+                "residual/epilogue maps"
+            } else {
+                "other elementwise"
+            }
+        };
+        // bytes a stage touches; expert stacks and embed are gather-indexed,
+        // so count only the rows actually read
+        let stage_bytes = |st: &sanic::emit_metal::MetalStageInfo| -> f64 {
+            let mut b = bufs[&st.output].byte_len() as f64;
+            for n in &st.inputs {
+                let full = bufs[n].byte_len() as f64;
+                b += if n.starts_with("we") || n.starts_with("se") {
+                    full * (TOPK + 1) as f64 / (NE + 1) as f64
+                } else if n == "embed" {
+                    (DM * 2) as f64
+                } else {
+                    full
+                };
+            }
+            b
+        };
+
+        const R: usize = 16;
+        let mut per_class: HashMap<&'static str, (usize, f64, f64)> = HashMap::new();
+        let mut rows: Vec<(f64, usize, String, &'static str)> = Vec::new();
+        for (i, st) in program.stages.iter().enumerate() {
+            let reps: Vec<_> = (0..R).map(|_| ds[i].clone()).collect();
+            let t = g.run_timed(&reps) / R as f64;
+            let cls = classify(st);
+            let e = per_class.entry(cls).or_default();
+            e.0 += 1;
+            e.1 += t;
+            e.2 += stage_bytes(st);
+            rows.push((t, st.grid_size, st.kernel.clone(), cls));
+        }
+        let total: f64 = per_class.values().map(|v| v.1).sum();
+        println!(
+            "sum of per-stage times: {:.1} ms (vs {:.1} ms replayed step)",
+            total * 1e3,
+            full_graph * 1e3
+        );
+        let mut classes: Vec<_> = per_class.into_iter().collect();
+        classes.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        println!("per class:  ms/step     n   MB/step    GB/s   (share)");
+        for (cls, (n, t, bytes)) in &classes {
+            println!(
+                "  {:>9.2}  {:>6}  {:>8.1}  {:>6.1}   {:>4.1}%  {}",
+                t * 1e3,
+                n,
+                bytes / 1e6,
+                bytes / t / 1e9,
+                t / total * 100.0,
+                cls
+            );
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!("top stages:");
+        for (t, grid, k, cls) in rows.iter().take(24) {
+            println!("  {:>9.3} ms  grid {:>8}  {:<28} {}", t * 1e3, grid, k, cls);
+        }
+        // one representative kernel per class (its slowest instance), plus
+        // the full MSL, for reading the generated code side by side with
+        // MLX's kernels
+        let mut seen: HashMap<&'static str, ()> = HashMap::new();
+        println!("representative kernels (slowest of each class):");
+        for (t, grid, k, cls) in &rows {
+            if seen.insert(cls, ()).is_none() {
+                println!("  {:<44} {:>9.3} ms  grid {:>8}  {}", cls, t * 1e3, grid, k);
+            }
+        }
+        std::fs::write("weights/trinity_kernels.msl", &program.msl).ok();
+        println!("MSL written to weights/trinity_kernels.msl");
+        return;
+    }
+
+    // ── --proto: hand-scheduled variants of the three dominant kernel
+    // classes, timed against the emitted kernels on the SAME buffers and
+    // verified against their outputs. These are the measured blueprint for
+    // the codegen schedule change (simdgroup-cooperative folds): same
+    // carrier math, different thread assignment — nothing here the planner
+    // doesn't already know (roles, split-merge legality).
+    if args.iter().any(|a| a == "--proto") {
+        const PROTO_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// q projection with fused RMSNorm, MLX-qmv schedule: 2 simdgroups x 4 rows,
+// lanes split dm 32-way with float4 loads, x*lnw computed once per lane and
+// reused across the 4 rows, simd_sum epilogue. (emitted: 1 thread = 1 row,
+// scalar loads, whole 1024-fold serial per thread)
+[[max_total_threads_per_threadgroup(64)]]
+kernel void proto_qproj(
+    device const float* x   [[buffer(0)]],
+    device const float* lnw [[buffer(1)]],
+    device const float* w   [[buffer(2)]],
+    device float* out       [[buffer(3)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]]
+) {
+    const int row0 = tgid.x * 8 + sgid * 4;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sx2 = 0.0f;
+    for (int k = lane * 4; k < 1024; k += 128) {
+        float4 xv = *(device const float4*)(x + k);
+        float4 lv = *(device const float4*)(lnw + k);
+        float4 xn = xv * lv;
+        sx2 += dot(xv, xv);
+        for (int r = 0; r < 4; r++) {
+            float4 wv = *(device const float4*)(w + (row0 + r) * 1024 + k);
+            acc[r] += dot(xn, wv);
+        }
+    }
+    float inv = rsqrt(simd_sum(sx2) * 0.0009765625f + 1e-5f);
+    for (int r = 0; r < 4; r++) {
+        float v = simd_sum(acc[r]);
+        if (lane == 0) out[row0 + r] = v * inv;
+    }
+}
+
+// decode attention, MLX sdpa_vector schedule on sanic's buffers/layout:
+// one threadgroup per (hk, qg); 32 simdgroups split the key axis, 32 lanes
+// split the head dim; the score is computed ONCE per key (simd_sum) instead
+// of once per rv lane; the 32 partial (m, l, o) carriers merge through
+// threadgroup memory -- run_carrier_split's stage 2, fused. Streams keys
+// 0..=pos instead of the whole T_MAX window (the masked tail folds the
+// monoid identity, so skipping it is algebraically free).
+kernel void proto_flash(
+    device const float* q    [[buffer(0)]],
+    device const float* ck   [[buffer(1)]],
+    device const float* pos  [[buffer(2)]],
+    device const float* vnew [[buffer(3)]],
+    device const float* cv   [[buffer(4)]],
+    device float* out        [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]]
+) {
+    constexpr int BN = 32, BD = 32, PT = 4;
+    threadgroup float outputs[BN * BD];
+    threadgroup float max_scores[BN];
+    threadgroup float sum_exp_scores[BN];
+    const int hk = tgid.x / 4, qg = tgid.x % 4;
+    const int P = (int)(pos[0] + 0.5f);
+    float qv[PT], kv[PT], o[PT];
+    device const float* qp = q + hk * 512 + qg * 128 + lane * PT;
+    for (int j = 0; j < PT; j++) { qv[j] = 0.08838834764831843f * qp[j]; o[j] = 0.0f; }
+    float m = -INFINITY, l = 0.0f;
+    for (int i = sgid; i <= P; i += BN) {
+        device const float* kp = ck + i * 256 + hk * 128 + lane * PT;
+        for (int j = 0; j < PT; j++) kv[j] = kp[j];
+        float s = 0.0f;
+        for (int j = 0; j < PT; j++) s += qv[j] * kv[j];
+        s = simd_sum(s);
+        float nm = max(m, s);
+        float factor = exp(m - nm), es = exp(s - nm);
+        m = nm;
+        l = l * factor + es;
+        device const float* vp = (i == P) ? (vnew + hk * 128 + lane * PT)
+                                          : (cv + i * 256 + hk * 128 + lane * PT);
+        for (int j = 0; j < PT; j++) o[j] = o[j] * factor + es * vp[j];
+    }
+    if (lane == 0) { max_scores[sgid] = m; sum_exp_scores[sgid] = l; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = max_scores[lane];
+    float nm = simd_max(m);
+    float factor = exp(m - nm);
+    float l_all = simd_sum(sum_exp_scores[lane] * factor);
+    for (int j = 0; j < PT; j++) {
+        outputs[lane * BD + sgid] = o[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[j] = simd_sum(outputs[sgid * BD + lane] * factor);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < PT; j++)
+            out[hk * 512 + qg * 128 + sgid * PT + j] = o[j] / l_all;
+    }
+}
+
+// grouped MoE gate/up fold, qmv schedule for packed int4: a threadgroup
+// owns 8 fe-rows of ONE slot (the expert index loads once, not per
+// element); each lane pulls 8 nibbles as one uint and the group scale
+// once per 128-block; x reused across the 4 rows of a simdgroup.
+[[max_total_threads_per_threadgroup(64)]]
+kernel void proto_moe_gate(
+    device const uchar* wq  [[buffer(0)]],
+    device const float* idx [[buffer(1)]],
+    device const float* x   [[buffer(2)]],
+    device const float* sc  [[buffer(3)]],
+    device float* out       [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]]
+) {
+    const int slot = tgid.x / 32;
+    const int fe0 = (tgid.x % 32) * 8 + sgid * 4;
+    const uint e = (uint)(idx[slot] + 0.5f);
+    device const uchar* wbase = wq + e * 131072;
+    device const float* sbase = sc + e * 2048;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int blk = 0; blk < 4; blk++) {
+        const int k = blk * 256 + lane * 8;
+        float xv[8];
+        float sx = 0.0f;
+        for (int j = 0; j < 8; j++) { xv[j] = x[k + j]; sx += xv[j]; }
+        const int gidx = k >> 7;
+        for (int r = 0; r < 4; r++) {
+            const int row = fe0 + r;
+            uint u = *(device const uint*)(wbase + row * 512 + (k >> 1));
+            float p = 0.0f;
+            for (int j = 0; j < 8; j++)
+                p += (float)((u >> (4 * j)) & 0xFu) * xv[j];
+            acc[r] += (p - 8.0f * sx) * sbase[row * 8 + gidx];
+        }
+    }
+    for (int r = 0; r < 4; r++) {
+        float v = simd_sum(acc[r]);
+        if (lane == 0) out[(fe0 + r) * 9 + slot] = v;
+    }
+}
+"#;
+        g.write_f64(&bufs["id"], &[prompt_ids[0] as f64]);
+        g.write_f64(&bufs["pos"], &[0.0]);
+        let ds = program_dispatches(&program, &bufs, &pipes);
+        g.run(&ds); // populate every intermediate (routing indices included)
+        let proto_pipes = g.compile(PROTO_MSL);
+
+        let stage_of = |pred: &dyn Fn(&sanic::emit_metal::MetalStageInfo) -> bool| {
+            program.stages.iter().position(|s| pred(s)).expect("stage")
+        };
+        let qi = stage_of(&|s| {
+            s.inputs.iter().any(|n| n == "wq_0") && s.kernel.ends_with("_fold")
+        });
+        let fi = stage_of(&|s| {
+            s.inputs.iter().any(|n| n == "cache_v_1") && !s.output.starts_with("cvN")
+        });
+        let mi = stage_of(&|s| s.inputs.iter().any(|n| n == "weg_2"));
+        println!(
+            "prototype targets: qproj={} flash={} moe={}",
+            program.stages[qi].kernel, program.stages[fi].kernel, program.stages[mi].kernel
+        );
+
+        let make = |kernel: &str, idx: usize, grid: usize, out_elems: usize| {
+            let st = &program.stages[idx];
+            sanic::metal::Dispatch {
+                pipe: proto_pipes.get(kernel),
+                inputs: st.inputs.iter().map(|n| bufs[n].clone()).collect(),
+                output: g.alloc_f32(out_elems),
+                grid,
+            }
+        };
+        let protos = [
+            ("proto_qproj", make("proto_qproj", qi, 8192, 1024), qi, 1024),
+            ("proto_flash", make("proto_flash", fi, 8192, 1024), fi, 1024),
+            ("proto_moe_gate", make("proto_moe_gate", mi, 18432, 2304), mi, 2304),
+        ];
+
+        // end-to-end: substitute the proto into ALL 56 flash stages (same
+        // output buffers, so downstream stages are untouched) and replay
+        // the whole step — checks the per-stage accounting adds up
+        g.write_f64(&bufs["pos"], &[15.0]);
+        let mut ds2 = program_dispatches(&program, &bufs, &pipes);
+        let mut subbed = 0;
+        for (i, st) in program.stages.iter().enumerate() {
+            if st.inputs.iter().any(|n| n.starts_with("cache_v_"))
+                && !st.output.starts_with("cvN")
+            {
+                ds2[i] = sanic::metal::Dispatch {
+                    pipe: proto_pipes.get("proto_flash"),
+                    inputs: st.inputs.iter().map(|n| bufs[n].clone()).collect(),
+                    output: bufs[&st.output].clone(),
+                    grid: 8192,
+                };
+                subbed += 1;
+            }
+        }
+        let base = program_dispatches(&program, &bufs, &pipes);
+        g.run(&base);
+        let t_base = (0..5).map(|_| g.run_timed(&base)).fold(f64::MAX, f64::min);
+        g.run(&ds2);
+        let t_sub = (0..5).map(|_| g.run_timed(&ds2)).fold(f64::MAX, f64::min);
+        let gb = g.capture(&ds2);
+        g.run_graph(&gb);
+        let t_sub_graph = (0..5)
+            .map(|_| g.run_graph_timed(&gb))
+            .fold(f64::MAX, f64::min);
+        println!(
+            "full step, {subbed} flash stages substituted: {:.1} ms -> {:.1} ms ({:.1} ms as graph replay)",
+            t_base * 1e3,
+            t_sub * 1e3,
+            t_sub_graph * 1e3
+        );
+
+        const R: usize = 32;
+        for pos in [0usize, 15, 255] {
+            g.write_f64(&bufs["pos"], &[pos as f64]);
+            println!("pos = {pos} (window = {}):", pos + 1);
+            for (name, d, idx, n) in &protos {
+                // verify: emitted then proto on identical inputs
+                g.run(&ds[*idx..idx + 1]);
+                g.run(std::slice::from_ref(d));
+                let want = g.read_f32(&bufs[&program.stages[*idx].output], *n);
+                let got = g.read_f32(&d.output, *n);
+                let err = want
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs() as f64 / (a.abs() as f64).max(1.0))
+                    .fold(0.0f64, f64::max);
+                let te = {
+                    let reps: Vec<_> = (0..R).map(|_| ds[*idx].clone()).collect();
+                    g.run_timed(&reps) / R as f64
+                };
+                let tp = {
+                    let reps: Vec<_> = (0..R).map(|_| d.clone()).collect();
+                    g.run_timed(&reps) / R as f64
+                };
+                println!(
+                    "  {name:<16} emitted {:>8.1} us -> proto {:>7.1} us  ({:>5.1}x)  max rel err {err:.2e}",
+                    te * 1e6,
+                    tp * 1e6,
+                    te / tp
+                );
+            }
+        }
+        return;
+    }
 
     // ── --time: warmed-up, stage-level timing of one mid layer ──
     if args.iter().any(|a| a == "--time") {

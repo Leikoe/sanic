@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::analyze::{Parallelism, analyze_all};
 use crate::cost::{Device, Kernel, feasible, kernel_time, schedule_time};
-use crate::derive::Carrier;
+use crate::derive::{Carrier, Expr, SlotKind};
 use crate::ir::{Axis, Node, NodeKind, all_axes, input_axes, input_dtypes, leaf_names, output_axes};
 
 /// Elements streamed per step along the folded axis.
@@ -442,6 +442,304 @@ pub fn split_factor(
         b *= 2;
     }
     best.filter(|(_, t)| *t < single).map(|(b, _)| b)
+}
+
+// ── intra-kernel fold schedules ──────────────────────────────────────────────
+
+/// How a fused fold maps onto the GPU's execution hierarchy. This is the
+/// intra-kernel form of the GROUP split: the SAME re-association law
+/// (`run_carrier_split`), with the partials merged through simd shuffles or
+/// threadgroup memory instead of a buffer round trip. Nothing here is
+/// computation-specific — the descriptor names axes and split factors, and
+/// the emitter renders the carrier's own `combine` as the merge at each
+/// level. The all-trivial value is today's one-thread-per-output kernel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FoldSched {
+    /// An output axis distributed across the simd lanes of every simdgroup
+    /// (extent must be a multiple of the simd width). Slots whose span
+    /// lacks this axis are computed once per simdgroup instead of once per
+    /// output point — the generic form of "the attention score does not
+    /// depend on the value head dim", read off `Carrier::spans`, and the
+    /// license for lane-splitting in-body contractions.
+    pub lane_axis: Option<Axis>,
+    /// Split the streamed axis across this many simdgroups per threadgroup
+    /// (1 = no split); partial carriers merge in threadgroup memory.
+    pub sgs: usize,
+    /// Split the streamed axis across the simd lanes as well (exclusive
+    /// with `lane_axis`); partials merge over simd shuffles.
+    pub lane_stream: bool,
+}
+
+/// The GPU simd width the scheduled emitter targets (Apple GPUs).
+pub const SIMD: usize = 32;
+
+impl FoldSched {
+    pub fn scalar() -> Self {
+        FoldSched {
+            lane_axis: None,
+            sgs: 1,
+            lane_stream: false,
+        }
+    }
+    pub fn is_scalar(&self) -> bool {
+        *self == Self::scalar()
+    }
+    /// Threads per threadgroup this schedule needs.
+    pub fn tg_threads(&self) -> usize {
+        if self.is_scalar() { 1 } else { SIMD * self.sgs }
+    }
+}
+
+/// Can this carrier's partial states be merged out of stream order? Every
+/// `Monoid` is commutative and the ExpShifted rescale merge is symmetric,
+/// so both split freely. ArgIdx ties break by FIRST position and the k-best
+/// combine is a singleton insert, not a two-list merge — an interleaved
+/// lane/simdgroup partition would change their meaning, so they decline
+/// (the same rule `emit_split_metal` enforces); AffineStep is sequential.
+pub fn mergeable_out_of_order(carrier: &Carrier) -> bool {
+    carrier
+        .kinds
+        .iter()
+        .all(|k| matches!(k, SlotKind::Plain(_) | SlotKind::ExpShifted { .. }))
+}
+
+/// Operation count of a carrier expression (for pricing slot updates).
+fn expr_ops(e: &Expr) -> f64 {
+    match e {
+        Expr::Const(_) | Expr::Item(_) | Expr::A(_) | Expr::B(_) | Expr::F(_) => 0.0,
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::Div(a, b)
+        | Expr::Max(a, b)
+        | Expr::Min(a, b)
+        | Expr::Lt(a, b) => 1.0 + expr_ops(a) + expr_ops(b),
+        Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
+            1.0 + expr_ops(a)
+        }
+        Expr::Where(c, a, b) => 1.0 + expr_ops(c) + expr_ops(a) + expr_ops(b),
+    }
+}
+
+/// Per-element ISSUE cost of evaluating a node the way the scalar emitter
+/// emits it — loads, index arithmetic (a flatten is a div/mod chain per
+/// member, a gather a rounded index), and arithmetic all cost slots, not
+/// just the `count_flops` op. Schedule choice hinges on recompute, and
+/// recompute is paid in issue slots; pricing it at one flop per element is
+/// what made one-thread-per-output look cheap.
+fn count_issue_ops(node: &Node, extents: &HashMap<Axis, f64>) -> f64 {
+    let vol = |n: &Node| -> f64 {
+        output_axes(n)
+            .iter()
+            .map(|ax| extents.get(ax).copied().unwrap_or(1.0))
+            .product()
+    };
+    match node.as_ref() {
+        NodeKind::Const { .. } => 0.0,
+        NodeKind::Iota { .. } => vol(node),
+        NodeKind::Input { axes, .. } => (1.0 + axes.len() as f64) * vol(node),
+        NodeKind::Map { inputs, .. } => {
+            inputs.iter().map(|i| count_issue_ops(i, extents)).sum::<f64>() + vol(node)
+        }
+        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
+            count_issue_ops(src, extents) + vol(src)
+        }
+        NodeKind::Gather { src, index, .. } => {
+            count_issue_ops(src, extents) + count_issue_ops(index, extents) + 2.0 * vol(node)
+        }
+        NodeKind::View { src, groups } => {
+            let split_ops: f64 = groups
+                .iter()
+                .map(|(m, _)| if m.len() > 1 { 2.0 * m.len() as f64 } else { 0.0 })
+                .sum();
+            count_issue_ops(src, extents) + split_ops * vol(node)
+        }
+        NodeKind::Reindex { src, map, padded } => {
+            let per = map.len() as f64 * 2.0 + if *padded { 2.0 } else { 0.0 };
+            count_issue_ops(src, extents) + per * vol(node)
+        }
+    }
+}
+
+/// Does a subtree contain a lane-splittable contraction (a `Reduce` whose
+/// extent is a simd multiple)? Such a leaf's work divides across the lanes
+/// instead of being issued redundantly by each.
+fn has_simd_reduce(node: &Node, extents: &HashMap<Axis, f64>) -> bool {
+    match node.as_ref() {
+        NodeKind::Reduce { src, axis, .. } => {
+            extents.get(axis).copied().unwrap_or(1.0) as usize % SIMD == 0
+                || has_simd_reduce(src, extents)
+        }
+        NodeKind::Map { inputs, .. } => inputs.iter().any(|i| has_simd_reduce(i, extents)),
+        NodeKind::Gather { src, index, .. } => {
+            has_simd_reduce(src, extents) || has_simd_reduce(index, extents)
+        }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } | NodeKind::Scan { src, .. } => {
+            has_simd_reduce(src, extents)
+        }
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
+    }
+}
+
+/// Pick the fold schedule for one fused kernel by pricing every candidate
+/// with the same roofline that ranks tiles and split factors. The decisive
+/// term is EXECUTION flops — what each schedule actually issues, recompute
+/// included: one thread per output point re-issues every span-invariant
+/// leaf per point (the measured disease), a lane-distributed axis issues it
+/// once per simdgroup, and a lane-split contraction divides it across the
+/// lanes. Traffic is schedule-invariant; parallelism and merge scratch are
+/// per-candidate. Scalar wins ties, so a fold that already fills the
+/// machine (a 200k-row head) keeps today's kernel.
+pub fn fold_sched(
+    fold_node: &Node,
+    streaming_axis: Axis,
+    carrier: &Carrier,
+    dev: &Device,
+    extents: &HashMap<Axis, f64>,
+) -> FoldSched {
+    if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
+        return FoldSched::scalar();
+    }
+    let ext = |ax: Axis| extents.get(&ax).copied().unwrap_or(1.0);
+    let s_ext = ext(streaming_axis);
+    let out_axes = output_axes(fold_node);
+    let out_vol: f64 = out_axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
+    let b_bytes = 4.0f64; // the Metal backend computes in f32
+
+    // Traffic — identical across schedules; only needed so memory-bound
+    // kernels rank by memory occupancy rather than flop noise.
+    let declared: HashMap<&'static str, f64> = input_dtypes(fold_node)
+        .into_iter()
+        .map(|(n, d)| (n, d.bytes()))
+        .collect();
+    let mut seen = HashSet::new();
+    let hbm: f64 = input_axes(fold_node)
+        .into_iter()
+        .filter(|(n, _)| seen.insert(*n))
+        .map(|(n, axes)| {
+            let vol: f64 = axes.iter().map(|&a| ext(a)).product();
+            vol * declared.get(n).copied().unwrap_or(b_bytes)
+        })
+        .sum::<f64>()
+        + out_vol * b_bytes;
+
+    // Per-leaf stats: issue cost of one evaluation, and which axes it reads.
+    let leaf_stats: Vec<(f64, Vec<Axis>, bool)> = carrier
+        .leaves
+        .iter()
+        .map(|l| {
+            let axes = output_axes(l);
+            let vol: f64 = axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
+            let per_eval = count_issue_ops(l, extents) / vol;
+            (per_eval, axes, has_simd_reduce(l, extents))
+        })
+        .collect();
+    let slot_ops: Vec<f64> = (0..carrier.slots)
+        .map(|j| expr_ops(&carrier.into[j]) + expr_ops(&carrier.combine[j]))
+        .collect();
+
+    // Execution flops + the candidate kernel, for one schedule.
+    let simd = SIMD as f64;
+    let price = |sched: &FoldSched| -> Option<f64> {
+        let f = (if sched.lane_stream { simd } else { 1.0 }) * sched.sgs as f64;
+        if f > s_ext {
+            return None; // an empty split unit would merge identity (the −∞ edge)
+        }
+        let (groups, lane_vol) = match sched.lane_axis {
+            Some(a) => (out_vol / ext(a), ext(a)),
+            None => (out_vol, 1.0),
+        };
+        let mut flops = 0.0;
+        for (per_eval, axes, splits) in &leaf_stats {
+            let issues = match sched.lane_axis {
+                Some(a) if !axes.contains(&a) => {
+                    // span-invariant: once per simdgroup; a simd-wide
+                    // contraction divides across the lanes, anything else
+                    // is issued by all of them.
+                    groups * if *splits { 1.0 } else { simd }
+                }
+                _ => out_vol,
+            };
+            flops += issues * per_eval * s_ext;
+        }
+        for (j, ops) in slot_ops.iter().enumerate() {
+            let sliced = sched
+                .lane_axis
+                .is_some_and(|a| carrier.spans[j].contains(&a));
+            let issues = if sched.lane_axis.is_some() && !sliced {
+                groups * simd
+            } else {
+                out_vol
+            };
+            flops += issues * ops * s_ext;
+        }
+        // merges: a shuffle butterfly per lane split, threadgroup rounds
+        // per simdgroup split
+        let merge_ops: f64 = slot_ops.iter().sum();
+        if sched.lane_stream {
+            flops += (simd.log2()) * merge_ops * groups * sched.sgs as f64;
+        }
+        if sched.sgs > 1 {
+            flops += (sched.sgs as f64).log2() * merge_ops * groups * lane_vol;
+        }
+        // scratch: the threadgroup partial arrays
+        let sliced_scratch: f64 = (0..carrier.slots)
+            .map(|j| {
+                if sched
+                    .lane_axis
+                    .is_some_and(|a| carrier.spans[j].contains(&a))
+                {
+                    lane_vol
+                } else {
+                    1.0
+                }
+            })
+            .sum();
+        let sram = if sched.sgs > 1 {
+            sched.sgs as f64 * sliced_scratch * b_bytes
+        } else {
+            carrier.slots as f64 * b_bytes
+        };
+        let k = Kernel {
+            name: "sched".into(),
+            flops,
+            hbm_bytes: hbm,
+            sram_per_block: sram,
+            regs_per_block: (sched.tg_threads() * carrier.slots) as f64 * b_bytes,
+            parallel_blocks: if sched.is_scalar() { out_vol } else { groups },
+            lanes_per_block: sched.tg_threads() as f64,
+        };
+        feasible(dev, &k).then(|| kernel_time(dev, &k))
+    };
+
+    let mut cands = vec![FoldSched::scalar()];
+    for sgs in [1usize, 2, 4, 8, 16, 32] {
+        cands.push(FoldSched {
+            lane_axis: None,
+            sgs,
+            lane_stream: true,
+        });
+        for &a in &out_axes {
+            if ext(a) as usize % SIMD == 0 && ext(a) >= simd {
+                cands.push(FoldSched {
+                    lane_axis: Some(a),
+                    sgs,
+                    lane_stream: false,
+                });
+            }
+        }
+    }
+    let mut best = FoldSched::scalar();
+    let mut best_t = f64::INFINITY;
+    for c in cands {
+        if let Some(t) = price(&c)
+            && t < best_t
+        {
+            best = c;
+            best_t = t;
+        }
+    }
+    best
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

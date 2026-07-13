@@ -696,7 +696,8 @@ fn main() {
         let model = build_decode(w, label);
 
         let t0 = std::time::Instant::now();
-        let program = sanic::emit_metal::emit_schedule_metal(&model.sched, &model.ext);
+        let program =
+            sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &model.sched, &model.ext);
         let Some(g) = MetalDevice::open() else {
             eprintln!("no Metal device — skipping");
             return;

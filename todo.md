@@ -120,6 +120,15 @@ page is substrate we need so the moat is usable on real workloads.
   token is two Metal calls instead of 1,856 encoder round-trips. Trinity
   236 → 200 ms/tok, GPT-2 numerics/latency unchanged, replay-stability
   GPU test (`graph_replay_matches_oracle`).
+- **Cooperative fold schedules (M10)** *(new)* — any derived fold can
+  split its streamed axis across lanes/simdgroups and lane-distribute one
+  output axis, with every merge rendered from the carrier's own `combine`
+  (`simd_shuffle_xor` butterflies, threadgroup rounds) — the GROUP law
+  intra-kernel. Priced by the roofline on a measured `Device::m1_pro`
+  profile with issue-op leaf costs; order-sensitive carriers decline.
+  Trinity 211.7 → 26.0 ms/step, GPT-2 29 → 8 ms/tok, numerics pinned, four
+  dedicated GPU tests (`coop_*` in `tests/metal.rs`). Details at M10 and
+  `vs_mlx.md`.
 
 **Exists but narrow / unproven:**
 
@@ -133,8 +142,11 @@ page is substrate we need so the moat is usable on real workloads.
 bytes + bit-unpacking — the pricing is done, the buffer model is not),
 two-pass row-resident kernels (softmax-as-output), cost-driven *cut*
 placement (the split-reduction factor is priced, but `partition` does not
-yet auto-invoke it or weigh extra legal cuts), autotuning/measurement,
-dynamic shapes, multi-device execution (the allreduce *math* is
+yet auto-invoke it or weigh extra legal cuts — now with a measured instance:
+the MoE down fold leaves SwiGLU in-body, recomputed per output row, 7.8
+ms/step on Trinity), autotuning/measurement (the `--bench`/`--proto`
+harnesses measure; nothing feeds measurements back into choices), dynamic
+shapes, multi-device execution (the allreduce *math* is
 `run_carrier_split`'s merge; a device runtime is not built), `Scan` backward,
 strided-AND-dilated window transposes.
 
@@ -172,10 +184,11 @@ The credibility step: **a kernel sanic emits runs on real hardware.**
    and — via `emit_schedule_metal` + a multi-kernel Swift host — the **whole
    14-kernel transformer block, every kernel dispatched on the GPU** with
    device-buffer intermediates and in-place epilogues (`tests/metal.rs`). [done]
-3. *Still open under M3 (follow-ups, not blockers):* no tiling / threadgroup-
-   memory use (drive it from `plan`'s row/col/batch roles); no benchmarking vs a
-   naive baseline; `rustgen` and `emit_metal` duplicate the node→code emitter and
-   should be unified behind one `Lang`-parameterized core.
+3. *The M3 follow-ups all closed since:* the emitters unified behind the
+   `Lang`-parameterized `codegen` core; benchmarking exists as the trinity
+   `--bench`/`--proto` GPU-timestamp harnesses; and threadgroup-memory /
+   simd scheduling landed as M10's cooperative fold schedules, driven from
+   the carrier's own structure.
 
 ### M4 — Basis + dtypes (unblocks quantized inference & RoPE) · [done]
 Additive to the IR, no algebra changes:
@@ -280,6 +293,41 @@ to 1e-9 of its start loss** (`tests/grad.rs`).
   (the priced split is not yet auto-invoked by `partition`), and
   multi-device execution — the allreduce math IS `run_carrier_split`'s
   stage-2 merge (each device folds its shard), but no device runtime exists.
+  M10 put the same re-association law INSIDE kernels; the two-dispatch form
+  remains the top tier of the same hierarchy (and the multi-device tier
+  above it).
+
+### M10 — Cooperative fold schedules · [done] · retires *kernel-quality risk*
+The biggest single latency win in the project's history, and it is ONE
+general mechanism, not a kernel library (`plan::FoldSched` →
+`plan::fold_sched` → `emit_fused_metal_sched`): any derived fold may split
+its streamed axis across simd lanes and/or simdgroups and may distribute
+one output axis across the lanes — slots whose span lacks that axis are
+computed once per simdgroup (the generic form of "the attention score does
+not depend on the value head dim", read off `Carrier::spans`), slots that
+span it vectorize per lane, and in-body contractions lane-split
+(`Gen::lane_body`). EVERY merge — lane butterfly over `simd_shuffle_xor`,
+threadgroup-memory rounds across simdgroups — renders the carrier's own
+`combine`: the M9 re-association law made intra-kernel, so the coupled
+online-softmax carrier merges by the same rescale algebra as a plain sum.
+The schedule is CHOSEN, per fold, by the existing roofline over a measured
+device profile (`Device::m1_pro`) with two honesty fixes the measurements
+forced: leaves priced in ISSUE ops (`count_issue_ops` — loads, div/mod
+index chains, gather arithmetic, not one flop per element; underpricing
+recompute is what made one-thread-per-output look fine), and hardware
+constants grounded in this machine's own kernels. Order-sensitive carriers
+(first-max-wins `ArgIdx`, k-best's singleton insert, `AffineStep`) decline
+to scalar — the same rule `emit_split_metal` enforces, tested on planted
+ties. MLX's sdpa-vector and qmv shapes fall out as priced instances; so
+does the *non*-change (the 200k-row lm_head stays scalar — it was already
+at bandwidth). **Measured: Trinity 211.7 → 26.0 ms/step GPU (196 → 26
+ms/tok wall, 38.1 tok/s), GPT-2 29 → 8 ms/tok (128 tok/s); numerics pinned
+(argmax MATCH at the same Δlogit, 24/24 SEQUENCE MATCH); 137 tests, four
+new `coop_*` GPU tests pinning each emitter path against the oracle.**
+Emitted-vs-hand-proto headroom that remains: 1.1× on f32 matvecs (at
+ceiling), 2.6× on int4 folds (vectorized `uint32` nibble loads, row
+batching per simdgroup), 1.8× on flash at full window (`float4` loads) —
+plus the honest-window early exit. `vs_mlx.md` has the full ledger.
 
 ## Critical path to "a real LLM on a GPU" — **REACHED**
 
@@ -304,9 +352,11 @@ on the Apple GPU. Against a `transformers` reference
   (HF/PyTorch, sanic-GPU/f32, sanic-interp/f64) of one graph, all agreeing,
 - **generation runs through the M6 KV-cache decode path**: one token per
   step (`id`/`pos` as data), 24 per-layer cache-row writes as extra schedule
-  roots, commits as on-device buffer swaps — **~30 ms/token (33 tok/s) with
+  roots, commits as on-device buffer swaps — **8 ms/token (128 tok/s) with
   tokens streamed to stdout as each dispatch lands** (byte-level BPE decoded,
-  partial UTF-8 held back), 36× the full-window re-prefill this replaced.
+  partial UTF-8 held back); this path started at ~1080 ms/token as a
+  full-window re-prefill, went to 30 with the decode graph, and to 8 with
+  M10's cooperative folds.
 
 The hunt also fixed a real backend bug the whole test suite had missed:
 Metal's fast-math `tanh` goes through `exp(2x)` and returns NaN for
@@ -335,8 +385,9 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   MoE itself ~10 — a router fold plus GROUPED gate/up/down folds over a
   9-slot axis (8 routed + the shared expert as stacked index 128), one
   vector-indexed gather selecting every expert's packed weights at once);
-  chunked MSL compile ~15 s cold / <1 s cached; 4.7 GB resident;
-  **~4 tok/s streaming at ~250 ms/token**. QK-norms fold their flattened
+  partition 10 s, chunked MSL compile <1 s; 4.7 GB resident;
+  **38 tok/s streaming at 26 ms/token** (4 tok/s before graph execution
+  and cooperative folds). QK-norms fold their flattened
   head pair in one kernel, and rotate-half RoPE is a pure `Reindex`
   (src `j2 = 1 − j2`) — no fold at all.
 - **Same machine, same models — the measured ladder** (batch-1 KV decode,
@@ -345,14 +396,14 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   | GPT-2 124M | kernels/step | latency |
   |---|---|---|
   | MLX | **~164** (494 primitives − 330 views; sdpa fused, GELU mx.compile'd) | **5.3 ms/tok** (190 tok/s) |
-  | sanic | 233 derived kernels | 29 ms/tok (35 tok/s) |
+  | sanic | 233 derived kernels | **8 ms/tok (128 tok/s)** cooperative folds; 29 before |
   | tinygrad (their examples/gpt2.py) | 250 kernels + 60 copies (jit replay census; 310 unjitted) | 98 ms/tok jitted (f32, no BEAM/HALF) |
   | torch eager MPS | 1,250 aten ops | 5.9 ms/tok (169 tok/s) |
 
   | Trinity 5.5B | kernels/step | latency |
   |---|---|---|
   | nanoinfer megakernel (int4/fp8) | **1 dispatch** (hand-written) | ~15 ms/tok (67.5 tok/s) |
-  | **sanic int4** | **1,856 derived kernels — fewest of any framework** | 200 ms/tok (5.0 tok/s) |
+  | **sanic int4** | **1,856 derived kernels — fewest of any framework** | **26 ms/tok (38 tok/s)** cooperative folds; 200 before |
   | mlx-lm 8-bit (upstream afmoe) | ~2,733 (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
   | tinygrad (afmoe port, f16 dequant) | 3,493 kernels in 7 jit graphs (3,438 scheduler kernels; **72,134 without a realize per layer**) | — (count-only: shrunk dims, no W4A16 path) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |
@@ -377,17 +428,28 @@ compressed-tensors checkpoint **stays packed on device end to end**:
 
   sanic now dispatches ~32% FEWER kernels than MLX on Trinity (1,856 vs
   ~2,733) — every one derived, none from a primitive library — and MLX is
-  still ~15× faster: kernel count is settled as NOT the latency story. The
-  gap is per-kernel quality (simdgroup-cooperative qmv at ~89% of bandwidth
-  ceiling, fused sdpa/rms_norm) plus async pipelining of the step.
+  still ~13× faster: kernel count is settled as NOT the latency story.
+  **The gap is now measured per kernel class** (`vs_mlx.md`, the `--bench`
+  GPU-timestamp profile): the 211 ms replayed step is 55% the derived
+  flash fold itself (one thread per output point recomputes the QKᵀ dot
+  once per rv lane — a 128× in-thread redundancy — and streams the full
+  T_MAX window), 25% the int4 MoE folds (per-nibble unpack, per-element
+  scale loads, 2.3k threads), 14% the f32 attention projections (26 GB/s
+  at grid 1024 — the same scalar fold hits 172 GB/s on the 200k-thread
+  lm_head, so it's launch shape, not codegen). The earlier "their qmv is
+  89% of bandwidth" story was the wrong suspect: at decode shapes MLX's
+  small matvecs are launch-bound too (43 GB/s measured); they win on
+  schedule and bytes.
 
-  All four GPT-2 rows emit the same greedy text. Lessons: sanic already
-  dispatches FEWER kernels than eager torch (the per-expert Python loop
-  probes 128 experts × 54 layers); the ~15× gap to MLX / the megakernel is
-  **per-kernel quality** — their decode matvec is a simdgroup-cooperative,
-  vectorized kernel at ~89% of the bandwidth ceiling (their own
-  measurement), ours is one thread per output with scalar loads. That is
-  the tiling/threadgroup-memory rung of the ladder, not kernel count.
+  All four GPT-2 rows emit the same greedy text. `--proto` bounded the fix
+  with hand-scheduled variants of sanic's own kernels, oracle-checked on
+  the real weights (flash 2,362 → 18.5 µs at the SAME 256 window — parity
+  with MLX's hand-written sdpa_vector, in f32; q-proj 185 → 26 µs; MoE
+  gate 384 → 14 µs), and M10 then shipped it as general codegen: the
+  measured step is now **26.0 ms replayed / 26 ms/tok wall**, with the
+  automatic kernels within 1.1× (f32 matvecs), 2.6× (int4 folds), and
+  1.8× (flash, full window) of those protos. The remaining 26 → 15.7
+  ladder is itemized in `vs_mlx.md` §"The blueprint, implemented".
 - The kernel-count postmortem drove three partitioner improvements, all
   oracle-guarded: fold leaves keep CHEAP per-element arithmetic in-body
   (dequantization, masks, gathers — packed int4 never spills; 342M
@@ -425,9 +487,14 @@ is a good future hardening).
 
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
-partition speed at 10k-kernel scale (~2 min), and the performance ladder
-(two-pass row kernels, cost-driven cuts, tiling/threadgroup memory, kernel
-dedup across isomorphic layers, autotuning, multi-device).
+partition speed at 10k-kernel scale, and the rest of the ladder, each
+measured in `vs_mlx.md`: MoE-down leaf placement (SwiGLU recomputed
+in-body per output row — cost-driven CUTS, 7.8 ms), one-fold-per-layer
+top-k (432 rank kernels, 4.9 ms), vectorized packed loads + row batching
+per simdgroup (the 2.6×/1.8× proto gap on int4/flash), f16 attention
+weights (−2.6 ms), honest-window streaming (skip the masked tail = fold
+the identity), elementwise-cone fusion, kernel dedup across isomorphic
+layers, autotuning, multi-device.
 
 ## The completeness oracle (`tests/completeness.rs`)
 
@@ -481,4 +548,7 @@ carrier, not a benchmark surprise.
   emit something unverified. Coverage grows by adding provable cases.
 - **Keep tinygrad's substrate, replace its criterion** (`vs_tinygrad.md`): index
   arithmetic, per-axis realize, measured tuning — with derivation where they cut.
-```
+- **Derive the kernel, then derive the schedule** (`vs_mlx.md`): launch
+  geometry is chosen by pricing carrier structure — axis spans, combine
+  laws, issue costs — never by matching operation shapes. A hand-written
+  kernel is a measurement target, not a template.

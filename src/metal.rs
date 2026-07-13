@@ -74,6 +74,7 @@ impl Pipelines {
 
 /// One kernel launch: the pipeline, its input buffers in `[[buffer(0..)]]`
 /// order, the output buffer, and the flat thread-grid size.
+#[derive(Clone)]
 pub struct Dispatch {
     pub pipe: Pipeline,
     pub inputs: Vec<MetalBuf>,
@@ -138,12 +139,33 @@ impl MetalDevice {
         progress: bool,
     ) -> Pipelines {
         let body = msl.strip_prefix(header).unwrap_or(msl);
-        let kernels: Vec<&str> = body.split("kernel void ").skip(1).collect();
+        // A kernel-level attribute (`[[max_total_threads_per_threadgroup(n)]]`
+        // on its own line) precedes `kernel void`, so the split leaves it at
+        // the TAIL of the previous kernel's segment — reattach it to the
+        // kernel it belongs to or a chunk boundary would orphan it.
+        let raw: Vec<&str> = body.split("kernel void ").skip(1).collect();
+        let mut kernels: Vec<(String, &str)> = Vec::new(); // (attr prefix, body)
+        let mut pending = String::new();
+        for k in raw {
+            let attr = std::mem::take(&mut pending);
+            let (piece, tail) = match k.rfind("\n[[") {
+                Some(p) if k[p + 1..].trim_end().ends_with("]]") => {
+                    (&k[..p + 1], k[p + 1..].trim_end().to_string())
+                }
+                _ => (k, String::new()),
+            };
+            pending = tail;
+            kernels.push((attr, piece));
+        }
         let mut map = HashMap::new();
         let t0 = std::time::Instant::now();
         for (ci, group) in kernels.chunks(chunk).enumerate() {
             let mut src = String::from(header);
-            for k in group {
+            for (attr, k) in group {
+                if !attr.is_empty() {
+                    src.push_str(attr);
+                    src.push('\n');
+                }
                 src.push_str("kernel void ");
                 src.push_str(k);
             }
@@ -151,7 +173,7 @@ impl MetalDevice {
                 .dev
                 .newLibraryWithSource_options_error(&NSString::from_str(&src), None)
                 .unwrap_or_else(|e| panic!("MSL chunk {ci} failed to compile: {e}"));
-            for k in group {
+            for (_, k) in group {
                 let name = k.split('(').next().unwrap().trim().to_string();
                 let f = lib
                     .newFunctionWithName(&NSString::from_str(&name))
@@ -271,6 +293,42 @@ impl MetalDevice {
         cb.commit();
         cb.waitUntilCompleted();
     }
+
+    /// [`Self::run`], returning the command buffer's GPU residency in
+    /// seconds (`GPUEndTime − GPUStartTime`) — kernel time plus any
+    /// inter-dispatch bubbles, free of CPU encode/submit cost. This is the
+    /// number per-dispatch wall clocks can't give: no sync floor.
+    pub fn run_timed(&self, dispatches: &[Dispatch]) -> f64 {
+        let cb = self.queue.commandBuffer().expect("command buffer");
+        for d in dispatches {
+            let enc = cb.computeCommandEncoder().expect("compute encoder");
+            enc.setComputePipelineState(&d.pipe);
+            for (i, b) in d.inputs.iter().enumerate() {
+                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), 0, i) };
+            }
+            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), 0, d.inputs.len()) };
+            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
+            enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: d.grid,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: tg,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.endEncoding();
+        }
+        cb.commit();
+        cb.waitUntilCompleted();
+        // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
+        let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
+        let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
+        t1 - t0
+    }
 }
 
 /// A captured dispatch sequence in an `MTLIndirectCommandBuffer`: encode
@@ -384,6 +442,28 @@ impl MetalDevice {
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
+    }
+
+    /// [`Self::run_graph`], returning GPU residency in seconds (see
+    /// [`Self::run_timed`]).
+    pub fn run_graph_timed(&self, g: &MetalGraph) -> f64 {
+        let cb = self.queue.commandBuffer().expect("command buffer");
+        let enc = cb.computeCommandEncoder().expect("compute encoder");
+        for b in &g.resources {
+            let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
+            enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        }
+        let range = NSRange {
+            location: 0,
+            length: g.len,
+        };
+        let _: () = unsafe { msg_send![&*enc, executeCommandsInBuffer: &*g.icb, withRange: range] };
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
+        let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
+        t1 - t0
     }
 }
 

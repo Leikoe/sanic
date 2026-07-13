@@ -1143,3 +1143,245 @@ fn graph_replay_matches_oracle() {
         program.stages.len()
     );
 }
+
+// ── cooperative fold schedules, each emitter path against the oracle ────────
+//
+// A FoldSched is the GROUP re-association law rendered intra-kernel: lanes
+// or simdgroups fold disjoint slices of the streamed axis and the partials
+// merge with the carrier's OWN combine — over simd shuffles at lane level,
+// through threadgroup memory across simdgroups. These tests pin every path:
+// the coupled online-softmax carrier through both merge kinds, the
+// lane-distributed output axis (sliced slots + the in-body contraction
+// lane-split), and the order-sensitive decline (first-max-wins argmax must
+// NOT split out of stream order).
+
+fn run_coop_on_gpu(
+    label: &str,
+    kernel: &MetalKernel,
+    env: &Env,
+    reference: &Tensor,
+    ext: &Extents,
+) -> Option<String> {
+    let dev = MetalDevice::open()?;
+    let pipes = dev.compile(&kernel.msl);
+    let pipe = pipes.get(&kernel.name);
+    let inputs: Vec<MetalBuf> = kernel
+        .inputs
+        .iter()
+        .map(|(n, axes)| dev.from_f64(&env[n].permuted_to(axes).data))
+        .collect();
+    // a cooperative kernel's grid_size is threads (TGs × TG width), not
+    // output elements — read back the output volume
+    let out_n: usize = kernel.grid.iter().map(|a| ext[a]).product::<usize>().max(1);
+    let output = dev.alloc_f32(kernel.grid_size.max(out_n));
+    dev.run(&[Dispatch {
+        pipe,
+        inputs,
+        output: output.clone(),
+        grid: kernel.grid_size,
+    }]);
+    let got = dev.read_f32(&output, out_n);
+    let expected = reference.permuted_to(&kernel.grid);
+    let maxrel = max_rel_err(&got, &expected.data);
+    assert!(maxrel < 2e-3, "GPU MISMATCH {maxrel:e} ({label})");
+    Some(format!("GPU OK {maxrel:e}"))
+}
+
+/// The coupled (m, ℓ, o) carrier with the stream split over lanes AND
+/// simdgroups: the ExpShifted rescale merge runs through the shuffle
+/// butterfly and then threadgroup rounds.
+#[test]
+fn coop_lane_stream_flash_matches_oracle() {
+    use sanic::emit_metal::emit_fused_metal_sched;
+    use sanic::plan::FoldSched;
+    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let ext: Extents = [(sq, 4), (k, 256), (d, 8), (e, 8)].into_iter().collect();
+    let mut rng = Lcg(0xC007);
+    let env: Env = [
+        ("Q", rand_tensor(&[sq, d], &ext, &mut rng)),
+        ("K", rand_tensor(&[k, d], &ext, &mut rng)),
+        ("V", rand_tensor(&[k, e], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+    let attn = attention(
+        input("Q", &[sq, d]),
+        input("K", &[k, d]),
+        input("V", &[k, e]),
+        d,
+        k,
+    );
+    let carrier = derive(&attn, k).unwrap();
+    let sched = FoldSched {
+        lane_axis: None,
+        sgs: 4,
+        lane_stream: true, // split factor 128 ≤ 256
+    };
+    let kernel = emit_fused_metal_sched("coop_ls_flash", &carrier, k, &attn, &ext, sched);
+    assert!(kernel.msl.contains("simd_shuffle_xor"), "lane merge emitted");
+    assert!(kernel.msl.contains("threadgroup_barrier"), "sg merge emitted");
+    let reference = eval(&attn, &env, &ext);
+    let Some(out) = run_coop_on_gpu("coop_ls_flash", &kernel, &env, &reference, &ext) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("lane-stream flash (sgs=4) on GPU: {}", out.trim());
+}
+
+/// The value head dim distributed across lanes: the o slot vectorizes per
+/// lane, m/ℓ stay once-per-simdgroup, the QKᵀ contraction lane-splits with
+/// a monoid butterfly (score computed once per key per simdgroup), and the
+/// sliced partials merge through threadgroup memory.
+#[test]
+fn coop_lane_axis_flash_matches_oracle() {
+    use sanic::emit_metal::emit_fused_metal_sched;
+    use sanic::plan::FoldSched;
+    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let ext: Extents = [(sq, 5), (k, 48), (d, 32), (e, 32)].into_iter().collect();
+    let mut rng = Lcg(0x1A4E);
+    let env: Env = [
+        ("Q", rand_tensor(&[sq, d], &ext, &mut rng)),
+        ("K", rand_tensor(&[k, d], &ext, &mut rng)),
+        ("V", rand_tensor(&[k, e], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+    let attn = attention(
+        input("Q", &[sq, d]),
+        input("K", &[k, d]),
+        input("V", &[k, e]),
+        d,
+        k,
+    );
+    let carrier = derive(&attn, k).unwrap();
+    let sched = FoldSched {
+        lane_axis: Some(e),
+        sgs: 8,
+        lane_stream: false,
+    };
+    let kernel = emit_fused_metal_sched("coop_la_flash", &carrier, k, &attn, &ext, sched);
+    assert!(kernel.msl.contains("accs_"), "sliced slot emitted");
+    assert!(kernel.msl.contains("simd_shuffle_xor"), "in-body contraction lane-split");
+    let reference = eval(&attn, &env, &ext);
+    let Some(out) = run_coop_on_gpu("coop_la_flash", &kernel, &env, &reference, &ext) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("lane-axis flash (e→lanes, sgs=8) on GPU: {}", out.trim());
+}
+
+/// A two-slot Plain(Add) carrier (RMSNorm fused into a matvec, trinity's
+/// projection shape): lane-distributed output rows with the norm slot
+/// uniform — the mixed sliced/uniform bookkeeping without a threadgroup
+/// merge — plus the lane-stream form.
+#[test]
+fn coop_norm_fused_matvec_matches_oracle() {
+    use sanic::emit_metal::emit_fused_metal_sched;
+    use sanic::plan::FoldSched;
+    let (o, dm) = (axis("o"), axis("dm"));
+    let ext: Extents = [(o, 64), (dm, 128)].into_iter().collect();
+    let mut rng = Lcg(0x2517);
+    let env: Env = [
+        ("x", rand_tensor(&[dm], &ext, &mut rng)),
+        ("ln", rand_tensor(&[dm], &ext, &mut rng)),
+        ("w", rand_tensor(&[o, dm], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+    let x = input("x", &[dm]);
+    let dot = reduce(
+        map(
+            MapOp::Mul,
+            vec![
+                map(MapOp::Mul, vec![x.clone(), input("ln", &[dm])]),
+                input("w", &[o, dm]),
+            ],
+        ),
+        dm,
+        BinOp::Monoid(Monoid::Add),
+    );
+    let ms = map(
+        MapOp::Mul,
+        vec![
+            reduce(
+                map(MapOp::Mul, vec![x.clone(), x]),
+                dm,
+                BinOp::Monoid(Monoid::Add),
+            ),
+            konst(1.0 / 128.0),
+        ],
+    );
+    let y = map(
+        MapOp::Mul,
+        vec![
+            dot,
+            map(
+                MapOp::Recip,
+                vec![map(MapOp::Sqrt, vec![map(MapOp::Add, vec![ms, konst(1e-5)])])],
+            ),
+        ],
+    );
+    let carrier = derive(&y, dm).unwrap();
+    let reference = eval(&y, &env, &ext);
+    for (label, sched) in [
+        (
+            "rows→lanes",
+            FoldSched {
+                lane_axis: Some(o),
+                sgs: 1,
+                lane_stream: false,
+            },
+        ),
+        (
+            "stream→lanes×sgs",
+            FoldSched {
+                lane_axis: None,
+                sgs: 2,
+                lane_stream: true,
+            },
+        ),
+    ] {
+        let kernel = emit_fused_metal_sched("coop_mv", &carrier, dm, &y, &ext, sched);
+        let Some(out) = run_coop_on_gpu(label, &kernel, &env, &reference, &ext) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        eprintln!("norm-fused matvec [{label}] on GPU: {}", out.trim());
+    }
+}
+
+/// First-max-wins argmax is order-SENSITIVE: an interleaved lane partition
+/// would change which duplicate wins, so the schedule must decline to the
+/// scalar kernel — and still be correct on planted exact ties.
+#[test]
+fn coop_declines_order_sensitive_argmax() {
+    use sanic::emit_metal::emit_fused_metal_sched;
+    use sanic::plan::FoldSched;
+    let (b, n) = (axis("b"), axis("n"));
+    let ext: Extents = [(b, 4), (n, 64)].into_iter().collect();
+    let mut t = rand_tensor(&[b, n], &ext, &mut Lcg(0x715));
+    // plant an exact tie in every row: positions 7 and 33 share the max
+    for row in 0..4 {
+        t.data[row * 64 + 7] = 9.0;
+        t.data[row * 64 + 33] = 9.0;
+    }
+    let env: Env = [("x", t)].into_iter().collect();
+    let am = argmax(input("x", &[b, n]), n);
+    let carrier = derive(&am, n).unwrap();
+    let sched = FoldSched {
+        lane_axis: None,
+        sgs: 4,
+        lane_stream: true,
+    };
+    let kernel = emit_fused_metal_sched("coop_am", &carrier, n, &am, &ext, sched);
+    assert!(
+        !kernel.msl.contains("simd_shuffle_xor"),
+        "order-sensitive carrier must fall back to the scalar schedule"
+    );
+    let reference = eval(&am, &env, &ext);
+    let Some(out) = run_coop_on_gpu("argmax-decline", &kernel, &env, &reference, &ext) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("argmax declined to scalar, ties first-max-wins: {}", out.trim());
+}

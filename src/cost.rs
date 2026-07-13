@@ -41,6 +41,26 @@ impl Device {
             mem_lanes: 2048.0,
         }
     }
+
+    /// The Apple M1 Pro this repo measures on (16-core GPU, f32 compute).
+    /// Two constants matter for schedule choice and are grounded in this
+    /// machine's own measured kernels (weights/trinity_bench.log): the f32
+    /// flop peak is ~60× below `toy`'s, so recompute-heavy folds really are
+    /// compute-bound here; and `mem_lanes` reflects that a 200k-lane scalar
+    /// fold reaches the DRAM ceiling while a 2.3k-lane one reaches ~2% of
+    /// it — saturation needs tens of thousands of scalar load streams.
+    pub fn m1_pro() -> Self {
+        Device {
+            sram_bytes: 32_768.0,  // threadgroup memory
+            regfile_bytes: 256_000.0,
+            hbm_bandwidth: 2.0e11, // 200 GB/s unified
+            peak_flops: 5.0e12,    // 16 cores × 128 lanes × FMA × ~1.3 GHz
+            launch_overhead: 2.0e-6,
+            dtype_bytes: 4.0,
+            min_blocks: 32.0, // ~2 resident threadgroups per core to hide latency
+            mem_lanes: 32_768.0,
+        }
+    }
 }
 
 /// A fully-parameterized kernel, ready to cost. A schedule is a sequence of

@@ -16,13 +16,14 @@
 use std::collections::HashMap;
 
 use crate::codegen::{
-    Gen, Lang, buffers, carrier_expr, grid_of, offset, san, thread_grid_decode,
-    thread_grid_decode_from, value,
+    Gen, Lang, LaneBody, buffers, carrier_expr, carrier_expr_map, grid_of, offset, san,
+    thread_grid_decode, thread_grid_decode_from, value,
 };
-use crate::derive::Carrier;
+use crate::derive::{Carrier, Expr};
 use crate::interp::Extents;
 use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, input_dtypes, output_axes};
 use crate::partition::{Schedule, Stage};
+use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
 
 // ── the Metal target ─────────────────────────────────────────────────────────
 
@@ -120,6 +121,23 @@ impl Lang for MetalLang {
             Some(Dtype::F64) => panic!("Apple GPUs have no f64 buffers"),
         }
     }
+    /// Present only in scheduled (cooperative) kernels, which is the only
+    /// place [`Gen::lane_body`] is ever set.
+    fn lane_var(&self) -> Option<String> {
+        Some("lane".into())
+    }
+    /// A shuffle butterfly: sound for any commutative monoid, which every
+    /// [`Monoid`] is.
+    fn simd_lane_merge(&self, acc: &str, m: Monoid, width: usize) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let mut off = width / 2;
+        while off > 0 {
+            let shuf = format!("simd_shuffle_xor({acc}, {off}u)");
+            out.push(format!("{acc} = {};", self.monoid(m, acc, &shuf)));
+            off /= 2;
+        }
+        Some(out)
+    }
 }
 
 /// The `[[buffer(i)]]` pointer type for a storage dtype.
@@ -181,6 +199,51 @@ fn wrap(name: &str, sig: String, body: Vec<String>) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+/// [`wrap`] for a cooperative kernel: pins the threadgroup size (the host
+/// derives it from `maxTotalThreadsPerThreadgroup`) and binds the simdgroup
+/// and lane indices the schedule addresses.
+fn wrap_sched(name: &str, bufs_sig: String, body: Vec<String>, tg_threads: usize) -> String {
+    let sig = format!(
+        "{bufs_sig},\n    uint sgid [[simdgroup_index_in_threadgroup]],\n    \
+         uint lane [[thread_index_in_simdgroup]]"
+    );
+    format!(
+        "[[max_total_threads_per_threadgroup({tg_threads})]]\n{}",
+        wrap(name, sig, body)
+    )
+}
+
+/// Which items and accumulator slots a carrier expression reads.
+fn expr_refs(e: &Expr, items: &mut std::collections::HashSet<usize>, slots: &mut std::collections::HashSet<usize>) {
+    match e {
+        Expr::Const(_) => {}
+        Expr::Item(i) => {
+            items.insert(*i);
+        }
+        Expr::A(k) | Expr::F(k) | Expr::B(k) => {
+            slots.insert(*k);
+        }
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::Div(a, b)
+        | Expr::Max(a, b)
+        | Expr::Min(a, b)
+        | Expr::Lt(a, b) => {
+            expr_refs(a, items, slots);
+            expr_refs(b, items, slots);
+        }
+        Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
+            expr_refs(a, items, slots)
+        }
+        Expr::Where(c, a, b) => {
+            expr_refs(c, items, slots);
+            expr_refs(a, items, slots);
+            expr_refs(b, items, slots);
+        }
+    }
 }
 
 /// Emit an MSL kernel for one fused, scalar-projecting carrier: one thread per
@@ -274,6 +337,355 @@ pub fn emit_fused_metal(
         dtypes,
         grid,
         grid_size,
+    }
+}
+
+/// [`emit_fused_metal`] under a cooperative [`FoldSched`]: the streamed axis
+/// splits across simdgroups and/or lanes, an optional lane-distributed
+/// output axis vectorizes the slots that span it (slots that don't are
+/// computed once per simdgroup — the span-asymmetry dedup), in-body
+/// contractions lane-split through [`Gen::lane_body`], and every merge is
+/// the carrier's own `combine`, rendered over simd shuffles or threadgroup
+/// memory — the same re-association `run_carrier_split` certifies, one
+/// level down from the GROUP split. Any precondition failure falls back to
+/// the scalar kernel: a schedule can be slow, never wrong.
+pub fn emit_fused_metal_sched(
+    name: &str,
+    carrier: &Carrier,
+    stream: Axis,
+    fold_node: &Node,
+    ext: &Extents,
+    sched: FoldSched,
+) -> MetalKernel {
+    use std::collections::HashSet;
+    let scalar = || emit_fused_metal(name, carrier, stream, fold_node, ext);
+    if sched.is_scalar() || !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
+        return scalar();
+    }
+    let s_ext = ext[&stream];
+    let f_split = if sched.lane_stream { SIMD * sched.sgs } else { sched.sgs };
+    if f_split > s_ext || (sched.lane_stream && sched.lane_axis.is_some()) {
+        return scalar();
+    }
+    let (grid, _) = grid_of(fold_node, ext);
+    if let Some(a) = sched.lane_axis
+        && (!grid.contains(&a) || ext[&a] % SIMD != 0)
+    {
+        return scalar();
+    }
+
+    let slots = carrier.slots;
+    let sliced_slot: Vec<bool> = (0..slots)
+        .map(|j| sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a)))
+        .collect();
+    let sliced_leaf: Vec<bool> = carrier
+        .leaves
+        .iter()
+        .map(|l| sched.lane_axis.is_some_and(|a| output_axes(l).contains(&a)))
+        .collect();
+    // A slot the schedule holds once per simdgroup must not read a
+    // lane-sliced item or slot; spans should guarantee it — verify anyway.
+    for j in 0..slots {
+        if sliced_slot[j] {
+            continue;
+        }
+        let (mut items, mut srefs) = (HashSet::new(), HashSet::new());
+        expr_refs(&carrier.into[j], &mut items, &mut srefs);
+        expr_refs(&carrier.combine[j], &mut items, &mut srefs);
+        if items.iter().any(|&i| sliced_leaf[i]) || srefs.iter().any(|&k| sliced_slot[k]) {
+            return scalar();
+        }
+    }
+
+    let bufs = buffers(fold_node);
+    let dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    let mut g = Gen::new();
+    g.dtypes = dtypes.clone();
+
+    let tgt = sched.tg_threads();
+    let sgs = sched.sgs;
+    let e_a = sched.lane_axis.map(|a| ext[&a]).unwrap_or(1);
+    let v_cnt = e_a / SIMD; // 0 only when lane_axis is None (e_a = 1)
+    let tg_grid: Vec<Axis> = grid
+        .iter()
+        .copied()
+        .filter(|ax| Some(*ax) != sched.lane_axis)
+        .collect();
+    let n_tgs: usize = tg_grid.iter().map(|a| ext[a]).product::<usize>().max(1);
+
+    let mut body: Vec<String> = vec![format!("uint tg_ = gid / {tgt}u;")];
+    let coord = thread_grid_decode_from(&METAL, "tg_", &tg_grid, ext, &mut g, &mut body);
+    if sgs > 1 {
+        // threadgroup partial arrays, declared at kernel scope
+        body.push(format!("threadgroup float tgu[{}];", slots * sgs));
+        for j in 0..slots {
+            if sliced_slot[j] {
+                body.push(format!("threadgroup float tgs_{j}[{}];", sgs * e_a));
+            }
+        }
+    }
+
+    let ident: Vec<String> = carrier.identity.iter().map(|v| METAL.lit(*v)).collect();
+    body.push(format!("float accu[{slots}] = {{ {} }};", ident.join(", ")));
+    for j in 0..slots {
+        if sliced_slot[j] {
+            body.push(format!(
+                "float accs_{j}[{v_cnt}]; for (uint v_ = 0; v_ < {v_cnt}u; v_++) accs_{j}[v_] = {};",
+                ident[j]
+            ));
+        }
+    }
+
+    // ── the stream loop, strided over the split units ────────────────────────
+    let unit = if sched.lane_stream {
+        format!("(sgid * {SIMD}u + lane)")
+    } else {
+        "sgid".to_string()
+    };
+    body.push(format!(
+        "for (uint s_ = {unit}; s_ < {s_ext}u; s_ += {f_split}u) {{"
+    ));
+    let mut cs = coord.clone();
+    cs.insert(stream, "s_".into());
+    if sched.lane_axis.is_some() {
+        g.lane_body = Some(LaneBody {
+            avoid_axis: sched.lane_axis,
+            simd_width: SIMD,
+        });
+    }
+    let mut inner: Vec<String> = Vec::new();
+    for (i, l) in carrier.leaves.iter().enumerate() {
+        if sliced_leaf[i] {
+            continue;
+        }
+        let mut stmts = Vec::new();
+        let v = value(&METAL, l, &cs, ext, &mut g, &mut stmts);
+        inner.extend(stmts);
+        inner.push(format!("float xu_{i} = {v};"));
+    }
+    // renderers: `ctx_sliced` decides whether lane-sliced names are in scope
+    let item_at = |i: usize, ctx_sliced: bool| -> String {
+        if sliced_leaf[i] {
+            debug_assert!(ctx_sliced);
+            format!("xs_{i}")
+        } else {
+            format!("xu_{i}")
+        }
+    };
+    let a_at = |k: usize| -> String {
+        if sliced_slot[k] {
+            format!("accs_{k}[v_]")
+        } else {
+            format!("accu[{k}]")
+        }
+    };
+    let b_el = |k: usize| -> String {
+        if sliced_slot[k] {
+            format!("els_{k}")
+        } else {
+            format!("elu_{k}")
+        }
+    };
+    for j in 0..slots {
+        if sliced_slot[j] {
+            continue;
+        }
+        inner.push(format!(
+            "float elu_{j} = {};",
+            carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, false), &a_at, &b_el)
+        ));
+    }
+    for j in 0..slots {
+        if sliced_slot[j] {
+            continue;
+        }
+        inner.push(format!(
+            "float nau_{j} = {};",
+            carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, false), &a_at, &b_el)
+        ));
+    }
+    if sliced_slot.iter().any(|&s| s) || sliced_leaf.iter().any(|&s| s) {
+        inner.push(format!("for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
+        inner.push(format!("    uint la_ = lane + v_ * {SIMD}u;"));
+        let mut cv = cs.clone();
+        cv.insert(sched.lane_axis.unwrap(), "la_".into());
+        let mut vstmts: Vec<String> = Vec::new();
+        for (i, l) in carrier.leaves.iter().enumerate() {
+            if !sliced_leaf[i] {
+                continue;
+            }
+            let mut stmts = Vec::new();
+            let v = value(&METAL, l, &cv, ext, &mut g, &mut stmts);
+            vstmts.extend(stmts);
+            vstmts.push(format!("float xs_{i} = {v};"));
+        }
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                continue;
+            }
+            vstmts.push(format!(
+                "float els_{j} = {};",
+                carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, true), &a_at, &b_el)
+            ));
+        }
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                continue;
+            }
+            vstmts.push(format!(
+                "float nas_{j} = {};",
+                carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, true), &a_at, &b_el)
+            ));
+        }
+        for j in 0..slots {
+            if sliced_slot[j] {
+                vstmts.push(format!("accs_{j}[v_] = nas_{j};"));
+            }
+        }
+        inner.extend(vstmts.into_iter().map(|s| format!("    {s}")));
+        inner.push("}".into());
+    }
+    for j in 0..slots {
+        if !sliced_slot[j] {
+            inner.push(format!("accu[{j}] = nau_{j};"));
+        }
+    }
+    body.extend(inner.into_iter().map(|s| format!("    {s}")));
+    body.push("}".into());
+    g.lane_body = None;
+
+    // ── merges: the carrier's combine at each level ──────────────────────────
+    let no_item = |_i: usize| "(0.0f)".to_string(); // combine is item-free (split stage 2 relies on it too)
+    if sched.lane_stream {
+        body.push(format!("for (uint off_ = {}; off_ > 0; off_ >>= 1) {{", SIMD / 2));
+        body.push(format!("    float elb[{slots}];"));
+        body.push(format!(
+            "    for (uint j_ = 0; j_ < {slots}u; j_++) elb[j_] = simd_shuffle_xor(accu[j_], off_);"
+        ));
+        for j in 0..slots {
+            body.push(format!(
+                "    float nab_{j} = {};",
+                carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &|k| format!("accu[{k}]"), &|k| {
+                    format!("elb[{k}]")
+                })
+            ));
+        }
+        for j in 0..slots {
+            body.push(format!("    accu[{j}] = nab_{j};"));
+        }
+        body.push("}".into());
+    }
+    if sgs > 1 {
+        body.push("if (lane == 0) {".into());
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                body.push(format!("    tgu[{j} * {sgs}u + sgid] = accu[{j}];"));
+            }
+        }
+        body.push("}".into());
+        for j in 0..slots {
+            if sliced_slot[j] {
+                body.push(format!(
+                    "for (uint v_ = 0; v_ < {v_cnt}u; v_++) tgs_{j}[sgid * {e_a}u + lane + v_ * {SIMD}u] = accs_{j}[v_];"
+                ));
+            }
+        }
+        body.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        body.push(format!("for (uint off_ = {}; off_ > 0; off_ >>= 1) {{", sgs / 2));
+        body.push("    if (sgid < off_) {".into());
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                body.push(format!(
+                    "        float au_{j} = tgu[{j} * {sgs}u + sgid]; float bu_{j} = tgu[{j} * {sgs}u + sgid + off_];"
+                ));
+            }
+        }
+        let a_tg = |k: usize| -> String {
+            if sliced_slot[k] { format!("as_{k}") } else { format!("au_{k}") }
+        };
+        let b_tg = |k: usize| -> String {
+            if sliced_slot[k] { format!("bs_{k}") } else { format!("bu_{k}") }
+        };
+        if sliced_slot.iter().any(|&s| s) {
+            body.push(format!("        for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
+            body.push(format!("            uint la_ = lane + v_ * {SIMD}u;"));
+            for j in 0..slots {
+                if sliced_slot[j] {
+                    body.push(format!(
+                        "            float as_{j} = tgs_{j}[sgid * {e_a}u + la_]; float bs_{j} = tgs_{j}[(sgid + off_) * {e_a}u + la_];"
+                    ));
+                }
+            }
+            for j in 0..slots {
+                if sliced_slot[j] {
+                    body.push(format!(
+                        "            float nms_{j} = {};",
+                        carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &a_tg, &b_tg)
+                    ));
+                }
+            }
+            for j in 0..slots {
+                if sliced_slot[j] {
+                    body.push(format!("            tgs_{j}[sgid * {e_a}u + la_] = nms_{j};"));
+                }
+            }
+            body.push("        }".into());
+        }
+        body.push("        if (lane == 0) {".into());
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                body.push(format!(
+                    "            float nmu_{j} = {};",
+                    carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &a_tg, &b_tg)
+                ));
+            }
+        }
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                body.push(format!("            tgu[{j} * {sgs}u + sgid] = nmu_{j};"));
+            }
+        }
+        body.push("        }".into());
+        body.push("    }".into());
+        body.push("    threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        body.push("}".into());
+    }
+
+    // ── project + write ──────────────────────────────────────────────────────
+    let proj_a = |k: usize| -> String {
+        match (sgs > 1, sliced_slot[k]) {
+            (true, true) => format!("tgs_{k}[la_]"),
+            (true, false) => format!("tgu[{k} * {sgs}u]"),
+            (false, true) => format!("accs_{k}[v_]"),
+            (false, false) => format!("accu[{k}]"),
+        }
+    };
+    let proj = carrier_expr_map(&METAL, &carrier.project[0], &no_item, &proj_a, &b_el);
+    if sched.lane_axis.is_some() {
+        body.push("if (sgid == 0) {".into());
+        body.push(format!("    for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
+        body.push(format!("        uint la_ = lane + v_ * {SIMD}u;"));
+        let mut wc = coord.clone();
+        wc.insert(sched.lane_axis.unwrap(), "la_".into());
+        body.push(format!("        outb[{}] = {proj};", offset(&grid, &wc, ext)));
+        body.push("    }".into());
+        body.push("}".into());
+    } else {
+        body.push("if (sgid == 0 && lane == 0) {".into());
+        body.push(format!("    outb[{}] = {proj};", offset(&grid, &coord, ext)));
+        body.push("}".into());
+    }
+
+    MetalKernel {
+        msl: format!(
+            "{MSL_HEADER}{}",
+            wrap_sched(name, signature(&bufs, &dtypes), body, tgt)
+        ),
+        name: name.to_string(),
+        inputs: bufs,
+        dtypes,
+        grid,
+        grid_size: n_tgs * tgt,
     }
 }
 
@@ -500,6 +912,14 @@ pub struct MetalProgram {
 /// Lower a whole schedule to a Metal program (the GPU analog of
 /// [`crate::rustgen::emit_schedule`]).
 pub fn emit_schedule_metal(sched: &Schedule, ext: &Extents) -> MetalProgram {
+    emit_schedule_metal_on(&crate::cost::Device::toy(), sched, ext)
+}
+
+/// [`emit_schedule_metal`] with fold schedules priced against a specific
+/// device — the Metal examples pass [`crate::cost::Device::m1_pro`], the
+/// machine the kernels actually run on.
+pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: &Extents) -> MetalProgram {
+    let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let mut msl = String::from(MSL_HEADER);
     let mut all_dtypes: HashMap<String, Dtype> = HashMap::new();
     let mut stages: Vec<MetalStageInfo> = Vec::new();
@@ -537,8 +957,15 @@ pub fn emit_schedule_metal(sched: &Schedule, ext: &Extents) -> MetalProgram {
                 note_inputs(fold_node, &produced, &mut inputs);
                 let out = spec.output_name.clone();
                 let kname = format!("k_{}_fold", san(&out));
-                let k =
-                    emit_fused_metal(&kname, &spec.carrier, spec.streaming_axis, fold_node, ext);
+                let sched = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
+                let k = emit_fused_metal_sched(
+                    &kname,
+                    &spec.carrier,
+                    spec.streaming_axis,
+                    fold_node,
+                    ext,
+                    sched,
+                );
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }

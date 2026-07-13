@@ -25,12 +25,33 @@ pub struct Gen {
     /// a name found here loads through [`Lang::buffer_load`] with its declared
     /// width — packed int4 nibbles, halfs — instead of the default float read.
     pub dtypes: HashMap<&'static str, Dtype>,
+    /// When set (by a cooperative GPU emitter), an in-body `Reduce` whose
+    /// subtree avoids `avoid_axis` and whose extent is a multiple of the
+    /// simd width is emitted lane-split: each lane folds a strided slice,
+    /// then the partials merge with the monoid over simd shuffles — the
+    /// same re-association the GROUP split proves, one level down. Only
+    /// meaningful for a target whose [`Lang::simd_lane_merge`] is `Some`,
+    /// and only sound when all lanes execute the reduce convergently (the
+    /// scheduled fold emitter guarantees it; pointwise kernels never set
+    /// this).
+    pub lane_body: Option<LaneBody>,
 }
+
+/// See [`Gen::lane_body`].
+#[derive(Clone, Copy)]
+pub struct LaneBody {
+    /// The lane-distributed output axis, if any: a reduce whose subtree
+    /// reads it varies per lane and must stay serial.
+    pub avoid_axis: Option<Axis>,
+    pub simd_width: usize,
+}
+
 impl Gen {
     pub fn new() -> Self {
         Gen {
             n: 0,
             dtypes: HashMap::new(),
+            lane_body: None,
         }
     }
     pub fn fresh(&mut self, tag: &str) -> String {
@@ -148,6 +169,16 @@ pub trait Lang {
             Some(d) => panic!("this backend has no {d:?} storage support"),
         }
     }
+    /// The current lane index expression, for targets with a simd width
+    /// (`None` = no lane parallelism; in-body reduces stay serial).
+    fn lane_var(&self) -> Option<String> {
+        None
+    }
+    /// Merge `acc` across the simd lanes with a COMMUTATIVE monoid (a
+    /// butterfly of shuffles). `None` on targets without simd lanes.
+    fn simd_lane_merge(&self, _acc: &str, _m: Monoid, _width: usize) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// `name = val;` — identical across targets.
@@ -196,10 +227,35 @@ pub fn value<L: Lang>(
             coord2.insert(*axis, lv.clone());
             let mut body = Vec::new();
             let ev = value(lang, src, &coord2, ext, g, &mut body);
-            out.push(lang.for_open(&lv, ext[axis]));
-            out.extend(body);
-            out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
-            out.push("}".into());
+            // Lane-split the contraction when the scheduled emitter asked
+            // for it and it is sound here: every monoid is commutative, so
+            // a strided lane partition + shuffle merge equals the serial
+            // fold — provided the subtree is lane-uniform (it must not read
+            // the lane-distributed axis).
+            let lane_split = g.lane_body.and_then(|lb| {
+                let lane = lang.lane_var()?;
+                let uniform = lb.avoid_axis.is_none_or(|a| !output_axes(src).contains(&a));
+                let merge = lang.simd_lane_merge(&acc, m, lb.simd_width)?;
+                (ext[axis] % lb.simd_width == 0 && uniform).then_some((lane, lb.simd_width, merge))
+            });
+            match lane_split {
+                Some((lane, w, merge)) => {
+                    out.push(format!(
+                        "for (uint {lv} = {lane}; {lv} < {}; {lv} += {w}) {{",
+                        ext[axis]
+                    ));
+                    out.extend(body);
+                    out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
+                    out.push("}".into());
+                    out.extend(merge);
+                }
+                None => {
+                    out.push(lang.for_open(&lv, ext[axis]));
+                    out.extend(body);
+                    out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
+                    out.push("}".into());
+                }
+            }
             acc
         }
         NodeKind::Gather { src, index, axis } => {
@@ -286,15 +342,29 @@ pub fn value<L: Lang>(
 /// `acc[i]`, `B(i)` → `el[i]` (identical in both targets); operators route
 /// through the language's [`Lang::map_op`].
 pub fn carrier_expr<L: Lang>(lang: &L, e: &Expr) -> String {
-    let bin = |op: MapOp, a: &Expr, b: &Expr| {
-        lang.map_op(op, &[carrier_expr(lang, a), carrier_expr(lang, b)])
-    };
-    let un = |op: MapOp, a: &Expr| lang.map_op(op, &[carrier_expr(lang, a)]);
+    carrier_expr_map(lang, e, &|i| format!("x[{i}]"), &|i| format!("acc[{i}]"), &|i| {
+        format!("el[{i}]")
+    })
+}
+
+/// [`carrier_expr`] with the leaf renderers supplied by the caller — a
+/// cooperative emitter routes `A(i)`/`B(i)` to per-lane arrays, threadgroup
+/// partials, or shuffled registers; the expression structure never changes.
+pub fn carrier_expr_map<L: Lang>(
+    lang: &L,
+    e: &Expr,
+    item: &dyn Fn(usize) -> String,
+    a_slot: &dyn Fn(usize) -> String,
+    b_slot: &dyn Fn(usize) -> String,
+) -> String {
+    let go = |e: &Expr| carrier_expr_map(lang, e, item, a_slot, b_slot);
+    let bin = |op: MapOp, a: &Expr, b: &Expr| lang.map_op(op, &[go(a), go(b)]);
+    let un = |op: MapOp, a: &Expr| lang.map_op(op, &[go(a)]);
     match e {
         Expr::Const(v) => lang.lit(*v),
-        Expr::Item(i) => format!("x[{i}]"),
-        Expr::A(i) | Expr::F(i) => format!("acc[{i}]"),
-        Expr::B(i) => format!("el[{i}]"),
+        Expr::Item(i) => item(*i),
+        Expr::A(i) | Expr::F(i) => a_slot(*i),
+        Expr::B(i) => b_slot(*i),
         Expr::Add(a, b) => bin(MapOp::Add, a, b),
         Expr::Sub(a, b) => bin(MapOp::Sub, a, b),
         Expr::Mul(a, b) => bin(MapOp::Mul, a, b),
@@ -307,14 +377,7 @@ pub fn carrier_expr<L: Lang>(lang: &L, e: &Expr) -> String {
         Expr::Sqrt(a) => un(MapOp::Sqrt, a),
         Expr::Sin(a) => un(MapOp::Sin, a),
         Expr::Cos(a) => un(MapOp::Cos, a),
-        Expr::Where(c, a, b) => lang.map_op(
-            MapOp::Where,
-            &[
-                carrier_expr(lang, c),
-                carrier_expr(lang, a),
-                carrier_expr(lang, b),
-            ],
-        ),
+        Expr::Where(c, a, b) => lang.map_op(MapOp::Where, &[go(c), go(a), go(b)]),
     }
 }
 
