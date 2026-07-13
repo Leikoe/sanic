@@ -215,6 +215,33 @@ fn wrap_sched(name: &str, bufs_sig: String, body: Vec<String>, tg_threads: usize
     )
 }
 
+/// Replace whole-identifier occurrences of `from` with `to` (an occurrence
+/// bordered by `[A-Za-z0-9_]` on either side is a different identifier —
+/// `b_t9` must not fire inside `b_t904`).
+fn replace_ident(src: &str, from: &str, to: &str) -> String {
+    let b = src.as_bytes();
+    let f = from.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i..].starts_with(f)
+            && (i == 0 || !ident(b[i - 1]))
+            && (i + f.len() == b.len() || !ident(b[i + f.len()]))
+        {
+            out.push_str(to);
+            i += f.len();
+        } else {
+            // advance one full UTF-8 char (identifiers are ASCII, but the
+            // source may hold comments)
+            let step = src[i..].chars().next().map_or(1, |c| c.len_utf8());
+            out.push_str(&src[i..i + step]);
+            i += step;
+        }
+    }
+    out
+}
+
 /// Which items and accumulator slots a carrier expression reads.
 fn expr_refs(e: &Expr, items: &mut std::collections::HashSet<usize>, slots: &mut std::collections::HashSet<usize>) {
     match e {
@@ -1101,6 +1128,31 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
     // strip the per-kernel MSL header; the program has one shared header.
     let strip = |k: &MetalKernel| k.msl.replace(MSL_HEADER, "");
 
+    // Kernel dedup across isomorphic stages: canonicalize each kernel's
+    // source (entry name + positional buffer identifiers masked) and reuse
+    // one entry point per canonical body. 54 isomorphic transformer layers
+    // emit 54 IDENTICAL functions over different buffers — same extents,
+    // same dtypes (both baked into the body, so canonical equality covers
+    // them) — and buffers bind positionally at dispatch, so the shared
+    // pipeline is exact, not approximate.
+    let mut canon: HashMap<String, String> = HashMap::new();
+    let dedup = |k: &MetalKernel, msl: &mut String, canon: &mut HashMap<String, String>| {
+        let mut c = strip(k);
+        c = replace_ident(&c, &k.name, "__K__");
+        for (i, (n, _)) in k.inputs.iter().enumerate() {
+            c = replace_ident(&c, &san(n), &format!("__b{i}__"));
+        }
+        match canon.get(&c) {
+            Some(existing) => existing.clone(),
+            None => {
+                canon.insert(c, k.name.clone());
+                msl.push_str(&strip(k));
+                msl.push('\n');
+                k.name.clone()
+            }
+        }
+    };
+
     let mut last_out = String::new();
     let mut last_axes: Vec<Axis> = Vec::new();
 
@@ -1127,8 +1179,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
-                msl.push_str(&strip(&k));
-                msl.push('\n');
+                let kname = dedup(&k, &mut msl, &mut canon);
                 note_buffer(&out, k.grid_size, &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
@@ -1144,8 +1195,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
                     for (n, d) in &k.dtypes {
                         all_dtypes.insert(n.to_string(), *d);
                     }
-                    msl.push_str(&strip(&k));
-                    msl.push('\n');
+                    let ename = dedup(&k, &mut msl, &mut canon);
                     stages.push(MetalStageInfo {
                         kernel: ename,
                         inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
@@ -1165,8 +1215,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
-                msl.push_str(&strip(&k));
-                msl.push('\n');
+                let kname = dedup(&k, &mut msl, &mut canon);
                 note_buffer(output, k.grid_size, &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
