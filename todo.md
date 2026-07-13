@@ -335,15 +335,35 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   | GPT-2 124M | kernels/step | latency |
   |---|---|---|
   | MLX | **~164** (494 primitives − 330 views; sdpa fused, GELU mx.compile'd) | **5.3 ms/tok** (190 tok/s) |
+  | sanic | 233 derived kernels | 29 ms/tok (35 tok/s) |
+  | tinygrad (their examples/gpt2.py) | 250 kernels + 60 copies (jit replay census; 310 unjitted) | 98 ms/tok jitted (f32, no BEAM/HALF) |
   | torch eager MPS | 1,250 aten ops | 5.9 ms/tok (169 tok/s) |
-  | sanic | 271 derived kernels | 29 ms/tok (35 tok/s) |
 
   | Trinity 5.5B | kernels/step | latency |
   |---|---|---|
-  | nanoinfer megakernel (int4/fp8) | **1 dispatch** | ~15 ms/tok (67.5 tok/s) |
-  | mlx-lm 8-bit (upstream afmoe) | **~2,733** (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
+  | nanoinfer megakernel (int4/fp8) | **1 dispatch** (hand-written) | ~15 ms/tok (67.5 tok/s) |
   | **sanic int4** | **1,856 derived kernels — fewest of any framework** | 236 ms/tok (4.2 tok/s) |
+  | mlx-lm 8-bit (upstream afmoe) | ~2,733 (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
+  | tinygrad (afmoe port, f16 dequant) | 3,493 kernels in 7 jit graphs (3,438 scheduler kernels; **72,134 without a realize per layer**) | — (count-only: shrunk dims, no W4A16 path) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |
+
+  tinygrad methodology (weights/tinygrad_*.py, tinygrad master in a uv
+  venv): the afmoe architecture ported op-for-op from nanoinfer's
+  modeling_afmoe.py (56 layers, GQA 8/2, QK-norms, gated attention, dual
+  sandwich norms, sigmoid router + bias top-8, shared expert, muP);
+  dequantized-f16 semantics because tinygrad has no compressed-tensors
+  W4A16 path (favors tinygrad — no unpack ops); dimensions shrunk 8× to
+  fit, count verified size-independent (3,438 vs 3,441 at 4×); TinyJit is
+  a replay cache + dispatch batcher, NOT the compiler — the scheduler and
+  codegen run on every realize, and the captured graphs replay exactly
+  the scheduler's kernels (3,493 ≈ 3,438 + input handling), so jitting
+  changes wall time, not count. Their count drivers, measured: router
+  top-8 = a 37-kernel bitonic-sort cascade (`Tensor.topk` has no k-best
+  fold), attention ≈ 15 kernels/layer (no online-softmax fusion — the
+  dependent-reduce cut of `vs_tinygrad.md`, now a number), norms 2 each;
+  and the 72k figure is what happens to a purely-lazy 56-layer chain
+  (each router sort re-walks the unrealized prefix) — the scheduling
+  fragility an algebraic fusion criterion exists to remove.
 
   sanic now dispatches ~32% FEWER kernels than MLX on Trinity (1,856 vs
   ~2,733) — every one derived, none from a primitive library — and MLX is

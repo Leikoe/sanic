@@ -153,6 +153,27 @@ Also adopted after this comparison: tinygrad's closed-op-basis discipline
 (sanic's `MapOp` replaced an open set of named ops, dissolving the `exp_sub`
 and `silu` special forms into compositions) and integer axis identities.
 
+## Measured (2026-07-12)
+
+The claim above is now a number, on the same M1 Pro, batch-1 KV decode:
+
+| model | tinygrad | sanic |
+|---|---|---|
+| GPT-2 124M | 250 kernels + 60 copies/token (their examples/gpt2.py, jit census; 310 unjitted) | **233** |
+| Trinity-Nano 5.5B afmoe | 3,493/token (faithful port, f16 dequant semantics, realize-per-layer; **72,134** left purely lazy) | **1,856** |
+
+Where the 1.9× on Trinity comes from, per component: their `Tensor.topk`
+lowers to a 37-kernel bitonic-sort cascade per router (sanic: one k-best
+fold per rank — the tuple monoid tinygrad's syntactic criterion cannot
+see); attention is ~15 kernels/layer against one derived flash fold (the
+dependent-reduce cut, measured); norms are un-fusable two-pass pairs where
+sanic's stream-invariant rule dissolves the second pass into every
+consumer GEMM. The purely-lazy 72k blowup — each sort stage re-walking the
+unrealized 56-layer prefix — is the sharpest form of the argument: fusion
+by graph-shape heuristics needs hand-placed realize points to not
+collapse, where a criterion that *knows* what a kernel is places its own
+boundaries.
+
 ## Positioning
 
 tinygrad's own trajectory is the strongest external validation of sanic's
