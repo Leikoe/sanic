@@ -230,6 +230,21 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**Chunked lane streams for packed folds (2026-07-13): MoE gate/up 2.27 →
+1.02 / 1.09 ms, down 4.40 → 3.75 ms.** `FoldSched.chunk`: with the
+stream split across lanes, each lane folds CONTIGUOUS runs of 8 elements
+(unrolled) instead of striding — consecutive int4 nibbles share bytes
+and cache lines, and the run's index chains constant-fold. Pure
+re-association, legal for exactly the carriers the lane split already
+requires; applied when the fold reads a packed input and the extents
+divide (a stated rule — the roofline cannot see load contiguity).
+Bit-checked against the f64 oracle on the GPU (`coop_chunked_w4_matvec`).
+Remaining headroom to the hand proto (~15 µs vs down's 69 µs/fold, gate
+at 19 vs 14.3): explicit 32-bit packed-word loads, output-row batching
+per simdgroup (x-vector reuse), and the compressed-tensors −8·Σx
+zero-point hoist. Step: ~19.5 ms replayed, ~21 ms/token — the step is
+now overlap-bound, so per-class wins land smaller than they measure.
+
 **One fold per layer for all top-k ranks (2026-07-13): 20.3 → 19.4
 ms/step, 1,968 → 1,590 kernels.** A new derivation rule, not stage
 plumbing: a fold's projection may read leaves that are CONSTANT along the

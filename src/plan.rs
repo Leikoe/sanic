@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use crate::analyze::{Parallelism, analyze_all};
 use crate::cost::{Device, Kernel, feasible, kernel_time, schedule_time};
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{Axis, Node, NodeKind, all_axes, input_axes, input_dtypes, leaf_names, output_axes};
+use crate::ir::{
+    Axis, Dtype, Node, NodeKind, all_axes, input_axes, input_dtypes, leaf_names, output_axes,
+};
 
 /// Elements streamed per step along the folded axis.
 pub const TILE_N: usize = 64;
@@ -468,6 +470,13 @@ pub struct FoldSched {
     /// Split the streamed axis across the simd lanes as well (exclusive
     /// with `lane_axis`); partials merge over simd shuffles.
     pub lane_stream: bool,
+    /// With `lane_stream`, each lane folds CONTIGUOUS runs of this many
+    /// streamed elements (1 = element-strided). Legal for any mergeable
+    /// carrier — chunking only re-associates — and chosen when a packed
+    /// (int4) leaf makes contiguity pay: consecutive nibbles share bytes
+    /// and cache lines, and the unrolled run's index arithmetic constant-
+    /// folds instead of re-deriving per element.
+    pub chunk: usize,
 }
 
 /// The GPU simd width the scheduled emitter targets (Apple GPUs).
@@ -479,6 +488,7 @@ impl FoldSched {
             lane_axis: None,
             sgs: 1,
             lane_stream: false,
+            chunk: 1,
         }
     }
     pub fn is_scalar(&self) -> bool {
@@ -721,6 +731,7 @@ pub fn fold_sched(
             lane_axis: None,
             sgs,
             lane_stream: true,
+            chunk: 1,
         });
         for &a in &out_axes {
             if ext(a) as usize % SIMD == 0 && ext(a) >= simd {
@@ -728,6 +739,7 @@ pub fn fold_sched(
                     lane_axis: Some(a),
                     sgs,
                     lane_stream: false,
+                    chunk: 1,
                 });
             }
         }
@@ -740,6 +752,24 @@ pub fn fold_sched(
         {
             best = c;
             best_t = t;
+        }
+    }
+    // A refinement of the winner, not a candidate: when the fold reads a
+    // PACKED input, each lane folds contiguous 8-element runs instead of
+    // striding — consecutive nibbles share bytes and cache lines, and the
+    // unrolled run's index chains constant-fold. Pure re-association
+    // (legal for exactly the carriers the lane split already requires);
+    // the roofline cannot see load contiguity, so this is a stated rule,
+    // not a priced choice.
+    if best.lane_stream
+        && best.lane_axis.is_none()
+        && input_dtypes(fold_node)
+            .iter()
+            .any(|(_, d)| matches!(d, Dtype::I4))
+    {
+        let f_split = SIMD * best.sgs;
+        if (s_ext as usize) % (f_split * 8) == 0 {
+            best.chunk = 8;
         }
     }
     best

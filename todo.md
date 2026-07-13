@@ -490,10 +490,15 @@ is a good future hardening).
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
 partition speed at 10k-kernel scale, and the rest of the ladder, each
-measured in `vs_mlx.md`: vectorized packed loads + row batching per
-simdgroup (the 2.6×/1.8× proto gap on int4/flash), honest-window
-streaming (skip the masked tail = fold the identity), elementwise-cone
-fusion, kernel dedup across isomorphic layers, autotuning, multi-device.
+measured in `vs_mlx.md`: honest-window streaming (skip the masked tail =
+fold the identity), elementwise-cone fusion, kernel dedup across
+isomorphic layers, autotuning, multi-device, flash float4 loads, and the
+rest of the packed-fold proto gap (explicit 32-bit packed-word loads,
+output-row batching per simdgroup, the −8·Σx zero-point hoist). CLIMBED:
+chunked lane streams (2026-07-13) — `FoldSched.chunk` folds contiguous
+8-element runs per lane when a packed leaf makes contiguity pay; MoE
+gate/up 2.2×, down 4.4 → 3.75 ms, GPU-bit-checked
+(`coop_chunked_w4_matvec`), numerics pinned (same Δ, SEQUENCE MATCH).
 CLIMBED: one-fold-per-layer top-k (2026-07-13) — the `project-leaf`
 derive rule (a projection may read stream-invariant leaves; k-best slots
 dedup across rank queries) makes `ir::topk_all` ONE 16-slot fold whose

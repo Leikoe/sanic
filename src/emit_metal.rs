@@ -464,16 +464,35 @@ pub fn emit_fused_metal_sched(
     }
 
     // ── the stream loop, strided over the split units ────────────────────────
+    // With `chunk`, each lane folds CONTIGUOUS runs of `chunk` elements
+    // (unrolled, so a packed leaf's nibble loads share bytes and the index
+    // arithmetic constant-folds). Pure re-association — legal for exactly
+    // the carriers this path already requires — and exclusive with the
+    // lane-distributed axis.
+    let chunk = if sched.chunk > 1
+        && sched.lane_stream
+        && sched.lane_axis.is_none()
+        && s_ext % (f_split * sched.chunk) == 0
+    {
+        sched.chunk
+    } else {
+        1
+    };
     let unit = if sched.lane_stream {
         format!("(sgid * {SIMD}u + lane)")
     } else {
         "sgid".to_string()
     };
-    body.push(format!(
-        "for (uint s_ = {unit}; s_ < {s_ext}u; s_ += {f_split}u) {{"
-    ));
-    let mut cs = coord.clone();
-    cs.insert(stream, "s_".into());
+    if chunk > 1 {
+        body.push(format!(
+            "for (uint c_ = {unit}; c_ < {}u; c_ += {f_split}u) {{",
+            s_ext / chunk
+        ));
+    } else {
+        body.push(format!(
+            "for (uint s_ = {unit}; s_ < {s_ext}u; s_ += {f_split}u) {{"
+        ));
+    }
     if sched.lane_axis.is_some() {
         g.lane_body = Some(LaneBody {
             avoid_axis: sched.lane_axis,
@@ -481,24 +500,6 @@ pub fn emit_fused_metal_sched(
         });
     }
     let mut inner: Vec<String> = Vec::new();
-    for (i, l) in carrier.leaves.iter().enumerate() {
-        if sliced_leaf[i] {
-            continue;
-        }
-        let mut stmts = Vec::new();
-        let v = value(&METAL, l, &cs, ext, &mut g, &mut stmts);
-        inner.extend(stmts);
-        inner.push(format!("float xu_{i} = {v};"));
-    }
-    // renderers: `ctx_sliced` decides whether lane-sliced names are in scope
-    let item_at = |i: usize, ctx_sliced: bool| -> String {
-        if sliced_leaf[i] {
-            debug_assert!(ctx_sliced);
-            format!("xs_{i}")
-        } else {
-            format!("xu_{i}")
-        }
-    };
     let a_at = |k: usize| -> String {
         if sliced_slot[k] {
             format!("accs_{k}[v_]")
@@ -506,75 +507,104 @@ pub fn emit_fused_metal_sched(
             format!("accu[{k}]")
         }
     };
-    let b_el = |k: usize| -> String {
-        if sliced_slot[k] {
-            format!("els_{k}")
-        } else {
-            format!("elu_{k}")
-        }
-    };
-    for j in 0..slots {
-        if sliced_slot[j] {
-            continue;
-        }
-        inner.push(format!(
-            "float elu_{j} = {};",
-            carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, false), &a_at, &b_el)
-        ));
-    }
-    for j in 0..slots {
-        if sliced_slot[j] {
-            continue;
-        }
-        inner.push(format!(
-            "float nau_{j} = {};",
-            carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, false), &a_at, &b_el)
-        ));
-    }
-    if sliced_slot.iter().any(|&s| s) || sliced_leaf.iter().any(|&s| s) {
-        inner.push(format!("for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
-        inner.push(format!("    uint la_ = lane + v_ * {SIMD}u;"));
-        let mut cv = cs.clone();
-        cv.insert(sched.lane_axis.unwrap(), "la_".into());
-        let mut vstmts: Vec<String> = Vec::new();
+    for jj in 0..chunk {
+        let mut cs = coord.clone();
+        cs.insert(
+            stream,
+            if chunk > 1 {
+                format!("(c_ * {chunk}u + {jj}u)")
+            } else {
+                "s_".into()
+            },
+        );
         for (i, l) in carrier.leaves.iter().enumerate() {
-            if !sliced_leaf[i] {
+            if sliced_leaf[i] {
                 continue;
             }
             let mut stmts = Vec::new();
-            let v = value(&METAL, l, &cv, ext, &mut g, &mut stmts);
-            vstmts.extend(stmts);
-            vstmts.push(format!("float xs_{i} = {v};"));
+            let v = value(&METAL, l, &cs, ext, &mut g, &mut stmts);
+            inner.extend(stmts);
+            inner.push(format!("float xu_{i}_{jj} = {v};"));
         }
+        // renderers: `ctx_sliced` decides whether lane-sliced names are in scope
+        let item_at = |i: usize, ctx_sliced: bool| -> String {
+            if sliced_leaf[i] {
+                debug_assert!(ctx_sliced);
+                format!("xs_{i}")
+            } else {
+                format!("xu_{i}_{jj}")
+            }
+        };
+        let b_el = |k: usize| -> String {
+            if sliced_slot[k] {
+                format!("els_{k}")
+            } else {
+                format!("elu_{k}_{jj}")
+            }
+        };
         for j in 0..slots {
-            if !sliced_slot[j] {
+            if sliced_slot[j] {
                 continue;
             }
-            vstmts.push(format!(
-                "float els_{j} = {};",
-                carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, true), &a_at, &b_el)
-            ));
-        }
-        for j in 0..slots {
-            if !sliced_slot[j] {
-                continue;
-            }
-            vstmts.push(format!(
-                "float nas_{j} = {};",
-                carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, true), &a_at, &b_el)
+            inner.push(format!(
+                "float elu_{j}_{jj} = {};",
+                carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, false), &a_at, &b_el)
             ));
         }
         for j in 0..slots {
             if sliced_slot[j] {
-                vstmts.push(format!("accs_{j}[v_] = nas_{j};"));
+                continue;
             }
+            inner.push(format!(
+                "float nau_{j}_{jj} = {};",
+                carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, false), &a_at, &b_el)
+            ));
         }
-        inner.extend(vstmts.into_iter().map(|s| format!("    {s}")));
-        inner.push("}".into());
-    }
-    for j in 0..slots {
-        if !sliced_slot[j] {
-            inner.push(format!("accu[{j}] = nau_{j};"));
+        if sliced_slot.iter().any(|&s| s) || sliced_leaf.iter().any(|&s| s) {
+            inner.push(format!("for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
+            inner.push(format!("    uint la_ = lane + v_ * {SIMD}u;"));
+            let mut cv = cs.clone();
+            cv.insert(sched.lane_axis.unwrap(), "la_".into());
+            let mut vstmts: Vec<String> = Vec::new();
+            for (i, l) in carrier.leaves.iter().enumerate() {
+                if !sliced_leaf[i] {
+                    continue;
+                }
+                let mut stmts = Vec::new();
+                let v = value(&METAL, l, &cv, ext, &mut g, &mut stmts);
+                vstmts.extend(stmts);
+                vstmts.push(format!("float xs_{i} = {v};"));
+            }
+            for j in 0..slots {
+                if !sliced_slot[j] {
+                    continue;
+                }
+                vstmts.push(format!(
+                    "float els_{j} = {};",
+                    carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, true), &a_at, &b_el)
+                ));
+            }
+            for j in 0..slots {
+                if !sliced_slot[j] {
+                    continue;
+                }
+                vstmts.push(format!(
+                    "float nas_{j} = {};",
+                    carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, true), &a_at, &b_el)
+                ));
+            }
+            for j in 0..slots {
+                if sliced_slot[j] {
+                    vstmts.push(format!("accs_{j}[v_] = nas_{j};"));
+                }
+            }
+            inner.extend(vstmts.into_iter().map(|s| format!("    {s}")));
+            inner.push("}".into());
+        }
+        for j in 0..slots {
+            if !sliced_slot[j] {
+                inner.push(format!("accu[{j}] = nau_{j}_{jj};"));
+            }
         }
     }
     body.extend(inner.into_iter().map(|s| format!("    {s}")));
@@ -687,7 +717,9 @@ pub fn emit_fused_metal_sched(
             (false, false) => format!("accu[{k}]"),
         }
     };
-    let proj = carrier_expr_map(&METAL, &carrier.project[0], &no_item, &proj_a, &b_el);
+    let proj = carrier_expr_map(&METAL, &carrier.project[0], &no_item, &proj_a, &|_| {
+        unreachable!("B slot in a projection")
+    });
     if sched.lane_axis.is_some() {
         body.push("if (sgid == 0) {".into());
         body.push(format!("    for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));

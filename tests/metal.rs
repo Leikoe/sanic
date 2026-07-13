@@ -1248,6 +1248,7 @@ fn coop_lane_stream_flash_matches_oracle() {
         lane_axis: None,
         sgs: 4,
         lane_stream: true, // split factor 128 ≤ 256
+        chunk: 1,
     };
     let kernel = emit_fused_metal_sched("coop_ls_flash", &carrier, k, &attn, &ext, sched);
     assert!(kernel.msl.contains("simd_shuffle_xor"), "lane merge emitted");
@@ -1290,6 +1291,7 @@ fn coop_lane_axis_flash_matches_oracle() {
         lane_axis: Some(e),
         sgs: 8,
         lane_stream: false,
+        chunk: 1,
     };
     let kernel = emit_fused_metal_sched("coop_la_flash", &carrier, k, &attn, &ext, sched);
     assert!(kernel.msl.contains("accs_"), "sliced slot emitted");
@@ -1362,6 +1364,7 @@ fn coop_norm_fused_matvec_matches_oracle() {
                 lane_axis: Some(o),
                 sgs: 1,
                 lane_stream: false,
+        chunk: 1,
             },
         ),
         (
@@ -1370,6 +1373,7 @@ fn coop_norm_fused_matvec_matches_oracle() {
                 lane_axis: None,
                 sgs: 2,
                 lane_stream: true,
+        chunk: 1,
             },
         ),
     ] {
@@ -1380,6 +1384,105 @@ fn coop_norm_fused_matvec_matches_oracle() {
         };
         eprintln!("norm-fused matvec [{label}] on GPU: {}", out.trim());
     }
+}
+
+/// The packed-leaf CHUNKED lane stream: each lane folds contiguous runs of
+/// 8 elements, so the int4 nibble loads share bytes and the unrolled index
+/// chains constant-fold — the trinity W4 fold shape, bit-checked against
+/// the f64 oracle (integer nibbles + f16-exact scales, like the scalar W4
+/// test).
+#[test]
+fn coop_chunked_w4_matvec_matches_oracle() {
+    use sanic::emit_metal::emit_fused_metal_sched;
+    use sanic::plan::FoldSched;
+    let (o, gq, r, c) = (axis("o"), axis("g"), axis("r"), axis("c"));
+    let (n_out, n_g, n_r) = (8usize, 8usize, 128usize);
+    let n_in = n_g * n_r; // 1024 = 32 lanes × 8-chunks × 4
+    let ext: Extents = [(o, n_out), (gq, n_g), (r, n_r), (c, n_in)]
+        .into_iter()
+        .collect();
+    let mut rng = Lcg(0xC4C4);
+
+    let q: Vec<i8> = (0..n_out * n_in)
+        .map(|_| ((rng.f() * 8.0).floor().clamp(-8.0, 7.0)) as i8)
+        .collect();
+    let mut packed = vec![0u8; n_out * n_in / 2];
+    for (i, &v) in q.iter().enumerate() {
+        let nib = (v + 8) as u8;
+        packed[i / 2] |= nib << ((i & 1) * 4);
+    }
+    let scales: Vec<f64> = (0..n_out * n_g)
+        .map(|_| (1.0 + (rng.f().abs() * 15.0).round()) / 64.0)
+        .collect();
+
+    let env: Env = [
+        (
+            "Wq",
+            Tensor::from_fn(&[o, gq, r], &ext, |cd| {
+                q[cd[&o] * n_in + cd[&gq] * n_r + cd[&r]] as f64
+            }),
+        ),
+        (
+            "S",
+            Tensor::from_fn(&[o, gq], &ext, |cd| scales[cd[&o] * n_g + cd[&gq]]),
+        ),
+        ("x", rand_tensor(&[gq, r], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let prod = map(
+        MapOp::Mul,
+        vec![
+            map(
+                MapOp::Mul,
+                vec![
+                    input_dt("Wq", &[o, gq, r], Dtype::I4),
+                    input("x", &[gq, r]),
+                ],
+            ),
+            input("S", &[o, gq]),
+        ],
+    );
+    let y = reduce(flatten(prod, &[gq, r], c), c, BinOp::Monoid(Monoid::Add));
+    let carrier = derive(&y, c).unwrap();
+    let sched = FoldSched {
+        lane_axis: None,
+        sgs: 1,
+        lane_stream: true,
+        chunk: 8,
+    };
+    let kernel = emit_fused_metal_sched("coop_w4c", &carrier, c, &y, &ext, sched);
+    assert!(kernel.msl.contains("c_ * 8u"), "chunked stream loop emitted");
+    assert!(kernel.msl.contains("simd_shuffle_xor"), "lane merge emitted");
+    let reference = eval(&y, &env, &ext);
+
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let pipes = dev.compile(&kernel.msl);
+    let pipe = pipes.get(&kernel.name);
+    let inputs: Vec<MetalBuf> = kernel
+        .inputs
+        .iter()
+        .map(|(n, axes)| match *n {
+            "Wq" => dev.from_bytes(&packed),
+            _ => dev.from_f64(&env[n].permuted_to(axes).data),
+        })
+        .collect();
+    let out = dev.alloc_f32(n_out);
+    dev.run(&[Dispatch {
+        pipe,
+        inputs,
+        output: out.clone(),
+        grid: kernel.grid_size,
+    }]);
+    let got = dev.read_f32(&out, n_out);
+    let expected = reference.permuted_to(&kernel.grid);
+    let maxrel = max_rel_err(&got, &expected.data);
+    assert!(maxrel < 2e-3, "chunked W4 matvec MISMATCH {maxrel:e}");
+    eprintln!("chunked (8-contiguous per lane) W4 matvec on GPU: GPU OK {maxrel:e}");
 }
 
 /// First-max-wins argmax is order-SENSITIVE: an interleaved lane partition
@@ -1404,6 +1507,7 @@ fn coop_declines_order_sensitive_argmax() {
         lane_axis: None,
         sgs: 4,
         lane_stream: true,
+        chunk: 1,
     };
     let kernel = emit_fused_metal_sched("coop_am", &carrier, n, &am, &ext, sched);
     assert!(
