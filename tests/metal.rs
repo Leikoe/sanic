@@ -1074,6 +1074,38 @@ fn topk_kbest_folds_run_on_gpu() {
     }
 }
 
+/// ALL ranks of the selection as ONE kernel: the rank axis is the grid, the
+/// k-best slots are shared across rank queries, and the projection reads the
+/// rank one-hot at PROJECT scope — leaf loads outside the stream loop, on
+/// real hardware, against the oracle, with the same planted exact ties.
+#[test]
+fn topk_all_single_fold_runs_on_gpu() {
+    let (n, rk) = (axis("n"), axis("rk"));
+    let ext: Extents = [(n, 129), (rk, 8)].into_iter().collect();
+    let mut rng = Lcg(0xC0BE5);
+    let mut vals: Vec<f64> = (0..129).map(|_| rng.f()).collect();
+    vals[97] = vals[13];
+    let m = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    vals[110] = m;
+    let env: Env = [(
+        "X",
+        Tensor::from_fn(&[n], &ext, |c| vals[c[&n]]),
+    )]
+    .into_iter()
+    .collect();
+
+    let all = topk_all(input("X", &[n]), n, 8, rk, true);
+    let carrier = derive(&all, n).expect("topk_all derives");
+    assert_eq!(carrier.slots, 16, "one shared k-best list");
+    let kernel = emit_fused_metal("top8_all", &carrier, n, &all, &ext);
+    let reference = eval(&all, &env, &ext);
+    let Some(out) = run_on_gpu("top8_all", &kernel, &env, &reference) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("top8_all (one fold, rank-indexed projection) on GPU: {}", out.trim());
+}
+
 /// Graph execution: the same schedule captured into an indirect command
 /// buffer and REPLAYED — twice, to prove the capture is stable — must match
 /// the oracle. The schedule is a dependent chain (norm folds feeding GEMMs

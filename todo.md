@@ -490,11 +490,19 @@ is a good future hardening).
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
 partition speed at 10k-kernel scale, and the rest of the ladder, each
-measured in `vs_mlx.md`: one-fold-per-layer top-k (432 rank kernels,
-4.9 ms), vectorized packed loads + row batching per simdgroup (the
-2.6×/1.8× proto gap on int4/flash), honest-window streaming (skip the
-masked tail = fold the identity), elementwise-cone fusion, kernel dedup
-across isomorphic layers, autotuning, multi-device. CLIMBED: f16
+measured in `vs_mlx.md`: vectorized packed loads + row batching per
+simdgroup (the 2.6×/1.8× proto gap on int4/flash), honest-window
+streaming (skip the masked tail = fold the identity), elementwise-cone
+fusion, kernel dedup across isomorphic layers, autotuning, multi-device.
+CLIMBED: one-fold-per-layer top-k (2026-07-13) — the `project-leaf`
+derive rule (a projection may read stream-invariant leaves; k-best slots
+dedup across rank queries) makes `ir::topk_all` ONE 16-slot fold whose
+projection is rank-indexed by the grid coordinate: 432 rank kernels → 54,
+Trinity 1,968 → 1,590 kernels, 20.3 → **19.4 ms/step (~22 ms/token
+wall)**, numerics bit-identical (SEQUENCE MATCH holds). Narrowed on
+measurement: Mul-only, order-sensitive carriers only — the general form
+absorbed attention gates into projections, declined the cooperative
+schedule, and cost 8×. CLIMBED: f16
 attention weights (2026-07-13) — the five projections upload bf16→f16
 through the existing typed-load path, −413 MB, 23.3 → **20.3 ms/step
 (~21 ms/token)**, and the 0.010 near-tie flips the other way: Trinity now

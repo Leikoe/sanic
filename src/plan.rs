@@ -597,7 +597,10 @@ pub fn fold_sched(
     dev: &Device,
     extents: &HashMap<Axis, f64>,
 ) -> FoldSched {
-    if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
+    if !mergeable_out_of_order(carrier)
+        || carrier.project.len() != 1
+        || carrier.project_reads_leaves()
+    {
         return FoldSched::scalar();
     }
     let ext = |ax: Axis| extents.get(&ax).copied().unwrap_or(1.0);

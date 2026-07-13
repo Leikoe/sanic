@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::codegen::{Gen, Lang, buffers, carrier_expr, offset, san, value};
+use crate::codegen::{Gen, Lang, buffers, carrier_expr, carrier_expr_map, offset, san, value};
 use crate::derive::Carrier;
 use crate::interp::Extents;
 use crate::ir::{Axis, MapOp, Monoid, Node, output_axes};
@@ -200,11 +200,35 @@ fn emit_fused(
     ));
     src.push("}".into());
 
-    src.push(format!(
-        "outb[{}] = {};",
-        offset(&grid, &coord, ext),
-        carrier_expr(&RUST, &carrier.project[0])
-    ));
+    // Leaves a projection reads are constant along the stream: render them
+    // at grid scope, where the stream variable no longer exists.
+    let pitems: Vec<usize> = {
+        let mut set = std::collections::BTreeSet::new();
+        for i in crate::derive::items_of(&carrier.project[0]) {
+            set.insert(i);
+        }
+        set.into_iter().collect()
+    };
+    let mut pv: HashMap<usize, String> = HashMap::new();
+    for &i in &pitems {
+        let leaf = &carrier.leaves[i];
+        assert!(
+            !crate::ir::all_axes(leaf).contains(&stream),
+            "a projection may only read stream-invariant leaves"
+        );
+        let e = value(&RUST, leaf, &coord, ext, &mut g, &mut src);
+        let v = g.fresh("pv");
+        src.push(format!("let {v} = {e};"));
+        pv.insert(i, v);
+    }
+    let proj = carrier_expr_map(
+        &RUST,
+        &carrier.project[0],
+        &|i| pv[&i].clone(),
+        &|i| format!("acc[{i}]"),
+        &|_| unreachable!("B slot in a projection"),
+    );
+    src.push(format!("outb[{}] = {proj};", offset(&grid, &coord, ext)));
     src.extend(close);
     src.push("    outb".into());
     src.push("}".into());

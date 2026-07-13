@@ -324,11 +324,34 @@ pub fn emit_fused_metal(
         "    for (uint _j = 0; _j < {slots}; _j++) acc[_j] = na[_j];"
     ));
     body.push("}".into());
-    body.push(format!(
-        "outb[{}] = {};",
-        offset(&grid, &coord, ext),
-        carrier_expr(&METAL, &carrier.project[0])
-    ));
+    // A projection may read leaves that are constant along the stream (a
+    // grid-axis one-hot picking this thread's rank): render those loads at
+    // grid scope, where the stream variable no longer exists.
+    let mut pitems = std::collections::HashSet::new();
+    let mut pslots = std::collections::HashSet::new();
+    expr_refs(&carrier.project[0], &mut pitems, &mut pslots);
+    let mut pitems: Vec<usize> = pitems.into_iter().collect();
+    pitems.sort_unstable();
+    let mut pv: HashMap<usize, String> = HashMap::new();
+    for &i in &pitems {
+        let leaf = &carrier.leaves[i];
+        assert!(
+            !crate::ir::all_axes(leaf).contains(&stream),
+            "a projection may only read stream-invariant leaves"
+        );
+        let e = value(&METAL, leaf, &coord, ext, &mut g, &mut body);
+        let v = g.fresh("pv");
+        body.push(format!("float {v} = {e};"));
+        pv.insert(i, v);
+    }
+    let proj = carrier_expr_map(
+        &METAL,
+        &carrier.project[0],
+        &|i| pv[&i].clone(),
+        &|i| format!("acc[{i}]"),
+        &|_| unreachable!("B slot in a projection"),
+    );
+    body.push(format!("outb[{}] = {proj};", offset(&grid, &coord, ext)));
 
     MetalKernel {
         msl: format!("{MSL_HEADER}{}", wrap(name, signature(&bufs, &dtypes), body)),
@@ -359,7 +382,11 @@ pub fn emit_fused_metal_sched(
 ) -> MetalKernel {
     use std::collections::HashSet;
     let scalar = || emit_fused_metal(name, carrier, stream, fold_node, ext);
-    if sched.is_scalar() || !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
+    if sched.is_scalar()
+        || !mergeable_out_of_order(carrier)
+        || carrier.project.len() != 1
+        || carrier.project_reads_leaves()
+    {
         return scalar();
     }
     let s_ext = ext[&stream];
@@ -722,6 +749,11 @@ pub fn emit_split_metal(
         carrier.project.len(),
         1,
         "metal split kernel needs a scalar projection"
+    );
+    assert!(
+        !carrier.project_reads_leaves(),
+        "split reduction: the combine stage projects from partials alone — \
+         a leaf-reading projection needs the single-kernel form"
     );
     assert!(
         blocks >= 1 && blocks <= ext[&stream],

@@ -313,6 +313,31 @@ impl Carrier {
         self.project.iter().map(|e| eval(e, &env)).collect()
     }
 
+    /// [`Carrier::project`] with per-grid-point leaf values available: a
+    /// projection may read leaves that are CONSTANT along the streamed axis
+    /// (a grid-axis one-hot selecting which slot this output wants — the
+    /// rank-indexed k-best projection). Runners that know the grid point
+    /// use this; stream-varying leaves are meaningless here and the caller
+    /// must not supply them (their slots are NaN-poisoned by
+    /// [`crate::interp::run_carrier`]).
+    pub fn project_with(&self, acc: &[f64], items: &[f64]) -> Vec<f64> {
+        let env = Env {
+            item: Some(items),
+            a: None,
+            b: None,
+            f: Some(acc),
+        };
+        self.project.iter().map(|e| eval(e, &env)).collect()
+    }
+
+    /// Does the projection read any leaf? (If so, only runners that supply
+    /// per-grid-point leaf values — and emitters that render leaf loads in
+    /// project scope — can drive this carrier; split/cooperative schedules
+    /// decline.)
+    pub fn project_reads_leaves(&self) -> bool {
+        self.project.iter().any(|e| !items_of(e).is_empty())
+    }
+
     /// Exact accumulator size (scalar count) for given axis extents — the
     /// number the scheduler feeds into its SRAM constraint. A slot spanning no
     /// free axes is one scalar; a slot spanning `{sq, e}` is
@@ -557,6 +582,45 @@ impl Ctx {
     }
 }
 
+/// Every `Item` in `e` references a leaf that never touches `axis`: the
+/// expression is constant along the fold and may evaluate at project time.
+fn invariant_along(e: &Expr, axis: Axis, ctx: &Ctx) -> bool {
+    items_of(e)
+        .iter()
+        .all(|&i| !crate::ir::output_axes(&ctx.leaves[i].0).contains(&axis))
+}
+
+/// The slot indices (`F`) an expression reads.
+fn slots_of(e: &Expr) -> Vec<usize> {
+    fn walk(e: &Expr, out: &mut Vec<usize>) {
+        match e {
+            Expr::F(i) => out.push(*i),
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Max(a, b)
+            | Expr::Min(a, b)
+            | Expr::Lt(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
+                walk(a, out)
+            }
+            Expr::Where(c, a, b) => {
+                walk(c, out);
+                walk(a, out);
+                walk(b, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    out
+}
+
 /// The `Item` field indices an expression reads.
 pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     let mut out = Vec::new();
@@ -756,28 +820,51 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
         let s = go(src, axis, ctx)?;
         let raw = plain_pe(&s)?;
         let k = k as usize;
-        let vbase = ctx.slots.len();
-        for r in 0..k {
-            let into = if r == 0 {
-                raw.clone()
-            } else {
-                cst(f64::NEG_INFINITY)
-            };
-            ctx.push_slot(SlotKind::KBestVal { base: vbase, rank: r }, into);
-        }
-        // A value-only query needs no index half; an index query needs both.
-        let ibase = ctx.slots.len();
-        if idx {
-            let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+        // One selection, many queries: if this derivation already carries
+        // the k-list over the same streamed values, REUSE its slots. Eight
+        // rank reduces of one score vector become one carrier with eight
+        // projections, not eight list copies.
+        let existing = ctx.slots.iter().position(|sl| {
+            matches!(sl.kind, SlotKind::KBestVal { base, rank: 0 } if {
+                ctx.slots[base..].iter().take(k).filter(|s2|
+                    matches!(s2.kind, SlotKind::KBestVal { base: b2, .. } if b2 == base)
+                ).count() == k
+            }) && sl.into == raw
+        });
+        let vbase = existing.unwrap_or_else(|| {
+            let vbase = ctx.slots.len();
             for r in 0..k {
                 let into = if r == 0 {
-                    Expr::Item(iota_leaf)
+                    raw.clone()
                 } else {
-                    cst(0.0)
+                    cst(f64::NEG_INFINITY)
                 };
-                ctx.push_slot(SlotKind::KBestIdx { vbase, ibase, rank: r }, into);
+                ctx.push_slot(SlotKind::KBestVal { base: vbase, rank: r }, into);
             }
-        }
+            vbase
+        });
+        // A value-only query needs no index half; an index query needs both
+        // (reusing the value half if a prior query built it).
+        let ibase = if idx {
+            let found = ctx.slots.iter().position(|sl| {
+                matches!(sl.kind, SlotKind::KBestIdx { vbase: v, rank: 0, .. } if v == vbase)
+            });
+            found.unwrap_or_else(|| {
+                let ibase = ctx.slots.len();
+                let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+                for r in 0..k {
+                    let into = if r == 0 {
+                        Expr::Item(iota_leaf)
+                    } else {
+                        cst(0.0)
+                    };
+                    ctx.push_slot(SlotKind::KBestIdx { vbase, ibase, rank: r }, into);
+                }
+                ibase
+            })
+        } else {
+            usize::MAX
+        };
         // Every slot of the list ranges over the same grid rows as rank 0.
         let span0 = ctx.slots[vbase].span.clone();
         for r in 0..k {
@@ -1043,6 +1130,42 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             Bin::Min => emin(p, q),
             Bin::Lt => elt(p, q),
         }));
+    }
+
+    // A collapsed value TIMES a per-element factor whose leaves never touch
+    // the axis: the factor is constant along the fold — data in the role of
+    // a promoted literal (a grid-axis one-hot) — so the product is collapsed
+    // too, the factor evaluated at PROJECT time, where the streamed axis is
+    // already gone. This is what lets the eight rank queries of one k-best
+    // selection become a single fold whose projection is rank-indexed by
+    // the grid coordinate (`ir::topk_all`).
+    //
+    // Deliberately NARROW on two counts. Mul only: an additive version
+    // would swallow residual/bias epilogues into the projection. And only
+    // when the collapsed side reads ORDER-SENSITIVE slots (k-best, argmax):
+    // a leaf-reading projection declines the cooperative schedule, so the
+    // absorption is free exactly when the carrier already declines it —
+    // an attention gate over a rescale carrier must stay an epilogue, or
+    // the flash fold falls back to one thread per output.
+    if matches!(op, Bin::Mul) {
+        let order_sensitive = |e: &Expr| {
+            slots_of(e).iter().any(|&i| {
+                matches!(
+                    ctx.slots[i].kind,
+                    SlotKind::KBestVal { .. } | SlotKind::KBestIdx { .. } | SlotKind::ArgIdx { .. }
+                )
+            })
+        };
+        let inv = |s: &S| plain_pe(s).filter(|raw| invariant_along(raw, axis, ctx));
+        let pq = match (&a, &b) {
+            (S::Coll(p), s) if order_sensitive(p) => inv(s).map(|q| (p.clone(), q)),
+            (s, S::Coll(p)) if order_sensitive(p) => inv(s).map(|q| (p.clone(), q)),
+            _ => None,
+        };
+        if let Some((p, q)) = pq {
+            ctx.rules.insert("project-leaf");
+            return Some(S::Coll(pmul(p, q)));
+        }
     }
 
     match (op, a, b) {

@@ -99,6 +99,82 @@ fn topk_partitions_and_executes() {
     }
 }
 
+// ALL ranks of one selection as ONE fold: the rank axis is grid, the k-best
+// list is derived ONCE (slots deduped across the rank queries), and the
+// projection reads the rank one-hot at project time — the composition
+// `topk_all` builds and the derive rule `project-leaf` makes streamable.
+#[test]
+fn topk_all_is_one_fold_with_shared_slots() {
+    let (n, rk) = (axis("n"), axis("rk"));
+    let k = 4usize;
+    let ext: Extents = [(n, 16), (rk, k)].into_iter().collect();
+    let mut rng = Lcg(0xA11);
+    let x = rand_tensor(&[n], &ext, &mut rng);
+    let env: Env = [("X", x.clone())].into_iter().collect();
+
+    let all = topk_all(input("X", &[n]), n, k, rk, true);
+
+    // one carrier: k value slots + k index slots, not k separate lists
+    let c = sanic::derive::derive(&all, n).expect("topk_all derives over the scored axis");
+    assert_eq!(c.slots, 2 * k, "k-best slots shared across rank queries");
+    assert!(c.project_reads_leaves(), "rank one-hot read at project time");
+    assert!(c.rules.contains(&"project-leaf"), "rules: {:?}", c.rules);
+
+    // the carrier equals the naive semantics, per rank
+    let got = sanic::interp::run_carrier(&all, n, &c, &env, &ext);
+    let want = eval(&all, &env, &ext);
+    let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
+    order.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for r in 0..k {
+        let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
+        assert_eq!(got.at(&coord), want.at(&coord), "rank {r}: carrier == eval");
+        assert_eq!(got.at(&coord), order[r].1 as f64, "rank {r}: == hand sort");
+    }
+
+    // and the whole thing schedules as ONE kernel
+    let sched = partition(&all, &Device::toy(), &as_f64(&ext));
+    assert_eq!(sched.stages.len(), 1, "one fold for all ranks");
+    let mut run_env = env.clone();
+    sched.execute_env(&mut run_env, &ext);
+    let out = run_env.get(sched.outputs[0].as_str()).unwrap();
+    for r in 0..k {
+        let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
+        assert_eq!(out.at(&coord), order[r].1 as f64, "scheduled rank {r}");
+    }
+}
+
+// Planted exact ties: the shared-slot fold keeps first-max-wins across the
+// WHOLE selection, exactly like the per-rank folds it replaces.
+#[test]
+fn topk_all_ties_match_per_rank_folds() {
+    let (n, rk) = (axis("n"), axis("rk"));
+    let k = 3usize;
+    let ext: Extents = [(n, 8), (rk, k)].into_iter().collect();
+    // ties everywhere: [2, 5, 5, 1, 5, 2, 0, 5] — ranks 0..3 are all the 5s,
+    // first-seen order 1, 2, 4
+    let data = [2.0, 5.0, 5.0, 1.0, 5.0, 2.0, 0.0, 5.0];
+    let x = Tensor::from_fn(&[n], &ext, |c| data[c[&n]]);
+    let env: Env = [("X", x)].into_iter().collect();
+
+    let all = topk_all(input("X", &[n]), n, k, rk, true);
+    let got = eval(&all, &env, &ext);
+    let pairs = topk(input("X", &[n]), n, k);
+    for (r, (_, i)) in pairs.iter().enumerate() {
+        let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
+        assert_eq!(
+            got.at(&coord),
+            eval(i, &env, &ext).data[0],
+            "rank {r} under ties"
+        );
+    }
+    let coord0: HashMap<Axis, usize> = [(rk, 0)].into_iter().collect();
+    let coord1: HashMap<Axis, usize> = [(rk, 1)].into_iter().collect();
+    let coord2: HashMap<Axis, usize> = [(rk, 2)].into_iter().collect();
+    assert_eq!(got.at(&coord0), 1.0);
+    assert_eq!(got.at(&coord1), 2.0);
+    assert_eq!(got.at(&coord2), 4.0);
+}
+
 // Batched top-1 (the MoE router shape): argmax per row.
 #[test]
 fn batched_top1_routes_rows() {

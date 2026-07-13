@@ -461,6 +461,9 @@ impl MetalDevice {
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
+        if let Some(err) = cb.error() {
+            eprintln!("graph replay FAILED: {err}");
+        }
         let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
         let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
         t1 - t0

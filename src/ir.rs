@@ -767,6 +767,34 @@ pub fn topk(x: Node, axis: Axis, k: usize) -> Vec<(Node, Node)> {
     (0..k).map(|r| (q(r, false), q(r, true))).collect()
 }
 
+/// ALL k ranks of the top-k selection as ONE tensor over a fresh rank axis
+/// `rk` — and, downstream, one KERNEL. Spelled as Σ_r onehot(rk = r)·rank_r:
+/// the per-rank reduces share one streamed source, so the deriver dedups
+/// their k-best lists into a single set of slots, and the rank one-hots
+/// never touch the streamed axis, so they evaluate at PROJECT time — each
+/// grid point of `rk` selects its slot from the shared list. Eight rank
+/// kernels per MoE layer become one.
+pub fn topk_all(x: Node, axis: Axis, k: usize, rk: Axis, idx: bool) -> Node {
+    let mut sum: Option<Node> = None;
+    for r in 0..k {
+        let q = reduce(
+            x.clone(),
+            axis,
+            BinOp::TopK {
+                k: k as u8,
+                rank: r as u8,
+                idx,
+            },
+        );
+        let term = map(MapOp::Mul, vec![one_hot(rk, konst(r as f64)), q]);
+        sum = Some(match sum {
+            None => term,
+            Some(s) => map(MapOp::Add, vec![s, term]),
+        });
+    }
+    sum.expect("k >= 1")
+}
+
 /// Scatter-add — the inverse of [`gather`], add-combining collisions:
 /// `out[to,·] = Σ_from (index[from] == to) · src[from,·]`. Dense as a graph
 /// (O(n·m) — a one-hot contraction); a device backend may later emit atomics,

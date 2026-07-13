@@ -315,30 +315,25 @@ fn build() -> Model {
             let score = sigmoid(matmul(xn2.clone(), router_in, dm));
             roots.push((score, nm("score")));
             let score_in = input(nm("score"), &[nr]);
-            // Selection is on bias-corrected scores; the k-best tuple monoid
-            // makes every rank ONE independent fold over them — no
-            // mask-the-winner chain, no per-round materialized cuts. The
-            // route WEIGHTS re-gather the raw sigmoid scores below.
+            // Selection is on bias-corrected scores; ALL EIGHT ranks are ONE
+            // fold (`topk_all`): the k-best slots are shared across the rank
+            // queries and the rank one-hot is read at project time, so the
+            // eight index kernels this layer used to launch are one kernel
+            // over the rank-axis grid. The route WEIGHTS re-gather the raw
+            // sigmoid scores below.
             let biased = map(
                 MapOp::Add,
                 vec![score_in.clone(), input(nm("ebias"), &[nr])],
             );
+            let rk = axis("rk");
+            ext.insert(rk, TOPK);
+            roots.push((topk_all(biased, nr, TOPK, rk, true), nm("ranks")));
+            let ranks_in = input(nm("ranks"), &[rk]);
 
             let mut idxs = Vec::new();
             let mut ws: Vec<Node> = Vec::new();
             for j in 0..TOPK {
-                let idx = reduce(
-                    biased.clone(),
-                    nr,
-                    BinOp::TopK {
-                        k: TOPK as u8,
-                        rank: j as u8,
-                        idx: true,
-                    },
-                );
-                let idx_name = leak(format!("idx{j}_{l}"));
-                roots.push((idx, idx_name));
-                let idx_in = input(idx_name, &[]);
+                let idx_in = gather(ranks_in.clone(), konst(j as f64), rk);
                 ws.push(gather(score_in.clone(), idx_in.clone(), nr));
                 idxs.push(idx_in);
             }

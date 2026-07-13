@@ -230,6 +230,22 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**One fold per layer for all top-k ranks (2026-07-13): 20.3 → 19.4
+ms/step, 1,968 → 1,590 kernels.** A new derivation rule, not stage
+plumbing: a fold's projection may read leaves that are CONSTANT along the
+streamed axis (`project-leaf`), and the per-rank k-best reduces of one
+score vector share their slots. So `Σ_r onehot(rk=r)·rank_r`
+(`ir::topk_all`) derives as ONE 16-slot carrier whose projection is
+rank-indexed by the grid coordinate — 432 grid-1 rank kernels become 54
+grid-8 kernels, first-max-wins ties preserved (GPU-tested on planted
+ties). The rule is deliberately narrow: Mul only (an additive form would
+swallow residual epilogues into projections), and only when the collapsed
+side reads order-sensitive slots — those carriers decline the cooperative
+schedule anyway, so the absorption is free; an attention gate over a
+rescale carrier stays an epilogue (the first, general version of the rule
+absorbed it, dropped the flash folds to scalar, and cost 8× — measured,
+then narrowed).
+
 **f16 attention weights (2026-07-13): 23.3 → 20.3 ms/step, ~21 ms/token
 wall (~46 tok/s).** The self-inflicted f32 doubling undone: the five
 attention projections (q/k/v/gate/o) now upload the checkpoint's bf16 as

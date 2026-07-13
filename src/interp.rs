@@ -657,7 +657,21 @@ pub fn run_carrier_split(
         for p in &partials[1..] {
             acc = carrier.merge(&acc, p);
         }
-        carrier.project(&acc)[0]
+        // A projection may read leaves that are constant along the streamed
+        // axis (a grid-axis one-hot picking this output's rank). A
+        // stream-varying leaf is meaningless here: poison it so misuse is
+        // loud, not silently the last element.
+        let proj_items: Vec<f64> = leaves
+            .iter()
+            .map(|t| {
+                if t.axes.contains(&axis) {
+                    f64::NAN
+                } else {
+                    t.at(gc)
+                }
+            })
+            .collect();
+        carrier.project_with(&acc, &proj_items)[0]
     })
 }
 
