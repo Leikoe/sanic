@@ -121,6 +121,14 @@ pub enum BinOp {
     /// what makes argmax / top-k selection ONE fold instead of a
     /// max-then-indicator-sum pair (which also differs on ties).
     ArgMax,
+    /// One projection of a k-best selection: the `rank`-th largest value
+    /// (`idx: false`) or its position (`idx: true`), first-max-wins on ties.
+    /// The k sorted (value, index) pairs form a tuple monoid — sorted lists
+    /// of length ≤ k under merge-take-k — so the whole selection is ONE fold
+    /// into a 2k-slot carrier; each rank projects a slot. This is what makes
+    /// top-k routing k independent single-kernel folds instead of k rounds
+    /// of (max, mask-the-winner) chained through materialized cuts.
+    TopK { k: u8, rank: u8, idx: bool },
     /// A non-associative step, e.g. `tanh(W·h + x)`. No legal fold exists; an
     /// axis governed by one of these is strictly serial.
     NonAssoc(&'static str),
@@ -737,27 +745,26 @@ pub fn argmax(x: Node, axis: Axis) -> Node {
 }
 
 /// Top-k along `axis` by repeated (max, mask-the-winner): k `(value, index)`
-/// pairs, largest first. Each round masks exactly the previous winner's
-/// position (a computed [`one_hot`] of its argmax), so equal values elsewhere
-/// survive; a tie *within* one round is undefined, as for [`argmax`]. This is
-/// a decomposition, not a new operator — sampling and MoE routing need small
-/// k, and each round is an ordinary fold the deriver already streams. A full
-/// sort stays out of the supported fragment on purpose: it is a
-/// data-movement network, not a fold, and nothing in an inference pipeline
-/// needs one.
+/// pairs, largest first. Each pair is one [`BinOp::TopK`] fold — the k-best
+/// tuple monoid — so every value/index is a single kernel over the raw
+/// scores, with no mask-the-winner chain between ranks and first-max-wins
+/// ties across the WHOLE selection (the old round decomposition left ties
+/// within a round undefined). A full sort stays out of the supported
+/// fragment on purpose: it is a data-movement network, not a fold, and
+/// nothing in an inference pipeline needs one.
 pub fn topk(x: Node, axis: Axis, k: usize) -> Vec<(Node, Node)> {
-    let mut cur = x;
-    let mut out = Vec::new();
-    for _ in 0..k {
-        let v = reduce(cur.clone(), axis, BinOp::Monoid(Monoid::Max));
-        let i = argmax(cur.clone(), axis);
-        out.push((v, i.clone()));
-        cur = map(
-            MapOp::Where,
-            vec![one_hot(axis, i), konst(f64::NEG_INFINITY), cur],
-        );
-    }
-    out
+    let q = |rank: usize, idx: bool| {
+        reduce(
+            x.clone(),
+            axis,
+            BinOp::TopK {
+                k: k as u8,
+                rank: rank as u8,
+                idx,
+            },
+        )
+    };
+    (0..k).map(|r| (q(r, false), q(r, true))).collect()
 }
 
 /// Scatter-add — the inverse of [`gather`], add-combining collisions:

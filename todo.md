@@ -226,9 +226,12 @@ Decided per op, decomposition over new node kinds in every case:
   carrier — the running max plus an `ArgIdx` slot streaming `iota` — so
   argmax is **one kernel**. Replaced the original `Σ i·[x == max]`
   composition (two kernels, and unsound to fuse: it differs on ties).
-- **top-k** — k rounds of (argmax, mask-the-winner's-position); values and
-  indices, batched routing (MoE top-1) included; partitions into one
-  multi-output schedule with the rounds chained through materialized cuts.
+- **top-k** — `BinOp::TopK`: sorted (value, index) lists of length ≤ k form
+  a tuple monoid (merge-take-k; streaming-side combine is the singleton
+  insert), so EVERY rank's value or index is one independent fold over the
+  raw scores — no mask-the-winner chain, first-max-wins across the whole
+  selection, GPU-verified with planted exact ties. Split reductions decline
+  (the singleton insert is not a two-list merge; guarded).
 - **scatter-add** — `ir::scatter_add`, a one-hot contraction: the inverse of
   gather with order-free collision handling — exactly gather's adjoint,
   which M8 leans on. Dense O(n·m) as a graph; atomics are a backend concern.
@@ -317,8 +320,8 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   fold per projection.
 - QK-RMSNorm, sigmoid-gated attention, RoPE on sliding layers only (NoPE
   every 4th), μP embed scaling — all plain basis compositions.
-- **3,515 kernels per decode step** (attention ~27, top-8 routing 18 —
-  each round ONE derived ArgMax fold plus a winner mask — the
+- **1,856 kernels per decode step** (attention ~27, top-8 routing 10/layer —
+  a score fold plus 8 INDEPENDENT k-best rank folds, no round chain — the
   MoE itself ~10 — a router fold plus GROUPED gate/up/down folds over a
   9-slot axis (8 routed + the shared expert as stacked index 128), one
   vector-indexed gather selecting every expert's packed weights at once);
@@ -339,12 +342,13 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   |---|---|---|
   | nanoinfer megakernel (int4/fp8) | **1 dispatch** | ~15 ms/tok (67.5 tok/s) |
   | mlx-lm 8-bit (upstream afmoe) | **~2,733** (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
-  | sanic int4 | 3,515 derived kernels | 242 ms/tok (4.1 tok/s) |
+  | **sanic int4** | **1,856 derived kernels — fewest of any framework** | 236 ms/tok (4.2 tok/s) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |
 
-  MLX launches ~2.7k kernels per Trinity token — the same order as sanic —
-  and is 15× faster: kernel count is settled as NOT the story. The gap is
-  per-kernel quality (simdgroup-cooperative qmv at ~89% of bandwidth
+  sanic now dispatches ~32% FEWER kernels than MLX on Trinity (1,856 vs
+  ~2,733) — every one derived, none from a primitive library — and MLX is
+  still ~15× faster: kernel count is settled as NOT the latency story. The
+  gap is per-kernel quality (simdgroup-cooperative qmv at ~89% of bandwidth
   ceiling, fused sdpa/rms_norm) plus async pipelining of the step.
 
   All four GPT-2 rows emit the same greedy text. Lessons: sanic already
@@ -362,18 +366,20 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   RoPE'd query recomputes per stream step); and `entanglers` now descends
   views/reindexes/gathers with the AXIS TRANSLATED at each boundary
   (below a flatten the entanglement lives on the members), placing retry
-  cuts as deep as the algebra allows. It also forced one IR-level fix:
-  each top-k round used to cost a max fold PLUS an index fold, because
-  `Σ i·[x == max]` cannot be fused soundly (it differs on ties) —
-  `BinOp::ArgMax` (the tuple monoid above) makes each round one derived
-  fold, −432 kernels at Trinity scale. The residual count gap to MLX is
-  structural and named: MLX routes with an `argpartition` *primitive*
-  (~7 stages/layer vs our 18 derived ones) and has single-pass `RMSNorm`
-  /`Softmax` primitives (ours are two-pass until the two-pass-row-kernel
-  rung lands); against that, sanic spends nothing on dequant (in-body)
-  where MLX dispatches 503 QuantizedMatmuls. Unrolled-expert baseline for
-  reference: 9,443 kernels, 1.3 GB/step of gather spill, 122 s partition
-  (now 10 s).
+  cuts as deep as the algebra allows. The count ladder then continued on
+  theory, not tuning: `BinOp::ArgMax` and `BinOp::TopK` (tuple monoids —
+  the old `Σ i·[x == max]` spelling is tie-unsound to fuse, and the
+  mask-the-winner chain wasted a fold per rank) collapsed routing to a
+  score fold + 8 independent rank folds; sharing stopped being a fusion
+  barrier where recompute is cheap (a residual add per consumer is nothing
+  next to a launch + round trip); transcendentals inline when their
+  subtree is stream-INVARIANT (a norm's rsqrt hoists out of the loop — so
+  normalized activations fuse into every consumer GEMM with no norm map
+  stage at all); and gathers joined elementwise cones as in-body indexed
+  loads (all 433 gather stages vanished). 9,443 → 4,143 → 3,947 → 3,515 →
+  3,083 → **1,856**, numerics pinned at every step. Unrolled-expert
+  baseline for reference: 9,443 kernels, 1.3 GB/step of gather spill,
+  122 s partition (now 10 s).
 - **Validated against the HF reference**: per-position prompt logit error
   is FLAT (0.23–0.57, bf16-reference noise, not positional drift), the
   prompt-end argmax MATCHES, and the first greedy divergence is a 0.010
@@ -392,6 +398,46 @@ sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
 partition speed at 10k-kernel scale (~2 min), and the performance ladder
 (two-pass row kernels, cost-driven cuts, tiling/threadgroup memory, kernel
 dedup across isomorphic layers, autotuning, multi-device).
+
+## The completeness oracle (`tests/completeness.rs`)
+
+The argmax and top-k fusions were found by counting kernels against MLX.
+That was a process failure, named precisely: soundness always had an oracle
+(everything derived runs against `eval`), completeness never did — nothing
+ever checked that a DECLINE was correct. Now it is a checkable claim:
+
+- **The criterion is semantic and universal**: h streams in one pass iff a
+  constant-size sketch of the prefix determines h on every extension —
+  a list homomorphism into a small carrier (Myhill–Nerode for folds). It
+  never mentions the deriver.
+- **The probe searches for the sketch** by collision testing over a
+  quantized alphabet (the tupling method): σ-colliding prefixes whose
+  futures agree on every suffix ⇒ a constructive carrier candidate whose
+  components NAME the slots; a separating witness ⇒ the decline is
+  justified relative to the pool, with the counterexample printed.
+- **The ledger** classifies a syllabus + a random-program sweep:
+  DERIVED (probe agrees, dimension audited against slot count),
+  GRAPH-FORM (graph declines, carrier exists, covered by a named op —
+  the two historical misses are pinned here and are found mechanically),
+  JUSTIFIED (median, count-above-half-max — witnesses printed), and any
+  unexplained decline-with-carrier is a RED TEST.
+- **It already paid for itself**: the first run of the random sweep flagged
+  thirteen declined-but-fusable programs. Ten became four new derivation
+  rules — `invariant` (Σ over an unvarying axis = n·value, the count is a
+  slot), `lattice` (`min_i max(z_i, c) = max(min z, c)`), `defer-add`
+  (offsets commute with order reductions), `defer-scale` (extremum of c·z
+  carries BOTH extrema, sign-dispatched at project) — each held to
+  `run_carrier == eval` in `tests/laws.rs`. Three are pinned with
+  explanations (closed-form iota sums; one alphabet-limited artifact).
+- **Stated limits**: the pool, alphabet, and collision budget bound what
+  the probe sees (they are printed in the report); a pass is evidence plus
+  a candidate, not a proof — the derivation itself, oracle-checked, is the
+  proof. The pins are open work items, not exemptions.
+
+"What proves we won't miss more?" — nothing proves it absolutely (the
+general question is undecidable); what exists now is a standing tripwire
+with the right failure mode: a missed fusion is a failing test naming its
+carrier, not a benchmark surprise.
 
 ## Principles (don't regress these)
 

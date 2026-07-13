@@ -844,3 +844,77 @@ fn soft_attention_over_logspace_dp() {
     // ── batch stays FREE through the whole composite ─────────────────────────
     assert_eq!(structure(&recur, b).level, Parallelism::Free);
 }
+
+/// The distributive laws the completeness probe forced into the algebra
+/// (invariant reduction, lattice coupling, additive deferral, signed
+/// defer-scale, and the k-best value-only carrier), each held to
+/// `run_carrier == eval` on random data — including sign flips, which are
+/// exactly where a wrong defer-scale would lie.
+#[test]
+fn probe_discovered_laws_are_sound() {
+    use sanic::interp::{Env, Extents, Tensor, eval, run_carrier};
+
+    let n = axis("n");
+    let x = || input("X", &[n]);
+    let coll = |op: BinOp| reduce(x(), n, op);
+    let mul = |a: Node, b: Node| map(MapOp::Mul, vec![a, b]);
+    let add = |a: Node, b: Node| map(MapOp::Add, vec![a, b]);
+    let subn = |a: Node, b: Node| map(MapOp::Sub, vec![a, b]);
+    let mx = |a: Node, b: Node| map(MapOp::Max, vec![a, b]);
+    let mn = |a: Node, b: Node| map(MapOp::Min, vec![a, b]);
+
+    let programs: Vec<(&str, Node)> = vec![
+        // invariant reductions: Σ/max/min/lse over a same-axis collapsed value
+        ("sum_of_sum", reduce(coll(add_r()), n, add_r())),
+        ("max_of_sum", reduce(coll(add_r()), n, max_r())),
+        ("lse_of_max", reduce(coll(max_r()), n, lse_r())),
+        (
+            "sum_of_scaled_max",
+            reduce(mul(coll(max_r()), konst(-1.5)), n, add_r()),
+        ),
+        // lattice coupling: reduce_m(max/min(pe, coll)) for m ∈ {Max, Min}
+        ("min_of_max_pe_coll", reduce(mx(subn(iota(n), x()), coll(add_r())), n, BinOp::Monoid(Monoid::Min))),
+        ("max_of_max_coll_pe", reduce(mx(coll(add_r()), x()), n, max_r())),
+        ("max_of_min_pe_coll", reduce(mn(x(), coll(add_r())), n, max_r())),
+        ("min_of_min_coll_pe", reduce(mn(coll(max_r()), x()), n, BinOp::Monoid(Monoid::Min))),
+        // additive deferral: pe ± coll under Max/Min/Add
+        ("max_of_pe_plus_coll", reduce(add(iota(n), coll(max_r())), n, max_r())),
+        ("min_of_coll_minus_pe", reduce(subn(coll(max_r()), x()), n, BinOp::Monoid(Monoid::Min))),
+        ("sum_of_pe_plus_coll", reduce(add(x(), coll(max_r())), n, add_r())),
+        // signed defer-scale: extremum of coll·pe dispatches on the sign
+        ("min_of_scaled_pe", reduce(mul(add(x(), konst(0.5)), coll(max_r())), n, BinOp::Monoid(Monoid::Min))),
+        ("max_of_scaled_iota", reduce(mul(mul(iota(n), coll(max_r())), coll(add_r())), n, max_r())),
+        // k-best values and indices at every rank
+        ("top3_v0", reduce(x(), n, BinOp::TopK { k: 3, rank: 0, idx: false })),
+        ("top3_v2", reduce(x(), n, BinOp::TopK { k: 3, rank: 2, idx: false })),
+        ("top3_i1", reduce(x(), n, BinOp::TopK { k: 3, rank: 1, idx: true })),
+    ];
+
+    let mut rng = Lcg::new(0xD15C0);
+    for (name, g) in programs {
+        let c = derive(&g, n).unwrap_or_else(|| panic!("{name}: must derive"));
+        for trial in 0..6 {
+            let len = 3 + trial;
+            let ext: Extents = [(n, len)].into_iter().collect();
+            // mixed signs, planted ties: the adversarial cases for these laws
+            let vals: Vec<f64> = (0..len)
+                .map(|i| {
+                    let v = (rng.next_f64() * 4.0 - 2.0) * 100.0;
+                    (v.round() / 4.0) * if i % 3 == 2 { -1.0 } else { 1.0 }
+                })
+                .collect();
+            let env: Env = [(
+                "X",
+                Tensor::from_fn(&[n], &ext, |c| vals[c[&n]]),
+            )]
+            .into_iter()
+            .collect();
+            let want = eval(&g, &env, &ext).data[0];
+            let got = run_carrier(&g, n, &c, &env, &ext).data[0];
+            assert!(
+                (want - got).abs() <= 1e-9 * (1.0 + want.abs()),
+                "{name} (len {len}): eval={want} run_carrier={got}\nvals={vals:?}"
+            );
+        }
+    }
+}

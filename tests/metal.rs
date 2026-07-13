@@ -1038,3 +1038,38 @@ fn w4_grouped_matvec_runs_on_gpu() {
     assert!(maxrel < 2e-3, "W4 matvec MISMATCH {maxrel:e}");
     eprintln!("W4A16 grouped matvec on GPU (packed int4 + f16 scales): GPU OK {maxrel:e}");
 }
+
+/// The k-best tuple monoid on real hardware: every rank's value AND index of
+/// a top-8 selection — including planted exact ties, where first-max-wins is
+/// the contract — derived as single folds and dispatched on the GPU.
+#[test]
+fn topk_kbest_folds_run_on_gpu() {
+    let n = axis("n");
+    let ext: Extents = [(n, 129)].into_iter().collect();
+    let mut rng = Lcg(0xC0BE5);
+    let mut vals: Vec<f64> = (0..129).map(|_| rng.f()).collect();
+    // exact ties: a duplicated maximum and an interior duplicate
+    vals[97] = vals[13]; // tie at some mid rank
+    let m = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    vals[110] = m; // duplicate of the max, later position
+    let env: Env = [(
+        "X",
+        Tensor::from_fn(&[n], &ext, |c| vals[c[&n]]),
+    )]
+    .into_iter()
+    .collect();
+
+    for (r, (v, i)) in topk(input("X", &[n]), n, 8).into_iter().enumerate() {
+        for (tag, node) in [("val", v), ("idx", i)] {
+            let carrier = derive(&node, n).expect("k-best derives");
+            let name = format!("top8_{tag}_{r}");
+            let kernel = emit_fused_metal(&name, &carrier, n, &node, &ext);
+            let reference = eval(&node, &env, &ext);
+            let Some(out) = run_on_gpu(&name, &kernel, &env, &reference) else {
+                eprintln!("skipping: no Metal device");
+                return;
+            };
+            eprintln!("{name} on GPU: {}", out.trim());
+        }
+    }
+}

@@ -116,6 +116,7 @@ fn intra_tile_batch(c: &Carrier, col_axis: Option<Axis>, row_inp: &str) -> Optio
         match c.kinds[i] {
             SlotKind::AffineStep => return None,
             SlotKind::ArgIdx { .. } => return None, // index-carrying: not in this family
+            SlotKind::KBestVal { .. } | SlotKind::KBestIdx { .. } => return None,
 
             SlotKind::Plain(m) => {
                 let op = match m {

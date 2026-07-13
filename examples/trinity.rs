@@ -315,34 +315,31 @@ fn build() -> Model {
             let score = sigmoid(matmul(xn2.clone(), router_in, dm));
             roots.push((score, nm("score")));
             let score_in = input(nm("score"), &[nr]);
-            let cur0 = map(
+            // Selection is on bias-corrected scores; the k-best tuple monoid
+            // makes every rank ONE independent fold over them — no
+            // mask-the-winner chain, no per-round materialized cuts. The
+            // route WEIGHTS re-gather the raw sigmoid scores below.
+            let biased = map(
                 MapOp::Add,
                 vec![score_in.clone(), input(nm("ebias"), &[nr])],
             );
-            roots.push((cur0, leak(format!("cur0_{l}"))));
-            let mut cur_in = input(leak(format!("cur0_{l}")), &[nr]);
 
             let mut idxs = Vec::new();
             let mut ws: Vec<Node> = Vec::new();
             for j in 0..TOPK {
-                let idx = argmax(cur_in.clone(), nr);
+                let idx = reduce(
+                    biased.clone(),
+                    nr,
+                    BinOp::TopK {
+                        k: TOPK as u8,
+                        rank: j as u8,
+                        idx: true,
+                    },
+                );
                 let idx_name = leak(format!("idx{j}_{l}"));
                 roots.push((idx, idx_name));
                 let idx_in = input(idx_name, &[]);
                 ws.push(gather(score_in.clone(), idx_in.clone(), nr));
-                if j + 1 < TOPK {
-                    let nxt = map(
-                        MapOp::Where,
-                        vec![
-                            one_hot(nr, idx_in.clone()),
-                            konst(f64::NEG_INFINITY),
-                            cur_in,
-                        ],
-                    );
-                    let nname = leak(format!("cur{}_{l}", j + 1));
-                    roots.push((nxt, nname));
-                    cur_in = input(nname, &[nr]);
-                }
                 idxs.push(idx_in);
             }
             let mut wsum = konst(1e-20);

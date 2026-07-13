@@ -9,8 +9,8 @@
 //! composition — `Exp(x − m)` where `m` is the running max of the same
 //! stream — not matched against a fused `exp_sub` op.
 //!
-//! Only five things ever happen during a derivation, and the carrier records
-//! which ones did (its `rules`), in plain words:
+//! A fixed set of things can happen during a derivation, and the carrier
+//! records which ones did (its `rules`), in plain words:
 //!
 //! * `fold` — a reduction along the axis became an accumulator slot.
 //! * `fused-map` — elementwise work was folded into the per-element lift, so
@@ -23,6 +23,30 @@
 //! * `defer-div` — a normalizer (a value folded over the same axis) was
 //!   pulled out of a linear reduction by distributivity and is applied once,
 //!   at the end.
+//! * `k-best` — an index-carrying selection ([`BinOp::ArgMax`] /
+//!   [`BinOp::TopK`]): sorted (value, index) lists of length ≤ k form a
+//!   tuple monoid, so argmax and every top-k rank are single folds.
+//! * `invariant` — a reduction over an axis its operand does not vary along:
+//!   `Σ = n·value` (the count is itself a slot), `max/min/lse = value (+ln n)`.
+//! * `lattice` — `reduce_m(max/min(z, c))` for m ∈ {Max, Min} and `c`
+//!   collapsed over the same axis: order homomorphisms commute, so the
+//!   coupling collapses after the fold (`min_i max(z_i, c) = max(min z, c)`).
+//! * `defer-add` — `z ± c` with `c` collapsed: offsets commute with order
+//!   reductions and leave a sum through a count slot (`Σ(z+c) = Σz + n·c`).
+//! * `defer-scale` — an extremum of `c·z`: the sign of `c` decides which
+//!   extremum survives, so BOTH are carried and project dispatches on sign.
+//!
+//! Soundness and completeness are guarded separately. Soundness: every
+//! carrier is executable data, run against the interpreter (`tests/laws.rs`
+//! holds each rule to `run_carrier == eval`, ties and sign flips included).
+//! Completeness: "fusable" has a semantic definition independent of this
+//! file — h streams iff some constant-size sketch of the prefix determines
+//! every extension (a list homomorphism into a small carrier, tested
+//! Myhill–Nerode-style by collision probing) — and `tests/completeness.rs`
+//! holds DECLINES to it: a declined program whose carrier the probe can
+//! exhibit is a red test, not a benchmark surprise waiting to happen. The
+//! `invariant`/`lattice`/`defer-add`/`defer-scale` rules above were found
+//! exactly that way.
 //!
 //! A derived carrier is *data* — slots plus three symbolic programs (`into`,
 //! `combine`, `project`) — so it can be executed by the interpreter below,
@@ -403,6 +427,17 @@ pub enum SlotKind {
     /// The index half of an index-carrying maximum: merged as
     /// `a₀ < b₀ ? b_i : a_i` against max slot `max_slot` — first max wins.
     ArgIdx { max_slot: usize },
+    /// Value slot `rank` of a k-best selection (descending, first-max-wins);
+    /// `base` is the rank-0 slot and ranks are contiguous from it. The
+    /// combine is the SINGLETON insert `merge(A, [b])` — exact for
+    /// element-at-a-time streaming, NOT a two-list merge, so split
+    /// reductions must decline (guarded in `run_carrier_split` /
+    /// `emit_split_metal`).
+    KBestVal { base: usize, rank: usize },
+    /// Index slot `rank` of a k-best selection; `vbase`/`ibase` are the
+    /// rank-0 value/index slots. Same singleton-insert caveat as
+    /// [`SlotKind::KBestVal`].
+    KBestIdx { vbase: usize, ibase: usize, rank: usize },
 }
 
 /// What streaming a sub-expression over the axis produced so far.
@@ -423,6 +458,17 @@ enum S {
     /// Only `Exp` may consume it; that consumption is where the coupling is
     /// discovered.
     PeOff { raw: Expr, max_slot: usize },
+    /// A per-element value max/min-ed with a value collapsed over the SAME
+    /// axis (`max(z, c)` / `min(z, c)`): the lattice-coupling intermediate.
+    /// Only a Max/Min reduction may consume it — lattice distributivity
+    /// (`min_i max(z_i, c) = max(min_i z_i, c)`) is where it collapses.
+    /// Found by the completeness probe.
+    PeExt { raw: Expr, coll: Expr, is_max: bool },
+    /// A per-element value plus a value collapsed over the same axis
+    /// (`z + c`): the additive-coupling intermediate. Max/Min pull the
+    /// offset out unchanged; Add pulls out `n·c` through a count slot.
+    /// Found by the completeness probe.
+    PeAdd { raw: Expr, off: Expr },
     /// Collapsed over the axis — a reduced value, over the final slots.
     Coll(Expr),
 }
@@ -572,7 +618,7 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
     // caller should target the reduction that consumes it instead.
     let project = match s {
         S::Coll(e) => vec![e],
-        S::Pe { .. } | S::PeOff { .. } => return None,
+        S::Pe { .. } | S::PeOff { .. } | S::PeExt { .. } | S::PeAdd { .. } => return None,
     };
 
     let (into, combine, identity) = assemble(&ctx.slots);
@@ -698,7 +744,51 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             SlotKind::ArgIdx { max_slot },
             Expr::Item(iota_leaf),
         );
+        // The index ranges over whatever grid rows the max does — its `into`
+        // (an iota) says nothing about that, so inherit the span.
+        ctx.slots[idx_slot].span = ctx.slots[max_slot].span.clone();
         return Some(S::Coll(Expr::F(idx_slot)));
+    }
+    // k-best selection: one carrier holds the whole sorted (value, index)
+    // k-list; each `rank` projects one slot. Ranks > 0 contribute the
+    // identity per element (a singleton list is rank 0 only).
+    if let BinOp::TopK { k, rank, idx } = op {
+        let s = go(src, axis, ctx)?;
+        let raw = plain_pe(&s)?;
+        let k = k as usize;
+        let vbase = ctx.slots.len();
+        for r in 0..k {
+            let into = if r == 0 {
+                raw.clone()
+            } else {
+                cst(f64::NEG_INFINITY)
+            };
+            ctx.push_slot(SlotKind::KBestVal { base: vbase, rank: r }, into);
+        }
+        // A value-only query needs no index half; an index query needs both.
+        let ibase = ctx.slots.len();
+        if idx {
+            let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+            for r in 0..k {
+                let into = if r == 0 {
+                    Expr::Item(iota_leaf)
+                } else {
+                    cst(0.0)
+                };
+                ctx.push_slot(SlotKind::KBestIdx { vbase, ibase, rank: r }, into);
+            }
+        }
+        // Every slot of the list ranges over the same grid rows as rank 0.
+        let span0 = ctx.slots[vbase].span.clone();
+        for r in 0..k {
+            ctx.slots[vbase + r].span = span0.clone();
+            if idx {
+                ctx.slots[ibase + r].span = span0.clone();
+            }
+        }
+        ctx.rules.insert("k-best");
+        let slot = if idx { ibase } else { vbase } + rank as usize;
+        return Some(S::Coll(Expr::F(slot)));
     }
     let BinOp::Monoid(m) = op else {
         return None; // non-associative / affine handled elsewhere
@@ -707,8 +797,27 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
 
     match m {
         Monoid::Add => {
+            // Σ over an axis the value does not vary along = n·value: the
+            // invariant distributes out of the sum. The count is itself a
+            // slot (into = 1) — the fold measures the extent, the carrier
+            // never needs to know it. Found by the completeness probe.
+            if let Some(e) = as_coll(&s) {
+                ctx.rules.insert("invariant");
+                let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
+                return Some(S::Coll(pmul(e, Expr::F(cnt))));
+            }
+            // Σ(z + c) = Σz + n·c — the offset leaves through a count slot.
+            if let S::PeAdd { raw, off } = s {
+                ctx.rules.insert("defer-add");
+                let slot = ctx.push_slot(SlotKind::Plain(Monoid::Add), raw);
+                let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
+                return Some(S::Coll(padd(
+                    Expr::F(slot),
+                    pmul(off, Expr::F(cnt)),
+                )));
+            }
             let S::Pe { raw, shift, post } = s else {
-                return None; // cannot re-reduce an already-collapsed axis
+                return None; // a shifted/deferred form we cannot re-reduce
             };
             let kind = match shift {
                 Some(max_slot) => {
@@ -727,8 +836,12 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
         }
 
         Monoid::LogSumExp => {
-            // Log-space reduction = the same (max, Σexp) pair, projected by
-            // `log(s) + m`. Built by the rules, not stored.
+            // LSE over an invariant = value + ln n (n from a count slot).
+            if let Some(e) = as_coll(&s) {
+                ctx.rules.insert("invariant");
+                let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
+                return Some(S::Coll(padd(e, log(Expr::F(cnt)))));
+            }
             let S::Pe {
                 raw,
                 shift: None,
@@ -748,6 +861,36 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
 
         // max / min / product: plain monoid slots; nothing rides, nothing defers.
         Monoid::Max | Monoid::Min | Monoid::Mul => {
+            // max/min over n ≥ 1 copies of an invariant is the invariant
+            // (extents are ≥ 1 everywhere in this system). A product would
+            // be value^n — no closed slot form; it stays declined.
+            if !matches!(m, Monoid::Mul)
+                && let Some(e) = as_coll(&s)
+            {
+                ctx.rules.insert("invariant");
+                return Some(S::Coll(e));
+            }
+            // Lattice distributivity: reduce_m(max/min(z, c)) = max/min
+            // applied AFTER reduce_m(z) — for every m, j ∈ {Max, Min}.
+            if !matches!(m, Monoid::Mul)
+                && let S::PeExt { raw, coll, is_max } = &s
+            {
+                ctx.rules.insert("lattice");
+                let slot = ctx.push_slot(SlotKind::Plain(m), raw.clone());
+                return Some(S::Coll(if *is_max {
+                    emax(Expr::F(slot), coll.clone())
+                } else {
+                    emin(Expr::F(slot), coll.clone())
+                }));
+            }
+            // max/min(z + c) = max/min(z) + c — offsets commute with order.
+            if !matches!(m, Monoid::Mul)
+                && let S::PeAdd { raw, off } = &s
+            {
+                ctx.rules.insert("defer-add");
+                let slot = ctx.push_slot(SlotKind::Plain(m), raw.clone());
+                return Some(S::Coll(padd(Expr::F(slot), off.clone())));
+            }
             let S::Pe {
                 raw,
                 shift: None,
@@ -756,11 +899,31 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             else {
                 return None;
             };
-            if !is1(&post) {
+            if is1(&post) {
+                let slot = ctx.push_slot(SlotKind::Plain(m), raw);
+                return Some(S::Coll(Expr::F(slot)));
+            }
+            // Deferred scale under an order reduction: the sign of the
+            // factor decides which extremum survives — max(c·z) is c·max(z)
+            // for c ≥ 0 but c·min(z) for c < 0 — so carry BOTH extrema and
+            // dispatch on the sign at project time. (Mul keeps declining:
+            // the factor would need an n-th power.)
+            if matches!(m, Monoid::Mul) {
                 return None;
             }
-            let slot = ctx.push_slot(SlotKind::Plain(m), raw);
-            Some(S::Coll(Expr::F(slot)))
+            ctx.rules.insert("defer-scale");
+            let mx = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw.clone());
+            let mn = ctx.push_slot(SlotKind::Plain(Monoid::Min), raw);
+            let (pos, neg) = match m {
+                Monoid::Max => (mx, mn),
+                Monoid::Min => (mn, mx),
+                _ => unreachable!(),
+            };
+            Some(S::Coll(ewhere(
+                elt(cst(0.0), post.clone()),
+                pmul(post.clone(), Expr::F(pos)),
+                pmul(post, Expr::F(neg)),
+            )))
         }
     }
 }
@@ -916,6 +1079,57 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             post: pdiv(post, q),
         }),
 
+        // Per-element max/min/± against a value GENUINELY collapsed over
+        // the same axis (a slot expression — as with the deferred factor, a
+        // promoted constant must NOT take these paths: constants combine
+        // into the per-element value directly and stay composable). The
+        // coupling collapses later, at the reduction that consumes it.
+        (Bin::Max, a, b) | (Bin::Min, a, b)
+            if matches!(op, Bin::Max | Bin::Min)
+                && (plain_pe(&a).is_some() && matches!(b, S::Coll(_))
+                    || matches!(a, S::Coll(_)) && plain_pe(&b).is_some()) =>
+        {
+            let (raw, coll) = match (plain_pe(&a), &b) {
+                (Some(r), S::Coll(c)) => (r, c.clone()),
+                _ => {
+                    let S::Coll(c) = a else { unreachable!() };
+                    (plain_pe(&b).unwrap(), c)
+                }
+            };
+            Some(S::PeExt {
+                raw,
+                coll,
+                is_max: matches!(op, Bin::Max),
+            })
+        }
+        (Bin::Add, a, b)
+            if plain_pe(&a).is_some() && matches!(b, S::Coll(_))
+                || matches!(a, S::Coll(_)) && plain_pe(&b).is_some() =>
+        {
+            let (raw, off) = match (plain_pe(&a), &b) {
+                (Some(r), S::Coll(c)) => (r, c.clone()),
+                _ => {
+                    let S::Coll(c) = a else { unreachable!() };
+                    (plain_pe(&b).unwrap(), c)
+                }
+            };
+            Some(S::PeAdd { raw, off })
+        }
+        (Bin::Sub, a, b) if plain_pe(&a).is_some() && matches!(b, S::Coll(_)) => {
+            let S::Coll(c) = b else { unreachable!() };
+            Some(S::PeAdd {
+                raw: plain_pe(&a).unwrap(),
+                off: sub(cst(0.0), c),
+            })
+        }
+        (Bin::Sub, a, b) if matches!(a, S::Coll(_)) && plain_pe(&b).is_some() => {
+            let S::Coll(c) = a else { unreachable!() };
+            Some(S::PeAdd {
+                raw: sub(cst(0.0), plain_pe(&b).unwrap()),
+                off: c,
+            })
+        }
+
         // Two per-element values. Multiplication merges exp-shift domains and
         // deferred factors; the other ops require plain values.
         (
@@ -987,6 +1201,41 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
                 // first max wins: switch to B only on a STRICT improvement
                 ewhere(elt(Expr::A(mx), Expr::B(mx)), Expr::B(i), Expr::A(i))
             }
+            // Insert the incoming element (B's rank-0 pair) into the sorted
+            // list: strict `<` everywhere, so an equal LATER element never
+            // displaces an earlier one — first-max-wins across all ranks.
+            SlotKind::KBestVal { base, rank } => {
+                let b = Expr::B(base);
+                if rank == 0 {
+                    ewhere(elt(Expr::A(base), b.clone()), b, Expr::A(base))
+                } else {
+                    // Displaced at rank r: the new value is the old rank r−1
+                    // (shifted down) if the element sits above it, else the
+                    // element itself lands exactly here.
+                    ewhere(
+                        elt(Expr::A(base + rank), b.clone()),
+                        ewhere(
+                            elt(Expr::A(base + rank - 1), b.clone()),
+                            Expr::A(base + rank - 1),
+                            b,
+                        ),
+                        Expr::A(base + rank),
+                    )
+                }
+            }
+            SlotKind::KBestIdx { vbase, ibase, rank } => {
+                let bv = Expr::B(vbase);
+                let bi = Expr::B(ibase);
+                if rank == 0 {
+                    ewhere(elt(Expr::A(vbase), bv), bi, Expr::A(ibase))
+                } else {
+                    ewhere(
+                        elt(Expr::A(vbase + rank), bv.clone()),
+                        ewhere(elt(Expr::A(vbase + rank - 1), bv), Expr::A(ibase + rank - 1), bi),
+                        Expr::A(ibase + rank),
+                    )
+                }
+            }
             SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();
@@ -996,6 +1245,8 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
             SlotKind::Plain(m) => m.identity(),
             SlotKind::ExpShifted { .. } => 0.0,
             SlotKind::ArgIdx { .. } => 0.0,
+            SlotKind::KBestVal { .. } => f64::NEG_INFINITY,
+            SlotKind::KBestIdx { .. } => 0.0,
             SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();

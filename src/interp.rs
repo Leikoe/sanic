@@ -261,6 +261,38 @@ fn eval_node(
             let s = eval_rc(src, env, extents, cache);
             let oaxes: Vec<Axis> = s.axes.iter().copied().filter(|a| a != axis).collect();
             let n = extent(extents, *axis);
+            // k-best: stable descending sort = first-max-wins ranks
+            if let BinOp::TopK { k: _, rank, idx } = op {
+                let (rank, idx) = (*rank as usize, *idx);
+                return Tensor::from_fn(&oaxes, extents, |c| {
+                    let mut coord = c.clone();
+                    let mut items: Vec<(f64, usize)> = (0..n)
+                        .map(|i| {
+                            coord.insert(*axis, i);
+                            (s.at(&coord), i)
+                        })
+                        .collect();
+                    items.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    match items.get(rank) {
+                        Some(&(v, i)) => {
+                            if idx {
+                                i as f64
+                            } else {
+                                v
+                            }
+                        }
+                        None => {
+                            if idx {
+                                0.0
+                            } else {
+                                f64::NEG_INFINITY
+                            }
+                        }
+                    }
+                });
+            }
             // the index-carrying maximum: value = position of the FIRST max
             if let BinOp::ArgMax = op {
                 return Tensor::from_fn(&oaxes, extents, |c| {
@@ -567,6 +599,16 @@ pub fn run_carrier_split(
     let grid = output_axes(node); // the free axes — the kernel's parallel grid
     let n = extent(extents, axis);
     assert!(
+        blocks == 1
+            || !carrier.kinds.iter().any(|k| matches!(
+                k,
+                crate::derive::SlotKind::KBestVal { .. }
+                    | crate::derive::SlotKind::KBestIdx { .. }
+            )),
+        "split reduction: a k-best carrier's combine is the singleton insert, \
+         not a two-list merge — partials cannot be merged"
+    );
+    assert!(
         blocks >= 1 && blocks <= n,
         "blocks must be in [1, extent({axis}) = {n}]; an empty chunk's identity \
          partial would hit the −∞ rescale edge"
@@ -607,9 +649,12 @@ pub fn run_carrier_split(
             }
             partials.push(acc);
         }
-        // stage 2: merge the partials, project once
-        let mut acc = carrier.identity.clone();
-        for p in &partials {
+        // stage 2: merge the partials, project once. Start from the first
+        // partial, not the identity: for a monoid the two are equal, and a
+        // k-best carrier (whose combine is the singleton insert, legal only
+        // at blocks = 1) must not see its full list on the B side of a merge.
+        let mut acc = partials[0].clone();
+        for p in &partials[1..] {
             acc = carrier.merge(&acc, p);
         }
         carrier.project(&acc)[0]

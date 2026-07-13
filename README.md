@@ -36,23 +36,31 @@ ir  →  analyze  →  derive  →  cost / plan / partition  →  interp (oracle
   primitives (`add mul max lt where exp log sqrt …`), so the deriver is
   total over the vocabulary — there is no open set of named ops to
   special-case. Matmul, softmax, attention, silu, causal masks, one-hot
-  position writes, argmax, top-k, scatter-add, convolution and SSM scans are
-  *compositions* of the basis. Axes are variables, not strings: an `Axis`
+  position writes, scatter-add, convolution and SSM scans are *compositions*
+  of the basis; argmax and top-k are single `Reduce` ops over tuple monoids
+  (an index-carrying max, and sorted k-lists under merge). Axes are variables, not strings: an `Axis`
   is a fresh integer identity with a printing label.
 - **`analyze`** — one recursive pass tags every `(node, axis)` as `FREE`
   (grid), `MONOIDAL` (foldable), `OPAQUE` (data-dependent gather), or
   `SEQUENTIAL` (non-associative recurrence). `analyze_all` packages the
   verdicts into the structure map.
 - **`derive`** — one bottom-up fold turns a foldable axis into a concrete
-  accumulator. Only five things ever happen, and each carrier records which
-  did: `fold` (a reduction became a slot), `fused-map` (elementwise work
-  fused into the lift), `tuple` (more than one slot), `rescale` (the
-  online-softmax coupling — a slot rides a running max), `defer-div` (the
-  normalizer is applied once, at the end). Coupling and deferral are detected
-  by *data dependence* — the online-softmax coupling is discovered from the
-  plain composition `Exp(x − max)`, not matched against a fused special
-  form — so the same code derives `sum`, `mean`, `variance`, `logsumexp`,
-  FlashAttention, and RMSNorm-fused GEMMs alike.
+  accumulator. A fixed set of rules fires, and each carrier records which
+  did: `fold`, `fused-map`, `tuple`, `rescale` (the online-softmax
+  coupling — a slot rides a running max), `defer-div` (the normalizer is
+  applied once, at the end), `k-best` (argmax / top-k as index-carrying
+  tuple monoids), `invariant` / `lattice` / `defer-add` / `defer-scale`
+  (the distributive laws — Σ over an unvarying axis is n·value, order
+  reductions commute with max/min/offset/scale couplings). Coupling and
+  deferral are detected by *data dependence* — the online-softmax coupling
+  is discovered from the plain composition `Exp(x − max)`, not matched
+  against a fused special form — so the same code derives `sum`, `mean`,
+  `variance`, `logsumexp`, FlashAttention, and RMSNorm-fused GEMMs alike.
+  Soundness AND completeness are both oracle-tested: every carrier runs
+  against the interpreter, and every DECLINE faces a semantic
+  carrier-existence probe (`tests/completeness.rs`) — a declined program
+  whose carrier the probe can exhibit is a failing test, so missed fusions
+  surface as red CI, not benchmark surprises.
 - **`cost` / `plan`** — the profitability half. `cost` knows only `Device`s
   and `Kernel`s: feasibility, a roofline, and two searches. `plan` assigns
   every output axis a role — row tile, column tile, grid batch, or
@@ -220,7 +228,8 @@ identical** (bf16-round-tripped weights: ≤ 0.54 drift, same tokens).
 
 **Trinity-Nano (5.5B AFMoE), int4-packed, on a 16 GB laptop:**
 `cargo run --release --example trinity` compiles a 56-layer, 128-expert MoE
-with grouped-query attention into **3,515 kernels per decode step** — GQA as
+with grouped-query attention into **1,856 kernels per decode step** (~32%
+fewer than mlx-lm dispatches for the same model, with zero primitives) — GQA as
 shared axis variables, top-8 sigmoid routing as the `topk` composition, and
 the MoE proper as a router plus **grouped gate/up/down folds over a 9-slot
 axis** (8 routed experts + the shared expert), one vector-indexed `gather`

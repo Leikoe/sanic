@@ -298,6 +298,14 @@ pub fn emit_split_metal(
     ext: &Extents,
     blocks: usize,
 ) -> (MetalKernel, MetalKernel) {
+    assert!(
+        !carrier.kinds.iter().any(|k| matches!(
+            k,
+            crate::derive::SlotKind::KBestVal { .. } | crate::derive::SlotKind::KBestIdx { .. }
+        )),
+        "split reduction: a k-best carrier's combine is the singleton insert, \
+         not a two-list merge — partials cannot be merged"
+    );
     assert_eq!(
         carrier.project.len(),
         1,

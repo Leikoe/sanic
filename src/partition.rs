@@ -357,14 +357,15 @@ impl Partitioner<'_> {
         }
     }
 
-    /// The subtrees of a fold LEAF that must be materialized: anything
-    /// carrying a fold of its own (a producer GEMM), anything DAG-shared
-    /// (materialize once, not per consumer), and anything already
+    /// The subtrees of a fold LEAF (streamed over `axis`) that must be
+    /// materialized: anything carrying a fold of its own (a producer GEMM),
+    /// stream-varying transcendental chains, and anything already
     /// materialized (read its buffer). Everything else — elementwise
-    /// arithmetic, views, reindexes, gathers — is per-element work the
-    /// kernel computes in-body. The [`Partitioner::entanglers`] idea,
-    /// applied to leaves: cut as deep as possible, keep the arithmetic.
-    fn leaf_cuts(&self, node: &Node, out: &mut Vec<Node>) {
+    /// arithmetic, views, reindexes, gathers, stream-INVARIANT
+    /// transcendentals — is per-element work the kernel computes in-body.
+    /// The [`Partitioner::entanglers`] idea, applied to leaves: cut as deep
+    /// as possible, keep the arithmetic.
+    fn leaf_cuts(&self, node: &Node, axis: Axis, out: &mut Vec<Node>) {
         let push = |node: &Node, out: &mut Vec<Node>| {
             if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
                 out.push(node.clone());
@@ -376,28 +377,28 @@ impl Partitioner<'_> {
         }
         // In-body leaf arithmetic runs once per (grid × stream) point, where
         // a materialized leaf is computed once per its own volume. Cheap ops
-        // (a dequant multiply, a mask) win inline; transcendental chains (a
-        // GELU, a rotary table) lose — recomputed per stream step they cost
-        // more than the spill they save.
-        let cheap = |op: MapOp| {
-            !matches!(
-                op,
-                MapOp::Exp | MapOp::Log | MapOp::Sqrt | MapOp::Tanh | MapOp::Sin | MapOp::Cos
-            )
-        };
+        // (a dequant multiply, a mask, a residual add) win inline — even
+        // DAG-SHARED ones: recomputing an add per consumer is nothing next
+        // to a kernel launch plus a memory round trip, so sharing is a
+        // reason to cut only when the work is real. A transcendental map
+        // inlines exactly when its subtree does not vary along the streamed
+        // axis: hoisted out of the stream loop it costs one evaluation per
+        // grid point, the same as a buffer read (a norm's rsqrt of a row
+        // scalar); varying along the stream it is recomputed every step (a
+        // GELU inside a GEMM) and materializes instead.
         match node.as_ref() {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Map { op, inputs } if !self.shared(node) && cheap(*op) => {
+            NodeKind::Map { inputs, op } if cheap_op(*op) || !all_axes(node).contains(&axis) => {
                 for i in inputs {
-                    self.leaf_cuts(i, out);
+                    self.leaf_cuts(i, axis, out);
                 }
             }
-            NodeKind::Gather { src, index, .. } if !self.shared(node) => {
-                self.leaf_cuts(src, out);
-                self.leaf_cuts(index, out);
+            NodeKind::Gather { src, index, .. } => {
+                self.leaf_cuts(src, axis, out);
+                self.leaf_cuts(index, axis, out);
             }
             NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-                self.leaf_cuts(src, out)
+                self.leaf_cuts(src, axis, out)
             }
             _ => push(node, out),
         }
@@ -512,7 +513,7 @@ impl Partitioner<'_> {
         let mut subs: Vec<(Node, Node)> = Vec::new();
         let cut_into = |p: &mut Self, node: &Node, subs: &mut Vec<(Node, Node)>| {
             let mut cuts = Vec::new();
-            p.leaf_cuts(node, &mut cuts);
+            p.leaf_cuts(node, axis, &mut cuts);
             for c in cuts {
                 p.cut(&c);
                 // splice, not `input(name, output_axes)`: a view/reindex above
@@ -670,9 +671,13 @@ impl Partitioner<'_> {
     /// multi-output partition, say — is a frontier read, not something to
     /// recompute inline.
     fn cone(&self, node: &Node, ops: &mut Vec<&'static str>, frontier: &mut Vec<Node>, top: bool) {
+        let live = !self.done.contains_key(&Rc::as_ptr(node));
         match node.as_ref() {
+            // A shared map joins the cone when its op is cheap — each
+            // consumer recomputes a few ALU ops instead of forcing a
+            // materialized stage. Shared transcendentals stay barriers.
             NodeKind::Map { op, inputs }
-                if top || (!self.shared(node) && !self.done.contains_key(&Rc::as_ptr(node))) =>
+                if top || (live && (!self.shared(node) || cheap_op(*op))) =>
             {
                 if !ops.contains(&op.name()) {
                     ops.push(op.name());
@@ -680,6 +685,15 @@ impl Partitioner<'_> {
                 for i in inputs {
                     self.cone(i, ops, frontier, false);
                 }
+            }
+            // An indexed load is per-element work, not a producer: keep it
+            // in-body and take its source and index as the cone's inputs.
+            NodeKind::Gather { src, index, .. } if live => {
+                if !ops.contains(&"gather") {
+                    ops.push("gather");
+                }
+                self.cone(src, ops, frontier, false);
+                self.cone(index, ops, frontier, false);
             }
             // Literals and iotas are ambient — not inputs, not producers.
             NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
@@ -696,6 +710,17 @@ impl Partitioner<'_> {
 
 fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
+}
+
+/// Per-element ops cheap enough to recompute rather than materialize — a
+/// launch plus a memory round trip always loses to a handful of ALU ops.
+/// The transcendentals are the exception; where they may still inline
+/// (stream-invariant subtrees) the caller checks axes, not the op.
+fn cheap_op(op: MapOp) -> bool {
+    !matches!(
+        op,
+        MapOp::Exp | MapOp::Log | MapOp::Sqrt | MapOp::Tanh | MapOp::Sin | MapOp::Cos
+    )
 }
 
 /// Free to read in any kernel: a raw input (possibly behind views or affine
