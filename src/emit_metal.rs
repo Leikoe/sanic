@@ -19,9 +19,9 @@ use crate::codegen::{
     Gen, Lang, LaneBody, buffers, carrier_expr, carrier_expr_map, grid_of, offset, san,
     thread_grid_decode, thread_grid_decode_from, value,
 };
-use crate::derive::{Carrier, Expr};
+use crate::derive::{Carrier, Expr, SlotKind};
 use crate::interp::Extents;
-use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, input_dtypes, output_axes};
+use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, NodeKind, input_dtypes, output_axes};
 use crate::partition::{Schedule, Stage};
 use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
 
@@ -246,6 +246,69 @@ fn expr_refs(e: &Expr, items: &mut std::collections::HashSet<usize>, slots: &mut
     }
 }
 
+/// The "honest window" of a prefix-masked rescale fold: the leaf index of
+/// the mask edge (`pos`), when every masked stream position is an EXACT
+/// f32 no-op so the stream loop may stop at `pos + 1`.
+///
+/// Detected structurally, and only for the carrier shape where the claim is
+/// provable: exactly one `Plain(Max)` slot whose lift carries an additive
+/// `where(edge < iota(stream), K, 0)` with `K ≤ -1e29`, and every other
+/// slot `ExpShifted` riding it. Then, in f32: a masked score rounds to K
+/// exactly (|score| ≪ ulp(K)); K never wins the max as long as one unmasked
+/// element was folded first (a PREFIX mask guarantees the unmasked elements
+/// come first, and the emitters keep the bound ≥ the split width so no lane
+/// folds an empty range — the −∞ merge edge); and each ExpShifted slot's
+/// contribution is its lift TIMES `exp(K − m)`, which underflows to exactly
+/// 0.0f. Skipping the masked tail is bit-identical, not approximate — dead
+/// work the algebra already knows is dead.
+fn prefix_mask_edge(carrier: &Carrier, stream: Axis) -> Option<usize> {
+    let max_slots: Vec<usize> = carrier
+        .kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| matches!(k, SlotKind::Plain(Monoid::Max)))
+        .map(|(j, _)| j)
+        .collect();
+    let [ms] = max_slots[..] else { return None };
+    if !carrier.kinds.iter().enumerate().all(|(j, k)| {
+        j == ms || matches!(k, SlotKind::ExpShifted { max_slot } if *max_slot == ms)
+    }) {
+        return None;
+    }
+    fn edge_of(e: &Expr, carrier: &Carrier, stream: Axis) -> Option<usize> {
+        let leaves = &carrier.leaves;
+        if let Expr::Where(c, a, b) = e
+            && let Expr::Lt(x, y) = &**c
+            && let (Expr::Item(p), Expr::Item(i)) = (&**x, &**y)
+            && matches!(leaves[*i].as_ref(), NodeKind::Iota { axis } if *axis == stream)
+            && !output_axes(&leaves[*p]).contains(&stream)
+            && matches!(&**a, Expr::Const(k) if *k <= -1e29)
+            && matches!(&**b, Expr::Const(z) if *z == 0.0)
+        {
+            return Some(*p);
+        }
+        match e {
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Max(a, b)
+            | Expr::Min(a, b)
+            | Expr::Lt(a, b) => {
+                edge_of(a, carrier, stream).or_else(|| edge_of(b, carrier, stream))
+            }
+            Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
+                edge_of(a, carrier, stream)
+            }
+            Expr::Where(c, a, b) => edge_of(c, carrier, stream)
+                .or_else(|| edge_of(a, carrier, stream))
+                .or_else(|| edge_of(b, carrier, stream)),
+            _ => None,
+        }
+    }
+    edge_of(&carrier.into[ms], carrier, stream)
+}
+
 /// Emit an MSL kernel for one fused, scalar-projecting carrier: one thread per
 /// output grid point, streaming `stream` in registers.
 pub fn emit_fused_metal(
@@ -278,6 +341,21 @@ pub fn emit_fused_metal(
         .join(", ");
     body.push(format!("float acc[{slots}] = {{ {ident} }};"));
 
+    // honest window: a prefix-masked rescale fold stops at the mask edge
+    // (bit-identical — the masked tail is an exact f32 no-op)
+    let s_bound = match prefix_mask_edge(carrier, stream) {
+        Some(p) => {
+            let e = value(&METAL, &carrier.leaves[p], &coord, ext, &mut g, &mut body);
+            let v = g.fresh("hi");
+            body.push(format!(
+                "uint {v} = min({}u, (uint)({e} + 0.5f) + 1u);",
+                ext[&stream]
+            ));
+            v
+        }
+        None => format!("{}", ext[&stream]),
+    };
+
     let sv = g.fresh("s");
     let mut cs = coord.clone();
     cs.insert(stream, sv.clone());
@@ -288,8 +366,7 @@ pub fn emit_fused_metal(
         .map(|l| value(&METAL, l, &cs, ext, &mut g, &mut sbody))
         .collect();
     body.push(format!(
-        "for (uint {sv} = 0; {sv} < {}; {sv}++) {{",
-        ext[&stream]
+        "for (uint {sv} = 0; {sv} < {s_bound}; {sv}++) {{"
     ));
     body.extend(sbody.into_iter().map(|s| format!("    {s}")));
     body.push(format!(
@@ -489,8 +566,25 @@ pub fn emit_fused_metal_sched(
             s_ext / chunk
         ));
     } else {
+        // honest window: a prefix-masked rescale fold stops at the mask
+        // edge — clamped UP to the split width so every lane folds at
+        // least one element (an identity-valued accumulator must never
+        // reach the rescale merge: the −∞ edge). Positions between the
+        // edge and the clamp are exact f32 no-ops, so the clamp only
+        // costs work, never correctness.
+        let s_bound = match prefix_mask_edge(carrier, stream) {
+            Some(p) => {
+                let e = value(&METAL, &carrier.leaves[p], &coord, ext, &mut g, &mut body);
+                let v = g.fresh("hi");
+                body.push(format!(
+                    "uint {v} = min({s_ext}u, max((uint)({e} + 0.5f) + 1u, {f_split}u));"
+                ));
+                v
+            }
+            None => format!("{s_ext}u"),
+        };
         body.push(format!(
-            "for (uint s_ = {unit}; s_ < {s_ext}u; s_ += {f_split}u) {{"
+            "for (uint s_ = {unit}; s_ < {s_bound}; s_ += {f_split}u) {{"
         ));
     }
     if sched.lane_axis.is_some() {

@@ -490,11 +490,16 @@ is a good future hardening).
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
 partition speed at 10k-kernel scale, and the rest of the ladder, each
-measured in `vs_mlx.md`: honest-window streaming (skip the masked tail =
-fold the identity), elementwise-cone fusion, kernel dedup across
+measured in `vs_mlx.md`: elementwise-cone fusion, kernel dedup across
 isomorphic layers, autotuning, multi-device, flash float4 loads, and the
 rest of the packed-fold proto gap (explicit 32-bit packed-word loads,
 output-row batching per simdgroup, the −8·Σx zero-point hoist). CLIMBED:
+honest-window early exit (2026-07-13) — a prefix-masked rescale fold
+stops at the mask edge (`pos` read at runtime, graph stays capturable);
+provably bit-identical (masked tail = exact f32 no-op; coop bound
+clamped to the split width so no lane merges identity — the −∞ edge);
+prefill causal flash gets per-row windows from the same detector; flash
+class 2.01 → 0.51 ms, GPU-tested at four positions vs the full oracle. CLIMBED:
 chunked lane streams (2026-07-13) — `FoldSched.chunk` folds contiguous
 8-element runs per lane when a packed leaf makes contiguity pay; MoE
 gate/up 2.2×, down 4.4 → 3.75 ms, GPU-bit-checked

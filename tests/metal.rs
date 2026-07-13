@@ -1485,6 +1485,71 @@ fn coop_chunked_w4_matvec_matches_oracle() {
     eprintln!("chunked (8-contiguous per lane) W4 matvec on GPU: GPU OK {maxrel:e}");
 }
 
+/// The honest window: a decode-shaped causal flash (pos as DATA) stops its
+/// stream loop at the mask edge. The masked tail is an exact f32 no-op —
+/// K never wins the max, exp(K − m) underflows to 0.0f — so early exit is
+/// bit-preserving, checked here at several positions on both the scalar
+/// and the cooperative (lane-clamped) kernels against the FULL-window
+/// oracle.
+#[test]
+fn honest_window_flash_matches_full_oracle() {
+    use sanic::emit_metal::emit_fused_metal_sched;
+    use sanic::plan::FoldSched;
+    let (t, d, e) = (axis("t"), axis("d"), axis("e"));
+    let ext: Extents = [(t, 256), (d, 8), (e, 8)].into_iter().collect();
+    let mut rng = Lcg(0x90E57);
+    let base_env: Env = [
+        ("q", rand_tensor(&[d], &ext, &mut rng)),
+        ("K", rand_tensor(&[t, d], &ext, &mut rng)),
+        ("V", rand_tensor(&[t, e], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    // decode attention: scores + where(pos < iota(t), -1e30, 0), softmax·V
+    let scores = matmul(input("q", &[d]), input("K", &[t, d]), d);
+    let future = map(MapOp::Lt, vec![input("pos", &[]), iota(t)]);
+    let masked = map(
+        MapOp::Add,
+        vec![
+            scores,
+            map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)]),
+        ],
+    );
+    let attn = matmul(softmax(masked, t), input("V", &[t, e]), t);
+    let carrier = derive(&attn, t).unwrap();
+
+    for pos in [0usize, 3, 40, 255] {
+        let mut env = base_env.clone();
+        env.insert(
+            "pos",
+            Tensor::from_fn(&[], &ext, |_| pos as f64),
+        );
+        let reference = eval(&attn, &env, &ext);
+
+        let kernel = emit_fused_metal("hw_flash", &carrier, t, &attn, &ext);
+        assert!(kernel.msl.contains("+ 0.5f) + 1u)"), "window bound emitted");
+        let Some(out) = run_on_gpu("hw_flash", &kernel, &env, &reference) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        eprintln!("honest-window scalar flash @pos={pos}: {}", out.trim());
+
+        let sched = FoldSched {
+            lane_axis: None,
+            sgs: 2,
+            lane_stream: true,
+            chunk: 1,
+        };
+        let kc = emit_fused_metal_sched("hw_flash_coop", &carrier, t, &attn, &ext, sched);
+        assert!(kc.msl.contains("max((uint)("), "lane-clamped bound emitted");
+        let Some(out) = run_coop_on_gpu("hw_flash_coop", &kc, &env, &reference, &ext) else {
+            return;
+        };
+        eprintln!("honest-window coop flash @pos={pos}: {}", out.trim());
+    }
+}
+
 /// First-max-wins argmax is order-SENSITIVE: an interleaved lane partition
 /// would change which duplicate wins, so the schedule must decline to the
 /// scalar kernel — and still be correct on planted exact ties.

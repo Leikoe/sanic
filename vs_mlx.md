@@ -230,6 +230,22 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**Honest-window early exit (2026-07-13): the flash class 2.01 → 0.51 ms.**
+A prefix-masked rescale fold now stops its stream loop at the mask edge,
+read from `pos` at runtime — the graph stays fixed-shape for capture, the
+kernel skips the masked tail. Detected structurally where the claim is
+PROVABLE (one Plain(Max) slot with an additive `where(edge < iota, −1e30,
+0)` lift, all other slots ExpShifted riding it), and the skip is
+bit-identical, not approximate: a masked score rounds to −1e30 exactly in
+f32, never wins the max (the prefix guarantees an unmasked element folded
+first, and the cooperative form clamps the bound up to the split width so
+no lane merges an identity accumulator — the −∞ edge), and `exp(−1e30 −
+m)` underflows to exactly 0.0f. The same detector gives PREFILL causal
+flash per-row windows for free (`iota(q)` is a stream-invariant leaf).
+GPU-checked at pos ∈ {0, 3, 40, 255} against the full-window oracle,
+scalar and cooperative. Remaining flash headroom: float4 K/V loads (the
+proto's last 1.8×).
+
 **Chunked lane streams for packed folds (2026-07-13): MoE gate/up 2.27 →
 1.02 / 1.09 ms, down 4.40 → 3.75 ms.** `FoldSched.chunk`: with the
 stream split across lanes, each lane folds CONTIGUOUS runs of 8 elements
