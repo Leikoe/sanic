@@ -321,17 +321,29 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   **~4 tok/s streaming at ~250 ms/token**. QK-norms fold their flattened
   head pair in one kernel, and rotate-half RoPE is a pure `Reindex`
   (src `j2 = 1 − j2`) — no fold at all.
-- **Same machine, same models, vs torch** (batch-1 KV-cache decode):
-  GPT-2 — torch eager MPS dispatches **1,250 aten ops/step at 5.9 ms/tok**;
-  sanic dispatches 271 kernels at 29 ms/tok. Trinity — torch eager
-  dispatches **93,228 ops/step at 1,180 ms/tok on CPU** (its per-expert
-  Python loop probes all 128 experts × 54 layers; and bf16 at 11 GB cannot
-  fit this machine's MPS working set at all, while sanic's int4 path runs
-  the model on the GPU at 252 ms/tok). Lesson: sanic already dispatches
-  FEWER kernels than eager torch on both models — the 5× gpt2 latency gap
-  is per-kernel quality (MPS's hand-tuned GEMM/SDPA vs our
-  one-thread-per-output folds), which is the tiling/threadgroup-memory
-  work, not the kernel count.
+- **Same machine, same models — the measured ladder** (batch-1 KV decode,
+  M1 Pro 16 GB):
+
+  | GPT-2 124M | per step | latency |
+  |---|---|---|
+  | MLX | (tuned lib kernels) | **5.3 ms/tok** (190 tok/s) |
+  | torch eager MPS | 1,250 aten ops | 5.9 ms/tok (169 tok/s) |
+  | sanic | 271 derived kernels | 29 ms/tok (35 tok/s) |
+
+  | Trinity 5.5B | per step | latency |
+  |---|---|---|
+  | nanoinfer megakernel (int4/fp8) | **1 dispatch** | ~15 ms/tok (67.5 tok/s) |
+  | mlx-lm 8-bit (afmoe upstream: gather_qmm grouped experts) | (tuned lib kernels) | 16.1 ms/tok (62 tok/s) |
+  | sanic int4 | 3,947 derived kernels | 252 ms/tok (4 tok/s) |
+  | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |
+
+  All four GPT-2 rows emit the same greedy text. Lessons: sanic already
+  dispatches FEWER kernels than eager torch (the per-expert Python loop
+  probes 128 experts × 54 layers); the ~15× gap to MLX / the megakernel is
+  **per-kernel quality** — their decode matvec is a simdgroup-cooperative,
+  vectorized kernel at ~89% of the bandwidth ceiling (their own
+  measurement), ours is one thread per output with scalar loads. That is
+  the tiling/threadgroup-memory rung of the ladder, not kernel count.
 - The kernel-count postmortem drove three partitioner improvements, all
   oracle-guarded: fold leaves keep CHEAP per-element arithmetic in-body
   (dequantization, masks, gathers — packed int4 never spills; 342M
