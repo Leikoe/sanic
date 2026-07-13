@@ -662,6 +662,60 @@ fn main() {
 
     println!("Trinity-Nano (afmoe): 56 layers, GQA 8/2, 128-expert MoE, W4A16");
     let model = build();
+    if args.iter().any(|a| a == "--dump") {
+        use sanic::partition::Stage;
+        // Normalized per-stage signatures for schedule diffing across
+        // compiler versions: intermediate numbers and layer suffixes masked.
+        let norm = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    out.push('N');
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        for st in &model.sched.stages {
+            match st {
+                Stage::Fused { spec, epilogue, .. } => println!(
+                    "F axis={} slots={} rules={:?} tiles={}x{}x{} eps={:?} in={:?} out={}",
+                    spec.streaming_axis.label(),
+                    spec.carrier.slots,
+                    spec.carrier.rules,
+                    spec.tile_m,
+                    spec.tile_n,
+                    spec.tile_c,
+                    epilogue,
+                    spec.input_names.iter().map(|n| norm(n)).collect::<Vec<_>>(),
+                    norm(&spec.output_name),
+                ),
+                Stage::Elementwise { ops, inputs, output, .. } => println!(
+                    "E ops={:?} in={:?} out={}",
+                    ops,
+                    inputs.iter().map(|n| norm(n)).collect::<Vec<_>>(),
+                    norm(output),
+                ),
+                Stage::Gather { inputs, output, .. } => println!(
+                    "G in={:?} out={}",
+                    inputs.iter().map(|n| norm(n)).collect::<Vec<_>>(),
+                    norm(output),
+                ),
+                Stage::Sequential { op, inputs, output, .. } => println!(
+                    "S op={op} in={:?} out={}",
+                    inputs.iter().map(|n| norm(n)).collect::<Vec<_>>(),
+                    norm(output),
+                ),
+                Stage::Infeasible { output, .. } => println!("I out={}", norm(output)),
+            }
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--stats") {
         use sanic::partition::Stage;
         let mut folds = 0usize;

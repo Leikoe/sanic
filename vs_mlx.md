@@ -228,6 +228,24 @@ the honest-window early exit), f32 attention weights (−2.6 ms at f16), and
 the 641-kernel elementwise tail. Summed, the identified rungs reach
 ~10–12 ms/tok — past mlx-lm, on an int4 model it can't hold at 8-bit.
 
+## The ladder, climbed (running)
+
+**Cut placement (2026-07-13): 26.0 → 23.3 ms/step, ~23 ms/token wall.**
+The MoE-down rung, and it took two corrections to land honestly. The
+partitioner's leaf cuts now translate the streamed axis through structural
+boundaries (below the W4 fold's flatten/split everything had looked
+stream-invariant, so the SwiGLU inlined); the first fix — materialize just
+the exp — made the fold *slower* (15.3 ms: the fold then loaded gate, up
+AND the exp per streamed element; three indexed loads cost more than the
+transcendental they replaced). The shipped rule cuts at the TOP of the
+offending cone when that materializes no more elements: the fold reads ONE
+activation value per element, MLX's gather_qmm shape. MoE-down class
+7.8 → 4.3 ms; the sigmoid-gated attention output (`ctx·σ(gate)` feeding
+the o proj) was the same disease, fixed by the same rule. Numerics
+bit-identical; +112 tiny cone maps, hidden by replay overlap (Σ per-stage
+37.7 ms vs 23.3 replayed). Remaining down-fold headroom is the vectorized
+int4 load rung, unchanged.
+
 ## Reproduce
 
 ```

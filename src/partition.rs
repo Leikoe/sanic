@@ -320,44 +320,115 @@ impl Partitioner<'_> {
     }
 
     fn splice(&self, node: &Node, is_root: bool) -> Node {
+        self.splice_memo(node, is_root, &mut HashMap::new())
+    }
+
+    /// Memoized by pointer, and a subtree with nothing spliced beneath
+    /// returns the ORIGINAL `Rc`: DAG sharing survives the rebuild (the
+    /// deriver dedups leaves by pointer, and `done` is keyed by pointer, so
+    /// a node another consumer will cut must keep its identity), and deep
+    /// shared chains splice in linear time.
+    fn splice_memo(
+        &self,
+        node: &Node,
+        is_root: bool,
+        memo: &mut HashMap<*const NodeKind, Node>,
+    ) -> Node {
         if !is_root {
             if is_free_source(node) {
                 return node.clone(); // read a raw input / const / index directly
             }
+            if let Some(m) = memo.get(&Rc::as_ptr(node)) {
+                return m.clone();
+            }
             if let NodeKind::View { src, groups } = node.as_ref() {
-                return crate::ir::view(self.splice(src, false), groups.clone());
+                let s = self.splice_memo(src, false, memo);
+                let out = if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    crate::ir::view(s, groups.clone())
+                };
+                memo.insert(Rc::as_ptr(node), out.clone());
+                return out;
             }
             if let NodeKind::Reindex { src, map, padded } = node.as_ref() {
-                return crate::ir::reindex(self.splice(src, false), map.clone(), *padded);
+                let s = self.splice_memo(src, false, memo);
+                let out = if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    crate::ir::reindex(s, map.clone(), *padded)
+                };
+                memo.insert(Rc::as_ptr(node), out.clone());
+                return out;
             }
             if let Some(name) = self.done.get(&Rc::as_ptr(node)) {
-                return input(name, &output_axes(node)); // a materialized buffer read
+                let read = input(name, &output_axes(node)); // a materialized buffer read
+                memo.insert(Rc::as_ptr(node), read.clone());
+                return read;
             }
         }
-        match node.as_ref() {
+        let out = match node.as_ref() {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => node.clone(),
             NodeKind::Map { op, inputs } => {
-                crate::ir::map(*op, inputs.iter().map(|i| self.splice(i, false)).collect())
+                let new: Vec<Node> = inputs
+                    .iter()
+                    .map(|i| self.splice_memo(i, false, memo))
+                    .collect();
+                if new.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+                    node.clone()
+                } else {
+                    crate::ir::map(*op, new)
+                }
             }
             NodeKind::Reduce { src, axis, op } => {
-                crate::ir::reduce(self.splice(src, false), *axis, *op)
+                let s = self.splice_memo(src, false, memo);
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    crate::ir::reduce(s, *axis, *op)
+                }
             }
             NodeKind::Scan { src, axis, op } => {
-                crate::ir::scan(self.splice(src, false), *axis, *op)
+                let s = self.splice_memo(src, false, memo);
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    crate::ir::scan(s, *axis, *op)
+                }
             }
             NodeKind::Gather { src, index, axis } => {
-                crate::ir::gather(self.splice(src, false), self.splice(index, false), *axis)
+                let s = self.splice_memo(src, false, memo);
+                let i = self.splice_memo(index, false, memo);
+                if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+                    node.clone()
+                } else {
+                    crate::ir::gather(s, i, *axis)
+                }
             }
             NodeKind::View { src, groups } => {
-                crate::ir::view(self.splice(src, false), groups.clone())
+                let s = self.splice_memo(src, false, memo);
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    crate::ir::view(s, groups.clone())
+                }
             }
             NodeKind::Reindex { src, map, padded } => {
-                crate::ir::reindex(self.splice(src, false), map.clone(), *padded)
+                let s = self.splice_memo(src, false, memo);
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    crate::ir::reindex(s, map.clone(), *padded)
+                }
             }
+        };
+        if !is_root {
+            memo.insert(Rc::as_ptr(node), out.clone());
         }
+        out
     }
 
-    /// The subtrees of a fold LEAF (streamed over `axis`) that must be
+    /// The subtrees of a fold LEAF (streamed over `axes`) that must be
     /// materialized: anything carrying a fold of its own (a producer GEMM),
     /// stream-varying transcendental chains, and anything already
     /// materialized (read its buffer). Everything else — elementwise
@@ -365,7 +436,16 @@ impl Partitioner<'_> {
     /// transcendentals — is per-element work the kernel computes in-body.
     /// The [`Partitioner::entanglers`] idea, applied to leaves: cut as deep
     /// as possible, keep the arithmetic.
-    fn leaf_cuts(&self, node: &Node, axis: Axis, out: &mut Vec<Node>) {
+    ///
+    /// `axes` is the streamed axis IN THE CURRENT FRAME: exactly as in
+    /// `entanglers`, the axis translates at every structural boundary (below
+    /// a flatten the stream lives on the group members; below a split, on
+    /// the mapped source axis; below a gather whose index varies with the
+    /// stream, on the gathered axis). Without the translation everything
+    /// under a flattened fold looks stream-invariant, and a SwiGLU's exp
+    /// stays in-body of the down projection — recomputed once per output
+    /// row instead of evaluated once per element.
+    fn leaf_cuts(&self, node: &Node, axes: &[Axis], out: &mut Vec<Node>) {
         let push = |node: &Node, out: &mut Vec<Node>| {
             if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
                 out.push(node.clone());
@@ -386,21 +466,155 @@ impl Partitioner<'_> {
         // grid point, the same as a buffer read (a norm's rsqrt of a row
         // scalar); varying along the stream it is recomputed every step (a
         // GELU inside a GEMM) and materializes instead.
+        //
+        // And when something below WILL be cut, cut at the TOP of the
+        // enclosing elementwise cone rather than around the offender — as
+        // long as that doesn't materialize more elements. Cutting a SwiGLU's
+        // exp alone leaves gate·recip(1+·)·up in-body: the fold then loads
+        // gate, up AND the exp per streamed element, which costs more than
+        // the exp did. Cutting the whole activation cone leaves ONE load.
+        // The launch is already paid; the volume bound keeps the lift from
+        // ever writing a broadcast product.
         match node.as_ref() {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Map { inputs, op } if cheap_op(*op) || !all_axes(node).contains(&axis) => {
+            NodeKind::Map { inputs, op }
+                if cheap_op(*op) || {
+                    let na = all_axes(node);
+                    !axes.iter().any(|a| na.contains(a))
+                } =>
+            {
+                if let Some(hot) = self.hot_volume(node, axes)
+                    && self.volume(node) <= hot
+                {
+                    push(node, out);
+                    return;
+                }
                 for i in inputs {
-                    self.leaf_cuts(i, axis, out);
+                    self.leaf_cuts(i, axes, out);
                 }
             }
-            NodeKind::Gather { src, index, .. } => {
-                self.leaf_cuts(src, axis, out);
-                self.leaf_cuts(index, axis, out);
+            NodeKind::Gather { src, index, axis: g } => {
+                // A stream-varying index touches a different `g`-slice of the
+                // source every step: below the gather, that variation lives
+                // on the gathered axis.
+                let ia = all_axes(index);
+                let mut sa = axes.to_vec();
+                if axes.iter().any(|a| ia.contains(a)) && !sa.contains(g) {
+                    sa.push(*g);
+                }
+                self.leaf_cuts(src, &sa, out);
+                self.leaf_cuts(index, axes, out);
             }
-            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-                self.leaf_cuts(src, axis, out)
+            NodeKind::View { src, groups } => {
+                // Below a flatten the stream lives on the group members.
+                let mut sa: Vec<Axis> = Vec::new();
+                for &a in axes {
+                    match groups.iter().find(|(_, to)| *to == a) {
+                        Some((members, _)) => sa.extend(members.iter().copied()),
+                        None => sa.push(a),
+                    }
+                }
+                self.leaf_cuts(src, &sa, out)
+            }
+            NodeKind::Reindex { src, map, .. } => {
+                // Below a split/window, the stream lives on the mapped source
+                // axes its terms drive.
+                let mut sa: Vec<Axis> = Vec::new();
+                for &a in axes {
+                    let mut driving = map
+                        .iter()
+                        .filter(|(_, terms, _)| terms.iter().any(|(_, t)| *t == a))
+                        .map(|(m, _, _)| *m)
+                        .peekable();
+                    if driving.peek().is_none() {
+                        sa.push(a);
+                    } else {
+                        sa.extend(driving);
+                    }
+                }
+                self.leaf_cuts(src, &sa, out)
             }
             _ => push(node, out),
+        }
+    }
+
+    /// Elements this node materializes to (the product of its output axes'
+    /// extents).
+    fn volume(&self, node: &Node) -> f64 {
+        output_axes(node)
+            .iter()
+            .map(|a| self.extents.get(a).copied().unwrap_or(1.0))
+            .product()
+    }
+
+    /// The largest volume among stream-varying transcendental maps in the
+    /// in-body cone below `node` — the elements `leaf_cuts` is about to
+    /// materialize anyway. `None` when nothing below forces a cut. Same
+    /// boundaries and axis translation as [`Partitioner::leaf_cuts`].
+    fn hot_volume(&self, node: &Node, axes: &[Axis]) -> Option<f64> {
+        if self.done.contains_key(&Rc::as_ptr(node)) {
+            return None;
+        }
+        {
+            // An invariant subtree cannot host a stream-varying map.
+            let na = all_axes(node);
+            if !axes.iter().any(|a| na.contains(a)) {
+                return None;
+            }
+        }
+        let max = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, None) | (None, x) => x,
+        };
+        match node.as_ref() {
+            NodeKind::Map { inputs, op } => {
+                let mut hot = if cheap_op(*op) {
+                    None
+                } else {
+                    Some(self.volume(node))
+                };
+                for i in inputs {
+                    hot = max(hot, self.hot_volume(i, axes));
+                }
+                hot
+            }
+            NodeKind::Gather { src, index, axis: g } => {
+                let ia = all_axes(index);
+                let mut sa = axes.to_vec();
+                if axes.iter().any(|a| ia.contains(a)) && !sa.contains(g) {
+                    sa.push(*g);
+                }
+                max(self.hot_volume(src, &sa), self.hot_volume(index, axes))
+            }
+            NodeKind::View { src, groups } => {
+                let mut sa: Vec<Axis> = Vec::new();
+                for &a in axes {
+                    match groups.iter().find(|(_, to)| *to == a) {
+                        Some((members, _)) => sa.extend(members.iter().copied()),
+                        None => sa.push(a),
+                    }
+                }
+                self.hot_volume(src, &sa)
+            }
+            NodeKind::Reindex { src, map, .. } => {
+                let mut sa: Vec<Axis> = Vec::new();
+                for &a in axes {
+                    let mut driving = map
+                        .iter()
+                        .filter(|(_, terms, _)| terms.iter().any(|(_, t)| *t == a))
+                        .map(|(m, _, _)| *m)
+                        .peekable();
+                    if driving.peek().is_none() {
+                        sa.push(a);
+                    } else {
+                        sa.extend(driving);
+                    }
+                }
+                self.hot_volume(src, &sa)
+            }
+            // Fold-bearing subtrees are pushed whole by `leaf_cuts` — their
+            // interior is not this cut's concern. Free sources carry no work.
+            _ => None,
         }
     }
 
@@ -467,10 +681,19 @@ impl Partitioner<'_> {
         }
     }
 
-    /// The cheapest axis that derives at this node, if any.
+    /// The cheapest axis that derives at this node, if any. Axes that live
+    /// only BENEATH an already-materialized producer are vetoed: a cut exp
+    /// over a done GEMM is an elementwise map of that buffer, not a second
+    /// GEMM with the exp at project. (The veto is the splice's only role
+    /// here — derivation, pricing and emission all stay on the original
+    /// node, so every surviving choice is unchanged.)
     fn best_fold(&self, node: &Node) -> Option<(Axis, Carrier)> {
+        let live = all_axes(&self.splice(node, true));
         let mut best: Option<(Axis, Carrier, f64)> = None;
         for axis in all_axes(node) {
+            if !live.contains(&axis) {
+                continue; // collapsed inside a done producer — read it instead
+            }
             if structure(node, axis).level != Parallelism::Monoidal {
                 continue;
             }
@@ -513,7 +736,7 @@ impl Partitioner<'_> {
         let mut subs: Vec<(Node, Node)> = Vec::new();
         let cut_into = |p: &mut Self, node: &Node, subs: &mut Vec<(Node, Node)>| {
             let mut cuts = Vec::new();
-            p.leaf_cuts(node, axis, &mut cuts);
+            p.leaf_cuts(node, &[axis], &mut cuts);
             for c in cuts {
                 p.cut(&c);
                 // splice, not `input(name, output_axes)`: a view/reindex above
@@ -1206,6 +1429,126 @@ mod tests {
             "silu·gate·up fused into the lift: {:?}",
             spec.carrier.rules
         );
+    }
+
+    // The FLATTENED variant of the down projection (the W4-matvec shape: the
+    // contraction split into (group, lane) so a per-group scale is pure axis
+    // structure, then flattened back to one streamed fold). The flatten blocks
+    // the lift-fusion path, so the whole product is one LEAF — and the leaf
+    // cut must translate the streamed axis through the flatten/split to see
+    // that the silu's exp VARIES along the stream. Left in-body it would be
+    // recomputed once per output row (the Trinity MoE-down regression). And
+    // the cut lands at the TOP of the activation cone, not around the exp:
+    // the fold reads ONE materialized activation per streamed element
+    // instead of gate + up + exp (three loads cost more than the exp did).
+    #[test]
+    fn swiglu_leaf_of_a_flattened_fold_materializes_the_cone() {
+        let (dm, f, gi, ri, fl) = (
+            axis("dm"),
+            axis("f"),
+            axis("gi"),
+            axis("ri"),
+            axis("fl"),
+        );
+        let gate = input("G", &[f]);
+        let up = input("U", &[f]);
+        let act = map(MapOp::Mul, vec![silu(gate), up]);
+        let xs = split(act, f, gi, ri, 32);
+        let prod = map(
+            MapOp::Mul,
+            vec![
+                map(MapOp::Mul, vec![input("Wd", &[dm, gi, ri]), xs]),
+                input("Sc", &[dm, gi]),
+            ],
+        );
+        let down = reduce(flatten(prod, &[gi, ri], fl), fl, add_r());
+
+        let sched = partition(
+            &down,
+            &Device::toy(),
+            &ext(&[
+                (dm, 1024.0),
+                (f, 4096.0),
+                (gi, 128.0),
+                (ri, 32.0),
+                (fl, 4096.0),
+            ]),
+        );
+        // The whole silu·up cone is one elementwise stage; the fold reads it.
+        assert_eq!(sched.stages.len(), 2, "activation cone + down fold");
+        let Stage::Elementwise { ops, .. } = &sched.stages[0] else {
+            panic!("the activation cone is its own elementwise stage")
+        };
+        assert!(ops.contains(&"exp"), "the cone holds the silu: {ops:?}");
+        assert!(ops.contains(&"mul"), "…and the gating multiply: {ops:?}");
+        let Stage::Fused {
+            spec, fold_node, ..
+        } = sched.stages.last().unwrap()
+        else {
+            panic!("last stage is the fused down fold")
+        };
+        assert_eq!(spec.streaming_axis, fl);
+        fn has_exp(n: &Node) -> bool {
+            match n.as_ref() {
+                NodeKind::Map { op, inputs } => *op == MapOp::Exp || inputs.iter().any(has_exp),
+                NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => has_exp(src),
+                NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => has_exp(src),
+                NodeKind::Gather { src, index, .. } => has_exp(src) || has_exp(index),
+                _ => false,
+            }
+        }
+        assert!(
+            !has_exp(fold_node),
+            "no exp recomputed in-body of the flattened fold"
+        );
+    }
+
+    // When the sibling projections share their contraction axis, the whole
+    // activation — both GEMMs, the silu, the gating multiply — derives as ONE
+    // fold (the product monoid over both dot products, exp at project): the
+    // cone lift hands `emit` the full cone and the algebra takes it whole.
+    #[test]
+    fn swiglu_siblings_on_one_axis_derive_as_one_fold() {
+        let (s, dm, f, gi, ri, fl) = (
+            axis("s"),
+            axis("dm"),
+            axis("f"),
+            axis("gi"),
+            axis("ri"),
+            axis("fl"),
+        );
+        let x = input("Xn", &[s, dm]);
+        let gate = matmul(x.clone(), input("Wg", &[f, dm]), dm); // [s, f]
+        let up = matmul(x, input("Wu", &[f, dm]), dm); // [s, f]
+        let act = map(MapOp::Mul, vec![silu(gate), up]);
+        let xs = split(act, f, gi, ri, 32);
+        let prod = map(
+            MapOp::Mul,
+            vec![
+                map(MapOp::Mul, vec![input("Wd", &[dm, gi, ri]), xs]),
+                input("Sc", &[dm, gi]),
+            ],
+        );
+        let down = reduce(flatten(prod, &[gi, ri], fl), fl, add_r());
+
+        let sched = partition(
+            &down,
+            &Device::toy(),
+            &ext(&[
+                (s, 1024.0),
+                (dm, 1024.0),
+                (f, 4096.0),
+                (gi, 128.0),
+                (ri, 32.0),
+                (fl, 4096.0),
+            ]),
+        );
+        assert_eq!(sched.stages.len(), 2, "gate+up+silu fold, then down fold");
+        let Stage::Fused { spec, .. } = &sched.stages[0] else {
+            panic!("the activation derives as one fold")
+        };
+        assert_eq!(spec.streaming_axis, dm);
+        assert!(spec.carrier.slots >= 2, "both dot products in one carrier");
     }
 
     // An embedding lookup is its own OPAQUE gather stage.

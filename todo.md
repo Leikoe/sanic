@@ -142,13 +142,15 @@ page is substrate we need so the moat is usable on real workloads.
 bytes + bit-unpacking — the pricing is done, the buffer model is not),
 two-pass row-resident kernels (softmax-as-output), cost-driven *cut*
 placement (the split-reduction factor is priced, but `partition` does not
-yet auto-invoke it or weigh extra legal cuts — now with a measured instance:
-the MoE down fold leaves SwiGLU in-body, recomputed per output row, 7.8
-ms/step on Trinity), autotuning/measurement (the `--bench`/`--proto`
-harnesses measure; nothing feeds measurements back into choices), dynamic
-shapes, multi-device execution (the allreduce *math* is
-`run_carrier_split`'s merge; a device runtime is not built), `Scan` backward,
-strided-AND-dilated window transposes.
+yet auto-invoke it or weigh extra legal cuts — the measured instance, the
+MoE down fold recomputing SwiGLU per output row, is FIXED: leaf cuts now
+translate the streamed axis through flatten/split/gather boundaries and
+lift the cut to the top of the offending cone, Trinity 26.0 → 23.3 ms/step;
+the general priced-cut machinery is still open), autotuning/measurement
+(the `--bench`/`--proto` harnesses measure; nothing feeds measurements back
+into choices), dynamic shapes, multi-device execution (the allreduce *math*
+is `run_carrier_split`'s merge; a device runtime is not built), `Scan`
+backward, strided-AND-dilated window transposes.
 
 ## What "done" looks like
 
@@ -488,13 +490,27 @@ is a good future hardening).
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
 partition speed at 10k-kernel scale, and the rest of the ladder, each
-measured in `vs_mlx.md`: MoE-down leaf placement (SwiGLU recomputed
-in-body per output row — cost-driven CUTS, 7.8 ms), one-fold-per-layer
-top-k (432 rank kernels, 4.9 ms), vectorized packed loads + row batching
-per simdgroup (the 2.6×/1.8× proto gap on int4/flash), f16 attention
-weights (−2.6 ms), honest-window streaming (skip the masked tail = fold
-the identity), elementwise-cone fusion, kernel dedup across isomorphic
-layers, autotuning, multi-device.
+measured in `vs_mlx.md`: one-fold-per-layer top-k (432 rank kernels,
+4.9 ms), vectorized packed loads + row batching per simdgroup (the
+2.6×/1.8× proto gap on int4/flash), f16 attention weights (−2.6 ms),
+honest-window streaming (skip the masked tail = fold the identity),
+elementwise-cone fusion, kernel dedup across isomorphic layers,
+autotuning, multi-device. CLIMBED (2026-07-13): MoE-down leaf placement —
+`leaf_cuts` translates the streamed axis at every structural boundary
+(flatten/split/gather, exactly as `entanglers` does) and lifts the cut to
+the top of an offending elementwise cone when that materializes no more
+elements (cutting the exp alone would trade one transcendental for three
+in-body loads — measured slower); the sigmoid-gated attention output was
+the same disease and fixed by the same rule. A cut node whose derivable
+axis lives only beneath a materialization no longer re-folds it
+(`best_fold` vetoes via a memoized, sharing-preserving splice probe).
+Trinity 26.0 → **23.3 ms/step replayed, ~23 ms/token wall (43 tok/s)**,
+MoE-down class 7.8 → 4.3 ms, numerics bit-identical (same per-position
+Δlogit, argmax MATCH, same text, same 0.010 near-tie flip), GPT-2
+untouched (8 ms/tok, 24/24). Kernels 1,856 → 1,968 (+112 tiny activation
+cones, fully hidden by graph replay). When the sibling projections share
+a contraction axis the lifted cone instead derives as ONE fold (both dot
+products in one carrier, exp at project) — pinned by test.
 
 ## The completeness oracle (`tests/completeness.rs`)
 
