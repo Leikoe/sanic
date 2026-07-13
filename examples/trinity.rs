@@ -183,37 +183,6 @@ fn w4_matvec(
     reduce(flatten(prod, &[gi, ri], flat), flat, BinOp::Monoid(Monoid::Add))
 }
 
-/// The same W4 matvec with the weight/scale GATHERED by a routed expert
-/// index — MoE's data-dependent weight selection, still one fused fold.
-#[allow(clippy::too_many_arguments)]
-fn w4_matvec_expert(
-    x: Node,
-    w: &'static str,
-    s: &'static str,
-    ne: Axis,
-    idx: Node,
-    out_axes: &[Axis],
-    x_axis: Axis,
-    gi: Axis,
-    ri: Axis,
-    flat: Axis,
-) -> Node {
-    let xs = split(x, x_axis, gi, ri, GROUP);
-    let mut w_axes = vec![ne];
-    w_axes.extend(out_axes);
-    w_axes.extend([gi, ri]);
-    let mut s_axes = vec![ne];
-    s_axes.extend(out_axes);
-    s_axes.push(gi);
-    let wg = gather(input_dt(w, &w_axes, Dtype::I4), idx.clone(), ne);
-    let sg = gather(input(s, &s_axes), idx, ne);
-    let prod = map(
-        MapOp::Mul,
-        vec![map(MapOp::Mul, vec![wg, xs]), sg],
-    );
-    reduce(flatten(prod, &[gi, ri], flat), flat, BinOp::Monoid(Monoid::Add))
-}
-
 struct Model {
     sched: Schedule,
     ext: Extents,
@@ -338,42 +307,46 @@ fn build() -> Model {
             let act = map(MapOp::Mul, vec![silu(gate_y), up_y]);
             w4_matvec(act, nm("wdown"), nm("sdown"), &[dm], fd, gd, rd, c3)
         } else {
+            // ── MoE as a router + grouped GEMMs ──────────────────────────
+            // The 8 routed experts AND the shared expert are one `slot` axis
+            // (extent 9); the stacked weights carry the shared expert as
+            // index 128, and ONE vector-indexed gather selects all nine
+            // weight sets. Three grouped folds do all experts at once.
             let ne = axis("ne");
-            ext.insert(ne, NE);
-            // Routing rounds are NAMED SCHEDULE ROOTS, not one nested
-            // expression: each round's masked scores and argmax materialize
-            // and the next round reads them back. Nesting them instead makes
-            // every graph walker re-visit the shared chain ~3^8 times.
-            let score = sigmoid(matmul(xn2.clone(), input(nm("router"), &[ne, dm]), dm));
+            ext.insert(ne, NE + 1); // experts 0..127 + the shared expert
+            let router_in = input(nm("router"), &[axis("nr"), dm]);
+            let nr = output_axes(&router_in)[0];
+            ext.insert(nr, NE);
+            let score = sigmoid(matmul(xn2.clone(), router_in, dm));
             roots.push((score, nm("score")));
-            let score_in = input(nm("score"), &[ne]);
+            let score_in = input(nm("score"), &[nr]);
             let cur0 = map(
                 MapOp::Add,
-                vec![score_in.clone(), input(nm("ebias"), &[ne])],
+                vec![score_in.clone(), input(nm("ebias"), &[nr])],
             );
             roots.push((cur0, leak(format!("cur0_{l}"))));
-            let mut cur_in = input(leak(format!("cur0_{l}")), &[ne]);
+            let mut cur_in = input(leak(format!("cur0_{l}")), &[nr]);
 
             let mut idxs = Vec::new();
             let mut ws: Vec<Node> = Vec::new();
             for j in 0..TOPK {
-                let idx = argmax(cur_in.clone(), ne);
+                let idx = argmax(cur_in.clone(), nr);
                 let idx_name = leak(format!("idx{j}_{l}"));
                 roots.push((idx, idx_name));
                 let idx_in = input(idx_name, &[]);
-                ws.push(gather(score_in.clone(), idx_in.clone(), ne));
+                ws.push(gather(score_in.clone(), idx_in.clone(), nr));
                 if j + 1 < TOPK {
                     let nxt = map(
                         MapOp::Where,
                         vec![
-                            one_hot(ne, idx_in.clone()),
+                            one_hot(nr, idx_in.clone()),
                             konst(f64::NEG_INFINITY),
                             cur_in,
                         ],
                     );
                     let nname = leak(format!("cur{}_{l}", j + 1));
                     roots.push((nxt, nname));
-                    cur_in = input(nname, &[ne]);
+                    cur_in = input(nname, &[nr]);
                 }
                 idxs.push(idx_in);
             }
@@ -382,61 +355,77 @@ fn build() -> Model {
                 wsum = map(MapOp::Add, vec![wsum, w.clone()]);
             }
 
-            let mut expert = |xin: Node, idx: Option<Node>, l: usize| -> Node {
-                let nm2 = |p: &str| leak(format!("{p}_{l}"));
-                let (fe, ge, re, e1, e2, e3) = (
-                    axis("fe"),
-                    axis("ge"),
-                    axis("re"),
-                    axis("e1"),
-                    axis("e2"),
-                    axis("e3"),
+            // slot vectors: idx_all = [topk indices…, 128 (shared)],
+            // coef = [route-normalized-and-scaled weights…, 1.0]
+            let sl = axis("sl");
+            ext.insert(sl, TOPK + 1);
+            let mut idx_all = map(
+                MapOp::Mul,
+                vec![one_hot(sl, konst(TOPK as f64)), konst(NE as f64)],
+            );
+            let mut coef = one_hot(sl, konst(TOPK as f64)); // shared slot = 1.0
+            for (j, idx_in) in idxs.iter().enumerate() {
+                let here = one_hot(sl, konst(j as f64));
+                idx_all = map(
+                    MapOp::Add,
+                    vec![idx_all, map(MapOp::Mul, vec![here.clone(), idx_in.clone()])],
                 );
-                for (a, n) in
-                    [(fe, FE), (ge, FE / GROUP), (re, GROUP), (e1, DM), (e2, DM), (e3, FE)]
-                {
-                    ext.insert(a, n);
-                }
-                let (g_y, u_y, d_y);
-                match &idx {
-                    Some(ix) => {
-                        g_y = w4_matvec_expert(
-                            xin.clone(), nm2("weg"), nm2("seg"), ne, ix.clone(), &[fe], dm, gi, ri, e1,
-                        );
-                        u_y = w4_matvec_expert(
-                            xin.clone(), nm2("weu"), nm2("seu"), ne, ix.clone(), &[fe], dm, gi, ri, e2,
-                        );
-                        let act = map(MapOp::Mul, vec![silu(g_y), u_y]);
-                        d_y = w4_matvec_expert(
-                            act, nm2("wed"), nm2("sed"), ne, ix.clone(), &[dm], fe, ge, re, e3,
-                        );
-                    }
-                    None => {
-                        g_y = w4_matvec(xin.clone(), nm2("wsg"), nm2("ssg"), &[fe], dm, gi, ri, e1);
-                        u_y = w4_matvec(xin.clone(), nm2("wsu"), nm2("ssu"), &[fe], dm, gi, ri, e2);
-                        let act = map(MapOp::Mul, vec![silu(g_y), u_y]);
-                        d_y = w4_matvec(act, nm2("wsd"), nm2("ssd"), &[dm], fe, ge, re, e3);
-                    }
-                }
-                d_y
-            };
-
-            let mut acc = expert(xn2.clone(), None, l); // the shared expert
-            for (j, idx) in idxs.iter().enumerate() {
-                let coef = map(
+                let cj = map(
                     MapOp::Mul,
                     vec![
                         map(MapOp::Div, vec![ws[j].clone(), wsum.clone()]),
                         konst(ROUTE_SCALE),
                     ],
                 );
-                let contrib = map(
-                    MapOp::Mul,
-                    vec![expert(xn2.clone(), Some(idx.clone()), l), coef],
-                );
-                acc = map(MapOp::Add, vec![acc, contrib]);
+                coef = map(MapOp::Add, vec![coef, map(MapOp::Mul, vec![here, cj])]);
             }
-            acc
+            roots.push((idx_all, leak(format!("idxall_{l}"))));
+            roots.push((coef, leak(format!("coef_{l}"))));
+            let idx_in = input(leak(format!("idxall_{l}")), &[sl]);
+            let coef_in = input(leak(format!("coef_{l}")), &[sl]);
+
+            // grouped gate/up/down: gather-by-slot over the stacked weights,
+            // dequantize in-body, one fold per projection for ALL slots
+            let (fe, ge, re, e1, e2, e3) = (
+                axis("fe"),
+                axis("ge"),
+                axis("re"),
+                axis("e1"),
+                axis("e2"),
+                axis("e3"),
+            );
+            for (a, n) in [
+                (fe, FE),
+                (ge, FE / GROUP),
+                (re, GROUP),
+                (e1, DM),
+                (e2, DM),
+                (e3, FE),
+            ] {
+                ext.insert(a, n);
+            }
+            let xs = split(xn2.clone(), dm, gi, ri, GROUP);
+            let grouped = |w: &'static str, s: &'static str, out_ax: Axis, gx: Axis, rx: Axis, x: Node, fl: Axis| {
+                let wsel = gather(
+                    input_dt(w, &[ne, out_ax, gx, rx], Dtype::I4),
+                    idx_in.clone(),
+                    ne,
+                );
+                let ssel = gather(input(s, &[ne, out_ax, gx]), idx_in.clone(), ne);
+                let prod = map(MapOp::Mul, vec![map(MapOp::Mul, vec![wsel, x]), ssel]);
+                reduce(flatten(prod, &[gx, rx], fl), fl, BinOp::Monoid(Monoid::Add))
+            };
+            let gate_y = grouped(nm("weg"), nm("seg"), fe, gi, ri, xs.clone(), e1); // [sl, fe]
+            let up_y = grouped(nm("weu"), nm("seu"), fe, gi, ri, xs.clone(), e2); // [sl, fe]
+            let act = map(MapOp::Mul, vec![silu(gate_y), up_y]);
+            let act_s = split(act, fe, ge, re, GROUP); // [sl, ge, re]
+            let down_y = grouped(nm("wed"), nm("sed"), dm, ge, re, act_s, e3); // [sl, dm]
+            // weighted combine over the slot axis — one more fold
+            reduce(
+                map(MapOp::Mul, vec![down_y, coef_in]),
+                sl,
+                BinOp::Monoid(Monoid::Add),
+            )
         };
 
         let x2 = map(MapOp::Add, vec![x1, rms(mlp_out, nm("ln_pmlp"), dm, DM)]);
@@ -516,11 +505,14 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
         }
         Payload::Bytes(out)
     };
+    // experts 0..127 stacked e-major, the SHARED expert appended as 128 —
+    // one slot axis serves routed and shared through the same gather
     let expert_cat_w = |proj: &str| {
         let mut out = Vec::with_capacity(size_hint / 2);
         for e in 0..NE {
             out.extend_from_slice(st.raw(&lp(&format!("mlp.experts.{e}.{proj}.weight_packed"))));
         }
+        out.extend_from_slice(st.raw(&lp(&format!("mlp.shared_experts.{proj}.weight_packed"))));
         Payload::Bytes(out)
     };
     let expert_cat_s = |proj: &str| {
@@ -528,6 +520,7 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
         for e in 0..NE {
             out.extend(st.f32(&lp(&format!("mlp.experts.{e}.{proj}.weight_scale"))));
         }
+        out.extend(st.f32(&lp(&format!("mlp.shared_experts.{proj}.weight_scale"))));
         Payload::F32(out)
     };
 
@@ -556,12 +549,6 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
         "sup" => Payload::F32(st.f32(&lp("mlp.up_proj.weight_scale"))),
         "wdown" => Payload::Bytes(st.raw(&lp("mlp.down_proj.weight_packed")).to_vec()),
         "sdown" => Payload::F32(st.f32(&lp("mlp.down_proj.weight_scale"))),
-        "wsg" => Payload::Bytes(st.raw(&lp("mlp.shared_experts.gate_proj.weight_packed")).to_vec()),
-        "ssg" => Payload::F32(st.f32(&lp("mlp.shared_experts.gate_proj.weight_scale"))),
-        "wsu" => Payload::Bytes(st.raw(&lp("mlp.shared_experts.up_proj.weight_packed")).to_vec()),
-        "ssu" => Payload::F32(st.f32(&lp("mlp.shared_experts.up_proj.weight_scale"))),
-        "wsd" => Payload::Bytes(st.raw(&lp("mlp.shared_experts.down_proj.weight_packed")).to_vec()),
-        "ssd" => Payload::F32(st.f32(&lp("mlp.shared_experts.down_proj.weight_scale"))),
         "weg" => expert_cat_w("gate_proj"),
         "seg" => expert_cat_s("gate_proj"),
         "weu" => expert_cat_w("up_proj"),
@@ -683,6 +670,93 @@ fn main() {
 
     println!("Trinity-Nano (afmoe): 56 layers, GQA 8/2, 128-expert MoE, W4A16");
     let model = build();
+    if args.iter().any(|a| a == "--stats") {
+        use sanic::partition::Stage;
+        let mut folds = 0usize;
+        let mut maps = 0usize;
+        let mut gathers = 0usize;
+        let mut seqs = 0usize;
+        let mut gather_elems = 0usize;
+        let mut by_tag: HashMap<&'static str, usize> = HashMap::new();
+        let tag = |out: &str, by: &mut HashMap<&'static str, usize>| {
+            let t = if out.starts_with("idx") || out.starts_with("cur") || out.starts_with("score") {
+                "routing (topk rounds)"
+            } else if out.starts_with("ck") || out.starts_with("cv") || out.starts_with("cache") {
+                "kv-cache writes"
+            } else if out.starts_with("xd") || out.starts_with("xf") || out == "logits" {
+                "layer outputs / logits"
+            } else {
+                "intermediates (t*)"
+            };
+            *by.entry(t).or_default() += 1;
+        };
+        for st in &model.sched.stages {
+            match st {
+                Stage::Fused { spec, .. } => {
+                    folds += 1;
+                    tag(&spec.output_name, &mut by_tag);
+                }
+                Stage::Elementwise { output, .. } => {
+                    maps += 1;
+                    tag(output, &mut by_tag);
+                }
+                Stage::Gather { output, exec, .. } => {
+                    gathers += 1;
+                    gather_elems += output_axes(exec)
+                        .iter()
+                        .map(|a| model.ext[a])
+                        .product::<usize>();
+                    tag(output, &mut by_tag);
+                }
+                Stage::Sequential { output, .. } => {
+                    seqs += 1;
+                    tag(output, &mut by_tag);
+                }
+                Stage::Infeasible { .. } => {}
+            }
+        }
+        println!(
+            "stages: {} total = {folds} folds + {maps} elementwise + {gathers} gathers + {seqs} sequential",
+            model.sched.stages.len()
+        );
+        println!("gathered/materialized elements across gather stages: {gather_elems}");
+        for (k, v) in &by_tag {
+            println!("  {k}: {v}");
+        }
+        // per-layer slice: everything between xd10 and xd11 outputs
+        let mut in_layer = false;
+        let mut layer_stages: Vec<String> = Vec::new();
+        for st in &model.sched.stages {
+            let out = match st {
+                Stage::Fused { spec, .. } => spec.output_name.clone(),
+                Stage::Elementwise { output, .. }
+                | Stage::Gather { output, .. }
+                | Stage::Sequential { output, .. } => output.clone(),
+                Stage::Infeasible { output, .. } => output.clone(),
+            };
+            if out == "xd10" {
+                in_layer = true;
+                continue;
+            }
+            if out == "xd11" {
+                layer_stages.push(out);
+                break;
+            }
+            if in_layer {
+                let kind = match st {
+                    Stage::Fused { .. } => "fold",
+                    Stage::Elementwise { .. } => "map",
+                    Stage::Gather { .. } => "gather",
+                    Stage::Sequential { .. } => "seq",
+                    Stage::Infeasible { .. } => "infeasible",
+                };
+                layer_stages.push(format!("{kind}:{out}"));
+            }
+        }
+        println!("one MoE layer (xd10→xd11) = {} stages:", layer_stages.len());
+        println!("  {}", layer_stages.join(" "));
+        return;
+    }
     let t0 = std::time::Instant::now();
     let program = sanic::emit_metal::emit_schedule_metal(&model.sched, &model.ext);
     println!(
@@ -754,6 +828,47 @@ inline float w4(device const uchar* p, uint i) {\n\
             }
         }
     };
+
+    // ── --time: warmed-up, stage-level timing of one mid layer ──
+    if args.iter().any(|a| a == "--time") {
+        g.write_f64(&bufs["id"], &[prompt_ids[0] as f64]);
+        g.write_f64(&bufs["pos"], &[0.0]);
+        let ds = program_dispatches(&program, &bufs, &pipes);
+        g.run(&ds); // full warmup (pages every buffer in)
+        let t0 = std::time::Instant::now();
+        g.run(&ds);
+        println!("warm full step: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        // locate layer 30's slice
+        let s30 = program.stages.iter().position(|s| s.output == "xd30").unwrap() + 1;
+        let e30 = program.stages.iter().position(|s| s.output == "xd31").unwrap() + 1;
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            g.run(&ds[s30..e30]);
+        }
+        println!(
+            "layer 30 slice ({} stages): {:.2} ms warm",
+            e30 - s30,
+            t0.elapsed().as_secs_f64() * 1e3 / 5.0
+        );
+        let mut rows = Vec::new();
+        for i in s30..e30 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..3 {
+                g.run(&ds[i..i + 1]);
+            }
+            rows.push((
+                t0.elapsed().as_secs_f64() / 3.0,
+                program.stages[i].kernel.clone(),
+                program.stages[i].grid_size,
+            ));
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!("stage times (incl ~sync floor), slowest first:");
+        for (t, k, gsz) in rows.iter().take(20) {
+            println!("  {:>8.2} ms  grid {:>8}  {}", t * 1e3, gsz, k);
+        }
+        return;
+    }
 
     // ── prompt, then streaming generation ──
     let mut stream = StreamPrinter::new();

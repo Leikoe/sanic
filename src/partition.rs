@@ -269,8 +269,10 @@ impl Partitioner<'_> {
                 let subs: Vec<(Node, Node)> = cuts
                     .iter()
                     .map(|c| {
-                        let t = self.cut(c);
-                        (c.clone(), input(t, &output_axes(c)))
+                        self.cut(c);
+                        // splice, not input(name, output_axes): a cut below a
+                        // view must be read under its stored axes
+                        (c.clone(), self.splice(c, false))
                     })
                     .collect();
                 let rebuilt =
@@ -355,24 +357,109 @@ impl Partitioner<'_> {
         }
     }
 
+    /// The subtrees of a fold LEAF that must be materialized: anything
+    /// carrying a fold of its own (a producer GEMM), anything DAG-shared
+    /// (materialize once, not per consumer), and anything already
+    /// materialized (read its buffer). Everything else — elementwise
+    /// arithmetic, views, reindexes, gathers — is per-element work the
+    /// kernel computes in-body. The [`Partitioner::entanglers`] idea,
+    /// applied to leaves: cut as deep as possible, keep the arithmetic.
+    fn leaf_cuts(&self, node: &Node, out: &mut Vec<Node>) {
+        let push = |node: &Node, out: &mut Vec<Node>| {
+            if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
+                out.push(node.clone());
+            }
+        };
+        if self.done.contains_key(&Rc::as_ptr(node)) {
+            push(node, out); // splices to its buffer read
+            return;
+        }
+        // In-body leaf arithmetic runs once per (grid × stream) point, where
+        // a materialized leaf is computed once per its own volume. Cheap ops
+        // (a dequant multiply, a mask) win inline; transcendental chains (a
+        // GELU, a rotary table) lose — recomputed per stream step they cost
+        // more than the spill they save.
+        let cheap = |op: MapOp| {
+            !matches!(
+                op,
+                MapOp::Exp | MapOp::Log | MapOp::Sqrt | MapOp::Tanh | MapOp::Sin | MapOp::Cos
+            )
+        };
+        match node.as_ref() {
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+            NodeKind::Map { op, inputs } if !self.shared(node) && cheap(*op) => {
+                for i in inputs {
+                    self.leaf_cuts(i, out);
+                }
+            }
+            NodeKind::Gather { src, index, .. } if !self.shared(node) => {
+                self.leaf_cuts(src, out);
+                self.leaf_cuts(index, out);
+            }
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+                self.leaf_cuts(src, out)
+            }
+            _ => push(node, out),
+        }
+    }
+
     /// The sub-expressions of `node` that entangle `axis` — not FREE along
     /// it, so no fold can stream through them (a norm's own same-axis
     /// reduction, an upstream projection over a reused contraction axis).
-    /// Descends through private, unmaterialized maps to place the cut as
-    /// deep as possible; anything shared or non-map is cut whole so other
-    /// consumers can reuse it.
+    /// Descends through private, unmaterialized maps AND through the
+    /// structural operators (views, reindexes, gathers — pure index
+    /// arithmetic that must stay in the kernel) to place the cut as deep as
+    /// possible; anything shared, already materialized, or fold-bearing is
+    /// cut whole so other consumers can reuse it.
     fn entanglers(&self, node: &Node, axis: Axis, out: &mut Vec<Node>) {
         if structure(node, axis).level == Parallelism::Free {
             return;
         }
-        if let NodeKind::Map { inputs, .. } = node.as_ref()
-            && !self.shared(node)
-            && !self.done.contains_key(&Rc::as_ptr(node))
-        {
-            for i in inputs {
-                self.entanglers(i, axis, out);
+        let private = !self.shared(node) && !self.done.contains_key(&Rc::as_ptr(node));
+        match node.as_ref() {
+            NodeKind::Map { inputs, .. } if private => {
+                for i in inputs {
+                    self.entanglers(i, axis, out);
+                }
+                return;
             }
-            return;
+            // The structural operators alias, so descending costs nothing —
+            // but the AXIS TRANSLATES at the boundary, exactly as it does in
+            // `structure`: below a flatten the entanglement lives on the
+            // group members; below a split/window, on the mapped source
+            // axis. Asking about the outer axis below the boundary would
+            // find nothing and miss the cut.
+            NodeKind::View { src, groups } => {
+                if let Some((members, _)) = groups.iter().find(|(_, to)| *to == axis) {
+                    for m in members {
+                        self.entanglers(src, *m, out);
+                    }
+                } else if !groups.iter().any(|(members, _)| members.contains(&axis)) {
+                    self.entanglers(src, axis, out);
+                } // else: consumed below the view — nothing entangles above
+                return;
+            }
+            NodeKind::Reindex { src, map: rmap, .. } => {
+                let driving: Vec<Axis> = rmap
+                    .iter()
+                    .filter(|(_, terms, _)| terms.iter().any(|(_, a)| *a == axis))
+                    .map(|(m, _, _)| *m)
+                    .collect();
+                if !driving.is_empty() {
+                    for m in driving {
+                        self.entanglers(src, m, out);
+                    }
+                } else if !rmap.iter().any(|(m, _, _)| *m == axis) {
+                    self.entanglers(src, axis, out);
+                } // else: consumed below the reindex
+                return;
+            }
+            NodeKind::Gather { src, index, axis: g } if private && *g != axis => {
+                self.entanglers(src, axis, out);
+                self.entanglers(index, axis, out);
+                return;
+            }
+            _ => {}
         }
         if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
             out.push(node.clone());
@@ -423,15 +510,24 @@ impl Partitioner<'_> {
         // targets are pointers into the original graph, and any rebuild
         // invalidates them for a second pass.
         let mut subs: Vec<(Node, Node)> = Vec::new();
-        for (idx, leaf) in carrier.leaves.iter().enumerate() {
-            // A free source — a raw input, possibly behind views, a literal,
-            // an index — is already available: it stays in the kernel graph
-            // as a (re-indexed or computed) load, not a cut.
-            if is_free_source(leaf) {
-                continue;
+        let cut_into = |p: &mut Self, node: &Node, subs: &mut Vec<(Node, Node)>| {
+            let mut cuts = Vec::new();
+            p.leaf_cuts(node, &mut cuts);
+            for c in cuts {
+                p.cut(&c);
+                // splice, not `input(name, output_axes)`: a view/reindex above
+                // the cut must keep its reshape so the buffer is read under
+                // the axes it was stored with.
+                subs.push((c.clone(), p.splice(&c, false)));
             }
+        };
+        for (idx, leaf) in carrier.leaves.iter().enumerate() {
             if in_body.contains(&idx) && is_matmul(leaf) {
-                // Fuse the contraction in-body; cut only its operands.
+                // Fuse the contraction in-body; cut its operands WHOLE. An
+                // in-body operand is re-read on every step of the streamed
+                // axis, so arithmetic left inline would be recomputed per
+                // step (a RoPE'd query's transcendentals × the whole key
+                // axis); materialized once, it is read like any tile.
                 let NodeKind::Reduce { src, .. } = leaf.as_ref() else {
                     unreachable!()
                 };
@@ -441,15 +537,15 @@ impl Partitioner<'_> {
                 for operand in inputs.clone() {
                     if !is_free_source(&operand) {
                         self.cut(&operand);
-                        // splice, not `input(name, output_axes)`: a view operand
-                        // (rename/flatten) must keep its reshape so the buffer is
-                        // read under the axes it was stored with.
                         subs.push((operand.clone(), self.splice(&operand, false)));
                     }
                 }
             } else {
-                self.cut(leaf);
-                subs.push((leaf.clone(), self.splice(leaf, false)));
+                // Cut exactly the fold-bearing / shared / already-materialized
+                // subtrees of the leaf; the per-element arithmetic around them
+                // (dequantization, gathers of expert weights, splits) stays
+                // in-body instead of spilling to memory.
+                cut_into(self, leaf, &mut subs);
             }
         }
         let cut_graph = replace_many(node, &subs, &mut HashMap::new());

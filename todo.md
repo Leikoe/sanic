@@ -313,8 +313,23 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   fold per projection.
 - QK-RMSNorm, sigmoid-gated attention, RoPE on sliding layers only (NoPE
   every 4th), μP embed scaling — all plain basis compositions.
-- 9,443 kernels per decode step; chunked MSL compile in ~15 s; 7.6 GB
-  resident; **~3.8 tok/s streaming**.
+- **4,143 kernels per decode step** (attention ~27, top-8 routing ~27, the
+  MoE itself ~10 — a router fold plus GROUPED gate/up/down folds over a
+  9-slot axis (8 routed + the shared expert as stacked index 128), one
+  vector-indexed gather selecting every expert's packed weights at once);
+  chunked MSL compile ~15 s cold / <1 s cached; 4.7 GB resident;
+  **~4 tok/s streaming at 248 ms/token**.
+- The kernel-count postmortem drove three partitioner improvements, all
+  oracle-guarded: fold leaves keep CHEAP per-element arithmetic in-body
+  (dequantization, masks, gathers — packed int4 never spills; 342M
+  materialized elements/step became 1.4k) while transcendental chains and
+  in-body contraction operands still materialize (inline, a GELU or a
+  RoPE'd query recomputes per stream step); and `entanglers` now descends
+  views/reindexes/gathers with the AXIS TRANSLATED at each boundary
+  (below a flatten the entanglement lives on the members), placing retry
+  cuts as deep as the algebra allows. Unrolled-expert baseline for
+  reference: 9,443 kernels, 1.3 GB/step of gather spill, 122 s partition
+  (now 10 s).
 - **Validated against the HF reference**: per-position prompt logit error
   is FLAT (0.23–0.57, bf16-reference noise, not positional drift), the
   prompt-end argmax MATCHES, and the first greedy divergence is a 0.010

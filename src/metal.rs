@@ -227,7 +227,8 @@ impl MetalDevice {
     // ── execution ────────────────────────────────────────────────────────────
 
     /// Encode every dispatch into ONE command buffer — an encoder per
-    /// dispatch, so Metal serializes on buffer hazards — run it, and wait.
+    /// dispatch, so Metal serializes on buffer hazards while still
+    /// overlapping independent stages — run it, and wait.
     pub fn run(&self, dispatches: &[Dispatch]) {
         let cb = self.queue.commandBuffer().expect("command buffer");
         for d in dispatches {

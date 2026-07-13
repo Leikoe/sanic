@@ -220,13 +220,15 @@ identical** (bf16-round-tripped weights: ≤ 0.54 drift, same tokens).
 
 **Trinity-Nano (5.5B AFMoE), int4-packed, on a 16 GB laptop:**
 `cargo run --release --example trinity` compiles a 56-layer, 128-expert MoE
-with grouped-query attention into **9,443 kernels per decode step** — GQA as
-shared axis variables, top-8 sigmoid routing as the `topk` composition,
-expert weights `gather`ed **directly from packed int4 device buffers**
+with grouped-query attention into **4,143 kernels per decode step** — GQA as
+shared axis variables, top-8 sigmoid routing as the `topk` composition, and
+the MoE proper as a router plus **grouped gate/up/down folds over a 9-slot
+axis** (8 routed experts + the shared expert), one vector-indexed `gather`
+selecting every slot's weights **directly from packed int4 device buffers**
 (typed storage: nibbles unpack inside the GEMM folds, per-group scales fused
 as axis structure; the 3.8 GB checkpoint never dequantizes). Per-position
 logits sit at bf16-reference noise with the prompt-end argmax matching HF,
-streaming *"The capital of France is Paris."* at ~3.8 tok/s.
+streaming *"The capital of France is Paris."* at ~4 tok/s.
 
 Every capability below is verified numerically against the interpreter, and
 where it says GPU, the kernels were dispatched on an Apple GPU and matched:
