@@ -345,14 +345,38 @@ pub fn emit_fused_metal(
     fold_node: &Node,
     ext: &Extents,
 ) -> MetalKernel {
+    emit_fused_metal_with(name, carrier, stream, fold_node, ext, None)
+}
+
+/// [`emit_fused_metal`] with an optional fused EPILOGUE: an elementwise node
+/// of the fold's own shape that reads the fold's result (as `input(out)`)
+/// plus other buffers, rendered IN the kernel after the projection — the
+/// projection lands in a register, `Gen::local_inputs` resolves the read,
+/// one dispatch instead of a fold plus an in-place map.
+pub fn emit_fused_metal_with(
+    name: &str,
+    carrier: &Carrier,
+    stream: Axis,
+    fold_node: &Node,
+    ext: &Extents,
+    epi: Option<(&Node, &str)>,
+) -> MetalKernel {
     assert_eq!(
         carrier.project.len(),
         1,
         "metal kernel needs a scalar projection"
     );
     let (grid, grid_size) = grid_of(fold_node, ext);
-    let bufs = buffers(fold_node);
-    let dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    let mut bufs = buffers(fold_node);
+    let mut dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    if let Some((e, out_name)) = epi {
+        for (n, ax) in buffers(e) {
+            if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
+                bufs.push((n, ax));
+            }
+        }
+        dtypes.extend(input_dtypes(e));
+    }
 
     let mut g = Gen::new();
     g.dtypes = dtypes.clone();
@@ -455,7 +479,16 @@ pub fn emit_fused_metal(
         &|i| format!("acc[{i}]"),
         &|_| unreachable!("B slot in a projection"),
     );
-    body.push(format!("outb[{}] = {proj};", offset(&grid, &coord, ext)));
+    let stored = match epi {
+        None => proj,
+        Some((e, out_name)) => {
+            let fv = g.fresh("fv");
+            body.push(format!("float {fv} = {proj};"));
+            g.local_inputs.insert(out_name.to_string(), fv);
+            value(&METAL, e, &coord, ext, &mut g, &mut body)
+        }
+    };
+    body.push(format!("outb[{}] = {stored};", offset(&grid, &coord, ext)));
 
     MetalKernel {
         msl: format!("{MSL_HEADER}{}", wrap(name, signature(&bufs, &dtypes), body)),
@@ -484,8 +517,22 @@ pub fn emit_fused_metal_sched(
     ext: &Extents,
     sched: FoldSched,
 ) -> MetalKernel {
+    emit_fused_metal_sched_with(name, carrier, stream, fold_node, ext, sched, None)
+}
+
+/// [`emit_fused_metal_sched`] with an optional fused epilogue (see
+/// [`emit_fused_metal_with`]).
+pub fn emit_fused_metal_sched_with(
+    name: &str,
+    carrier: &Carrier,
+    stream: Axis,
+    fold_node: &Node,
+    ext: &Extents,
+    sched: FoldSched,
+    epi: Option<(&Node, &str)>,
+) -> MetalKernel {
     use std::collections::HashSet;
-    let scalar = || emit_fused_metal(name, carrier, stream, fold_node, ext);
+    let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, ext, epi);
     if sched.is_scalar()
         || !mergeable_out_of_order(carrier)
         || carrier.project.len() != 1
@@ -528,8 +575,16 @@ pub fn emit_fused_metal_sched(
         }
     }
 
-    let bufs = buffers(fold_node);
-    let dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    let mut bufs = buffers(fold_node);
+    let mut dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    if let Some((e, out_name)) = epi {
+        for (n, ax) in buffers(e) {
+            if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
+                bufs.push((n, ax));
+            }
+        }
+        dtypes.extend(input_dtypes(e));
+    }
     let mut g = Gen::new();
     g.dtypes = dtypes.clone();
 
@@ -841,18 +896,40 @@ pub fn emit_fused_metal_sched(
     let proj = carrier_expr_map(&METAL, &carrier.project[0], &no_item, &proj_a, &|_| {
         unreachable!("B slot in a projection")
     });
+    // an epilogue renders in the same kernel: projection → register, the
+    // epilogue's read of the fold's own output resolves to it
+    let store = |wc: &HashMap<Axis, String>,
+                     g: &mut Gen,
+                     out: &mut Vec<String>,
+                     indent: &str| {
+        let stored = match epi {
+            None => proj.clone(),
+            Some((e, out_name)) => {
+                let fv = g.fresh("fv");
+                let mut tmp = vec![format!("float {fv} = {proj};")];
+                g.local_inputs.insert(out_name.to_string(), fv);
+                let ev = value(&METAL, e, wc, ext, g, &mut tmp);
+                out.extend(tmp.into_iter().map(|s| format!("{indent}{s}")));
+                ev
+            }
+        };
+        out.push(format!(
+            "{indent}outb[{}] = {stored};",
+            offset(&grid, wc, ext)
+        ));
+    };
     if sched.lane_axis.is_some() {
         body.push("if (sgid == 0) {".into());
         body.push(format!("    for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
         body.push(format!("        uint la_ = lane + v_ * {SIMD}u;"));
         let mut wc = coord.clone();
         wc.insert(sched.lane_axis.unwrap(), "la_".into());
-        body.push(format!("        outb[{}] = {proj};", offset(&grid, &wc, ext)));
+        store(&wc, &mut g, &mut body, "        ");
         body.push("    }".into());
         body.push("}".into());
     } else {
         body.push("if (sgid == 0 && lane == 0) {".into());
-        body.push(format!("    outb[{}] = {proj};", offset(&grid, &coord, ext)));
+        store(&coord.clone(), &mut g, &mut body, "    ");
         body.push("}".into());
     }
 
@@ -1168,13 +1245,17 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
                 let out = spec.output_name.clone();
                 let kname = format!("k_{}_fold", san(&out));
                 let sched = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
-                let k = emit_fused_metal_sched(
+                // an epilogue renders INSIDE the fold kernel (one dispatch):
+                // the projection lands in a register and the epilogue's read
+                // of the fold's own output resolves to it
+                let k = emit_fused_metal_sched_with(
                     &kname,
                     &spec.carrier,
                     spec.streaming_axis,
                     fold_node,
                     ext,
                     sched,
+                    epilogue_node.as_ref().map(|e| (e, out.as_str())),
                 );
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
@@ -1189,19 +1270,9 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
                 });
                 produced.push(out.clone());
                 if let Some(epi) = epilogue_node {
+                    // register the epilogue's OTHER reads as program inputs
+                    // (the fold's own output is already `produced`)
                     note_inputs(epi, &produced, &mut inputs);
-                    let ename = format!("k_{}_epi", san(&out));
-                    let k = emit_pointwise_metal(&ename, epi, ext);
-                    for (n, d) in &k.dtypes {
-                        all_dtypes.insert(n.to_string(), *d);
-                    }
-                    let ename = dedup(&k, &mut msl, &mut canon);
-                    stages.push(MetalStageInfo {
-                        kernel: ename,
-                        inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
-                        output: out.clone(), // in place on the fold buffer
-                        grid_size: k.grid_size,
-                    });
                 }
                 last_out = out;
                 last_axes = output_axes(epilogue_node.as_ref().unwrap_or(fold_node));

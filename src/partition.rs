@@ -824,16 +824,36 @@ impl Partitioner<'_> {
             })
             .collect();
 
-        // Epilogue fusion: exactly one producer, unshared, not yet
-        // materialized, same output shape → ride its kernel for free.
-        if let [producer] = complex.as_slice()
-            && !self.shared(producer)
-            && !self.done.contains_key(&Rc::as_ptr(producer))
-            && output_axes(producer) == output_axes(node)
-        {
+        // Epilogue fusion: the cone rides the LAST of its producers — any
+        // earlier ones are materialized first and read as buffers (a
+        // SwiGLU cone reads both the gate and the up GEMM; it rides the up
+        // fold and loads the gate). The host must be unshared, not yet
+        // materialized, and of the cone's own shape.
+        let host = complex
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, p)| {
+                !self.shared(p)
+                    && !self.done.contains_key(&Rc::as_ptr(p))
+                    && output_axes(p) == output_axes(node)
+            })
+            .map(|(i, _)| i);
+        if let Some(hi) = host {
+            let producer = complex[hi].clone();
+            // materialize the other producers first (execution order)
+            let mut subs: Vec<(Node, Node)> = Vec::new();
+            let mut extra: Vec<&'static str> = Vec::new();
+            for (i, p) in complex.iter().enumerate() {
+                if i != hi {
+                    let name = self.cut(p);
+                    extra.push(name);
+                    subs.push((p.clone(), input(name, &output_axes(p))));
+                }
+            }
             let t = self.fresh();
             let before = self.stages.len();
-            let landed = self.emit(producer, t);
+            let landed = self.emit(&producer, t);
             if self.stages.len() > before
                 && let Some(Stage::Fused {
                     spec,
@@ -846,24 +866,28 @@ impl Partitioner<'_> {
                 && epilogue.is_empty()
             {
                 // The fold now writes the final output name; the epilogue reads
-                // that same buffer (`input(out)`) and its extra plain inputs,
-                // producing the final result in place.
-                let epi = replace_many(
-                    node,
-                    &[(producer.clone(), input(leak(out), &output_axes(producer)))],
-                    &mut HashMap::new(),
-                );
+                // that same buffer (`input(out)`), the other producers'
+                // materializations, and its extra plain inputs, producing the
+                // final result in place.
+                subs.push((
+                    producer.clone(),
+                    input(leak(out), &output_axes(&producer)),
+                ));
+                let epi = replace_many(node, &subs, &mut HashMap::new());
                 spec.output_name = out.to_string();
                 *epilogue = ops;
-                *epilogue_inputs = plain_inputs;
+                let mut all_inputs = plain_inputs;
+                all_inputs.extend(extra);
+                *epilogue_inputs = all_inputs;
                 *epilogue_node = Some(epi);
                 return leak(out);
             }
             // The producer didn't land as a fused kernel — keep the map stage,
-            // reading the producer's materialized buffer.
-            self.done.insert(Rc::as_ptr(producer), landed);
+            // reading the producers' materialized buffers.
+            self.done.insert(Rc::as_ptr(&producer), landed);
             let exec = self.executable(node);
             let mut inputs = vec![landed];
+            inputs.extend(extra);
             inputs.extend(plain_inputs);
             self.stages.push(Stage::Elementwise {
                 ops,

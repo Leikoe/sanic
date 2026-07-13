@@ -490,10 +490,21 @@ is a good future hardening).
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, partition speed at 10k-kernel scale, and the rest of the
 ladder, each
-measured in `vs_mlx.md`: elementwise-cone fusion, kernel dedup across
-isomorphic layers, autotuning, multi-device, flash float4 loads, and the
-rest of the packed-fold proto gap (explicit 32-bit packed-word loads,
-output-row batching per simdgroup, the −8·Σx zero-point hoist). CLIMBED:
+measured in `vs_mlx.md`: autotuning, multi-device, flash float4 loads,
+and the rest of the packed-fold proto gap (explicit 32-bit packed-word
+loads, output-row batching per simdgroup, the −8·Σx zero-point hoist).
+CLIMBED: kernel dedup (2026-07-13) — canonicalized sources (entry name +
+positional buffer identifiers masked) let 1,478 dispatches share ~30
+entry points; MSL compile 10.3 s → 0.2 s; closes MLX's specialization
+column. CLIMBED: cone fusion via wider epilogues (2026-07-13) — a cone
+rides the LAST of its producers (multi-producer epilogues: the SwiGLU
+and attention-gate cones ride their up/gate folds), and epilogues render
+INSIDE the fold kernel (`Gen::local_inputs` resolves the fold's own
+output to a register), one dispatch per fold+epilogue. Trinity 1,856 →
+**1,478 dispatches/step**, GPT-2 233 → 221; numerics bit-identical.
+Partition speed itself (9.6 s at 1.5k kernels) remains open — the
+walkers re-derive whole prefixes per emit; global memoization of
+`structure`/`derive` is the design, deferred for churn risk. CLIMBED:
 honest-window early exit (2026-07-13) — a prefix-masked rescale fold
 stops at the mask edge (`pos` read at runtime, graph stays capturable);
 provably bit-identical (masked tail = exact f32 no-op; coop bound

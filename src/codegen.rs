@@ -35,6 +35,12 @@ pub struct Gen {
     /// scheduled fold emitter guarantees it; pointwise kernels never set
     /// this).
     pub lane_body: Option<LaneBody>,
+    /// Input names whose value is already IN A REGISTER at the current
+    /// render site — read the variable instead of the buffer. This is how a
+    /// fused epilogue reads the fold's own result: the projection lands in
+    /// a local, the epilogue's `input(out)` resolves to it, and the kernel
+    /// writes the final value in one pass.
+    pub local_inputs: HashMap<String, String>,
 }
 
 /// See [`Gen::lane_body`].
@@ -52,6 +58,7 @@ impl Gen {
             n: 0,
             dtypes: HashMap::new(),
             lane_body: None,
+            local_inputs: HashMap::new(),
         }
     }
     pub fn fresh(&mut self, tag: &str) -> String {
@@ -205,6 +212,9 @@ pub fn value<L: Lang>(
         NodeKind::Const { v } => lang.lit(*v),
         NodeKind::Iota { axis } => lang.iota_val(&coord[axis]),
         NodeKind::Input { name, axes, .. } => {
+            if let Some(v) = g.local_inputs.get(*name) {
+                return v.clone();
+            }
             let dt = g.dtypes.get(name).copied();
             lang.buffer_load(name, &offset(axes, coord, ext), dt)
         }

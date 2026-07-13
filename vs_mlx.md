@@ -230,6 +230,21 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**Kernel dedup + fused epilogues (2026-07-13): 1,856 → 1,478 dispatches,
+32 → 30 unique kernels, cold MSL compile 10.3 s → 0.2 s.** Two rungs at
+once. Canonicalization: each kernel's source with the entry name and
+positional buffer identifiers masked — 54 isomorphic layers emit
+IDENTICAL functions over different buffers, so 1,478 dispatches share ~30
+entry points and the "function-constant specialization" column MLX held
+is closed. Epilogue fusion widened: a cone now rides the LAST of its
+producers (a SwiGLU cone reads both gate and up GEMMs; it rides the up
+fold and loads the gate — the single-producer rule was the barrier), and
+epilogues render INSIDE the fold kernel (the projection lands in a
+register; `Gen::local_inputs` resolves the epilogue's read of the fold's
+own output), so a fold + its epilogue is ONE dispatch, not a fold plus an
+in-place map. GPT-2: 233 → 221 kernels. Numerics bit-identical on both
+models.
+
 **Honest-window early exit (2026-07-13): the flash class 2.01 → 0.51 ms.**
 A prefix-masked rescale fold now stops its stream loop at the mask edge,
 read from `pos` at runtime — the graph stays fixed-shape for capture, the
