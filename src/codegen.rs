@@ -144,6 +144,9 @@ pub trait Lang {
     fn scalar_decl(&self, name: &str, init: &str) -> String;
     /// Open a `0..count` loop over `var`; the close is always `}`.
     fn for_open(&self, var: &str, count: usize) -> String;
+    /// Open a loop `var = 0..=bound` where `bound` is a runtime index
+    /// EXPRESSION (a prefix scan folds up to its own output position).
+    fn for_open_upto(&self, var: &str, bound: &str) -> String;
     /// Declare an integer index from a rounded float value (for `Gather`).
     fn round_index(&self, name: &str, val: &str) -> String;
     /// Declare an integer index (mutable iff it will be updated, as flatten's
@@ -344,7 +347,34 @@ pub fn value<L: Lang>(
             }
         }
 
-        NodeKind::Scan { .. } => panic!("codegen: Scan is not implemented (sequential recurrence)"),
+        // A MONOIDAL prefix scan: each output point folds its own prefix —
+        // parallel across points, serial within one (O(n²) work; these are
+        // small stages, and correctness comes first — a cost-driven
+        // work-efficient scan is a schedule refinement, not new semantics).
+        // Non-associative recurrences stay unemittable, loudly.
+        NodeKind::Scan { src, axis, op } => {
+            let m = match op {
+                BinOp::Monoid(m) => *m,
+                other => panic!(
+                    "codegen: {other:?} scan is not emittable (only monoidal \
+                     prefix scans are; a non-associative recurrence is serial \
+                     by nature and an affine scan's tensor convention is not \
+                     yet defined — see todo.md)"
+                ),
+            };
+            let acc = g.fresh("acc");
+            out.push(lang.scalar_decl(&acc, &lang.lit(m.identity())));
+            let lv = g.fresh("r");
+            let mut coord2 = coord.clone();
+            coord2.insert(*axis, lv.clone());
+            let mut body = Vec::new();
+            let ev = value(lang, src, &coord2, ext, g, &mut body);
+            out.push(lang.for_open_upto(&lv, &coord[axis]));
+            out.extend(body);
+            out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
+            out.push("}".into());
+            acc
+        }
     }
 }
 

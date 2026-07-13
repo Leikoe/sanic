@@ -43,6 +43,9 @@ impl Lang for RustLang {
     fn for_open(&self, var: &str, count: usize) -> String {
         format!("for {var} in 0..{count} {{")
     }
+    fn for_open_upto(&self, var: &str, bound: &str) -> String {
+        format!("for {var} in 0..=({bound}) {{")
+    }
     fn round_index(&self, name: &str, val: &str) -> String {
         format!("let {name} = ({val}).round() as usize;")
     }

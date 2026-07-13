@@ -199,9 +199,34 @@ pub fn grad(
                 add_adj(&mut adj, src, inv);
             }
 
-            NodeKind::Scan { .. } => panic!(
-                "grad: Scan backward (a reversed recurrence) is not implemented; \
-                 extend the rule before differentiating through a scan"
+            // A prefix SUM's adjoint is the reversed prefix sum of the
+            // cotangent: y_j = Σ_{i≤j} x_i ⇒ ∂L/∂x_i = Σ_{j≥i} g_j —
+            // reverse, cumsum, reverse, all existing IR (reversal is a
+            // self-referential Reindex). Max/Min scans (winner masks per
+            // prefix) and the affine scan's adjoint recurrence stay
+            // declined, stated in todo.md.
+            NodeKind::Scan {
+                src,
+                axis,
+                op: BinOp::Monoid(Monoid::Add),
+            } => {
+                let n = extents.get(axis).copied().unwrap_or_else(|| {
+                    panic!("grad: scan backward needs the extent of {axis}")
+                });
+                let rev = |x: Node| {
+                    crate::ir::reindex(x, vec![(*axis, vec![(-1, *axis)], (n - 1) as i64)], false)
+                };
+                let contrib = rev(crate::ir::scan(
+                    rev(g.clone()),
+                    *axis,
+                    BinOp::Monoid(Monoid::Add),
+                ));
+                add_adj(&mut adj, src, contrib);
+            }
+            NodeKind::Scan { op, .. } => panic!(
+                "grad: {op:?} scan backward is not implemented (Add-scan has \
+                 the reversed-cumsum rule; Max/Min need per-prefix winner \
+                 masks and the affine scan an adjoint recurrence — see todo.md)"
             ),
         }
     }

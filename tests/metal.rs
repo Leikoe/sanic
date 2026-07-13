@@ -1586,3 +1586,26 @@ fn coop_declines_order_sensitive_argmax() {
     };
     eprintln!("argmax declined to scalar, ties first-max-wins: {}", out.trim());
 }
+
+/// A monoidal prefix scan (cumsum) EMITS now: each output point folds its
+/// own prefix — a Sequential stage the metal path previously refused.
+/// Max-scan too (running maximum), against the oracle.
+#[test]
+fn monoidal_prefix_scans_run_on_gpu() {
+    let (s, t) = (axis("s"), axis("t"));
+    let ext: Extents = [(s, 3), (t, 17)].into_iter().collect();
+    let mut rng = Lcg(0x5CA9);
+    let env: Env = [("X", rand_tensor(&[s, t], &ext, &mut rng))]
+        .into_iter()
+        .collect();
+    for (label, m) in [("cumsum", Monoid::Add), ("cummax", Monoid::Max)] {
+        let node = scan(input("X", &[s, t]), t, BinOp::Monoid(m));
+        let kernel = sanic::emit_metal::emit_pointwise_metal(label, &node, &ext);
+        let reference = eval(&node, &env, &ext);
+        let Some(out) = run_on_gpu(label, &kernel, &env, &reference) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        eprintln!("{label} prefix scan on GPU: {}", out.trim());
+    }
+}

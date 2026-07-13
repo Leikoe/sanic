@@ -361,3 +361,28 @@ fn sgd_training_loop_converges() {
         "SGD did not converge: first loss {first:e}, last {last:e}"
     );
 }
+
+// ── cumsum backward: the reversed prefix sum, held to finite differences ─────
+#[test]
+fn cumsum_backward_is_the_reversed_cumsum() {
+    let (s, t) = (axis("s"), axis("t"));
+    let ext: Extents = [(s, 3), (t, 7)].into_iter().collect();
+    let mut rng = Lcg(0xC5C5);
+    let env: Env = [
+        ("X", rand_tensor(&[s, t], &ext, &mut rng)),
+        ("W", rand_tensor(&[s, t], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    // loss = Σ (W ⊙ cumsum_t(X))² — the scan inside a nonlinear consumer
+    let cs = scan(input("X", &[s, t]), t, BinOp::Monoid(Monoid::Add));
+    let wx = map(MapOp::Mul, vec![cs, input("W", &[s, t])]);
+    let sq = map(MapOp::Mul, vec![wx.clone(), wx]);
+    let loss = reduce(
+        reduce(sq, t, BinOp::Monoid(Monoid::Add)),
+        s,
+        BinOp::Monoid(Monoid::Add),
+    );
+    check_grads(&loss, &env, &ext, &["X", "W"]);
+}

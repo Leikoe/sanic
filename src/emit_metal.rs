@@ -49,6 +49,9 @@ impl Lang for MetalLang {
     fn for_open(&self, var: &str, count: usize) -> String {
         format!("for (uint {var} = 0; {var} < {count}; {var}++) {{")
     }
+    fn for_open_upto(&self, var: &str, bound: &str) -> String {
+        format!("for (uint {var} = 0; {var} <= {bound}; {var}++) {{")
+    }
     fn round_index(&self, name: &str, val: &str) -> String {
         format!("uint {name} = (uint)({val} + 0.5f);")
     }

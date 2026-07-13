@@ -135,8 +135,15 @@ page is substrate we need so the moat is usable on real workloads.
 - **`emit_cutile`** — CuTile Python for the attention-shaped family only;
   string-tested, **never run on a GPU** (one `#[ignore]`d test). Superseded by
   `emit_metal` as the GPU path on this hardware.
-- **SSM/`Scan`** — classified and derivable (affine carrier), but not emitted
-  and not in the interpreter beyond monoidal prefix scans.
+- **SSM/`Scan`** — narrowed (2026-07-13), each edge now a rule or a stated
+  decline: MONOIDAL prefix scans evaluate, EMIT (each point folds its own
+  prefix — Rust and GPU, oracle-checked, `monoidal_prefix_scans_run_on_gpu`)
+  and Add-scans DIFFERENTIATE (cumsum ⟵ reversed cumsum, held to finite
+  differences). Declined, precisely: the affine scan's TENSOR convention
+  (how a step's (A_t, b_t) pair rides an axis — the carrier itself is
+  proven at the algebra level in `tests/laws.rs`, but picking an IR
+  convention without an SSM consumer would be a guess), Max/Min scan
+  backward (per-prefix winner masks), and the affine adjoint recurrence.
 
 **Absent (the honest remainder):** real int8/int4 *byte storage* (buffers of
 bytes + bit-unpacking — the pricing is done, the buffer model is not),
