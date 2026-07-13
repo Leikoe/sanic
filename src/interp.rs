@@ -261,6 +261,22 @@ fn eval_node(
             let s = eval_rc(src, env, extents, cache);
             let oaxes: Vec<Axis> = s.axes.iter().copied().filter(|a| a != axis).collect();
             let n = extent(extents, *axis);
+            // the index-carrying maximum: value = position of the FIRST max
+            if let BinOp::ArgMax = op {
+                return Tensor::from_fn(&oaxes, extents, |c| {
+                    let mut coord = c.clone();
+                    let (mut m, mut mi) = (f64::NEG_INFINITY, 0usize);
+                    for i in 0..n {
+                        coord.insert(*axis, i);
+                        let v = s.at(&coord);
+                        if v > m {
+                            m = v;
+                            mi = i;
+                        }
+                    }
+                    mi as f64
+                });
+            }
             Tensor::from_fn(&oaxes, extents, |c| {
                 let mut coord = c.clone();
                 let mut acc = binop_identity(*op);

@@ -221,8 +221,12 @@ mechanism runs optimizer state (see M8's SGD loop).
 
 ### M7 — Irregular ops that aren't fold+elementwise · [done, sort declined]
 Decided per op, decomposition over new node kinds in every case:
-- **argmax** — `Σ i·[x == max]`, promoted to `ir::argmax` (GPU-exact).
-- **top-k** — k rounds of (max, mask-the-winner's-position); values and
+- **argmax** — `BinOp::ArgMax`, an index-carrying maximum: a (max, idx)
+  tuple monoid (first-max-wins ties), derived like any fold via a two-slot
+  carrier — the running max plus an `ArgIdx` slot streaming `iota` — so
+  argmax is **one kernel**. Replaced the original `Σ i·[x == max]`
+  composition (two kernels, and unsound to fuse: it differs on ties).
+- **top-k** — k rounds of (argmax, mask-the-winner's-position); values and
   indices, batched routing (MoE top-1) included; partitions into one
   multi-output schedule with the rounds chained through materialized cuts.
 - **scatter-add** — `ir::scatter_add`, a one-hot contraction: the inverse of
@@ -313,7 +317,8 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   fold per projection.
 - QK-RMSNorm, sigmoid-gated attention, RoPE on sliding layers only (NoPE
   every 4th), μP embed scaling — all plain basis compositions.
-- **3,947 kernels per decode step** (attention ~27, top-8 routing ~27, the
+- **3,515 kernels per decode step** (attention ~27, top-8 routing 18 —
+  each round ONE derived ArgMax fold plus a winner mask — the
   MoE itself ~10 — a router fold plus GROUPED gate/up/down folds over a
   9-slot axis (8 routed + the shared expert as stacked index 128), one
   vector-indexed gather selecting every expert's packed weights at once);
@@ -334,7 +339,7 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   |---|---|---|
   | nanoinfer megakernel (int4/fp8) | **1 dispatch** | ~15 ms/tok (67.5 tok/s) |
   | mlx-lm 8-bit (upstream afmoe) | **~2,733** (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
-  | sanic int4 | 3,947 derived kernels | 252 ms/tok (4 tok/s) |
+  | sanic int4 | 3,515 derived kernels | 242 ms/tok (4.1 tok/s) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |
 
   MLX launches ~2.7k kernels per Trinity token — the same order as sanic —
@@ -357,7 +362,16 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   RoPE'd query recomputes per stream step); and `entanglers` now descends
   views/reindexes/gathers with the AXIS TRANSLATED at each boundary
   (below a flatten the entanglement lives on the members), placing retry
-  cuts as deep as the algebra allows. Unrolled-expert baseline for
+  cuts as deep as the algebra allows. It also forced one IR-level fix:
+  each top-k round used to cost a max fold PLUS an index fold, because
+  `Σ i·[x == max]` cannot be fused soundly (it differs on ties) —
+  `BinOp::ArgMax` (the tuple monoid above) makes each round one derived
+  fold, −432 kernels at Trinity scale. The residual count gap to MLX is
+  structural and named: MLX routes with an `argpartition` *primitive*
+  (~7 stages/layer vs our 18 derived ones) and has single-pass `RMSNorm`
+  /`Softmax` primitives (ours are two-pass until the two-pass-row-kernel
+  rung lands); against that, sanic spends nothing on dequant (in-body)
+  where MLX dispatches 503 QuantizedMatmuls. Unrolled-expert baseline for
   reference: 9,443 kernels, 1.3 GB/step of gather spill, 122 s partition
   (now 10 s).
 - **Validated against the HF reference**: per-position prompt logit error

@@ -114,6 +114,13 @@ pub enum BinOp {
     /// so an SSM / linear recurrence streams even though it is not a scalar
     /// monoid.
     AffineCompose,
+    /// Index-carrying maximum: the reduce's VALUE is the position of the
+    /// first maximum along the axis. Associative over `(max, idx)` pairs
+    /// with first-max-wins tie-breaking — a tuple monoid, not a scalar one,
+    /// so it ships its own two-slot carrier (like `AffineCompose`). This is
+    /// what makes argmax / top-k selection ONE fold instead of a
+    /// max-then-indicator-sum pair (which also differs on ties).
+    ArgMax,
     /// A non-associative step, e.g. `tanh(W·h + x)`. No legal fold exists; an
     /// axis governed by one of these is strictly serial.
     NonAssoc(&'static str),
@@ -722,21 +729,11 @@ pub fn one_hot(axis: Axis, v: Node) -> Node {
     )
 }
 
-/// The index of the maximum along `axis`, as a value: `Σ i·[x == max]`.
-/// Exact for a unique maximum; ties sum their indices (undefined) — random
-/// continuous data never ties, and a caller that must break ties can add an
-/// index-scaled epsilon.
+/// The index of the FIRST maximum along `axis`, as a value — one
+/// index-carrying fold ([`BinOp::ArgMax`]): the `(max, idx)` tuple monoid
+/// with first-max-wins ties, matching every framework's argmax convention.
 pub fn argmax(x: Node, axis: Axis) -> Node {
-    let m = reduce(x.clone(), axis, BinOp::Monoid(Monoid::Max));
-    let hit = map(
-        MapOp::Sub,
-        vec![konst(1.0), map(MapOp::Lt, vec![x, m])],
-    ); // [x == max], since nothing exceeds the max
-    reduce(
-        map(MapOp::Mul, vec![iota(axis), hit]),
-        axis,
-        BinOp::Monoid(Monoid::Add),
-    )
+    reduce(x, axis, BinOp::ArgMax)
 }
 
 /// Top-k along `axis` by repeated (max, mask-the-winner): k `(value, index)`

@@ -400,6 +400,9 @@ pub enum SlotKind {
     /// Affine-map composition (the SSM carrier). Not a scalar monoid slot;
     /// emitters must handle it separately or decline.
     AffineStep,
+    /// The index half of an index-carrying maximum: merged as
+    /// `a₀ < b₀ ? b_i : a_i` against max slot `max_slot` — first max wins.
+    ArgIdx { max_slot: usize },
 }
 
 /// What streaming a sub-expression over the axis produced so far.
@@ -674,6 +677,29 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
 
 /// Reduce `src` over `axis` with monoid `op`, allocating slot(s).
 fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
+    // Index-carrying maximum: two slots — the running max of the streamed
+    // values, and the index (an iota leaf) that first achieved it.
+    if let BinOp::ArgMax = op {
+        let s = go(src, axis, ctx)?;
+        let S::Pe {
+            raw,
+            shift: None,
+            post,
+        } = s
+        else {
+            return None;
+        };
+        if !is1(&post) {
+            return None;
+        }
+        let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
+        let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+        let idx_slot = ctx.push_slot(
+            SlotKind::ArgIdx { max_slot },
+            Expr::Item(iota_leaf),
+        );
+        return Some(S::Coll(Expr::F(idx_slot)));
+    }
     let BinOp::Monoid(m) = op else {
         return None; // non-associative / affine handled elsewhere
     };
@@ -957,6 +983,10 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
                 let rb = exp(sub(Expr::B(mx), big));
                 padd(pmul(Expr::A(i), ra), pmul(Expr::B(i), rb))
             }
+            SlotKind::ArgIdx { max_slot: mx } => {
+                // first max wins: switch to B only on a STRICT improvement
+                ewhere(elt(Expr::A(mx), Expr::B(mx)), Expr::B(i), Expr::A(i))
+            }
             SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();
@@ -965,6 +995,7 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
         .map(|s| match s.kind {
             SlotKind::Plain(m) => m.identity(),
             SlotKind::ExpShifted { .. } => 0.0,
+            SlotKind::ArgIdx { .. } => 0.0,
             SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();

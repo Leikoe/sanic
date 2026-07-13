@@ -220,7 +220,7 @@ identical** (bf16-round-tripped weights: ≤ 0.54 drift, same tokens).
 
 **Trinity-Nano (5.5B AFMoE), int4-packed, on a 16 GB laptop:**
 `cargo run --release --example trinity` compiles a 56-layer, 128-expert MoE
-with grouped-query attention into **4,143 kernels per decode step** — GQA as
+with grouped-query attention into **3,515 kernels per decode step** — GQA as
 shared axis variables, top-8 sigmoid routing as the `topk` composition, and
 the MoE proper as a router plus **grouped gate/up/down folds over a 9-slot
 axis** (8 routed experts + the shared expert), one vector-indexed `gather`
