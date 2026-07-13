@@ -793,10 +793,27 @@ impl Partitioner<'_> {
                     epilogue_node: None,
                 });
             }
-            None => self.stages.push(Stage::Infeasible {
-                axis,
-                output: out.to_string(),
-            }),
+            // Legal but UNPLANNABLE: a deferred coupling can price a
+            // per-slot column as SRAM-resident (an RMSNorm's deferred
+            // normalizer fused into a 200k-vocab head). Cost-driven cut
+            // placement, the measured instance: cut the smallest DIV in the
+            // body — the normalizer's application site — so the norm
+            // becomes its own small stages and the fold re-derives plain.
+            // Each retry removes one Div, so the recursion terminates; any
+            // feasible schedule strictly beats an Infeasible stage.
+            None => {
+                if let Some(div) = smallest_div(&cut_graph, self.extents) {
+                    self.cut(&div);
+                    let spliced = self.splice(&div, false);
+                    let rebuilt =
+                        replace_many(&cut_graph, &[(div, spliced)], &mut HashMap::new());
+                    return self.emit(&rebuilt, out);
+                }
+                self.stages.push(Stage::Infeasible {
+                    axis,
+                    output: out.to_string(),
+                });
+            }
         }
         leak(out)
     }
@@ -968,6 +985,57 @@ fn cheap_op(op: MapOp) -> bool {
         op,
         MapOp::Exp | MapOp::Log | MapOp::Sqrt | MapOp::Tanh | MapOp::Sin | MapOp::Cos
     )
+}
+
+/// The smallest-volume normalizer APPLICATION site in the graph — a `Div`,
+/// or a `Mul` applying a `Recip` (the two spellings of ÷). This is the cut
+/// that removes a deferred coupling from an unplannable fold (see the retry
+/// in `emit_fold`).
+fn smallest_div(node: &Node, extents: &HashMap<Axis, f64>) -> Option<Node> {
+    let mut best: Option<(f64, Node)> = None;
+    fn is_site(node: &Node) -> bool {
+        match node.as_ref() {
+            NodeKind::Map {
+                op: MapOp::Div, ..
+            } => true,
+            NodeKind::Map {
+                op: MapOp::Mul,
+                inputs,
+            } => inputs
+                .iter()
+                .any(|i| matches!(i.as_ref(), NodeKind::Map { op: MapOp::Recip, .. })),
+            _ => false,
+        }
+    }
+    fn walk(node: &Node, extents: &HashMap<Axis, f64>, best: &mut Option<(f64, Node)>) {
+        match node.as_ref() {
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+            NodeKind::Map { inputs, .. } => {
+                if is_site(node) {
+                    let vol: f64 = output_axes(node)
+                        .iter()
+                        .map(|a| extents.get(a).copied().unwrap_or(1.0))
+                        .product();
+                    if best.as_ref().is_none_or(|(b, _)| vol < *b) {
+                        *best = Some((vol, node.clone()));
+                    }
+                }
+                for i in inputs {
+                    walk(i, extents, best);
+                }
+            }
+            NodeKind::Reduce { src, .. }
+            | NodeKind::Scan { src, .. }
+            | NodeKind::View { src, .. }
+            | NodeKind::Reindex { src, .. } => walk(src, extents, best),
+            NodeKind::Gather { src, index, .. } => {
+                walk(src, extents, best);
+                walk(index, extents, best);
+            }
+        }
+    }
+    walk(node, extents, &mut best);
+    best.map(|(_, n)| n)
 }
 
 /// Free to read in any kernel: a raw input (possibly behind views or affine
@@ -1390,6 +1458,49 @@ mod tests {
         };
         assert_eq!(spec.carrier.slots, 2, "dot product + Σx²");
         assert!(spec.carrier.rules.contains(&"defer-div"));
+    }
+
+    // The SAME norm-into-GEMM fusion at a 200k-vocab head is legal but
+    // UNPLANNABLE (the deferred normalizer prices a per-slot column as
+    // SRAM-resident). The partitioner must not emit Infeasible: it cuts the
+    // normalizer's Div, the norm becomes its own stages, and the head
+    // re-derives as a plain GEMV — the cut Trinity used to place by hand.
+    #[test]
+    fn unplannable_norm_head_cuts_the_normalizer() {
+        let (s, d, v) = (axis("s"), axis("d"), axis("v"));
+        let x = input("X", &[s, d]);
+        let g = input("G", &[d]);
+        let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), d, add_r());
+        let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
+        let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
+        let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom]);
+        let head = matmul(norm, input("W", &[v, d]), d);
+
+        let sched = partition(
+            &head,
+            &Device::toy(),
+            &ext(&[(s, 1.0), (d, 1024.0), (v, 200192.0)]),
+        );
+        assert!(
+            !sched
+                .stages
+                .iter()
+                .any(|st| matches!(st, Stage::Infeasible { .. })),
+            "the retry must find a feasible schedule, not report Infeasible"
+        );
+        let Stage::Fused { spec, .. } = sched.stages.last().unwrap() else {
+            panic!("head lands as a fold")
+        };
+        assert_eq!(spec.streaming_axis, d);
+        assert_eq!(
+            spec.carrier.slots, 1,
+            "plain GEMV after the cut, not a deferred-normalizer coupling"
+        );
+        assert!(
+            sched.stages.len() >= 3,
+            "norm fold + norm map + head: {} stages",
+            sched.stages.len()
+        );
     }
 
     // A residual add rides its producer GEMM as an epilogue — no extra kernel.

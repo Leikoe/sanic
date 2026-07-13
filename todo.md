@@ -298,13 +298,27 @@ to 1e-9 of its start loss** (`tests/grad.rs`).
   compute needs resident blocks (latency hiding), bandwidth needs total
   lanes in flight (`lanes_per_block`, `Device::mem_lanes`) — so the 4-lane
   matvec splits and the 1024² flash does not (`tests/group.rs`).
-- **Still open:** per-axis partial realize, cost-driven placement of *cuts*
-  (the priced split is not yet auto-invoked by `partition`), and
-  multi-device execution — the allreduce math IS `run_carrier_split`'s
-  stage-2 merge (each device folds its shard), but no device runtime exists.
-  M10 put the same re-association law INSIDE kernels; the two-dispatch form
-  remains the top tier of the same hierarchy (and the multi-device tier
-  above it).
+- **Cost-driven cut on plan failure** — [done 2026-07-13]. A derived fold
+  that is legal but UNPLANNABLE (the deferred normalizer of an RMSNorm
+  fused into a 200k-vocab head prices a per-slot column as SRAM-resident)
+  no longer emits `Infeasible`: `emit_fold` cuts the smallest normalizer
+  application site in the body (`Div`, or `Mul`-of-`Recip` — the two
+  spellings of ÷) and re-emits; each retry removes one site, and any
+  feasible schedule strictly beats an infeasible stage. Trinity's manual
+  `xfinal` root is GONE — the partitioner places that cut itself, same
+  numerics (suite-pinned in `unplannable_norm_head_cuts_the_normalizer`).
+- **Auto-invoking the two-dispatch split** — assessed and deferred, with
+  the reason on record: M10's cooperative schedules apply the SAME
+  re-association law intra-kernel and cover every occupancy-starved fold
+  both real models have (the 4-lane matvec that motivated the split now
+  lane-splits inside one kernel). The split pair's remaining niche is
+  order-INSENSITIVE folds too large for one threadgroup's worth of lanes —
+  no current workload has one; wire `plan::split_factor` into `partition`
+  when one appears.
+- **Still open:** per-axis partial realize, and multi-device execution —
+  the allreduce math IS `run_carrier_split`'s stage-2 merge (each device
+  folds its shard), but no device runtime exists. M10 put the same
+  re-association law INSIDE kernels; the multi-device tier sits above it.
 
 ### M10 — Cooperative fold schedules · [done] · retires *kernel-quality risk*
 The biggest single latency win in the project's history, and it is ONE

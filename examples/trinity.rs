@@ -420,19 +420,19 @@ fn build() -> Model {
         roots.push((x2, leak(format!("xd{}", l + 1))));
     }
 
-    // Materialize the final norm: fused, its deferred normalizer would make
-    // the 200k-vocab axis a per-slot "column" the planner prices as
-    // SRAM-resident (a real cost-driven-cuts gap — the fusion is legal but
-    // slower AND unplannable; the cut is better on every axis).
-    let xf = rms(
-        input(leak(format!("xd{N_LAYER}")), &prev_axes),
-        "fnorm",
-        dm,
-        DM,
-    );
-    roots.push((xf, "xfinal"));
+    // The final norm FUSED into the 200k-vocab head is legal but
+    // unplannable (its deferred normalizer prices a per-slot column as
+    // SRAM-resident) — the partitioner now places that cut itself: the
+    // plan-failure retry cuts the normalizer's Div, the norm becomes its
+    // own stages, and the head re-derives as a plain GEMV. This root used
+    // to carry the cut by hand.
     let logits = matmul(
-        input("xfinal", &[dm]),
+        rms(
+            input(leak(format!("xd{N_LAYER}")), &prev_axes),
+            "fnorm",
+            dm,
+            DM,
+        ),
         input_dt("lm_head", &[vv, dm], Dtype::F16),
         dm,
     );
