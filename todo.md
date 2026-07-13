@@ -488,8 +488,8 @@ graph walkers (bounded by making rounds schedule roots; walker memoization
 is a good future hardening).
 
 Still open beyond the capstones: GQA-style long-context ring buffers for
-sliding windows, a tokenizer *encoder* (prompts are pre-tokenized ids),
-partition speed at 10k-kernel scale, and the rest of the ladder, each
+sliding windows, partition speed at 10k-kernel scale, and the rest of the
+ladder, each
 measured in `vs_mlx.md`: elementwise-cone fusion, kernel dedup across
 isomorphic layers, autotuning, multi-device, flash float4 loads, and the
 rest of the packed-fold proto gap (explicit 32-bit packed-word loads,
@@ -499,7 +499,16 @@ stops at the mask edge (`pos` read at runtime, graph stays capturable);
 provably bit-identical (masked tail = exact f32 no-op; coop bound
 clamped to the split width so no lane merges identity — the −∞ edge);
 prefill causal flash gets per-row windows from the same detector; flash
-class 2.01 → 0.51 ms, GPU-tested at four positions vs the full oracle. CLIMBED:
+class 2.01 → 0.51 ms, GPU-tested at four positions vs the full oracle.
+CLOSED: tokenizer encoder (2026-07-13) — `src/bpe.rs`, GPT-2 byte-level
+BPE in the dependency-free house style (the pre-tokenizer regex
+hand-rolled as its ordered-alternative matcher), held to HuggingFace
+tokenizations generated on this repo's own vocab files (`tests/bpe.rs`,
+unicode/emoji/whitespace gauntlet); `gpt2 --prompt "..."` now takes raw
+text. Trinity's tokenizer DECLINED, stated: its pre-tokenizer is a
+sequence of lookahead regexes this crate cannot honestly reproduce
+without a regex engine — a wrong split silently corrupts prompts, so
+trinity keeps pre-tokenized ids. CLIMBED:
 chunked lane streams (2026-07-13) — `FoldSched.chunk` folds contiguous
 8-element runs per lane when a packed leaf makes contiguity pay; MoE
 gate/up 2.2×, down 4.4 → 3.75 ms, GPU-bit-checked

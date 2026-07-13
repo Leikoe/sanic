@@ -674,12 +674,29 @@ fn main() {
     let reference = std::fs::read_to_string(format!("{wdir}/reference.json"))
         .ok()
         .map(|s| parse_json(&s).expect("parse reference.json"));
-    let prompt_ids: Vec<usize> = reference
-        .as_ref()
-        .and_then(|r| r.get("ids"))
-        .and_then(Json::as_arr)
-        .map(|a| a.iter().map(|v| v.as_num().unwrap() as usize).collect())
-        .unwrap_or_else(|| vec![15496, 11, 314, 1101, 257, 3303, 2746, 11]);
+    // --prompt "text": encode with the in-tree byte-level BPE (the reference
+    // comparison only applies to the default prompt, so it is skipped)
+    let custom_prompt = args
+        .iter()
+        .position(|a| a == "--prompt")
+        .and_then(|i| args.get(i + 1).cloned());
+    let reference = if custom_prompt.is_some() { None } else { reference };
+    let prompt_ids: Vec<usize> = match &custom_prompt {
+        Some(text) => {
+            let bpe = sanic::bpe::Bpe::from_gpt2(
+                &format!("{wdir}/vocab.json"),
+                &format!("{wdir}/merges.txt"),
+            )
+            .expect("load BPE (vocab.json + merges.txt)");
+            bpe.encode(text).into_iter().map(|i| i as usize).collect()
+        }
+        None => reference
+            .as_ref()
+            .and_then(|r| r.get("ids"))
+            .and_then(Json::as_arr)
+            .map(|a| a.iter().map(|v| v.as_num().unwrap() as usize).collect())
+            .unwrap_or_else(|| vec![15496, 11, 314, 1101, 257, 3303, 2746, 11]),
+    };
     let vocab = load_vocab(&format!("{wdir}/vocab.json"));
 
     let mut variants: Vec<(&str, bool)> = vec![("f32", false)];

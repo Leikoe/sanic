@@ -41,6 +41,7 @@
 //! associativity and correctness certificates in one assertion.
 
 pub mod analyze;
+pub mod bpe;
 pub mod codegen;
 pub mod cost;
 pub mod derive;
