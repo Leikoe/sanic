@@ -251,9 +251,11 @@ fn main() {
         ("b2", vec![cls]),
     ];
     let grads = grad(&loss, &["W1", "b1", "W2", "b2"], &ext);
-    // one schedule, many outputs: the loss, the logits (for accuracy), and each
+    // one schedule, many outputs: the logits (for accuracy), the loss, and each
     // post-step weight `w − lr·∇w` — the update rides its gradient's kernel.
-    let mut roots: Vec<(Node, &'static str)> = vec![(loss.clone(), "loss"), (logits, "logits")];
+    // Logits first so it is materialized before the cross-entropy's logsumexp,
+    // which then READS it instead of recomputing the second GEMM in-body.
+    let mut roots: Vec<(Node, &'static str)> = vec![(logits, "logits"), (loss.clone(), "loss")];
     for (name, axes) in &params {
         let update = map(
             MapOp::Sub,

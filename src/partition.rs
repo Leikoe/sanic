@@ -746,7 +746,17 @@ impl Partitioner<'_> {
             }
         };
         for (idx, leaf) in carrier.leaves.iter().enumerate() {
-            if in_body.contains(&idx) && is_matmul(leaf) {
+            // Fuse the online-softmax score contraction in-body (FlashAttention's
+            // QKᵀ) — UNLESS it is already materialized. Fusing recomputes the
+            // contraction on every streamed step; that pays for itself only by
+            // never writing the scores. When the very same contraction is
+            // already a live buffer (a logits GEMM demanded as an output, then
+            // re-folded by a cross-entropy's logsumexp), reading it is strictly
+            // cheaper — recomputing it is the cost-blind cut. Read it instead.
+            if in_body.contains(&idx)
+                && is_matmul(leaf)
+                && !self.done.contains_key(&Rc::as_ptr(leaf))
+            {
                 // Fuse the contraction in-body; cut its operands WHOLE. An
                 // in-body operand is re-read on every step of the streamed
                 // axis, so arithmetic left inline would be recomputed per
