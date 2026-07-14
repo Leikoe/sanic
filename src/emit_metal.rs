@@ -1295,7 +1295,13 @@ pub fn emit_schedule_metal_over(
                     all_dtypes.insert(n.to_string(), *d);
                 }
                 let kname = dedup(&k, &mut msl, &mut canon);
-                note_buffer(&out, k.grid_size, &mut bufsizes);
+                // Size the output buffer by the output TENSOR VOLUME, not the
+                // dispatch grid: a cooperative/packed fold dispatches fewer
+                // threads than it writes elements (each thread projects a lane
+                // strip), so `grid_size` undercounts the allocation — the
+                // weight-gradient folds (dWf/dWp) write 16 elements per thread.
+                let out_vol = grid_of(epilogue_node.as_ref().unwrap_or(fold_node), ext).1;
+                note_buffer(&out, out_vol, &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
                     inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
@@ -1321,7 +1327,7 @@ pub fn emit_schedule_metal_over(
                     all_dtypes.insert(n.to_string(), *d);
                 }
                 let kname = dedup(&k, &mut msl, &mut canon);
-                note_buffer(output, k.grid_size, &mut bufsizes);
+                note_buffer(output, grid_of(exec, ext).1, &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
                     inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
