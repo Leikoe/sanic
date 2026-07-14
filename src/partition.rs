@@ -1566,6 +1566,38 @@ mod tests {
         );
     }
 
+    // A composed logsumexp — `m + log(Σ exp(x − m))` — folds as ONE carrier,
+    // not a bare `max` spilled beside a `Σexp` that recomputes it. A free map
+    // wrapping only PLAIN reductions is kept whole and re-derives as a single
+    // (max, Σexp) rescale carrier; the streamed max never materializes twice.
+    // (The dual is above: a free map wrapping a CONTRACTION — silu·gate·up,
+    // scale·QKᵀ+mask — still decomposes so the matmul stays in-body / cut.)
+    #[test]
+    fn composed_logsumexp_folds_as_one_carrier() {
+        let (b, c) = (axis("b"), axis("c"));
+        let z = input("Z", &[b, c]);
+        let m = reduce(z.clone(), c, BinOp::Monoid(Monoid::Max));
+        let sumexp = reduce(
+            map(MapOp::Exp, vec![map(MapOp::Sub, vec![z.clone(), m.clone()])]),
+            c,
+            add_r(),
+        );
+        let lse = map(MapOp::Add, vec![m, map(MapOp::Log, vec![sumexp])]); // [b]
+        let loss = reduce(lse, b, add_r()); // scalar
+
+        let sched = partition(&loss, &Device::toy(), &ext(&[(b, 128.0), (c, 32.0)]));
+        assert_eq!(
+            sched.stages.len(),
+            2,
+            "the (max, Σexp) carrier + the outer sum — no third bare-max stage"
+        );
+        let Stage::Fused { spec, .. } = &sched.stages[0] else {
+            panic!("first stage is the fused logsumexp carrier")
+        };
+        assert_eq!(spec.streaming_axis, c);
+        assert_eq!(spec.carrier.slots, 2, "one (max, Σexp) rescale carrier");
+    }
+
     // The FLATTENED variant of the down projection (the W4-matvec shape: the
     // contraction split into (group, lane) so a per-group scale is pure axis
     // structure, then flattened back to one streamed fold). The flatten blocks

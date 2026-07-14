@@ -702,6 +702,42 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
     })
 }
 
+/// Classify the folds over axes OTHER than `axis` inside a free-along-`axis`
+/// sub-expression: `(has_plain_reduction, has_contraction)`. A logsumexp's
+/// `max`/`Σexp` are plain single-tensor reductions; an attention score or a
+/// GEMM is a two-tensor contraction the emitters compute in-body (or cut as a
+/// separate GEMM). A free map worth keeping WHOLE wraps only plain
+/// reductions — wrapping a contraction, it must stay decomposed so the matmul
+/// machinery still sees it.
+fn other_axis_folds(node: &Node, axis: Axis) -> (bool, bool) {
+    let is_contraction = matches!(node.as_ref(),
+        NodeKind::Reduce { src, op: BinOp::Monoid(Monoid::Add), axis: a }
+            if *a != axis
+            && matches!(src.as_ref(),
+                NodeKind::Map { op: MapOp::Mul, inputs } if inputs.len() == 2));
+    match node.as_ref() {
+        NodeKind::Reduce { src, axis: a, .. } | NodeKind::Scan { src, axis: a, .. } => {
+            let (plain, contr) = other_axis_folds(src, axis);
+            match (*a != axis, is_contraction) {
+                (true, true) => (plain, true),
+                (true, false) => (true, contr),
+                (false, _) => (plain, contr),
+            }
+        }
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => (false, false),
+        NodeKind::Map { inputs, .. } => inputs.iter().fold((false, false), |(p, c), i| {
+            let (p2, c2) = other_axis_folds(i, axis);
+            (p || p2, c || c2)
+        }),
+        NodeKind::Gather { src, index, .. } => {
+            let (p, c) = other_axis_folds(src, axis);
+            let (p2, c2) = other_axis_folds(index, axis);
+            (p || p2, c || c2)
+        }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => other_axis_folds(src, axis),
+    }
+}
+
 /// Stream `node` over `axis`, registering reductions-over-axis as slots.
 /// Memoized per node, so DAG-shared sub-expressions register once.
 fn go(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
@@ -727,10 +763,24 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
     // A maximal sub-expression that is FREE along the axis is, from the
     // axis's point of view, a per-element constant: treat it as a leaf input
     // (raw tensors, iotas, values reduced over other axes, views…). Maps are
-    // decomposed first so their elementwise work fuses into the lift.
-    if !matches!(node.as_ref(), NodeKind::Map { .. })
-        && structure(node, axis).level == Parallelism::Free
-    {
+    // decomposed first so their elementwise work fuses into the lift — EXCEPT a
+    // free map that wraps a fold over another axis. Decomposing a free map buys
+    // no algebra (the defer/invariant rules act on the STREAMED axis, which a
+    // free map does not touch); it only splits a linear combination of nested
+    // folds — logsumexp's `m + log(Σ exp(x − m))` — into a separate leaf per
+    // fold, so each becomes its own kernel and the shared inner reduction (the
+    // running max) is duplicated. Kept whole, the combination cuts once and
+    // re-derives as a single carrier downstream.
+    let is_free = structure(node, axis).level == Parallelism::Free;
+    let is_map = matches!(node.as_ref(), NodeKind::Map { .. });
+    // Keep a free map whole only when it wraps plain reductions and no
+    // contraction — logsumexp's `m + log(Σexp)`, yes; `scale·QKᵀ + mask` or
+    // `silu(gate)·up`, no (those decompose so the matmul stays in-body / cut).
+    let keep_map_whole = is_map && {
+        let (plain, contraction) = other_axis_folds(node, axis);
+        plain && !contraction
+    };
+    if is_free && (!is_map || keep_map_whole) {
         // The leaf's free axes are its output shape minus the streamed axis.
         let free = output_axes(node)
             .into_iter()
