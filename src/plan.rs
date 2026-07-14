@@ -985,8 +985,8 @@ mod tests {
         let dev = Device::toy();
         let extents = ext(&[(n, 65536.0)]);
 
-        // Sum has a carrier, so planning succeeds even though the CuTile
-        // emitter declines it (no row tile, no contraction).
+        // Sum has a carrier, so planning succeeds even for a fold with no
+        // row tile and no inner contraction.
         let plan = plan(&s, &dev, &extents);
         assert!(plan.is_some(), "sum should have a feasible kernel");
         assert_eq!(plan.unwrap().kernels.len(), 1);

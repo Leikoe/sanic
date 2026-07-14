@@ -11,7 +11,6 @@ use std::collections::HashMap;
 
 use sanic::cost::Device;
 use sanic::derive;
-use sanic::emit_cutile::emit_module;
 use sanic::emit_rust::{rust_kernel, tiled_kernel};
 use sanic::ir::*;
 use sanic::plan::plan;
@@ -91,28 +90,4 @@ fn main() {
     let total = map(MapOp::Add, vec![o1, o2]);
     let mv = derive(&total, k4).unwrap();
     println!("{}", rust_kernel(&mv, "multi_value_attention", "k", &[]));
-
-    // ── 5. the GPU-shaped emission: CuTile Python + launcher ─────────────────
-    banner("5. multi-head flash as CuTile Python (kernel + launcher)");
-    let (b, h) = (axis("b"), axis("h"));
-    let (sq5, k5, d5, e5) = (axis("sq"), axis("k"), axis("d"), axis("e"));
-    let mha = attention(
-        input("Q", &[b, h, sq5, d5]),
-        input("K", &[b, h, k5, d5]),
-        input("V", &[b, h, k5, e5]),
-        d5,
-        k5,
-    );
-    let extents5: HashMap<Axis, f64> = [
-        (b, 1.0),
-        (h, 8.0),
-        (sq5, 2048.0),
-        (k5, 2048.0),
-        (d5, 64.0),
-        (e5, 64.0),
-    ]
-    .into_iter()
-    .collect();
-    let gpu_plan = plan(&mha, &dev, &extents5).unwrap();
-    println!("{}", emit_module(&gpu_plan));
 }

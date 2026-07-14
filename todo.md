@@ -132,9 +132,6 @@ page is substrate we need so the moat is usable on real workloads.
 
 **Exists but narrow / unproven:**
 
-- **`emit_cutile`** — CuTile Python for the attention-shaped family only;
-  string-tested, **never run on a GPU** (one `#[ignore]`d test). Superseded by
-  `emit_metal` as the GPU path on this hardware.
 - **SSM/`Scan`** — narrowed (2026-07-13), each edge now a rule or a stated
   decline: MONOIDAL prefix scans evaluate, EMIT (each point folds its own
   prefix — Rust and GPU, oracle-checked, `monoidal_prefix_scans_run_on_gpu`)
@@ -202,8 +199,8 @@ The credibility step: **a kernel sanic emits runs on real hardware.**
 ### M4 — Basis + dtypes (unblocks quantized inference & RoPE) · [done]
 Additive to the IR, no algebra changes:
 - **Transcendentals `Sin`/`Cos`** — [done]. Threaded through every layer
-  (`ir`, `derive` incl. `Expr`, `codegen`, `emit_cutile`, `emit_rust`) — ~2
-  lines each, confirming the closed basis stays cheap to extend and total.
+  (`ir`, `derive` incl. `Expr`, `codegen`, `emit_rust`) — ~2 lines each,
+  confirming the closed basis stays cheap to extend and total.
 - **RoPE** — [done, without new IR]. Named axes make the pair/half split a
   matter of *axis structure*, not a reshape: express the head dim as a pair
   axis and apply a **computed 2×2 rotation matmul** (memory-free, from
@@ -698,8 +695,8 @@ carrier, not a benchmark surprise.
 - **The algebra stays honest.** `Monoid`/linearity laws are load-bearing; a
   false law is a wrong kernel. Keep the enums tiny and the laws few.
 - **Decline, don't guess.** Where a computation leaves the supported fragment,
-  return `None`/refuse (as `derive` and `emit_cutile` already do) rather than
-  emit something unverified. Coverage grows by adding provable cases.
+  return `None`/refuse (as `derive` already does) rather than emit something
+  unverified. Coverage grows by adding provable cases.
 - **Keep tinygrad's substrate, replace its criterion** (`vs_tinygrad.md`): index
   arithmetic, per-axis realize, measured tuning — with derivation where they cut.
 - **Derive the kernel, then derive the schedule** (`vs_mlx.md`): launch

@@ -31,8 +31,6 @@
 //!   Rust (verified by `rustc`-compile-and-run) and to Metal (dispatched on
 //!   the Apple GPU by the tests)
 //! * [`emit_rust`] — a single derived kernel as compilable Rust
-//! * [`emit_cutile`] — the derived kernel as CuTile Python (attention-shaped
-//!   family; string-tested, not yet run on a GPU)
 //!
 //! The headline: given naive `softmax(QKᵀ)·V` as a dataflow graph, `derive`
 //! reconstructs the FlashAttention `(m, ℓ, o)` running accumulator from
@@ -45,7 +43,6 @@ pub mod bpe;
 pub mod codegen;
 pub mod cost;
 pub mod derive;
-pub mod emit_cutile;
 pub mod emit_metal;
 pub mod emit_rust;
 pub mod grad;

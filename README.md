@@ -102,10 +102,6 @@ ir  →  analyze  →  derive  →  cost / plan / partition  →  interp (oracle
   and a two-kernel split reduction.
 - **`emit_rust`** — the derived kernel as compilable Rust: scalar and tiled
   (single-carrier; superseded by `rustgen` for whole schedules).
-- **`emit_cutile`** — the derived kernel as CuTile Python, plus a launcher.
-  Honest scope: it covers the row-tiled, inner-contraction (attention-shaped)
-  family and declines everything else; it is string-tested and has not yet
-  run on a GPU.
 
 ```rust
 let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
@@ -294,8 +290,9 @@ Each is a concrete, reproducible gap:
    the dequant fusion exist; buffers are still f64/f32), **no memory
    planning** (liveness, buffer reuse), **no dynamic shapes, no multi-device
    execution** (the allreduce math exists as the split-reduction merge; a
-   device runtime does not). `Scan` has no backward. The CuTile emitter
-   covers the attention-shaped family only and has not run on a GPU.
+   device runtime does not). Monoidal prefix scans emit and `Add`-scans
+   differentiate (cumsum ⟵ reversed cumsum); `Max`/`Min` and affine-scan
+   backward are declined.
 
 What's genuinely novel here versus the mainstream: XLA/Inductor-class
 compilers fuse by op-category pattern rules and treat online-softmax-style
@@ -324,7 +321,7 @@ cargo run --example mha      # naive multi-head attention → FlashAttention
 cargo run --example mla      # DeepSeek MLA, standard & absorbed → same kernel
 cargo run --example llm      # a transformer block, split into 13 kernels
 cargo run --example execute  # run a partitioned schedule on real tensors
-cargo run --example kernels  # a gallery of derived flash kernels (Rust + CuTile)
+cargo run --example kernels  # a gallery of derived flash kernels (Rust)
 cargo test                   # 123 tests (incl. rustc-compiled and GPU-dispatched)
 ```
 
@@ -350,8 +347,8 @@ pub fn flash_attention(elements: impl IntoIterator<Item = [f64; 2]>) -> f64 {
 
 The planner then sizes it — the carrier's exact accumulator size feeds the
 SRAM constraint, the tile sweep keeps the cheapest tile that fits — and the
-emitter blocks the kernel by that tile. Still a CPU scalar kernel; the CuTile
-path emits the GPU-shaped source but hasn't been run on hardware yet.
+emitter blocks the kernel by that tile. For the GPU, `emit_metal` lowers the
+same schedule to MSL and the tests dispatch it on the Apple GPU.
 
 The structure map for attention, straight from `cargo run --example derive`:
 

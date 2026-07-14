@@ -6,7 +6,7 @@ rust-version = "1.85"
 # Description grounded in todo.md's "Where we are" — every capability named
 # here is a verified item there (derived and run on interp / rustc / GPU).
 description = "Derives streaming ML kernels — FlashAttention, RoPE, convolution, quantized matmul, KV-cache decode, backward passes — from naive dataflow graphs by algebra, not templates, then lowers whole schedules to compilable Rust and to Metal for the GPU."
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/Leikoe/fusion-engine"
 documentation = "https://docs.rs/sanic"
 readme = "README.md"
