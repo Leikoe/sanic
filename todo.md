@@ -522,13 +522,34 @@ header whose length isn't a multiple of 4 (GPT-2's!) still lands every
 tensor at a bindable offset. GPT-2 binds wte+wpe — 158 MB including the
 tied logits head — straight from the checkpoint, numerics bit-identical
 (24/24), GPU test proves pointer identity (a host write is visible to the
-GPU with no re-upload). Trinity, measured honestly, does NOT benefit yet:
-its checkpoint interleaves expert tensors in STRING order (e0, e1, e10,
-e100…), so the stacked per-projection tensors the gathers read are not
-contiguous file ranges, and everything else is bf16→f16/f32 converted at
-load. The design that unlocks it: a one-time REPACK to a device-image file
-(tensors stacked and aligned exactly as the graph reads them) that every
-later run maps zero-copy whole — recorded here, not yet built.
+GPU with no re-upload).
+
+Trinity, measured honestly, does NOT benefit — and the mmap path to make
+it benefit was BUILT, measured, and reverted (2026-07-13) because it lost
+on this checkpoint. Two independent blockers, each proven on the metal:
+(1) its 128 experts are interleaved in STRING order (e0, e1, e10, e100…),
+so the stacked per-projection tensors the gathers read are not contiguous
+file ranges and MUST be assembled host-side; the experts are 72% of the
+file, so zero-copying the other 28% (the bf16 attn/head/embed weights,
+which DID bind — 1.23 GB, numerics pinned) can't beat the simple path.
+(2) a lazy mmap made the dominant cost — reading the experts — SLOWER
+(scattered page faults: 14.8 s vs 5.9 s), and a sequential prefault to
+fix that just faults the whole file resident, defeating the memory point.
+The `Dtype::BF16` half of it SHIPPED (the weights are now checkpoint-
+native and bindable); the mmap primitives did not (no caller wins). The
+real unlock stands unchanged: a one-time REPACK to a device-image file
+(tensors stacked and aligned exactly as the graph reads them, header
+padded to 4) that every later run binds whole — bf16 is the prerequisite,
+now in place; the repack is the remaining piece.
+
+GPT-2's binding is single-copy-plus-offset, not a true mmap: its header
+length isn't a multiple of 4, so every tensor sits at an unbindable
+offset; `open_zero_copy` reads the file once into a lead-PADDED
+page-aligned region (that region IS the device buffer via
+`newBufferWithBytesNoCopy`, so the disk read lands straight in GPU
+memory — no host→device copy) and binds wte+wpe at their realigned
+offsets. A true mmap can't pad, so it can't serve GPT-2's misaligned
+checkpoint; the padded single-copy is the honest best here.
 
 **Ring-buffer caches — designed precisely, deferred (2026-07-13):** a
 sliding window beyond T_MAX needs no new runtime machinery, because

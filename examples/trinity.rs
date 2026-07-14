@@ -797,7 +797,13 @@ inline float w4(device const uchar* p, uint i) {\n\
     };
     let pipes = g.compile_chunked(&program.msl, MSL_HEADER, 96, true);
 
-    // ── upload: every input straight from the checkpoint, typed ──
+    // ── upload: every input from the checkpoint, typed. bf16 weights upload
+    // their RAW bytes (no host conversion — they're checkpoint-native). Not
+    // zero-copied: Trinity's experts (72% of the file) are gathered from
+    // non-contiguous ranges and must be stacked host-side, so mapping the
+    // whole file to bind only the bf16 weights is a wash — the win needs a
+    // one-time repack to a device-image file (see todo.md; the bf16 dtype is
+    // the prerequisite, now in place). ──
     let st = StFile::open(std::path::Path::new(&st_path)).expect("open safetensors");
     let t0 = std::time::Instant::now();
     let mut bufs: HashMap<String, MetalBuf> = HashMap::new();

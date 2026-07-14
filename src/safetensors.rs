@@ -257,28 +257,6 @@ impl std::ops::Deref for Payload {
     }
 }
 
-/// A page-aligned, page-rounded copy of a file's bytes — the shape a
-/// zero-copy device wrap (`newBufferWithBytesNoCopy`) requires. On unified
-/// memory the allocation IS the device buffer; leak it for the model's
-/// lifetime and bind tensors at their file offsets.
-pub fn read_page_aligned(path: &Path) -> Result<&'static [u8], String> {
-    const PAGE: usize = 16384;
-    let meta = fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    let len = meta.len() as usize;
-    let cap = len.div_ceil(PAGE).max(1) * PAGE;
-    let layout = std::alloc::Layout::from_size_align(cap, PAGE).map_err(|e| e.to_string())?;
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        return Err("page-aligned allocation failed".into());
-    }
-    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-    use std::io::Read;
-    let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    f.read_exact(&mut buf[..len])
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(buf)
-}
-
 impl StFile {
     pub fn open(path: &Path) -> Result<StFile, String> {
         let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;

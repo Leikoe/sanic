@@ -272,8 +272,8 @@ impl MetalDevice {
     /// no second residency; on unified memory the pointer IS the device
     /// address. The region must be page-aligned with a page-multiple length
     /// (`None` otherwise — copy instead), and must outlive every use: pass
-    /// leaked (`Box::leak`) or otherwise 'static memory. Bind individual
-    /// tensors inside it with [`MetalBuf::slice`].
+    /// leaked / 'static memory. Bind individual tensors inside it with
+    /// [`MetalBuf::slice`].
     pub fn from_bytes_nocopy(&self, data: &'static [u8]) -> Option<MetalBuf> {
         let page = 16384usize; // Apple silicon page size
         if data.as_ptr() as usize % page != 0 || data.len() % page != 0 || data.is_empty() {

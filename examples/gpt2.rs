@@ -726,13 +726,14 @@ fn main() {
             t0.elapsed().as_secs_f32()
         );
 
-        // ZERO COPY: unified memory means the checkpoint's bytes can BE the
-        // device buffer. The file wraps whole (page-aligned, leaked for the
-        // model's lifetime) and any tensor stored f32 and used UNTRANSPOSED
-        // binds at its file offset — wte (154 MB, doubling as the tied
-        // logits head) and wpe. The rest are transposed or split host-side
-        // and still copy; bf16 mode round-trips values, so it never
-        // zero-copies.
+        // Offset binding: unified memory lets several tensors alias ONE
+        // device buffer. The file is read once into a page-aligned, lead-
+        // padded region (the pad realigns GPT-2's header-not-%4 offsets to a
+        // 4-byte bind boundary) and any tensor stored f32 and used
+        // UNTRANSPOSED binds at its file offset with no second upload — wte
+        // (154 MB, doubling as the tied logits head) and wpe. The rest are
+        // transposed or split host-side and still copy; bf16 mode round-trips
+        // values, so it never binds directly.
         let zc = if bf16 {
             None
         } else {
