@@ -333,7 +333,16 @@ pub fn input_dt(name: &'static str, axes: &[Axis], dtype: Dtype) -> Node {
 /// Every input that DECLARES a storage dtype, by name (first declaration
 /// wins). Inputs without one price at the device's compute dtype.
 pub fn input_dtypes(node: &Node) -> Vec<(&'static str, Dtype)> {
-    fn go(n: &Node, out: &mut Vec<(&'static str, Dtype)>) {
+    fn go(
+        n: &Node,
+        out: &mut Vec<(&'static str, Dtype)>,
+        seen: &mut std::collections::HashSet<*const NodeKind>,
+    ) {
+        // Walk each DAG node once — exponential on shared backward graphs
+        // otherwise (dtypes dedup by name, so first-reach is equivalent).
+        if !seen.insert(std::rc::Rc::as_ptr(n)) {
+            return;
+        }
         match n.as_ref() {
             NodeKind::Input {
                 name,
@@ -345,19 +354,19 @@ pub fn input_dtypes(node: &Node) -> Vec<(&'static str, Dtype)> {
                 }
             }
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out)),
+            NodeKind::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out, seen)),
             NodeKind::Reduce { src, .. }
             | NodeKind::Scan { src, .. }
             | NodeKind::View { src, .. }
-            | NodeKind::Reindex { src, .. } => go(src, out),
+            | NodeKind::Reindex { src, .. } => go(src, out, seen),
             NodeKind::Gather { src, index, .. } => {
-                go(src, out);
-                go(index, out);
+                go(src, out, seen);
+                go(index, out, seen);
             }
         }
     }
     let mut out = Vec::new();
-    go(node, &mut out);
+    go(node, &mut out, &mut std::collections::HashSet::new());
     out
 }
 
@@ -537,31 +546,44 @@ fn output_axes_rc(node: &Node, cache: &mut std::collections::HashMap<*const Node
 /// `Const` and `Iota` carry no storage and are not reported.
 pub fn input_axes(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
     let mut out = Vec::new();
-    collect_input_axes(node, &mut out);
+    let mut seen = std::collections::HashSet::new();
+    collect_input_axes(node, &mut out, &mut seen);
     out
 }
 
-fn collect_input_axes(node: &Node, out: &mut Vec<(&'static str, Vec<Axis>)>) {
+fn collect_input_axes(
+    node: &Node,
+    out: &mut Vec<(&'static str, Vec<Axis>)>,
+    seen: &mut std::collections::HashSet<*const NodeKind>,
+) {
+    // Walk each DAG node once. Without this the per-PATH result is exponential
+    // in a backward graph's sharing (both time AND output size — a diamond
+    // doubles it per level). Consumers dedup by name and read only byte volume
+    // (`plan`), which is invariant under the rename/flatten relabeling below, so
+    // keeping the first-reached occurrence is equivalent.
+    if !seen.insert(Rc::as_ptr(node)) {
+        return;
+    }
     match node.as_ref() {
         NodeKind::Input { name, axes, .. } => out.push((name, axes.clone())),
         NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
         NodeKind::Map { inputs, .. } => {
             for i in inputs {
-                collect_input_axes(i, out);
+                collect_input_axes(i, out, seen);
             }
         }
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
-            collect_input_axes(src, out);
+            collect_input_axes(src, out, seen);
         }
         NodeKind::Gather { src, index, .. } => {
-            collect_input_axes(src, out);
-            collect_input_axes(index, out);
+            collect_input_axes(src, out, seen);
+            collect_input_axes(index, out, seen);
         }
         // A view relabels: report the inputs below under the viewed names, so
         // shape-based modeling (SRAM, traffic) sees what the consumer reads.
         NodeKind::View { src, groups } => {
             let before = out.len();
-            collect_input_axes(src, out);
+            collect_input_axes(src, out, seen);
             for (_, axes) in out[before..].iter_mut() {
                 let mut mapped: Vec<Axis> = Vec::new();
                 for a in axes.iter() {
@@ -586,7 +608,7 @@ fn collect_input_axes(node: &Node, out: &mut Vec<(&'static str, Vec<Axis>)>) {
         // which is what the consumer-side model should price).
         NodeKind::Reindex { src, map, .. } => {
             let before = out.len();
-            collect_input_axes(src, out);
+            collect_input_axes(src, out, seen);
             for (_, axes) in out[before..].iter_mut() {
                 let mut mapped: Vec<Axis> = Vec::new();
                 for a in axes.iter() {
