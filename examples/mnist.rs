@@ -265,6 +265,16 @@ fn main() {
         roots.push((update, leak(format!("{name}_next"))));
     }
 
+    // Algebraically simplify the whole training step before scheduling. The
+    // gradient's stabilizing max-shift cancels to `softmax` (no winner-mask),
+    // and cross-root CSE lets the backward reuse the forward's logsumexp carrier
+    // via `exp(z − lse)` instead of recomputing it — so the composed
+    // cross-entropy's backward derives to the same kernels a hand-written
+    // `softmax − onehot` rule would. See `sanic::simplify`.
+    let nodes = sanic::simplify::simplify_many(&roots.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+    let roots: Vec<(Node, &'static str)> =
+        nodes.into_iter().zip(&roots).map(|(n, (_, name))| (n, *name)).collect();
+
     let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let t0 = std::time::Instant::now();
     let sched = partition_many(&roots, &Device::toy(), &ext_f);
