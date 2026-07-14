@@ -1609,3 +1609,66 @@ fn monoidal_prefix_scans_run_on_gpu() {
         eprintln!("{label} prefix scan on GPU: {}", out.trim());
     }
 }
+
+/// Unified memory means weights need no upload: a page-aligned host region
+/// wraps as a device buffer (`newBufferWithBytesNoCopy`) and tensors bind
+/// at byte offsets into it. The kernel must read the SAME memory — proven
+/// by writing through the host pointer AFTER wrapping and seeing the GPU
+/// observe it.
+#[test]
+fn zero_copy_wrap_binds_tensors_at_offsets() {
+    use sanic::metal::MetalDevice;
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    const PAGE: usize = 16384;
+    let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
+    let region: &'static mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), PAGE) };
+    // two "tensors" at offsets 0 and 4096 (4-byte aligned, mid-page)
+    let n = 64usize;
+    for i in 0..n {
+        let b = ((i as f32) * 0.5).to_le_bytes();
+        region[i * 4..i * 4 + 4].copy_from_slice(&b);
+        region[4096 + i * 4..4096 + i * 4 + 4].copy_from_slice(&(i as f32).to_le_bytes());
+    }
+    let base = region.as_mut_ptr();
+    let whole = dev
+        .from_bytes_nocopy(unsafe { std::slice::from_raw_parts(base, PAGE) })
+        .expect("page-aligned wrap");
+    let a = whole.slice(0);
+    let b = whole.slice(4096);
+
+    // y[i] = A[i] + B[i], a trivial kernel over the two offset views
+    let msl = r#"#include <metal_stdlib>
+using namespace metal;
+kernel void zc_add(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* outb [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid < 64) outb[gid] = A[gid] + B[gid]; }
+"#;
+    let pipes = dev.compile(msl);
+    let out = dev.alloc_f32(n);
+    let run = |dev: &MetalDevice| {
+        dev.run(&[Dispatch {
+            pipe: pipes.get("zc_add"),
+            inputs: vec![a.clone(), b.clone()],
+            output: out.clone(),
+            grid: n,
+        }]);
+        dev.read_f32(&out, n)
+    };
+    let got = run(&dev);
+    for i in 0..n {
+        assert_eq!(got[i], (i as f32) * 1.5, "offset-bound reads");
+    }
+    // the zero-copy property itself: mutate through the HOST pointer, the
+    // device sees it without any re-upload
+    unsafe { (base as *mut f32).write(100.0) };
+    let got = run(&dev);
+    assert_eq!(got[0], 100.0, "host write visible to the GPU: same memory");
+    eprintln!("zero-copy wrap + offset binding on GPU: OK");
+}

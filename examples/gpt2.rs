@@ -726,19 +726,55 @@ fn main() {
             t0.elapsed().as_secs_f32()
         );
 
+        // ZERO COPY: unified memory means the checkpoint's bytes can BE the
+        // device buffer. The file wraps whole (page-aligned, leaked for the
+        // model's lifetime) and any tensor stored f32 and used UNTRANSPOSED
+        // binds at its file offset — wte (154 MB, doubling as the tied
+        // logits head) and wpe. The rest are transposed or split host-side
+        // and still copy; bf16 mode round-trips values, so it never
+        // zero-copies.
+        let zc = if bf16 {
+            None
+        } else {
+            sanic::safetensors::StFile::open_zero_copy(std::path::Path::new(&st_path))
+                .ok()
+                .and_then(|(st, region)| Some((st, g.from_bytes_nocopy(region)?)))
+        };
+
         // buffers: weights uploaded once; `id`/`pos` rewritten per step;
         // caches allocated zeroed and PERSISTED across steps by swap-commit
         let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
+        let mut zc_bytes = 0usize;
         for (name, axes) in &program.inputs {
             let size: usize = axes.iter().map(|a| model.ext[a]).product::<usize>().max(1);
             if *name == "id" || *name == "pos" || name.starts_with("cache_") {
                 bufs.insert(name.to_string(), g.alloc_f32(size));
-            } else {
-                let t = model.env[name].permuted_to(axes);
-                let b = g.alloc_f32(t.data.len());
-                g.write_f64(&b, &t.data);
-                bufs.insert(name.to_string(), b);
+                continue;
             }
+            let src = match *name {
+                "wte" => Some("wte.weight"),
+                "wpe" => Some("wpe.weight"),
+                _ => None,
+            };
+            if let (Some((st, fb)), Some(src)) = (&zc, src)
+                && st.meta(src).0 == "F32"
+                && st.file_range(src).0 % 4 == 0
+            {
+                let (a, b) = st.file_range(src);
+                zc_bytes += b - a;
+                bufs.insert(name.to_string(), fb.slice(a));
+                continue;
+            }
+            let t = model.env[name].permuted_to(axes);
+            let b = g.alloc_f32(t.data.len());
+            g.write_f64(&b, &t.data);
+            bufs.insert(name.to_string(), b);
+        }
+        if zc_bytes > 0 {
+            println!(
+                "[{label}] {:.0} MB bound zero-copy from the checkpoint (no upload)",
+                zc_bytes as f64 / 1e6
+            );
         }
         for (n, size) in &program.buffers {
             bufs.insert(n.clone(), g.alloc_f32(*size));

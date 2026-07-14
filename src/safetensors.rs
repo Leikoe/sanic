@@ -235,14 +235,65 @@ pub struct RawTensor {
 /// quantized checkpoint never widens wholesale. `weight_packed` int32
 /// tensors pass through as raw bytes for typed GPU buffers.
 pub struct StFile {
-    bytes: Vec<u8>,
+    bytes: Payload,
     data_off: usize,
     entries: HashMap<String, (String, Vec<usize>, usize, usize)>,
+}
+
+/// The file's payload: owned (the plain reader) or a leaked page-aligned
+/// region a device wraps zero-copy.
+enum Payload {
+    Owned(Vec<u8>),
+    Static(&'static [u8]),
+}
+
+impl std::ops::Deref for Payload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Payload::Owned(v) => v,
+            Payload::Static(s) => s,
+        }
+    }
+}
+
+/// A page-aligned, page-rounded copy of a file's bytes — the shape a
+/// zero-copy device wrap (`newBufferWithBytesNoCopy`) requires. On unified
+/// memory the allocation IS the device buffer; leak it for the model's
+/// lifetime and bind tensors at their file offsets.
+pub fn read_page_aligned(path: &Path) -> Result<&'static [u8], String> {
+    const PAGE: usize = 16384;
+    let meta = fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let len = meta.len() as usize;
+    let cap = len.div_ceil(PAGE).max(1) * PAGE;
+    let layout = std::alloc::Layout::from_size_align(cap, PAGE).map_err(|e| e.to_string())?;
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err("page-aligned allocation failed".into());
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
+    use std::io::Read;
+    let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    f.read_exact(&mut buf[..len])
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(buf)
 }
 
 impl StFile {
     pub fn open(path: &Path) -> Result<StFile, String> {
         let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        StFile::parse_owned(bytes)
+    }
+
+    fn parse(bytes: &[u8]) -> Result<StFile, String> {
+        StFile::parse_owned(bytes.to_vec()).map(|mut st| {
+            // callers replace the payload; keep only header-derived state
+            st.bytes = Payload::Owned(Vec::new());
+            st
+        })
+    }
+
+    fn parse_owned(bytes: Vec<u8>) -> Result<StFile, String> {
         if bytes.len() < 8 {
             return Err("file too short for a safetensors header".into());
         }
@@ -284,10 +335,49 @@ impl StFile {
             entries.insert(name, (dtype, shape, a, b));
         }
         Ok(StFile {
-            bytes,
+            bytes: Payload::Owned(bytes),
             data_off: 8 + hlen,
             entries,
         })
+    }
+
+    /// Open with a page-aligned, LEAKED backing suitable for a zero-copy
+    /// device wrap: returns the file plus the 'static region — pass the
+    /// region to `MetalDevice::from_bytes_nocopy` and bind tensors at
+    /// [`StFile::file_range`] offsets. The bytes live for the process (a
+    /// model's weights do anyway); nothing is read twice or copied to the
+    /// GPU.
+    pub fn open_zero_copy(path: &Path) -> Result<(StFile, &'static [u8]), String> {
+        // A file whose header length is not a multiple of 4 puts every
+        // tensor at a misaligned byte offset (GPT-2's checkpoint does), and
+        // device buffers cannot bind there. All tensors share the parity,
+        // so ONE lead pad in the allocation realigns the whole data
+        // section.
+        use std::io::Read;
+        let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut hd = [0u8; 8];
+        f.read_exact(&mut hd).map_err(|e| e.to_string())?;
+        let hlen = u64::from_le_bytes(hd) as usize;
+        let data_off = 8 + hlen;
+        let pad = (4 - data_off % 4) % 4;
+
+        const PAGE: usize = 16384;
+        let len = fs::metadata(path).map_err(|e| e.to_string())?.len() as usize;
+        let cap = (pad + len).div_ceil(PAGE).max(1) * PAGE;
+        let layout = std::alloc::Layout::from_size_align(cap, PAGE).map_err(|e| e.to_string())?;
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err("page-aligned allocation failed".into());
+        }
+        let region: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
+        region[pad..pad + 8].copy_from_slice(&hd);
+        f.read_exact(&mut region[pad + 8..pad + len])
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+
+        let mut st = StFile::parse(&region[pad..pad + len])?;
+        st.data_off += pad; // ranges are absolute in the padded region
+        st.bytes = Payload::Static(region);
+        Ok((st, region))
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -314,6 +404,16 @@ impl StFile {
             .get(name)
             .unwrap_or_else(|| panic!("no tensor `{name}` in file"));
         &self.bytes[self.data_off + a..self.data_off + b]
+    }
+
+    /// The tensor's ABSOLUTE byte range in the file — where a zero-copy
+    /// wrap of the whole file binds this tensor (`MetalBuf::slice`).
+    pub fn file_range(&self, name: &str) -> (usize, usize) {
+        let (_, _, a, b) = self
+            .entries
+            .get(name)
+            .unwrap_or_else(|| panic!("no tensor `{name}` in file"));
+        (self.data_off + a, self.data_off + b)
     }
 
     /// Decode to f32 (BF16/F16/F32 sources).

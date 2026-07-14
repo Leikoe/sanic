@@ -49,15 +49,32 @@ use crate::plan::FoldSched;
 /// A pipeline for one compiled kernel.
 pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
-/// A device buffer in shared (unified) memory. Cloning retains the same
-/// underlying allocation — a name→buffer map can swap entries in O(1), which
-/// is exactly how a session commits a KV-cache update on device.
+/// A device buffer in shared (unified) memory, with a byte OFFSET into the
+/// underlying allocation: several logical buffers can alias one `MTLBuffer`
+/// (a zero-copy weight file wrapped whole, tensors bound at their file
+/// offsets). Cloning retains the same underlying allocation — a name→buffer
+/// map can swap entries in O(1), which is exactly how a session commits a
+/// KV-cache update on device.
 #[derive(Clone)]
-pub struct MetalBuf(Retained<ProtocolObject<dyn MTLBuffer>>);
+pub struct MetalBuf(Retained<ProtocolObject<dyn MTLBuffer>>, usize);
 
 impl MetalBuf {
     pub fn byte_len(&self) -> usize {
-        self.0.length()
+        self.0.length() - self.1
+    }
+    /// This buffer, re-based `off` bytes further in. Apple GPUs require
+    /// device-buffer bind offsets in multiples of 4; misaligned tensors must
+    /// copy instead.
+    pub fn slice(&self, off: usize) -> MetalBuf {
+        assert!(
+            (self.1 + off) % 4 == 0,
+            "buffer bind offsets must be 4-byte aligned (got {})",
+            self.1 + off
+        );
+        MetalBuf(self.0.clone(), self.1 + off)
+    }
+    fn contents(&self) -> *mut u8 {
+        unsafe { (self.0.contents().as_ptr() as *mut u8).add(self.1) }
     }
 }
 
@@ -216,7 +233,7 @@ impl MetalDevice {
             .newBufferWithLength_options(bytes.max(4), MTLResourceOptions::StorageModeShared)
             .expect("buffer allocation");
         unsafe { std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes.max(4)) };
-        MetalBuf(buf)
+        MetalBuf(buf, 0)
     }
 
     pub fn from_f32(&self, data: &[f32]) -> MetalBuf {
@@ -224,7 +241,7 @@ impl MetalDevice {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                buf.0.contents().as_ptr() as *mut f32,
+                buf.contents() as *mut f32,
                 data.len(),
             )
         };
@@ -244,23 +261,46 @@ impl MetalDevice {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                buf.0.contents().as_ptr() as *mut u8,
+                buf.contents(),
                 data.len(),
             )
         };
         buf
     }
 
+    /// ZERO-COPY: wrap caller-owned memory as a device buffer — no upload,
+    /// no second residency; on unified memory the pointer IS the device
+    /// address. The region must be page-aligned with a page-multiple length
+    /// (`None` otherwise — copy instead), and must outlive every use: pass
+    /// leaked (`Box::leak`) or otherwise 'static memory. Bind individual
+    /// tensors inside it with [`MetalBuf::slice`].
+    pub fn from_bytes_nocopy(&self, data: &'static [u8]) -> Option<MetalBuf> {
+        let page = 16384usize; // Apple silicon page size
+        if data.as_ptr() as usize % page != 0 || data.len() % page != 0 || data.is_empty() {
+            return None;
+        }
+        let ptr = std::ptr::NonNull::new(data.as_ptr() as *mut std::ffi::c_void)?;
+        let buf = unsafe {
+            self.dev.newBufferWithBytesNoCopy_length_options_deallocator(
+                ptr,
+                data.len(),
+                MTLResourceOptions::StorageModeShared,
+                None, // caller-owned ('static): no deallocator
+            )
+        }?;
+        Some(MetalBuf(buf, 0))
+    }
+
     /// Overwrite a buffer's leading elements (f64 host values → f32 device).
     pub fn write_f64(&self, buf: &MetalBuf, data: &[f64]) {
-        let ptr = buf.0.contents().as_ptr() as *mut f32;
+        let ptr = buf.contents() as *mut f32;
         for (i, &v) in data.iter().enumerate() {
             unsafe { *ptr.add(i) = v as f32 };
         }
     }
 
     pub fn read_f32(&self, buf: &MetalBuf, count: usize) -> Vec<f32> {
-        let ptr = buf.0.contents().as_ptr() as *const f32;
+        let ptr = buf.contents() as *const f32;
         (0..count).map(|i| unsafe { *ptr.add(i) }).collect()
     }
 
@@ -275,9 +315,9 @@ impl MetalDevice {
             let enc = cb.computeCommandEncoder().expect("compute encoder");
             enc.setComputePipelineState(&d.pipe);
             for (i, b) in d.inputs.iter().enumerate() {
-                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), 0, i) };
+                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
             }
-            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), 0, d.inputs.len()) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
             let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
             enc.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
@@ -307,9 +347,9 @@ impl MetalDevice {
             let enc = cb.computeCommandEncoder().expect("compute encoder");
             enc.setComputePipelineState(&d.pipe);
             for (i, b) in d.inputs.iter().enumerate() {
-                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), 0, i) };
+                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
             }
-            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), 0, d.inputs.len()) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
             let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
             enc.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
@@ -386,12 +426,12 @@ impl MetalDevice {
             let cmd = unsafe { icb.indirectComputeCommandAtIndex(i) };
             cmd.setComputePipelineState(&d.pipe);
             for (bi, b) in d.inputs.iter().enumerate() {
-                unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, 0, bi) };
+                unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, b.1, bi) };
                 if seen.insert(Retained::as_ptr(&b.0) as usize) {
                     resources.push(b.clone());
                 }
             }
-            unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, 0, d.inputs.len()) };
+            unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, d.inputs.len()) };
             if seen.insert(Retained::as_ptr(&d.output.0) as usize) {
                 resources.push(d.output.clone());
             }

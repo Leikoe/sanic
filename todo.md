@@ -508,6 +508,24 @@ manually), and deeply *nested* routing expressions blow up the un-memoized
 graph walkers (bounded by making rounds schedule roots; walker memoization
 is a good future hardening).
 
+**Zero-copy weights (2026-07-13, unified memory):** the library now binds
+host memory as device buffers with NO upload — `MetalBuf` carries a byte
+offset (several tensors alias one `MTLBuffer`), `MetalDevice::
+from_bytes_nocopy` wraps any page-aligned region (`newBufferWithBytesNoCopy`
+— tinygrad's external-ptr move), and `StFile::open_zero_copy` reads a
+checkpoint once into a page-aligned leaked region, LEAD-PADDING it so a
+header whose length isn't a multiple of 4 (GPT-2's!) still lands every
+tensor at a bindable offset. GPT-2 binds wte+wpe — 158 MB including the
+tied logits head — straight from the checkpoint, numerics bit-identical
+(24/24), GPU test proves pointer identity (a host write is visible to the
+GPU with no re-upload). Trinity, measured honestly, does NOT benefit yet:
+its checkpoint interleaves expert tensors in STRING order (e0, e1, e10,
+e100…), so the stacked per-projection tensors the gathers read are not
+contiguous file ranges, and everything else is bf16→f16/f32 converted at
+load. The design that unlocks it: a one-time REPACK to a device-image file
+(tensors stacked and aligned exactly as the graph reads them) that every
+later run maps zero-copy whole — recorded here, not yet built.
+
 Still open beyond the capstones: GQA-style long-context ring buffers for
 sliding windows, partition speed at 10k-kernel scale, and the rest of the
 ladder, each
