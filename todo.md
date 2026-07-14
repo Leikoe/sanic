@@ -647,6 +647,69 @@ cones, fully hidden by graph replay). When the sibling projections share
 a contraction axis the lifted cone instead derives as ONE fold (both dot
 products in one carrier, exp at project) — pinned by test.
 
+## Capstone III — training on the GPU (`beautiful_mnist`, and the road to nanoGPT)
+
+The inference capstones prove the forward direction; this proves training end
+to end on the metal. **Training is just another graph**: `grad` transposes the
+forward net into ordinary IR, and the SGD update `w − lr·∇w` rides each
+gradient's fold as an epilogue, so ONE `partition_many` schedule computes the
+loss and the new weights — lowered to Metal, weights committed by buffer swap
+between steps (the M6 discipline, on optimizer state instead of a KV cache).
+
+- **`beautiful_mnist`** (`cargo run --release --example mnist`) — a 784→128→10
+  MLP, ReLU, softmax cross-entropy, plain minibatch SGD, trained from scratch on
+  the GPU: **~97% test accuracy in ~4 s, 13 kernels/step** (forward + backward +
+  all four weight updates in one schedule). The whole trainer is `mlp` +
+  `cross_entropy` as plain IR, then `grad` / `simplify_many` / `partition_many` /
+  `emit_metal` — the same pipeline GPT-2 inference uses.
+
+- **The composed logsumexp now derives — forward AND backward — to the same
+  kernels the hardcoded `Monoid::LogSumExp` would**, so softmax cross-entropy
+  needs no gradient rule for logsumexp at all. Three pieces, each
+  value-preserving and suite-pinned:
+  - `derive`: a free-along-axis map wrapping only PLAIN reductions folds WHOLE
+    (`m + log(Σexp)` → one carrier), guarded against contractions so flash QKᵀ
+    and SwiGLU GEMMs still decompose. Composed CE forward 4→3 kernels.
+  - `simplify` (`src/simplify.rs`, a CLIENT-SIDE training pass, not on the
+    inference partition path — its factoring/regrouping perturb tuned inference
+    fusion, measured as Trinity +82 kernels): two phases to a fixpoint with CSE.
+    Phase 1 cancels the stabilizing max-shift's winner-mask — its cotangent is
+    algebraically ZERO (`+g` from `+m`, `−g` from the shift), recognized via
+    `Σ(k·x)=k·Σx`, `(a/b)·b=a`, and CSE of the gradient's `Σexp` with the forward
+    `s`. Phase 2 reconstructs `exp(z−lse)` (the log-sum-exp identity) and, run
+    over forward+backward TOGETHER (`simplify_many`, one CSE table), reuses the
+    forward carrier — the backward drops to the primitive's kernel count. NOT a
+    stop-gradient: the cancellation is derived.
+  - `partition`: `emit_fold` no longer recomputes an online-softmax score
+    contraction in-body when it is ALREADY materialized (a logits GEMM demanded
+    as an output, then re-folded by the loss's logsumexp) — it reads the live
+    buffer. Flash scores are never materialized elsewhere, so attention is
+    untouched (plain_attention one kernel, gpt2 221 + SEQUENCE MATCH, trinity
+    1478). mnist 14→13.
+
+- **The backward-graph walkers were exponential — CLOSED** (the "walker
+  memoization" hardening flagged twice above). A transformer training step's
+  partition HUNG for minutes; a sampler pinned two pure axis walks
+  (`ir::collect_axes` via `all_axes`, `derive::other_axis_folds`) re-expanding
+  DAG-shared subtrees along every path — backward graphs share heavily, so it
+  blew up (66 s to partition ONE attention weight's gradient). Memoizing both
+  (per-node visited-set / cache; identical results, 152 tests green) took a
+  1-block GPT training step from hanging to **0.07 s** total (grad + partition +
+  simplify + emit). Unblocks transformer training. (The broader `structure` /
+  `derive` global memoization for Trinity's forward partition speed stays open.)
+
+### [next] — nanoGPT on tinyshakespeare
+A small char-level GPT (≈4 layers, 128 dim, 4 heads, block 64, char vocab)
+trained from scratch on the GPU — the transformer analog of `beautiful_mnist`.
+Feasibility PROVEN: the 1-block training graph (embeddings, causal self-
+attention, MLP(GELU), tied LM head, next-token cross-entropy, `grad` over every
+weight, fused SGD) derives, partitions, simplifies and emits Metal in 0.07 s.
+The remainder is the example, not the compiler: a tinyshakespeare loader + char
+tokenizer, the training loop (the mnist loop over sequence batches), and
+sampling to watch noise → Shakespeare-ish babble. Fine-tuning the 124M
+checkpoint is the heavier sibling (full 12-layer backward + optimizer state),
+deferred behind the from-scratch demo.
+
 ## The completeness oracle (`tests/completeness.rs`)
 
 The argmax and top-k fusions were found by counting kernels against MLX.
