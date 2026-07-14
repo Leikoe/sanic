@@ -322,6 +322,7 @@ cargo run --example mla      # DeepSeek MLA, standard & absorbed → same kernel
 cargo run --example llm      # a transformer block, split into 13 kernels
 cargo run --example execute  # run a partitioned schedule on real tensors
 cargo run --example kernels  # a gallery of derived flash kernels (Rust)
+cargo run --release --example mnist  # train an MLP on MNIST end to end, on the GPU
 cargo test                   # 123 tests (incl. rustc-compiled and GPU-dispatched)
 ```
 
