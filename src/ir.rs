@@ -626,11 +626,23 @@ pub fn leaf_names(node: &Node) -> Vec<&'static str> {
 /// map classifies.
 pub fn all_axes(node: &Node) -> Vec<Axis> {
     let mut out = Vec::new();
-    collect_axes(node, &mut out);
+    let mut seen = std::collections::HashSet::new();
+    collect_axes(node, &mut out, &mut seen);
     out
 }
 
-fn collect_axes(node: &Node, out: &mut Vec<Axis>) {
+fn collect_axes(
+    node: &Node,
+    out: &mut Vec<Axis>,
+    seen: &mut std::collections::HashSet<*const NodeKind>,
+) {
+    // A DAG-shared node reached along several paths is walked ONCE: its axes are
+    // already in `out`. Without this, a backward graph's heavy sharing makes the
+    // walk exponential in the sharing depth (measured: a 1-block transformer's
+    // attention gradient took 66s to partition, almost all of it here).
+    if !seen.insert(Rc::as_ptr(node)) {
+        return;
+    }
     let push = |a: Axis, out: &mut Vec<Axis>| {
         if !out.contains(&a) {
             out.push(a);
@@ -646,23 +658,23 @@ fn collect_axes(node: &Node, out: &mut Vec<Axis>) {
         NodeKind::Iota { axis } => push(*axis, out),
         NodeKind::Map { inputs, .. } => {
             for i in inputs {
-                collect_axes(i, out);
+                collect_axes(i, out, seen);
             }
         }
         NodeKind::Reduce { src, axis, .. } | NodeKind::Scan { src, axis, .. } => {
             push(*axis, out);
-            collect_axes(src, out);
+            collect_axes(src, out, seen);
         }
         NodeKind::Gather { src, index, axis } => {
             push(*axis, out);
-            collect_axes(src, out);
-            collect_axes(index, out);
+            collect_axes(src, out, seen);
+            collect_axes(index, out, seen);
         }
         NodeKind::View { src, groups } => {
             for (_, to) in groups {
                 push(*to, out);
             }
-            collect_axes(src, out);
+            collect_axes(src, out, seen);
         }
         NodeKind::Reindex { src, map, .. } => {
             for (_, terms, _) in map {
@@ -670,7 +682,7 @@ fn collect_axes(node: &Node, out: &mut Vec<Axis>) {
                     push(*t, out);
                 }
             }
-            collect_axes(src, out);
+            collect_axes(src, out, seen);
         }
     }
 }

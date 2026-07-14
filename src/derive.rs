@@ -538,6 +538,8 @@ struct Ctx {
     /// slots instead of registering duplicates.
     memo: Vec<(*const NodeKind, S)>,
     rules: BTreeSet<&'static str>,
+    /// Memoizes `other_axis_folds` per node — the free-map-vs-contraction check.
+    other_folds: std::collections::HashMap<*const NodeKind, (bool, bool)>,
 }
 
 impl Ctx {
@@ -674,6 +676,7 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
         leaves: Vec::new(),
         memo: Vec::new(),
         rules: BTreeSet::new(),
+        other_folds: std::collections::HashMap::new(),
     };
     let s = go(node, axis, &mut ctx)?;
 
@@ -709,15 +712,26 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
 /// separate GEMM). A free map worth keeping WHOLE wraps only plain
 /// reductions — wrapping a contraction, it must stay decomposed so the matmul
 /// machinery still sees it.
-fn other_axis_folds(node: &Node, axis: Axis) -> (bool, bool) {
+fn other_axis_folds(
+    node: &Node,
+    axis: Axis,
+    cache: &mut std::collections::HashMap<*const NodeKind, (bool, bool)>,
+) -> (bool, bool) {
+    // Memoized per node (the streamed axis is fixed for a whole derivation):
+    // a DAG-shared subtree is classified once. Unmemoized, this re-walks shared
+    // subtrees and is exponential on backward graphs.
+    let ptr = Rc::as_ptr(node);
+    if let Some(&r) = cache.get(&ptr) {
+        return r;
+    }
     let is_contraction = matches!(node.as_ref(),
         NodeKind::Reduce { src, op: BinOp::Monoid(Monoid::Add), axis: a }
             if *a != axis
             && matches!(src.as_ref(),
                 NodeKind::Map { op: MapOp::Mul, inputs } if inputs.len() == 2));
-    match node.as_ref() {
+    let result = match node.as_ref() {
         NodeKind::Reduce { src, axis: a, .. } | NodeKind::Scan { src, axis: a, .. } => {
-            let (plain, contr) = other_axis_folds(src, axis);
+            let (plain, contr) = other_axis_folds(src, axis, cache);
             match (*a != axis, is_contraction) {
                 (true, true) => (plain, true),
                 (true, false) => (true, contr),
@@ -725,17 +739,26 @@ fn other_axis_folds(node: &Node, axis: Axis) -> (bool, bool) {
             }
         }
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => (false, false),
-        NodeKind::Map { inputs, .. } => inputs.iter().fold((false, false), |(p, c), i| {
-            let (p2, c2) = other_axis_folds(i, axis);
-            (p || p2, c || c2)
-        }),
+        NodeKind::Map { inputs, .. } => {
+            let (mut p, mut c) = (false, false);
+            for i in inputs {
+                let (p2, c2) = other_axis_folds(i, axis, cache);
+                p |= p2;
+                c |= c2;
+            }
+            (p, c)
+        }
         NodeKind::Gather { src, index, .. } => {
-            let (p, c) = other_axis_folds(src, axis);
-            let (p2, c2) = other_axis_folds(index, axis);
+            let (p, c) = other_axis_folds(src, axis, cache);
+            let (p2, c2) = other_axis_folds(index, axis, cache);
             (p || p2, c || c2)
         }
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => other_axis_folds(src, axis),
-    }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+            other_axis_folds(src, axis, cache)
+        }
+    };
+    cache.insert(ptr, result);
+    result
 }
 
 /// Stream `node` over `axis`, registering reductions-over-axis as slots.
@@ -777,7 +800,7 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
     // contraction — logsumexp's `m + log(Σexp)`, yes; `scale·QKᵀ + mask` or
     // `silu(gate)·up`, no (those decompose so the matmul stays in-body / cut).
     let keep_map_whole = is_map && {
-        let (plain, contraction) = other_axis_folds(node, axis);
+        let (plain, contraction) = other_axis_folds(node, axis, &mut ctx.other_folds);
         plain && !contraction
     };
     if is_free && (!is_map || keep_map_whole) {
