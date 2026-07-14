@@ -725,25 +725,7 @@ pub fn fold_sched(
         feasible(dev, &k).then(|| kernel_time(dev, &k))
     };
 
-    let mut cands = vec![FoldSched::scalar()];
-    for sgs in [1usize, 2, 4, 8, 16, 32] {
-        cands.push(FoldSched {
-            lane_axis: None,
-            sgs,
-            lane_stream: true,
-            chunk: 1,
-        });
-        for &a in &out_axes {
-            if ext(a) as usize % SIMD == 0 && ext(a) >= simd {
-                cands.push(FoldSched {
-                    lane_axis: Some(a),
-                    sgs,
-                    lane_stream: false,
-                    chunk: 1,
-                });
-            }
-        }
-    }
+    let cands = fold_sched_candidates(fold_node, streaming_axis, carrier, extents);
     let mut best = FoldSched::scalar();
     let mut best_t = f64::INFINITY;
     for c in cands {
@@ -775,10 +757,65 @@ pub fn fold_sched(
     best
 }
 
+/// Every LEGAL cooperative schedule for a fold — the candidate set the
+/// analytical chooser prices, exposed so a measured tuner can time the same
+/// set on the real device and overrule the model (`--tune`). Order-sensitive
+/// carriers get only the scalar entry, exactly as the chooser treats them.
+pub fn fold_sched_candidates(
+    fold_node: &Node,
+    streaming_axis: Axis,
+    carrier: &Carrier,
+    extents: &HashMap<Axis, f64>,
+) -> Vec<FoldSched> {
+    let mut cands = vec![FoldSched::scalar()];
+    if !mergeable_out_of_order(carrier)
+        || carrier.project.len() != 1
+        || carrier.project_reads_leaves()
+    {
+        return cands;
+    }
+    let ext = |ax: Axis| extents.get(&ax).copied().unwrap_or(1.0);
+    let s_ext = ext(streaming_axis) as usize;
+    let out_axes = output_axes(fold_node);
+    let packed = input_dtypes(fold_node)
+        .iter()
+        .any(|(_, d)| matches!(d, Dtype::I4));
+    for sgs in [1usize, 2, 4, 8, 16, 32] {
+        cands.push(FoldSched {
+            lane_axis: None,
+            sgs,
+            lane_stream: true,
+            chunk: 1,
+        });
+        // the chunked twin prices identically (the roofline cannot see load
+        // contiguity), so it never changes the analytic choice; it exists
+        // for the measured tuner
+        if packed && s_ext % (SIMD * sgs * 8) == 0 {
+            cands.push(FoldSched {
+                lane_axis: None,
+                sgs,
+                lane_stream: true,
+                chunk: 8,
+            });
+        }
+        for &a in &out_axes {
+            if ext(a) as usize % SIMD == 0 && ext(a) >= SIMD as f64 {
+                cands.push(FoldSched {
+                    lane_axis: Some(a),
+                    sgs,
+                    lane_stream: false,
+                    chunk: 1,
+                });
+            }
+        }
+    }
+    cands
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// True when the IR reduces an axis that is neither streamed nor in the output
-/// — an inner contraction (the `d` of a matmul), whose intermediate must sit
+/// — an inner contraction (the `d` of a matvec), whose intermediate must sit
 /// in SRAM.
 fn has_contraction(node: &Node, streaming: Axis, out_set: &HashSet<Axis>) -> bool {
     match node.as_ref() {

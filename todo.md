@@ -145,19 +145,19 @@ page is substrate we need so the moat is usable on real workloads.
   convention without an SSM consumer would be a guess), Max/Min scan
   backward (per-prefix winner masks), and the affine adjoint recurrence.
 
-**Absent (the honest remainder):** real int8/int4 *byte storage* (buffers of
-bytes + bit-unpacking — the pricing is done, the buffer model is not),
-two-pass row-resident kernels (softmax-as-output), cost-driven *cut*
-placement (the split-reduction factor is priced, but `partition` does not
-yet auto-invoke it or weigh extra legal cuts — the measured instance, the
-MoE down fold recomputing SwiGLU per output row, is FIXED: leaf cuts now
-translate the streamed axis through flatten/split/gather boundaries and
-lift the cut to the top of the offending cone, Trinity 26.0 → 23.3 ms/step;
-the general priced-cut machinery is still open), autotuning/measurement
-(the `--bench`/`--proto` harnesses measure; nothing feeds measurements back
-into choices), dynamic shapes, multi-device execution (the allreduce *math*
-is `run_carrier_split`'s merge; a device runtime is not built), `Scan`
-backward, strided-AND-dilated window transposes.
+**Absent (the honest remainder):** two-pass row-resident kernels
+(softmax-as-OUTPUT: the derivation's Pe forms already carry the recipe —
+slots = the same-axis normalizer folds, the per-element expression = the
+raw with the running max's per-element contribution substituted by the
+FINAL slot value; that substitution is the missing piece, and no current
+workload materializes a softmax — greedy decode never does, and sampling
+wants top-k plus a k-length host softmax — so the convention waits for a
+consumer rather than being guessed), dynamic shapes, multi-device
+execution (the allreduce *math* is `run_carrier_split`'s merge; a device
+runtime is not built). Cut placement, `Scan` backward (Add), and
+strided-AND-dilated transposes CLOSED 2026-07-13 (see milestone notes);
+autotuning landed as measured device profiles + the `--bench`/`--proto`
+loop (see M10/vs_mlx.md) with on-line per-kernel re-choice still open.
 
 ## What "done" looks like
 
@@ -517,7 +517,12 @@ loads, output-row batching per simdgroup, the −8·Σx zero-point hoist).
 CLIMBED: kernel dedup (2026-07-13) — canonicalized sources (entry name +
 positional buffer identifiers masked) let 1,478 dispatches share ~30
 entry points; MSL compile 10.3 s → 0.2 s; closes MLX's specialization
-column. CLIMBED: cone fusion via wider epilogues (2026-07-13) — a cone
+column. CLIMBED: measured tuning (2026-07-13) — `metal::tune_schedules`
+times every legal FoldSched per canonical class on the model's real
+buffers, verifies each against the scalar base BEFORE it may win, and a
+full-step logits gate accepts or discards the tuned program; `trinity
+--tune`: 450 stages overruled, 21 → **18 ms/token (56 tok/s)**, numerics
+exact. CLIMBED: cone fusion via wider epilogues (2026-07-13) — a cone
 rides the LAST of its producers (multi-producer epilogues: the SwiGLU
 and attention-gate cones ride their up/gate folds), and epilogues render
 INSIDE the fold kernel (`Gen::local_inputs` resolves the fold's own

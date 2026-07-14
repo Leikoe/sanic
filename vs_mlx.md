@@ -230,6 +230,23 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**Measured tuning (2026-07-13): 21 → 18 ms/token (56 tok/s), 450 stages
+overruled.** `metal::tune_schedules` closes the measurement loop the
+`--bench`/`--proto` harnesses ran by hand: per CANONICAL kernel class
+(isomorphic layers share one measurement), every legal `FoldSched`
+candidate is emitted, compiled, VERIFIED against the scalar base on the
+model's real buffers (the --proto discipline, in the loop — a mismatch is
+an emitter bug surfacing, never a choice), timed over 16 in-buffer
+repeats, and the winner overrules the analytical chooser only when it
+clearly beats it (>5%). A full-step logits gate then accepts or discards
+the whole tuned program. The silicon's verdicts: projections want sgs=2
+(the model priced sgs=1), score folds sgs=4 not 8, the MoE-down prefers
+unchunked sgs=1 at decode shapes, the elementwise-tail folds sgs=16 not
+32. Found the hard way and now guarded three deep: a tuning scratch
+buffer must fit the OUTPUT, not the thread grid — a lane-distributed
+kernel writes more elements than it has threads, and the resulting OOB
+writes silently corrupted neighboring weight buffers before SIGBUSing.
+
 **Kernel dedup + fused epilogues (2026-07-13): 1,856 → 1,478 dispatches,
 32 → 30 unique kernels, cold MSL compile 10.3 s → 0.2 s.** Two rungs at
 once. Canonicalization: each kernel's source with the entry name and

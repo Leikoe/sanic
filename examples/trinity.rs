@@ -856,6 +856,63 @@ inline float w4(device const uchar* p, uint i) {\n\
         t0.elapsed().as_secs_f32()
     );
 
+    // ── --tune: measure the legal schedules per canonical kernel class on
+    // the real buffers and overrule the analytical chooser where the
+    // silicon clearly disagrees, then re-emit and recompile (dedup makes
+    // the recompile ~0.2 s) ──
+    let mut program = program;
+    let mut pipes = pipes;
+    if args.iter().any(|a| a == "--tune") {
+        // a mid-window position so the honest-window kernels time on a
+        // realistic live range — and ONE full pass first, so every
+        // intermediate holds real values: tuned kernels read routing
+        // indices, and a gather over an uninitialized buffer is an
+        // out-of-bounds address, not a slow measurement
+        g.write_f64(&bufs["pos"], &[(T_MAX / 2) as f64]);
+        g.write_f64(&bufs["id"], &[prompt_ids[0] as f64]);
+        g.run(&program_dispatches(&program, &bufs, &pipes));
+        let t0 = std::time::Instant::now();
+        let overrides =
+            sanic::metal::tune_schedules(&g, &model.sched, &Device::m1_pro(), &model.ext, &bufs);
+        println!(
+            "tuned: {} stages overruled in {:.1}s",
+            overrides.len(),
+            t0.elapsed().as_secs_f32()
+        );
+        if !overrides.is_empty() {
+            // end-to-end gate: the tuned program must reproduce the
+            // analytic program's logits on a full step, or it is discarded
+            // — per-kernel verification samples one data point; the step
+            // is the oracle that counts
+            let ds0 = program_dispatches(&program, &bufs, &pipes);
+            g.run(&ds0);
+            let l0 = g.read_f32(&bufs["logits"], VOCAB);
+            let tuned = sanic::emit_metal::emit_schedule_metal_over(
+                &Device::m1_pro(),
+                &model.sched,
+                &model.ext,
+                &overrides,
+            );
+            let tuned_pipes = g.compile_chunked(&tuned.msl, MSL_HEADER, 96, true);
+            let ds1 = program_dispatches(&tuned, &bufs, &tuned_pipes);
+            g.run(&ds1);
+            let l1 = g.read_f32(&bufs["logits"], VOCAB);
+            let bad = l0
+                .iter()
+                .zip(&l1)
+                .any(|(a, b)| !((a - b).abs() <= 2e-3 * (1.0 + a.abs().max(b.abs()))));
+            if bad {
+                eprintln!(
+                    "tune: tuned program MISMATCHES the analytic program on a \
+                     full step — overrides DISCARDED (emitter bug: isolate \
+                     with the per-class report above)"
+                );
+            } else {
+                program = tuned;
+                pipes = tuned_pipes;
+            }
+        }
+    }
 
     let graphs: std::cell::RefCell<[Option<MetalGraph>; 2]> = Default::default();
     let step = |bufs: &mut HashMap<String, MetalBuf>, id: usize, pos: usize| {

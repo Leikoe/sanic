@@ -42,6 +42,9 @@ use objc2_metal::{
 };
 
 use crate::emit_metal::MetalProgram;
+use crate::interp::Extents;
+use crate::partition::Schedule;
+use crate::plan::FoldSched;
 
 /// A pipeline for one compiled kernel.
 pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -468,6 +471,209 @@ impl MetalDevice {
         let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
         t1 - t0
     }
+}
+
+/// Measure the legal cooperative schedules of a partitioned schedule's fold
+/// stages ON THE REAL DEVICE and return the per-stage winners where the
+/// silicon disagrees with the analytical chooser — the measurement feedback
+/// the `--bench`/`--proto` harnesses collected by hand, closed into a loop.
+///
+/// Runs over the model's ACTUAL buffers (pass the uploaded buffer map), so
+/// data-dependent bounds — the honest window reads `pos` — time truthfully;
+/// outputs go to scratch, never the real intermediates (a tuned kernel must
+/// not scribble over a persistent cache). One measurement per CANONICAL
+/// kernel class: isomorphic layers share it. Feed the result to
+/// [`crate::emit_metal::emit_schedule_metal_over`].
+pub fn tune_schedules(
+    g: &MetalDevice,
+    sched: &Schedule,
+    dev: &crate::cost::Device,
+    ext: &Extents,
+    bufs: &HashMap<String, MetalBuf>,
+) -> HashMap<String, FoldSched> {
+    use crate::emit_metal::{canonical_source, emit_fused_metal_sched_with};
+    use crate::partition::Stage;
+    use crate::plan::{fold_sched, fold_sched_candidates};
+
+    let ext_f: HashMap<crate::ir::Axis, f64> =
+        ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
+
+    // group fold stages by canonical class under the ANALYTIC choice
+    let mut classes: HashMap<String, (usize, Vec<String>)> = HashMap::new();
+    for (i, st) in sched.stages.iter().enumerate() {
+        let Stage::Fused {
+            spec,
+            fold_node,
+            epilogue_node,
+            ..
+        } = st
+        else {
+            continue;
+        };
+        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
+        let k = emit_fused_metal_sched_with(
+            "probe",
+            &spec.carrier,
+            spec.streaming_axis,
+            fold_node,
+            ext,
+            analytic,
+            epilogue_node.as_ref().map(|e| (e, spec.output_name.as_str())),
+        );
+        classes
+            .entry(canonical_source(&k))
+            .or_insert_with(|| (i, Vec::new()))
+            .1
+            .push(spec.output_name.clone());
+    }
+
+    let mut overrides = HashMap::new();
+    for (class_key, (rep, outs)) in classes {
+        let Stage::Fused {
+            spec,
+            fold_node,
+            epilogue_node,
+            ..
+        } = &sched.stages[rep]
+        else {
+            unreachable!()
+        };
+        let epi = epilogue_node.as_ref().map(|e| (e, spec.output_name.as_str()));
+        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
+        let cands =
+            fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &ext_f);
+
+        // emit each candidate; guards fall back to scalar, so dedup by body.
+        // Pre-filter by the threadgroup-memory budget the emitter would
+        // allocate — an over-budget pipeline fails to CREATE, not to rank.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut entries: Vec<(FoldSched, crate::emit_metal::MetalKernel, String)> = Vec::new();
+        for (ci, c) in cands.into_iter().enumerate() {
+            if c.sgs > 1 {
+                let e_a = c.lane_axis.map(|a| ext[&a]).unwrap_or(1);
+                let sliced: usize = (0..spec.carrier.slots)
+                    .filter(|&j| {
+                        c.lane_axis
+                            .is_some_and(|a| spec.carrier.spans[j].contains(&a))
+                    })
+                    .map(|_| c.sgs * e_a)
+                    .sum();
+                if (spec.carrier.slots * c.sgs + sliced) * 4 > 32 * 1024 {
+                    continue;
+                }
+            }
+            let k = emit_fused_metal_sched_with(
+                &format!("tune{ci}"),
+                &spec.carrier,
+                spec.streaming_axis,
+                fold_node,
+                ext,
+                c,
+                epi,
+            );
+            let canon = canonical_source(&k);
+            if seen.insert(canon.clone()) {
+                entries.push((c, k, canon));
+            }
+        }
+        if entries.len() < 2 {
+            continue; // nothing to choose between
+        }
+        let full_msl = format!(
+            "{}{}",
+            crate::emit_metal::MSL_HEADER,
+            entries
+                .iter()
+                .map(|(_, k, _)| k.msl.replace(crate::emit_metal::MSL_HEADER, ""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let pipes = g.compile(&full_msl);
+
+        // The FIRST entry is the scalar base kernel — the reference every
+        // other candidate must MATCH on the same buffers before it may win:
+        // the --proto discipline (same math, same buffers, checked), in the
+        // loop. A mismatch is an emitter bug surfacing, not a schedule
+        // preference; it is reported and never chosen.
+        let out_elems: usize = crate::ir::output_axes(fold_node)
+            .iter()
+            .map(|a| ext[a])
+            .product::<usize>()
+            .max(1);
+        let mut reference: Option<Vec<f32>> = None;
+        let mut best: Option<(f64, FoldSched)> = None;
+        let mut analytic_t = f64::INFINITY;
+        for (c, k, canon) in &entries {
+            let Some(inputs) = k
+                .inputs
+                .iter()
+                .map(|(n, _)| bufs.get(*n).cloned())
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue; // a buffer the caller didn't upload — skip the class
+            };
+            // scratch must fit the OUTPUT, not the thread grid: a
+            // lane-distributed kernel writes out_elems from far fewer
+            // threads, and an undersized buffer is an out-of-bounds WRITE
+            // over whatever the allocator placed next (measured: silent
+            // weight corruption, then SIGBUS)
+            let out_buf = g.alloc_f32(k.grid_size.max(out_elems).max(1));
+            let d = Dispatch {
+                pipe: pipes.get(&k.name),
+                inputs,
+                output: out_buf.clone(),
+                grid: k.grid_size,
+            };
+            g.run(&[d.clone()]); // warm + the correctness sample
+            let got = g.read_f32(&out_buf, out_elems);
+            match &reference {
+                None => reference = Some(got), // the scalar base
+                Some(r) => {
+                    // NaN-poisoned garbage in unwritten intermediates must
+                    // FAIL the equivalence, not slip through a vacuous
+                    // comparison
+                    let bad = r.iter().zip(&got).any(|(a, b)| {
+                        !((a - b).abs() <= 2e-3 * (1.0 + a.abs().max(b.abs())))
+                    });
+                    if bad {
+                        eprintln!(
+                            "tune: candidate {c:?} MISMATCHES the scalar base on \
+                             `{}` — skipped (emitter bug: report it)",
+                            spec.output_name
+                        );
+                        continue;
+                    }
+                }
+            }
+            let reps: Vec<Dispatch> = (0..16).map(|_| d.clone()).collect();
+            let t = (0..3).map(|_| g.run_timed(&reps)).fold(f64::MAX, f64::min) / 16.0;
+            if *canon == class_key {
+                analytic_t = t;
+            }
+            if best.as_ref().is_none_or(|(bt, _)| t < *bt) {
+                best = Some((t, *c));
+            }
+        }
+        if let Some((bt, bc)) = best
+            && bc != analytic
+            && bt < analytic_t * 0.95
+        {
+            // the measurement overrules the model only when it CLEARLY wins
+            for out in &outs {
+                overrides.insert(out.clone(), bc);
+            }
+            eprintln!(
+                "tune: `{}` ×{}: {:?} → {:?} ({:.1} → {:.1} µs)",
+                spec.output_name,
+                outs.len(),
+                analytic,
+                bc,
+                analytic_t * 1e6,
+                bt * 1e6
+            );
+        }
+    }
+    overrides
 }
 
 /// Entry-point names defined in an MSL source.

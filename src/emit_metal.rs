@@ -155,7 +155,7 @@ fn buf_ty(dtype: Option<Dtype>) -> &'static str {
 }
 
 /// The shared MSL prelude: the int4 nibble decode used by `buffer_load`.
-const MSL_HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\n\
+pub(crate) const MSL_HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\n\
 inline float w4(device const uchar* p, uint i) {\n\
     return (float)(int)((p[i >> 1] >> ((i & 1u) << 2)) & 0xFu) - 8.0f;\n\
 }\n\n";
@@ -216,6 +216,19 @@ fn wrap_sched(name: &str, bufs_sig: String, body: Vec<String>, tg_threads: usize
         "[[max_total_threads_per_threadgroup({tg_threads})]]\n{}",
         wrap(name, sig, body)
     )
+}
+
+/// A kernel's source with the shared header stripped and its entry name and
+/// positional buffer identifiers masked — the exact identity the schedule
+/// assembler dedups entry points by, exposed so a measured tuner can group
+/// isomorphic stages and time one representative per class.
+pub fn canonical_source(k: &MetalKernel) -> String {
+    let mut c = k.msl.replace(MSL_HEADER, "");
+    c = replace_ident(&c, &k.name, "__K__");
+    for (i, (n, _)) in k.inputs.iter().enumerate() {
+        c = replace_ident(&c, &san(n), &format!("__b{i}__"));
+    }
+    c
 }
 
 /// Replace whole-identifier occurrences of `from` with `to` (an occurrence
@@ -1183,7 +1196,23 @@ pub fn emit_schedule_metal(sched: &Schedule, ext: &Extents) -> MetalProgram {
 /// [`emit_schedule_metal`] with fold schedules priced against a specific
 /// device — the Metal examples pass [`crate::cost::Device::m1_pro`], the
 /// machine the kernels actually run on.
-pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: &Extents) -> MetalProgram {
+pub fn emit_schedule_metal_on(
+    dev: &crate::cost::Device,
+    sched: &Schedule,
+    ext: &Extents,
+) -> MetalProgram {
+    emit_schedule_metal_over(dev, sched, ext, &HashMap::new())
+}
+
+/// [`emit_schedule_metal_on`] with per-stage schedule OVERRIDES (keyed by
+/// output name): a measured tuner times the legal candidates on the real
+/// device and overrules the analytical chooser where the silicon disagrees.
+pub fn emit_schedule_metal_over(
+    dev: &crate::cost::Device,
+    sched: &Schedule,
+    ext: &Extents,
+    overrides: &HashMap<String, FoldSched>,
+) -> MetalProgram {
     let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let mut msl = String::from(MSL_HEADER);
     let mut all_dtypes: HashMap<String, Dtype> = HashMap::new();
@@ -1217,11 +1246,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
     // pipeline is exact, not approximate.
     let mut canon: HashMap<String, String> = HashMap::new();
     let dedup = |k: &MetalKernel, msl: &mut String, canon: &mut HashMap<String, String>| {
-        let mut c = strip(k);
-        c = replace_ident(&c, &k.name, "__K__");
-        for (i, (n, _)) in k.inputs.iter().enumerate() {
-            c = replace_ident(&c, &san(n), &format!("__b{i}__"));
-        }
+        let c = canonical_source(k);
         match canon.get(&c) {
             Some(existing) => existing.clone(),
             None => {
@@ -1247,7 +1272,9 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule, ext: 
                 note_inputs(fold_node, &produced, &mut inputs);
                 let out = spec.output_name.clone();
                 let kname = format!("k_{}_fold", san(&out));
-                let sched = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
+                let sched = overrides.get(&out).copied().unwrap_or_else(|| {
+                    fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f)
+                });
                 // an epilogue renders INSIDE the fold kernel (one dispatch):
                 // the projection lands in a register and the epilogue's read
                 // of the fold's own output resolves to it
