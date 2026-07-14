@@ -698,17 +698,31 @@ between steps (the M6 discipline, on optimizer state instead of a KV cache).
   simplify + emit). Unblocks transformer training. (The broader `structure` /
   `derive` global memoization for Trinity's forward partition speed stays open.)
 
-### [next] — nanoGPT on tinyshakespeare
-A small char-level GPT (≈4 layers, 128 dim, 4 heads, block 64, char vocab)
-trained from scratch on the GPU — the transformer analog of `beautiful_mnist`.
-Feasibility PROVEN: the 1-block training graph (embeddings, causal self-
-attention, MLP(GELU), tied LM head, next-token cross-entropy, `grad` over every
-weight, fused SGD) derives, partitions, simplifies and emits Metal in 0.07 s.
-The remainder is the example, not the compiler: a tinyshakespeare loader + char
-tokenizer, the training loop (the mnist loop over sequence batches), and
-sampling to watch noise → Shakespeare-ish babble. Fine-tuning the 124M
-checkpoint is the heavier sibling (full 12-layer backward + optimizer state),
-deferred behind the from-scratch demo.
+- **`shakespeare`** (`cargo run --release --example shakespeare`) — a char-level
+  nanoGPT (1 layer, 128 dim, single-head, block 64, char vocab) trained from
+  scratch on the GPU: embeddings, causal self-attention, MLP(GELU), tied LM
+  head, next-token cross-entropy, `grad` over every weight, fused SGD — ONE
+  73-kernel schedule computes the loss and every new weight. **loss 4.15 → 2.5**,
+  ~330 steps/s, weights committed by buffer swap, sampled with temperature.
+
+  - **The core bug it surfaced — output buffers were sized by the DISPATCH GRID,
+    not the tensor shape** (`emit_metal`). A cooperative/packed fold dispatches
+    fewer threads than it writes elements (each thread projects a lane strip), so
+    `grid_size` undercounts the allocation: `dWf` is `[f=512, dm=128]=65536` but
+    dispatches 4096 threads (16 elements each), so the buffer was allocated 16×
+    too small — the kernel wrote out of bounds, corrupting memory (GPU gradients
+    exploded to ~3e37 while the interpreter gave correct ~1e-3). Only training
+    exercises packed-fold outputs, so inference never tripped it. Fixed: size
+    every stage output by `grid_of(node).1` (the product of its `output_axes`
+    extents — the SHAPE), never `grid_size`, which stays for dispatch alone.
+    Any node has a valid shape; allocation must key off it.
+
+- **[next] — lift the Metal 31-buffer limit for ≥2 layers.** A 2+ layer training
+  step builds a gradient-accumulation cone wider than Metal's 31-buffer bind
+  limit (3L peaks at 46 inputs on one kernel); the from-scratch demo runs at
+  1 layer to stay under it. Needs cone-splitting in emit/partition (spill the
+  accumulation into a reduction tree of ≤30-input partials). Fine-tuning the
+  124M checkpoint (full 12-layer backward + optimizer state) sits behind this.
 
 ## The completeness oracle (`tests/completeness.rs`)
 
