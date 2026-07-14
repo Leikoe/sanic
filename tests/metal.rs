@@ -933,6 +933,79 @@ fn tanh_survives_large_arguments_on_gpu() {
     eprintln!("large-argument tanh on GPU: {}", out.trim());
 }
 
+// ── typed storage: bf16 weights loaded straight from their checkpoint bytes ──
+// A bf16 buffer widens `bits << 16` in the kernel — exact over the whole f32
+// range, and byte-identical to the checkpoint (so it is what a zero-copy
+// weight binds). The oracle sees the widened f64 values; equality proves the
+// widen is bit-exact.
+#[test]
+fn bf16_matvec_runs_on_gpu() {
+    let (o, k) = (axis("o"), axis("k"));
+    let ext: Extents = [(o, 40), (k, 96)].into_iter().collect();
+    let mut rng = Lcg(0xBF16);
+
+    // random f32 weights, TRUNCATED to bf16 (drop the low 16 mantissa bits) —
+    // exactly what a bf16 checkpoint stores; the oracle uses the same values.
+    let bf16_of = |x: f32| -> (u16, f64) {
+        let hi = (x.to_bits() >> 16) as u16; // round-toward-zero truncation
+        let widened = f32::from_bits((hi as u32) << 16);
+        (hi, widened as f64)
+    };
+    let mut wbytes = Vec::with_capacity(40 * 96 * 2);
+    let wvals: Vec<f64> = (0..40 * 96)
+        .map(|_| {
+            let (bits, v) = bf16_of(rng.f() as f32 * 4.0);
+            wbytes.extend_from_slice(&bits.to_le_bytes());
+            v
+        })
+        .collect();
+
+    let env: Env = [
+        ("W", Tensor::from_fn(&[o, k], &ext, |c| wvals[c[&o] * 96 + c[&k]])),
+        ("x", rand_tensor(&[k], &ext, &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let y = reduce(
+        map(MapOp::Mul, vec![input_dt("W", &[o, k], Dtype::BF16), input("x", &[k])]),
+        k,
+        BinOp::Monoid(Monoid::Add),
+    );
+    let carrier = derive(&y, k).unwrap();
+    let kernel = emit_fused_metal("bf16mv", &carrier, k, &y, &ext);
+    assert!(kernel.msl.contains("device const ushort* b_W"), "bf16 buffer typed");
+    assert!(kernel.msl.contains("<< 16u"), "bf16 widen emitted");
+    let reference = eval(&y, &env, &ext);
+
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let pipes = dev.compile(&kernel.msl);
+    let pipe = pipes.get(&kernel.name);
+    let inputs: Vec<MetalBuf> = kernel
+        .inputs
+        .iter()
+        .map(|(n, axes)| match *n {
+            "W" => dev.from_bytes(&wbytes),
+            _ => dev.from_f64(&env[n].permuted_to(axes).data),
+        })
+        .collect();
+    let out = dev.alloc_f32(kernel.grid_size);
+    dev.run(&[Dispatch {
+        pipe,
+        inputs,
+        output: out.clone(),
+        grid: kernel.grid_size,
+    }]);
+    let got = dev.read_f32(&out, kernel.grid_size);
+    let expected = reference.permuted_to(&kernel.grid);
+    let maxrel = max_rel_err(&got, &expected.data);
+    assert!(maxrel < 1e-6, "bf16 matvec MISMATCH {maxrel:e}");
+    eprintln!("bf16 matvec on GPU (widened from checkpoint bytes): GPU OK {maxrel:e}");
+}
+
 // ── typed storage: a W4A16 grouped-quantized matvec, packed bytes on device ──
 // The byte-storage milestone made real: the weight buffer holds PACKED int4
 // nibbles (compressed-tensors layout: unsigned q+8, low nibble = even

@@ -237,6 +237,12 @@ pub enum Dtype {
     F64,
     F32,
     F16,
+    /// bfloat16 — the top 16 bits of an f32, so a load widens by
+    /// `bits << 16` (exact, full f32 range). It is the dtype most
+    /// checkpoints ship in, and it is BYTE-IDENTICAL to those bytes, so a
+    /// bf16 input can bind zero-copy straight from the file (unlike f16,
+    /// which needs a host conversion pass).
+    BF16,
     I8,
     I4,
 }
@@ -247,7 +253,7 @@ impl Dtype {
         match self {
             Dtype::F64 => 8.0,
             Dtype::F32 => 4.0,
-            Dtype::F16 => 2.0,
+            Dtype::F16 | Dtype::BF16 => 2.0,
             Dtype::I8 => 1.0,
             Dtype::I4 => 0.5,
         }

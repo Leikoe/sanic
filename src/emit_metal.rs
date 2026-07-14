@@ -119,6 +119,9 @@ impl Lang for MetalLang {
         match dtype {
             None | Some(Dtype::F32) => format!("{b}[{off}]"),
             Some(Dtype::F16) => format!("((float){b}[{off}])"),
+            // bf16 = the high 16 bits of an f32: widen by shifting back up,
+            // exact over the whole f32 range (no rounding, no range limit).
+            Some(Dtype::BF16) => format!("as_type<float>((uint){b}[{off}] << 16u)"),
             Some(Dtype::I8) => format!("((float){b}[{off}])"),
             Some(Dtype::I4) => format!("w4({b}, {off})"),
             Some(Dtype::F64) => panic!("Apple GPUs have no f64 buffers"),
@@ -148,6 +151,7 @@ fn buf_ty(dtype: Option<Dtype>) -> &'static str {
     match dtype {
         None | Some(Dtype::F32) => "device const float*",
         Some(Dtype::F16) => "device const half*",
+        Some(Dtype::BF16) => "device const ushort*",
         Some(Dtype::I8) => "device const char*",
         Some(Dtype::I4) => "device const uchar*",
         Some(Dtype::F64) => panic!("Apple GPUs have no f64 buffers"),

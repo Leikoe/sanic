@@ -189,7 +189,7 @@ fn build() -> Model {
     let pos = input("pos", &[]);
 
     // μP-scaled token embedding, read from an f16 table
-    let tok = gather(input_dt("embed", &[vv, dm], Dtype::F16), input("id", &[]), vv);
+    let tok = gather(input_dt("embed", &[vv, dm], Dtype::BF16), input("id", &[]), vv);
     let x0 = map(MapOp::Mul, vec![tok, konst((DM as f64).sqrt())]);
 
     let mut roots: Vec<(Node, &'static str)> = vec![(x0.clone(), "xd0")];
@@ -229,9 +229,9 @@ fn build() -> Model {
         let xn = rms(x.clone(), nm("ln_in"), dm, DM);
 
         // ── attention: GQA as axis structure, QK-norm, RoPE-or-NoPE ──
-        let q = matmul(xn.clone(), input_dt(nm("wq"), &[hk, qg, j2, rr, dm], Dtype::F16), dm);
-        let k = matmul(xn.clone(), input_dt(nm("wk"), &[hk, j2, rr, dm], Dtype::F16), dm);
-        let v = matmul(xn.clone(), input_dt(nm("wv"), &[hk, rv, dm], Dtype::F16), dm);
+        let q = matmul(xn.clone(), input_dt(nm("wq"), &[hk, qg, j2, rr, dm], Dtype::BF16), dm);
+        let k = matmul(xn.clone(), input_dt(nm("wk"), &[hk, j2, rr, dm], Dtype::BF16), dm);
+        let v = matmul(xn.clone(), input_dt(nm("wv"), &[hk, rv, dm], Dtype::BF16), dm);
         let mut qn = rms_head(q, nm("qn"), j2, rr, hq); // [hk, qg, j2, rr]
         let mut kn = rms_head(k, nm("kn"), j2, rr, hkn); // [hk, j2, rr]
         if is_sliding {
@@ -272,10 +272,10 @@ fn build() -> Model {
             ],
         );
         let ctx = matmul(softmax(masked, t), cv, t); // [hk, qg, rv]
-        let gate = matmul(xn, input_dt(nm("wg"), &[hk, qg, rv, dm], Dtype::F16), dm);
+        let gate = matmul(xn, input_dt(nm("wg"), &[hk, qg, rv, dm], Dtype::BF16), dm);
         let gated = map(MapOp::Mul, vec![ctx, sigmoid(gate)]);
         let flat = flatten(gated, &[hk, qg, rv], dmv);
-        let attn_out = matmul(flat, input_dt(nm("wo"), &[dm, dmv], Dtype::F16), dmv); // [dm]
+        let attn_out = matmul(flat, input_dt(nm("wo"), &[dm, dmv], Dtype::BF16), dmv); // [dm]
         let x1 = map(MapOp::Add, vec![x, rms(attn_out, nm("ln_pa"), dm, DM)]);
 
         // ── MLP: dense SwiGLU (l<2) or 128-expert MoE, all weights int4 ──
@@ -433,7 +433,7 @@ fn build() -> Model {
             dm,
             DM,
         ),
-        input_dt("lm_head", &[vv, dm], Dtype::F16),
+        input_dt("lm_head", &[vv, dm], Dtype::BF16),
         dm,
     );
     roots.push((logits, "logits"));
@@ -450,21 +450,6 @@ fn build() -> Model {
 }
 
 // ── weights: name → data straight out of the checkpoint ─────────────────────
-
-fn f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u32;
-    let exp = (((b >> 23) & 0xFF) as i32) - 127 + 15;
-    let man = b & 0x7F_FFFF;
-    if exp >= 31 {
-        return (sign | 0x7C00) as u16;
-    }
-    if exp <= 0 {
-        return sign as u16; // flush denormals — weights are far from 6e-5
-    }
-    let base = sign | ((exp as u32) << 10) | (man >> 13);
-    (base + ((man >> 12) & 1)) as u16
-}
 
 enum Payload {
     F32(Vec<f32>),
@@ -484,14 +469,6 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
         _ => (name, usize::MAX),
     };
     let lp = |s: &str| format!("model.layers.{l}.{s}");
-    let f16_of = |key: &str| {
-        let f = st.f32(key);
-        let mut out = Vec::with_capacity(f.len() * 2);
-        for v in f {
-            out.extend_from_slice(&f16_bits(v).to_le_bytes());
-        }
-        Payload::Bytes(out)
-    };
     // experts 0..127 stacked e-major, the SHARED expert appended as 128 —
     // one slot axis serves routed and shared through the same gather
     let expert_cat_w = |proj: &str| {
@@ -513,8 +490,8 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
 
     match base {
         "id" | "pos" => Payload::PerStep,
-        "embed" => f16_of("model.embed_tokens.weight"),
-        "lm_head" => f16_of("lm_head.weight"),
+        "embed" => Payload::Bytes(st.raw("model.embed_tokens.weight").to_vec()),
+        "lm_head" => Payload::Bytes(st.raw("lm_head.weight").to_vec()),
         "fnorm" => Payload::F32(st.f32("model.norm.weight")),
         "cache_k" | "cache_v" => Payload::ZeroF32(size_hint),
         "ln_in" => Payload::F32(st.f32(&lp("input_layernorm.weight"))),
@@ -525,11 +502,11 @@ fn fetch(st: &StFile, name: &str, size_hint: usize) -> Payload {
         "kn" => Payload::F32(st.f32(&lp("self_attn.k_norm.weight"))),
         // the checkpoint stores these bf16; f16 on device halves their
         // bytes/step (bf16→f16 is exact in f16's normal range)
-        "wq" => f16_of(&lp("self_attn.q_proj.weight")),
-        "wk" => f16_of(&lp("self_attn.k_proj.weight")),
-        "wv" => f16_of(&lp("self_attn.v_proj.weight")),
-        "wg" => f16_of(&lp("self_attn.gate_proj.weight")),
-        "wo" => f16_of(&lp("self_attn.o_proj.weight")),
+        "wq" => Payload::Bytes(st.raw(&lp("self_attn.q_proj.weight")).to_vec()),
+        "wk" => Payload::Bytes(st.raw(&lp("self_attn.k_proj.weight")).to_vec()),
+        "wv" => Payload::Bytes(st.raw(&lp("self_attn.v_proj.weight")).to_vec()),
+        "wg" => Payload::Bytes(st.raw(&lp("self_attn.gate_proj.weight")).to_vec()),
+        "wo" => Payload::Bytes(st.raw(&lp("self_attn.o_proj.weight")).to_vec()),
         "router" => Payload::F32(st.f32(&lp("mlp.router.gate.weight"))),
         "ebias" => Payload::F32(st.f32(&lp("mlp.expert_bias"))),
         "wgate" => Payload::Bytes(st.raw(&lp("mlp.gate_proj.weight_packed")).to_vec()),
