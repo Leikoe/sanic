@@ -838,29 +838,54 @@ fn has_contraction(node: &Node, streaming: Axis, out_set: &HashSet<Axis>) -> boo
 }
 
 /// Rough flop count: one op per Map output element, one per Reduce/Scan source
-/// element. Good enough to rank on the roofline.
+/// element. Good enough to rank on the roofline. Memoized by pointer — a DAG
+/// otherwise re-counts shared subtrees per path, the dominant cost profiling
+/// found; the `output_axes` cache is threaded through so per-node volumes are
+/// computed once for the whole walk.
 fn count_flops(node: &Node, extents: &HashMap<Axis, f64>) -> f64 {
-    let vol = |n: &Node| -> f64 {
-        output_axes(n)
-            .iter()
+    let mut oa = HashMap::new();
+    let mut fc = HashMap::new();
+    count_flops_memo(node, extents, &mut oa, &mut fc)
+}
+
+fn count_flops_memo(
+    node: &Node,
+    extents: &HashMap<Axis, f64>,
+    oa: &mut HashMap<*const NodeKind, Vec<Axis>>,
+    fc: &mut HashMap<*const NodeKind, f64>,
+) -> f64 {
+    let key = std::rc::Rc::as_ptr(node);
+    if let Some(f) = fc.get(&key) {
+        return *f;
+    }
+    let vol = |n: &Node, oa: &mut HashMap<*const NodeKind, Vec<Axis>>| -> f64 {
+        let axes = oa
+            .entry(std::rc::Rc::as_ptr(n))
+            .or_insert_with(|| output_axes(n))
+            .clone();
+        axes.iter()
             .map(|ax| extents.get(ax).copied().unwrap_or(1.0))
             .product()
     };
-    match node.as_ref() {
+    let f = match node.as_ref() {
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => 0.0,
         NodeKind::Map { inputs, .. } => {
-            let child: f64 = inputs.iter().map(|i| count_flops(i, extents)).sum();
-            child + vol(node)
+            let child: f64 = inputs.iter().map(|i| count_flops_memo(i, extents, oa, fc)).sum();
+            child + vol(node, oa)
         }
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
-            count_flops(src, extents) + vol(src)
+            count_flops_memo(src, extents, oa, fc) + vol(src, oa)
         }
         NodeKind::Gather { src, index, .. } => {
-            count_flops(src, extents) + count_flops(index, extents)
+            count_flops_memo(src, extents, oa, fc) + count_flops_memo(index, extents, oa, fc)
         }
         // Reindexing costs nothing.
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => count_flops(src, extents),
-    }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+            count_flops_memo(src, extents, oa, fc)
+        }
+    };
+    fc.insert(key, f);
+    f
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

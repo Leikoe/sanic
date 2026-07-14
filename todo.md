@@ -554,9 +554,8 @@ leaf cuts with axis translation + cone-top lifting + the plan-failure
 retry place materializations per-subtree already; what remains is
 realizing a PREFIX of one axis, which no current workload wants.
 
-Still open beyond the capstones: partition speed at 10k-kernel scale
-(walker memoization — the emit-time walkers re-derive whole prefixes),
-the repack-to-device-image file for full zero-copy, and the rest of the
+Still open beyond the capstones: the repack-to-device-image file for
+full zero-copy, and the rest of the
 ladder, each
 measured in `vs_mlx.md`: autotuning, multi-device, flash float4 loads,
 and the rest of the packed-fold proto gap (explicit 32-bit packed-word

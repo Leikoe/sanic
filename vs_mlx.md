@@ -230,6 +230,17 @@ the 641-kernel elementwise tail. Summed, the identified rungs reach
 
 ## The ladder, climbed (running)
 
+**Partition memoization (2026-07-13): Trinity build 9.2 → 1.3 s, GPT-2
+0.15 → 0.04 s, byte-identical schedule.** Profiling (`sample`) named the
+cost with no ambiguity: `output_axes` at 39k samples, 10× the next frame
+— an un-memoized `Vec`-allocating DAG walk the roofline calls at every
+node, so `count_flops` was O(n²) and it runs once per schedule candidate.
+`output_axes`, `structure`, and `count_flops` now memoize by `Rc`
+pointer within each call (fresh cache per call — pure, no cross-call
+stale-pointer risk). The schedule is unchanged (verified via `--dump`
+diff), so this is pure speed: the whole build is now front-end-bound on
+MSL compile, not the partitioner.
+
 **Measured tuning (2026-07-13): 21 → 18 ms/token (56 tok/s), 450 stages
 overruled.** `metal::tune_schedules` closes the measurement loop the
 `--bench`/`--proto` harnesses ran by hand: per CANONICAL kernel class

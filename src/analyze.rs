@@ -60,8 +60,35 @@ fn join_all(it: impl Iterator<Item = Structure>) -> Structure {
 /// the answer is per (node, axis), the middle axis of `(X·Y)·Z` can be free at
 /// the first matmul and contracted at the second — which is exactly the fact
 /// that distinguishes the two kinds of fusion.
-pub fn structure(node: &NodeKind, axis: Axis) -> Structure {
-    match node {
+///
+/// Memoized by pointer WITHIN one call: the IR is a DAG (a 56-layer chain
+/// shares its whole prefix), so an unmemoized walk re-derives shared
+/// subtrees once per path to them — the dominant cost of partitioning a
+/// deep model. A fresh cache per call keeps it pure and stale-pointer-free.
+pub fn structure(node: &Node, axis: Axis) -> Structure {
+    structure_memo(node, axis, &mut std::collections::HashMap::new())
+}
+
+fn structure_memo(
+    node: &Node,
+    axis: Axis,
+    cache: &mut std::collections::HashMap<(*const NodeKind, Axis), Structure>,
+) -> Structure {
+    let key = (std::rc::Rc::as_ptr(node), axis);
+    if let Some(s) = cache.get(&key) {
+        return *s;
+    }
+    let s = structure_uncached(node, axis, cache);
+    cache.insert(key, s);
+    s
+}
+
+fn structure_uncached(
+    node: &Node,
+    axis: Axis,
+    cache: &mut std::collections::HashMap<(*const NodeKind, Axis), Structure>,
+) -> Structure {
+    match node.as_ref() {
         // Raw data, literals and index values depend on no axis (an Iota
         // varies *with* its axis, but elementwise — no cross-element
         // dependence, which is what FREE means).
@@ -70,12 +97,12 @@ pub fn structure(node: &NodeKind, axis: Axis) -> Structure {
         // Elementwise: pass the joined input structure through. Linearity
         // survives only if the op itself preserves it.
         NodeKind::Map { op, inputs } => {
-            let up = join_all(inputs.iter().map(|n| structure(n, axis)));
+            let up = join_all(inputs.iter().map(|n| structure_memo(n, axis, cache)));
             Structure::at(up.level, up.linear && op.preserves_linear())
         }
 
         NodeKind::Reduce { src, axis: red, op } => {
-            let up = structure(src, axis);
+            let up = structure_memo(src, axis, cache);
             if *red != axis {
                 // Reducing a different axis says nothing about this one.
                 up
@@ -91,9 +118,9 @@ pub fn structure(node: &NodeKind, axis: Axis) -> Structure {
 
         NodeKind::Scan { src, axis: sc, op } => {
             if *sc != axis {
-                structure(src, axis)
+                structure_memo(src, axis, cache)
             } else if op.is_monoid() {
-                let up = structure(src, axis);
+                let up = structure_memo(src, axis, cache);
                 Structure::at(Parallelism::Monoidal, op.is_additive() && up.linear)
             } else {
                 Structure::at(Parallelism::Sequential, false)
@@ -101,7 +128,7 @@ pub fn structure(node: &NodeKind, axis: Axis) -> Structure {
         }
 
         NodeKind::Gather { src, axis: g, .. } => {
-            let up = structure(src, axis);
+            let up = structure_memo(src, axis, cache);
             if *g == axis {
                 up.join(Structure::at(Parallelism::Opaque, false))
             } else {
@@ -116,12 +143,12 @@ pub fn structure(node: &NodeKind, axis: Axis) -> Structure {
         // else passes through.
         NodeKind::View { src, groups } => {
             if let Some((members, _)) = groups.iter().find(|(_, to)| *to == axis) {
-                return join_all(members.iter().map(|m| structure(src, *m)));
+                return join_all(members.iter().map(|m| structure_memo(src, *m, cache)));
             }
             if groups.iter().any(|(members, _)| members.contains(&axis)) {
                 return Structure::FREE;
             }
-            structure(src, axis)
+            structure_memo(src, axis, cache)
         }
 
         // Affine reindexing scopes like a view: an output axis inherits the
@@ -136,18 +163,18 @@ pub fn structure(node: &NodeKind, axis: Axis) -> Structure {
                 .map(|(m, _, _)| *m)
                 .collect();
             if !driving.is_empty() {
-                return join_all(driving.into_iter().map(|m| structure(src, m)));
+                return join_all(driving.into_iter().map(|m| structure_memo(src, m, cache)));
             }
             if map.iter().any(|(m, _, _)| *m == axis) {
                 return Structure::FREE;
             }
-            structure(src, axis)
+            structure_memo(src, axis, cache)
         }
     }
 }
 
 /// Can this axis be folded in one pass? Yes iff FREE or MONOIDAL.
-pub fn streamable(node: &NodeKind, axis: Axis) -> bool {
+pub fn streamable(node: &Node, axis: Axis) -> bool {
     matches!(
         structure(node, axis).level,
         Parallelism::Free | Parallelism::Monoidal

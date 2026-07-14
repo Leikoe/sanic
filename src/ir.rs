@@ -442,32 +442,57 @@ pub fn window(src: Node, from: Axis, out: Axis, k: Axis, stride: usize, dilation
 /// remaps. This is what tells the deriver which free axes an accumulator
 /// slot spans.
 pub fn output_axes(node: &Node) -> Vec<Axis> {
-    let union = |mut acc: Vec<Axis>, more: Vec<Axis>| {
-        for a in more {
+    // Memoized by pointer WITHIN one call: the IR is a DAG, and this is
+    // called at every node by the roofline (`count_flops`, grid/volume) —
+    // an unmemoized walk re-derives shared subtrees once per path to them,
+    // which profiling showed to be the dominant cost of partitioning.
+    // A fresh cache per call keeps it pure and stale-pointer-free.
+    output_axes_memo(node, &mut std::collections::HashMap::new())
+}
+
+fn output_axes_memo(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Vec<Axis> {
+    (*output_axes_rc(node, cache)).clone()
+}
+
+fn output_axes_rc(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Rc<Vec<Axis>> {
+    let key = Rc::as_ptr(node);
+    if let Some(v) = cache.get(&key) {
+        return v.clone();
+    }
+    let union = |mut acc: Vec<Axis>, more: &[Axis]| {
+        for &a in more {
             if !acc.contains(&a) {
                 acc.push(a);
             }
         }
         acc
     };
-    match node.as_ref() {
+    let out: Vec<Axis> = match node.as_ref() {
         NodeKind::Input { axes, .. } => axes.clone(),
         NodeKind::Const { .. } => Vec::new(),
         NodeKind::Iota { axis } => vec![*axis],
-        NodeKind::Map { inputs, .. } => inputs
+        NodeKind::Map { inputs, .. } => inputs.iter().fold(Vec::new(), |acc, i| {
+            let ia = output_axes_rc(i, cache);
+            union(acc, &ia)
+        }),
+        NodeKind::Reduce { src, axis, .. } => output_axes_rc(src, cache)
             .iter()
-            .fold(Vec::new(), |acc, i| union(acc, output_axes(i))),
-        NodeKind::Reduce { src, axis, .. } => {
-            output_axes(src).into_iter().filter(|a| a != axis).collect()
-        }
-        NodeKind::Scan { src, .. } => output_axes(src),
+            .copied()
+            .filter(|a| a != axis)
+            .collect(),
+        NodeKind::Scan { src, .. } => (*output_axes_rc(src, cache)).clone(),
         NodeKind::Gather { src, index, axis } => {
-            let kept = output_axes(src).into_iter().filter(|a| a != axis).collect();
-            union(kept, output_axes(index))
+            let kept: Vec<Axis> = output_axes_rc(src, cache)
+                .iter()
+                .copied()
+                .filter(|a| a != axis)
+                .collect();
+            let ia = output_axes_rc(index, cache);
+            union(kept, &ia)
         }
         NodeKind::View { src, groups } => {
             let mut out: Vec<Axis> = Vec::new();
-            for a in output_axes(src) {
+            for a in output_axes_rc(src, cache).iter().copied() {
                 if let Some((_, to)) = groups.iter().find(|(members, _)| members.contains(&a)) {
                     if !out.contains(to) {
                         out.push(*to);
@@ -482,7 +507,7 @@ pub fn output_axes(node: &Node) -> Vec<Axis> {
         // is computed from; unmapped axes pass through.
         NodeKind::Reindex { src, map, .. } => {
             let mut out: Vec<Axis> = Vec::new();
-            for a in output_axes(src) {
+            for a in output_axes_rc(src, cache).iter().copied() {
                 if let Some((_, terms, _)) = map.iter().find(|(m, _, _)| *m == a) {
                     for (_, t) in terms {
                         if !out.contains(t) {
@@ -495,7 +520,10 @@ pub fn output_axes(node: &Node) -> Vec<Axis> {
             }
             out
         }
-    }
+    };
+    let out = Rc::new(out);
+    cache.insert(key, out.clone());
+    out
 }
 
 /// Every `Input` leaf and its axes, in first-seen order. May repeat a name if
