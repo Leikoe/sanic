@@ -526,8 +526,37 @@ load. The design that unlocks it: a one-time REPACK to a device-image file
 (tensors stacked and aligned exactly as the graph reads them) that every
 later run maps zero-copy whole — recorded here, not yet built.
 
-Still open beyond the capstones: GQA-style long-context ring buffers for
-sliding windows, partition speed at 10k-kernel scale, and the rest of the
+**Ring-buffer caches — designed precisely, deferred (2026-07-13):** a
+sliding window beyond T_MAX needs no new runtime machinery, because
+softmax is PERMUTATION-INVARIANT over the key set — slots may live at
+`pos mod W` in any order as long as the mask knows each slot's true age.
+The pieces: the write index `pos mod W` arrives as a second per-step data
+input (host-side mod, zero new ops); the mask reconstructs each slot's
+absolute position `p(t) = pos − ((pos − t) mod W)` in-kernel, which needs
+ONE basis addition (`Floor` — a 2-line-per-layer extension by the M4
+discipline) since `t` varies per element; RoPE is unaffected (keys cache
+pre-rotated at their own positions). Cost: the honest-window early exit
+declines on a wrapped interval (streams the full W). Deferred because
+neither capstone exercises ctx > its window and the fixed-shape graph
+capture is unchanged either way; build it with the first long-context
+model.
+
+**Big-infra status (2026-07-13), each a decision, not silence:**
+*Dynamic shapes* — the decode graphs stay SHAPE-static by design (that is
+what makes ICB capture and 2-call tokens possible); dynamism enters as
+DATA-dependent bounds inside fixed shapes — the honest window is the
+pattern (pos read at runtime, loop bound clamped) — and grows case by
+case, never by making extents symbolic everywhere. *Multi-device* — the
+allreduce math is proven (`run_carrier_split`'s stage-2 merge); this
+machine has one GPU, so a runtime cannot be built honestly here; declined
+until hardware exists. *Per-axis partial realize* — largely subsumed:
+leaf cuts with axis translation + cone-top lifting + the plan-failure
+retry place materializations per-subtree already; what remains is
+realizing a PREFIX of one axis, which no current workload wants.
+
+Still open beyond the capstones: partition speed at 10k-kernel scale
+(walker memoization — the emit-time walkers re-derive whole prefixes),
+the repack-to-device-image file for full zero-copy, and the rest of the
 ladder, each
 measured in `vs_mlx.md`: autotuning, multi-device, flash float4 loads,
 and the rest of the packed-fold proto gap (explicit 32-bit packed-word
