@@ -231,7 +231,14 @@ pub fn grad(
         }
     }
 
-    by_name.into_iter().map(|(n, (_, g))| (n, g)).collect()
+    // Algebraically simplify each gradient: the transpose is faithful but
+    // naive (a stabilizing max-shift differentiates into winner-mask terms
+    // whose cotangent is zero), and the cancellation is derivable, not a
+    // stop-gradient. See [`crate::simplify`].
+    by_name
+        .into_iter()
+        .map(|(n, (_, g))| (n, crate::simplify::simplify(&g)))
+        .collect()
 }
 
 /// The transpose of one affine axis map: the cotangent `g` (over the map's

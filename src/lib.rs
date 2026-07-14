@@ -55,6 +55,7 @@ pub mod plan;
 pub mod runtime;
 pub mod rustgen;
 pub mod safetensors;
+pub mod simplify;
 
 pub use analyze::{
     AxisReport, Parallelism, Report, Structure, analyze, analyze_all, streamable, structure,
