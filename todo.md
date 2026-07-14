@@ -416,17 +416,21 @@ compressed-tensors checkpoint **stays packed on device end to end**:
 - **Same machine, same models — the measured ladder** (batch-1 KV decode,
   M1 Pro 16 GB):
 
+  Latencies are the current tree (the ladder climbed 2026-07-13; see
+  `vs_mlx.md` for the per-rung autopsy). The "before" figures are the
+  cooperative-fold baseline this arc started from.
+
   | GPT-2 124M | kernels/step | latency |
   |---|---|---|
   | MLX | **~164** (494 primitives − 330 views; sdpa fused, GELU mx.compile'd) | **5.3 ms/tok** (190 tok/s) |
-  | sanic | 233 derived kernels | **8 ms/tok (128 tok/s)** cooperative folds; 29 before |
+  | sanic | 221 derived kernels | **~8 ms/tok (median 9, best 7)** |
   | tinygrad (their examples/gpt2.py) | 250 kernels + 60 copies (jit replay census; 310 unjitted) | 98 ms/tok jitted (f32, no BEAM/HALF) |
   | torch eager MPS | 1,250 aten ops | 5.9 ms/tok (169 tok/s) |
 
   | Trinity 5.5B | kernels/step | latency |
   |---|---|---|
   | nanoinfer megakernel (int4/fp8) | **1 dispatch** (hand-written) | ~15 ms/tok (67.5 tok/s) |
-  | **sanic int4** | **1,856 derived kernels — fewest of any framework** | **26 ms/tok (38 tok/s)** cooperative folds; 200 before |
+  | **sanic int4** | **1,478 dispatches, ≈30 unique — fewest of any framework** | **~22 ms/tok (18 with `--tune`)**; 26 before |
   | mlx-lm 8-bit (upstream afmoe) | ~2,733 (4,137 primitives − 1,404 views: QuantizedMatmul×503, RMSNorm×337, GatherQMM×162) | 16.1 ms/tok (62 tok/s) |
   | tinygrad (afmoe port, f16 dequant) | 3,493 kernels in 7 jit graphs (3,438 scheduler kernels; **72,134 without a realize per layer**) | — (count-only: shrunk dims, no W4A16 path) |
   | torch eager | 93,228 aten ops | 1,180 ms/tok CPU — bf16 exceeds MPS on 16 GB |

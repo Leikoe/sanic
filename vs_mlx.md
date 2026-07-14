@@ -22,19 +22,23 @@ is replay overlap; MLX: Σ over census counts ≈ 16.4 ms vs 15.7 measured).
 
 ## Scoreboard (one decode step)
 
-|  | sanic | mlx-lm 8-bit |
-|---|---|---|
-| kernels dispatched | **1,856** (all derived) | ~2,733 (primitive library) |
-| step GPU time | 211.7 ms replayed (246.5 encoder-per-dispatch) | **15.7 ms** (63.6 tok/s measured) |
-| active bytes/step | ~1.58 GB (f32 attn + f16 head + int4 experts) | ~0.87 GB (8-bit everything) |
-| bandwidth floor | ~8 ms | ~4.5 ms |
+The document below is the AUTOPSY that started at 211.7 ms; the ladder was
+then climbed. Both states, so the reasoning stays legible:
 
-sanic dispatches 32% fewer kernels and takes 13.4× longer: kernel count and
-kernel quality are fully decoupled, and this document is the autopsy of the
-quality gap. It ends measured, not speculative: three hand-scheduled
-rewrites of sanic's own kernels (same math, same buffers, oracle-checked)
-recover 123 ms of the 196 ms gap, and the per-class ledger accounts for the
-rest.
+|  | sanic (autopsy) | sanic (now) | mlx-lm 8-bit |
+|---|---|---|---|
+| kernels dispatched | 1,856 | **1,478** (≈30 unique) | ~2,733 (primitive library) |
+| step GPU time (replayed) | 211.7 ms | **20.2 ms** (18 tuned) | **15.7 ms** |
+| decode wall | 196 ms/tok | **~22 ms/tok (18 tuned)** | 15.7 ms/tok |
+| active bytes/step | ~1.58 GB | ~1.14 GB (f16 attn + head + int4) | ~0.87 GB |
+| partition / compile | 10 s / 15 s | **1.3 s / 0.2 s** | — |
+
+The autopsy's finding held: kernel count and kernel quality are fully
+decoupled (sanic dispatched 32% fewer than MLX and ran 13× slower). Every
+one of that 13× is launch geometry, and the sections below climb it — each
+change measured, oracle-checked, and numerics-pinned — from 211.7 ms to
+20.2 ms, within 1.3× of MLX on a fatter (int4 + f16, not 8-bit) model.
+The original autopsy that pointed the way follows.
 
 ## Where the 13× lives (sanic per-class GPU times)
 

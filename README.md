@@ -218,26 +218,33 @@ frontier.)
 ## What runs today, end to end
 
 **GPT-2 (124M), real OpenAI weights, on the GPU, matching HuggingFace:**
-`cargo run --release --example gpt2` loads the official safetensors
-(dependency-free reader; bf16/f16/f32), builds the 12-layer network as plain
-IR, partitions the KV-cache decode step into ~270 kernels in 0.16 s,
-dispatches on Metal, and **streams greedy tokens at ~35 tok/s** (cache
-commits are on-device buffer swaps — the Session discipline). Logits match a
-`transformers` reference to **max |Δlogit| = 1e-4 with 24/24 greedy tokens
-identical** (bf16-round-tripped weights: ≤ 0.54 drift, same tokens).
+`cargo run --release --example gpt2 --prompt "…"` loads the official
+safetensors (dependency-free reader; bf16/f16/f32), builds the 12-layer
+network as plain IR, partitions the KV-cache decode step into ~220 kernels
+in **0.04 s**, and dispatches on Metal — the wte/wpe tables (158 MB) bound
+**zero-copy** straight from the checkpoint on unified memory, no upload. It
+**streams greedy tokens at ~125 tok/s (~8 ms/tok)** through the in-tree
+byte-level BPE encoder (cache commits are on-device buffer swaps — the
+Session discipline). Logits match a `transformers` reference to **max
+|Δlogit| = 1e-4 with 24/24 greedy tokens identical** (bf16-round-tripped
+weights: ≤ 0.54 drift, same tokens).
 
 **Trinity-Nano (5.5B AFMoE), int4-packed, on a 16 GB laptop:**
 `cargo run --release --example trinity` compiles a 56-layer, 128-expert MoE
-with grouped-query attention into **1,856 kernels per decode step** (~32%
-fewer than mlx-lm dispatches for the same model, with zero primitives) — GQA as
-shared axis variables, top-8 sigmoid routing as the `topk` composition, and
-the MoE proper as a router plus **grouped gate/up/down folds over a 9-slot
-axis** (8 routed experts + the shared expert), one vector-indexed `gather`
-selecting every slot's weights **directly from packed int4 device buffers**
-(typed storage: nibbles unpack inside the GEMM folds, per-group scales fused
-as axis structure; the 3.8 GB checkpoint never dequantizes). Per-position
-logits sit at bf16-reference noise with the prompt-end argmax matching HF,
-streaming *"The capital of France is Paris."* at ~4 tok/s.
+with grouped-query attention into **1,478 dispatches per decode step, ~30
+unique kernels** (~46% fewer than mlx-lm dispatches for the same model, with
+zero primitives) — GQA as shared axis variables, top-8 sigmoid routing as
+**one fold over all ranks** (the k-best tuple monoid, rank-indexed
+projection), and the MoE proper as a router plus **grouped gate/up/down folds
+over a 9-slot axis** (8 routed experts + the shared expert), one
+vector-indexed `gather` selecting every slot's weights **directly from packed
+int4 device buffers** (typed storage: nibbles unpack inside the GEMM folds,
+per-group scales fused as axis structure; the 3.8 GB checkpoint never
+dequantizes). Per-position logits sit at bf16-reference noise, greedy output
+matches the HF reference token-for-token, streaming *"The capital of France
+is Paris."* at **~45 tok/s (~22 ms/tok, or 18 with `--tune`)** — a measured
+ladder from 26 ms, itemized against MLX's hand-written kernels in
+`vs_mlx.md`.
 
 Every capability below is verified numerically against the interpreter, and
 where it says GPU, the kernels were dispatched on an Apple GPU and matched:
