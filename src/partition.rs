@@ -124,6 +124,7 @@ pub fn partition_many(
         stages: Vec::new(),
         fresh: 0,
         done: HashMap::new(),
+        keepalive: Vec::new(),
         parents,
     };
     let mut outputs = Vec::new();
@@ -257,6 +258,13 @@ struct Partitioner<'a> {
     /// Nodes already materialized, by pointer → the name they live under.
     /// A DAG-shared producer (a residual, say) is cut once, not per consumer.
     done: HashMap<*const NodeKind, &'static str>,
+    /// Keeps every `done`-keyed node alive for the whole partition. `done` is
+    /// keyed by raw pointer, and partition rebuilds transient graphs
+    /// (`replace_many` in a Reduce/backward cut); once such a node drops, the
+    /// allocator can hand its address to a NEW node, and the stale `done` entry
+    /// would then answer for the wrong node (a materialized read under totally
+    /// unrelated axes). Holding an `Rc` pins the address, so no reuse.
+    keepalive: Vec<Node>,
     /// How many consumers each node has in the original graph. A node with
     /// more than one is a fusion barrier for elementwise cones: computing it
     /// inside one consumer would recompute or corrupt it for the others.
@@ -325,6 +333,7 @@ impl Partitioner<'_> {
             NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
                 let name = self.cut(src);
                 self.done.insert(Rc::as_ptr(node), name);
+                self.keepalive.push(node.clone());
                 name
             }
 
@@ -416,6 +425,7 @@ impl Partitioner<'_> {
         // under is emit's return value, not necessarily `t`.
         let name = self.emit(node, t);
         self.done.insert(Rc::as_ptr(node), name);
+        self.keepalive.push(node.clone());
         name
     }
 
@@ -1034,6 +1044,7 @@ impl Partitioner<'_> {
             // The producer didn't land as a fused kernel — keep the map stage,
             // reading the producers' materialized buffers.
             self.done.insert(Rc::as_ptr(&producer), landed);
+            self.keepalive.push(producer.clone());
             let exec = self.executable(node);
             let mut inputs = vec![landed];
             inputs.extend(extra);

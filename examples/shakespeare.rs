@@ -25,7 +25,6 @@ use sanic::interp::{Extents, Tensor};
 use sanic::ir::*;
 use sanic::partition::partition_many;
 
-const N_LAYER: usize = 1;
 const D: usize = 128; // embedding / single-head attention dim
 const F: usize = 512; // MLP hidden
 const S: usize = 64; // context length
@@ -136,6 +135,7 @@ fn main() {
     };
     let lr = argf("--lr", 0.05);
     let steps = argf("--steps", 4000.0) as usize;
+    let n_layer = argf("--layers", 2.0) as usize; // ≥3 exercises the bindless path
 
     if !std::path::Path::new("data/shakespeare.txt").exists() {
         eprintln!("tinyshakespeare not found — fetch it first (see the module doc)");
@@ -143,12 +143,12 @@ fn main() {
     }
     let (data, vocab) = load_data();
     let vsize = vocab.itos.len();
-    println!("tinyshakespeare: {} chars, vocab {vsize} — {N_LAYER}L {D}d {S}ctx", data.len());
+    println!("tinyshakespeare: {} chars, vocab {vsize} — {n_layer}L {D}d {S}ctx", data.len());
 
     // ── axes ──
     let (s, dm, vv, pp) = (axis("s"), axis("dm"), axis("v"), axis("p"));
     let mut ext: Extents = [(s, S), (dm, D), (vv, vsize), (pp, S)].into_iter().collect();
-    let per_layer: Vec<[Axis; 4]> = (0..N_LAYER).map(|_| [axis("dk"), axis("dv"), axis("t"), axis("f")]).collect();
+    let per_layer: Vec<[Axis; 4]> = (0..n_layer).map(|_| [axis("dk"), axis("dv"), axis("t"), axis("f")]).collect();
     for [dk, dv, t, f] in &per_layer {
         ext.insert(*dk, D);
         ext.insert(*dv, D);
@@ -210,7 +210,8 @@ fn main() {
     let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let sched = partition_many(&roots, &Device::toy(), &ext_f);
     let program = sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &sched, &ext);
-    println!("training step: {} kernels", program.stages.len());
+    let bindless = program.stages.iter().filter(|s| s.argbuf.is_some()).count();
+    println!("training step: {} kernels ({bindless} bindless)", program.stages.len());
 
     let Some(dev) = MetalDevice::open() else {
         eprintln!("no Metal device — skipping");
