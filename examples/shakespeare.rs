@@ -280,8 +280,15 @@ fn main() {
         out
     };
 
+    // ── model FLOPs / step, for MFU (PaLM formula): 6N counts every weight
+    // matmul forward+backward, 12·L·H·Q·T the attention score/value matmuls
+    // (H=1 head, Q=D head dim, T=S). One step is one seq (batch 1) of S tokens.
+    let n_params: usize = params.iter().map(|(_, ax)| ax.iter().map(|a| ext[a]).product::<usize>()).sum();
+    let flops_per_step = ((6 * n_params + 12 * n_layer * D * S) * S) as f64;
+    let peak_flops = Device::m1_pro().peak_flops;
+
     // ── training loop: SGD on next-token prediction ──
-    println!("training {steps} steps (lr {lr})…");
+    println!("training {steps} steps (lr {lr}) — {n_params} params, {:.0} MFLOP/step…", flops_per_step / 1e6);
     let t0 = std::time::Instant::now();
     let mut ids = vec![0f64; S];
     let mut tgt = vec![0f64; S];
@@ -294,7 +301,9 @@ fn main() {
         run_window(&bufs, &ids, &tgt); // updates every weight in place
         if step < 8 || step % 250 == 0 || step == steps - 1 {
             let loss = dev.read_f32(&bufs["loss"], 1)[0];
-            println!("  step {step:>5}  loss {loss:.3}  ({:.0} steps/s)", (step + 1) as f32 / t0.elapsed().as_secs_f32());
+            let sps = (step + 1) as f64 / t0.elapsed().as_secs_f64();
+            let mfu = 100.0 * flops_per_step * sps / peak_flops;
+            println!("  step {step:>5}  loss {loss:.3}  ({sps:.0} steps/s, {mfu:.2}% MFU)");
         }
     }
 
