@@ -141,7 +141,13 @@ pub fn partition_many(
     let graph_inputs: HashSet<String> =
         roots.iter().flat_map(|(r, _)| leaf_names(r)).map(|s| s.to_string()).collect();
     let stages = order_in_place(p.stages, &graph_inputs);
-    Schedule { stages, outputs }
+    let sched = Schedule { stages, outputs };
+    // SANIC_DEBUG (any non-zero value): dump the schedule and each kernel's
+    // fusion, like tinygrad's DEBUG — the compilation made inspectable.
+    if std::env::var("SANIC_DEBUG").ok().and_then(|v| v.parse::<u32>().ok()).is_some_and(|l| l >= 1) {
+        sched.debug_dump();
+    }
+    sched
 }
 
 fn stage_output(s: &Stage) -> &str {
@@ -1463,6 +1469,116 @@ impl Schedule {
         }
         out
     }
+
+    /// The `SANIC_DEBUG` dump: one line per kernel — its output, kind (fold over
+    /// which axis + the derivation moves that fired, map, gather, scan), the
+    /// buffers it reads, and the scalar ops it FUSES (the composition collapsed
+    /// into that single kernel). This is the fusion boundary made legible: what
+    /// the deriver folded into each streaming pass.
+    pub fn debug_dump(&self) {
+        let (mut nf, mut nm, mut ng, mut ns) = (0, 0, 0, 0);
+        for s in &self.stages {
+            match s {
+                Stage::Fused { .. } => nf += 1,
+                Stage::Elementwise { .. } => nm += 1,
+                Stage::Gather { .. } => ng += 1,
+                Stage::Sequential { .. } => ns += 1,
+                Stage::Infeasible { .. } => {}
+            }
+        }
+        eprintln!(
+            "[sanic] schedule — {} kernels ({nf} fold, {nm} map, {ng} gather, {ns} scan)",
+            self.stages.len()
+        );
+        for (i, st) in self.stages.iter().enumerate() {
+            match st {
+                Stage::Fused { spec, fold_node, epilogue, epilogue_inputs, .. } => {
+                    let mut ops = Vec::new();
+                    collect_ops(fold_node, &mut ops);
+                    let epi = if epilogue.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ▸then {}({})", epilogue.join("·"), epilogue_inputs.join(", "))
+                    };
+                    eprintln!(
+                        "  [{i:>3}] {:<12} = fold `{}` [{}]  ⇐  {}{}",
+                        spec.output_name,
+                        spec.streaming_axis.label(),
+                        spec.carrier.rules.join("+"),
+                        op_bag(&ops),
+                        epi
+                    );
+                    eprintln!("        reads {}", spec.input_names.join(", "));
+                }
+                Stage::Elementwise { output, exec, inputs, .. } => {
+                    let mut ops = Vec::new();
+                    collect_ops(exec, &mut ops);
+                    eprintln!("  [{i:>3}] {output:<12} = map  ⇐  {}", op_bag(&ops));
+                    eprintln!("        reads {}", inputs.join(", "));
+                }
+                Stage::Gather { output, axis, inputs, .. } => {
+                    eprintln!("  [{i:>3}] {output:<12} = gather `{}`   reads {}", axis.label(), inputs.join(", "));
+                }
+                Stage::Sequential { output, op, axis, inputs, .. } => {
+                    eprintln!("  [{i:>3}] {output:<12} = scan `{op}` over `{}`   reads {}", axis.label(), inputs.join(", "));
+                }
+                Stage::Infeasible { output, axis } => {
+                    eprintln!("  [{i:>3}] {output:<12} = fold `{}` — INFEASIBLE (no block fits)", axis.label());
+                }
+            }
+        }
+    }
+}
+
+/// Every scalar op fused into a stage's body, in tree pre-order — walking the
+/// cut graph and stopping at its materialized-buffer leaves (`input`), which
+/// are the fusion boundary, not ops.
+fn collect_ops(node: &Node, out: &mut Vec<String>) {
+    match node.as_ref() {
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+        NodeKind::Map { op, inputs } => {
+            out.push(format!("{op:?}"));
+            inputs.iter().for_each(|i| collect_ops(i, out));
+        }
+        NodeKind::Reduce { op, axis, src } => {
+            out.push(format!("Σ{}/{}", monoid_name(op), axis.label()));
+            collect_ops(src, out);
+        }
+        NodeKind::Scan { op, axis, src } => {
+            out.push(format!("scan{}/{}", monoid_name(op), axis.label()));
+            collect_ops(src, out);
+        }
+        NodeKind::Gather { axis, src, index } => {
+            out.push(format!("gather/{}", axis.label()));
+            collect_ops(src, out);
+            collect_ops(index, out);
+        }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => collect_ops(src, out),
+    }
+}
+
+/// A reduce/scan's combiner as a short label (`Add`, `Max`, `LogSumExp`).
+fn monoid_name(op: &BinOp) -> String {
+    match op {
+        BinOp::Monoid(m) => format!("{m:?}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Collapse a repeated op list to counted, first-seen order: `Mul×3, Add, Exp`.
+fn op_bag(ops: &[String]) -> String {
+    let mut bag: Vec<(String, usize)> = Vec::new();
+    for o in ops {
+        if let Some(e) = bag.iter_mut().find(|(k, _)| k == o) {
+            e.1 += 1;
+        } else {
+            bag.push((o.clone(), 1));
+        }
+    }
+    bag.iter()
+        .map(|(k, n)| if *n > 1 { format!("{k}×{n}") } else { k.clone() })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
