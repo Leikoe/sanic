@@ -465,6 +465,14 @@ pub fn output_axes(node: &Node) -> Vec<Axis> {
     output_axes_memo(node, &mut std::collections::HashMap::new())
 }
 
+/// The number of elements a node's output holds — the product of its shape's
+/// extents (`1` for a scalar). This is the size a materialized buffer for the
+/// node needs; a stage's dispatch grid may be smaller (a packed fold writes
+/// several elements per thread), so allocation keys off THIS, never the grid.
+pub fn volume(node: &Node, ext: &std::collections::HashMap<Axis, usize>) -> usize {
+    output_axes(node).iter().map(|a| ext[a]).product::<usize>().max(1)
+}
+
 fn output_axes_memo(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Vec<Axis> {
     (*output_axes_rc(node, cache)).clone()
 }

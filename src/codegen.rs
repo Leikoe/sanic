@@ -460,7 +460,5 @@ pub fn thread_grid_decode_from<L: Lang>(
 
 /// The output grid (free axes) and its flattened size for a kernel node.
 pub fn grid_of(node: &Node, ext: &Extents) -> (Vec<Axis>, usize) {
-    let grid = output_axes(node);
-    let size = grid.iter().map(|a| ext[a]).product::<usize>().max(1);
-    (grid, size)
+    (output_axes(node), crate::ir::volume(node, ext))
 }

@@ -21,7 +21,7 @@ use crate::codegen::{
 };
 use crate::derive::{Carrier, Expr, SlotKind};
 use crate::interp::Extents;
-use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, NodeKind, input_dtypes, output_axes};
+use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, NodeKind, input_dtypes, output_axes, volume};
 use crate::partition::{Schedule, Stage};
 use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
 
@@ -1384,7 +1384,7 @@ pub fn emit_schedule_metal_over(
                 // threads than it writes elements (each thread projects a lane
                 // strip), so `grid_size` undercounts the allocation — the
                 // weight-gradient folds (dWf/dWp) write 16 elements per thread.
-                let out_vol = grid_of(epilogue_node.as_ref().unwrap_or(fold_node), ext).1;
+                let out_vol = volume(epilogue_node.as_ref().unwrap_or(fold_node), ext);
                 note_buffer(&out, out_vol, &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
@@ -1417,7 +1417,7 @@ pub fn emit_schedule_metal_over(
                 }
                 let argbuf = bindless_argbuf(&mut k, output, &mut bufsizes);
                 let kname = dedup(&k, &mut msl, &mut canon);
-                note_buffer(output, grid_of(exec, ext).1, &mut bufsizes);
+                note_buffer(output, volume(exec, ext), &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
                     inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
