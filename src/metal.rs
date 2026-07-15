@@ -76,6 +76,13 @@ impl MetalBuf {
     fn contents(&self) -> *mut u8 {
         unsafe { (self.0.contents().as_ptr() as *mut u8).add(self.1) }
     }
+    /// This handle's GPU virtual address (Metal 3+, Apple Silicon), including
+    /// its byte offset. On Tier 2 hardware an argument buffer stores exactly
+    /// this per `device T*` member, so a bindless kernel binds one address
+    /// table in place of dozens of direct buffers (past Metal's 31-bind cap).
+    pub fn gpu_address(&self) -> u64 {
+        self.0.gpuAddress() + self.1 as u64
+    }
 }
 
 /// Compiled kernels, indexed by entry-point name.
@@ -94,12 +101,20 @@ impl Pipelines {
 
 /// One kernel launch: the pipeline, its input buffers in `[[buffer(0..)]]`
 /// order, the output buffer, and the flat thread-grid size.
+///
+/// A *bindless* dispatch (`argbuf: Some`) instead binds one argument buffer —
+/// a table of the inputs' GPU addresses — at `[[buffer(0)]]` and the output at
+/// `[[buffer(1)]]`; `inputs` then names the resources to make resident
+/// (`useResource`) rather than buffers to bind directly. This is how a kernel
+/// reading more than ~30 buffers (a wide gradient-accumulation cone) fits
+/// under Metal's 31-argument cap.
 #[derive(Clone)]
 pub struct Dispatch {
     pub pipe: Pipeline,
     pub inputs: Vec<MetalBuf>,
     pub output: MetalBuf,
     pub grid: usize,
+    pub argbuf: Option<MetalBuf>,
 }
 
 pub struct MetalDevice {
@@ -314,10 +329,20 @@ impl MetalDevice {
         for d in dispatches {
             let enc = cb.computeCommandEncoder().expect("compute encoder");
             enc.setComputePipelineState(&d.pipe);
-            for (i, b) in d.inputs.iter().enumerate() {
-                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+            if let Some(ab) = &d.argbuf {
+                // bindless: one address table at 0, output at 1, inputs resident
+                unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
+                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
+                for b in &d.inputs {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
+                    enc.useResource_usage(res, MTLResourceUsage::Read);
+                }
+            } else {
+                for (i, b) in d.inputs.iter().enumerate() {
+                    unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+                }
+                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
             }
-            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
             let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
             enc.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
@@ -346,10 +371,20 @@ impl MetalDevice {
         for d in dispatches {
             let enc = cb.computeCommandEncoder().expect("compute encoder");
             enc.setComputePipelineState(&d.pipe);
-            for (i, b) in d.inputs.iter().enumerate() {
-                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+            if let Some(ab) = &d.argbuf {
+                // bindless: one address table at 0, output at 1, inputs resident
+                unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
+                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
+                for b in &d.inputs {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
+                    enc.useResource_usage(res, MTLResourceUsage::Read);
+                }
+            } else {
+                for (i, b) in d.inputs.iter().enumerate() {
+                    unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+                }
+                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
             }
-            unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
             let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
             enc.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
@@ -661,6 +696,7 @@ pub fn tune_schedules(
             let d = Dispatch {
                 pipe: pipes.get(&k.name),
                 inputs,
+                argbuf: None,
                 output: out_buf.clone(),
                 grid: k.grid_size,
             };
@@ -734,11 +770,26 @@ pub fn program_dispatches(
     program
         .stages
         .iter()
-        .map(|st| Dispatch {
-            pipe: pipes.get(&st.kernel),
-            inputs: st.inputs.iter().map(|n| bufs[n].clone()).collect(),
-            output: bufs[&st.output].clone(),
-            grid: st.grid_size,
+        .map(|st| {
+            let inputs: Vec<MetalBuf> = st.inputs.iter().map(|n| bufs[n].clone()).collect();
+            // a bindless stage fills its argument buffer with the inputs' GPU
+            // addresses (rebuilt each call, so a post-commit buffer swap is
+            // reflected) and binds that table instead of the inputs directly.
+            let argbuf = st.argbuf.as_ref().map(|name| {
+                let ab = bufs[name].clone();
+                let ptr = ab.contents() as *mut u64;
+                for (i, b) in inputs.iter().enumerate() {
+                    unsafe { *ptr.add(i) = b.gpu_address() };
+                }
+                ab
+            });
+            Dispatch {
+                pipe: pipes.get(&st.kernel),
+                inputs,
+                output: bufs[&st.output].clone(),
+                grid: st.grid_size,
+                argbuf,
+            }
         })
         .collect()
 }

@@ -222,6 +222,82 @@ fn wrap_sched(name: &str, bufs_sig: String, body: Vec<String>, tg_threads: usize
     )
 }
 
+/// Metal binds at most 31 buffers to a kernel (`[[buffer(0..30)]]`). A stage
+/// binding more — a wide gradient-accumulation cone — is emitted *bindless*
+/// instead (see [`make_bindless`]): its inputs move into one argument buffer.
+pub(crate) const METAL_MAX_BUFFERS: usize = 31;
+
+/// Rewrite a wide kernel to bind its inputs through an **argument buffer**
+/// (Metal's escape hatch past the 31-buffer cap; on Apple-Silicon Tier 2 an
+/// argument buffer is just a table of GPU addresses, effectively unbounded).
+///
+/// Purely a signature swap — the body is untouched. The inputs become fields
+/// of a `struct` bound at `[[buffer(0)]]`, the output moves to `[[buffer(1)]]`,
+/// and a one-line alias `b_x = _ab.b_x` per input restores the names the body
+/// already uses. Returns the new MSL (`k.inputs`/order are unchanged, so the
+/// host fills the address table in the same order).
+fn make_bindless(k: &MetalKernel) -> String {
+    let strct = format!("Args_{}", k.name);
+    let field = |n: &str| -> &'static str { buf_ty(k.dtypes.get(n).copied()) };
+
+    // struct of the inputs, in bind order (one `device const T*` per input)
+    let mut def = format!("struct {strct} {{\n");
+    for (n, _) in &k.inputs {
+        def.push_str(&format!("    {} {};\n", field(n), san(n)));
+    }
+    def.push_str("};\n\n");
+
+    // locate the signature: `kernel void NAME(\n    <params>\n) {\n<body>`
+    let head = format!("kernel void {}(\n    ", k.name);
+    let hpos = k.msl.find(&head).expect("kernel decl");
+    let sig_start = hpos + head.len();
+    let close = "\n) {\n";
+    let sig_end = sig_start + k.msl[sig_start..].find(close).expect("signature close");
+    let body_start = sig_end + close.len();
+
+    // keep every non-buffer param (the `[[thread_position…]]`/simd builtins);
+    // replace the buffer params with the argument buffer + the output at 1.
+    let builtins: Vec<&str> =
+        k.msl[sig_start..sig_end].split(",\n    ").filter(|p| !p.contains("[[buffer(")).collect();
+    let mut params = vec![
+        format!("constant {strct}& _ab [[buffer(0)]]"),
+        "device float* outb [[buffer(1)]]".to_string(),
+    ];
+    params.extend(builtins.iter().map(|s| s.to_string()));
+    let new_sig = params.join(",\n    ");
+
+    // alias each input back to the name the body reads
+    let aliases: String =
+        k.inputs.iter().map(|(n, _)| format!("    {} {} = _ab.{};\n", field(n), san(n), san(n))).collect();
+
+    let mut out = String::with_capacity(k.msl.len() + def.len() + aliases.len());
+    out.push_str(&k.msl[..MSL_HEADER.len()]); // shared header (stripped later)
+    out.push_str(&def);
+    out.push_str(&k.msl[MSL_HEADER.len()..sig_start]); // `[[attr]]\nkernel void NAME(\n    `
+    out.push_str(&new_sig);
+    out.push_str(close);
+    out.push_str(&aliases);
+    out.push_str(&k.msl[body_start..]); // the original body, verbatim
+    out
+}
+
+/// If `k` binds more buffers than Metal allows (inputs + output > 31), rewrite
+/// it bindless and register the address-table scratch buffer (one 64-bit GPU
+/// address — 2×f32 — per input). Returns the table's name, or `None` when `k`
+/// fits the direct-bind path. Runs before dedup so isomorphic wide kernels
+/// still share one entry point.
+fn bindless_argbuf(k: &mut MetalKernel, out: &str, bufsizes: &mut Vec<(String, usize)>) -> Option<String> {
+    if k.inputs.len() + 1 <= METAL_MAX_BUFFERS {
+        return None;
+    }
+    k.msl = make_bindless(k);
+    let ab = format!("__ab_{out}");
+    if !bufsizes.iter().any(|(n, _)| *n == ab) {
+        bufsizes.push((ab.clone(), k.inputs.len() * 2));
+    }
+    Some(ab)
+}
+
 /// A kernel's source with the shared header stripped and its entry name and
 /// positional buffer identifiers masked — the exact identity the schedule
 /// assembler dedups entry points by, exposed so a measured tuner can group
@@ -1169,11 +1245,17 @@ pub fn emit_pointwise_metal(name: &str, exec: &Node, ext: &Extents) -> MetalKern
 /// One dispatch in a whole-schedule GPU program.
 pub struct MetalStageInfo {
     pub kernel: String,
-    /// Buffer names bound to `[[buffer(0..)]]`, in order.
+    /// Buffer names bound to `[[buffer(0..)]]`, in order. For a bindless stage
+    /// (`argbuf` set) these are bound indirectly through the argument buffer
+    /// and made resident, rather than bound to `[[buffer(0..)]]` directly.
     pub inputs: Vec<String>,
     /// Buffer name written by this dispatch.
     pub output: String,
     pub grid_size: usize,
+    /// Set when the kernel binds its inputs through an argument buffer (they
+    /// exceed Metal's direct-bind cap): the name of the address-table scratch
+    /// buffer the host fills with the inputs' GPU addresses.
+    pub argbuf: Option<String>,
 }
 
 /// A whole schedule lowered to Metal: all kernels in one MSL source, plus the
@@ -1271,6 +1353,7 @@ pub fn emit_schedule_metal_over(
                 spec,
                 fold_node,
                 epilogue_node,
+                epi_fold_read,
                 ..
             } => {
                 note_inputs(fold_node, &produced, &mut inputs);
@@ -1281,19 +1364,20 @@ pub fn emit_schedule_metal_over(
                 });
                 // an epilogue renders INSIDE the fold kernel (one dispatch):
                 // the projection lands in a register and the epilogue's read
-                // of the fold's own output resolves to it
-                let k = emit_fused_metal_sched_with(
+                // of the fold's own output (under `epi_fold_read`) resolves to it
+                let mut k = emit_fused_metal_sched_with(
                     &kname,
                     &spec.carrier,
                     spec.streaming_axis,
                     fold_node,
                     ext,
                     sched,
-                    epilogue_node.as_ref().map(|e| (e, out.as_str())),
+                    epilogue_node.as_ref().map(|e| (e, *epi_fold_read)),
                 );
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
+                let argbuf = bindless_argbuf(&mut k, &out, &mut bufsizes);
                 let kname = dedup(&k, &mut msl, &mut canon);
                 // Size the output buffer by the output TENSOR VOLUME, not the
                 // dispatch grid: a cooperative/packed fold dispatches fewer
@@ -1307,12 +1391,17 @@ pub fn emit_schedule_metal_over(
                     inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
                     output: out.clone(),
                     grid_size: k.grid_size,
+                    argbuf,
                 });
                 produced.push(out.clone());
                 if let Some(epi) = epilogue_node {
-                    // register the epilogue's OTHER reads as program inputs
-                    // (the fold's own output is already `produced`)
-                    note_inputs(epi, &produced, &mut inputs);
+                    // register the epilogue's OTHER reads as program inputs —
+                    // NOT the fold's own output, read under `epi_fold_read`
+                    // (which is a distinct temp for an in-place update, so add
+                    // it to the produced/excluded set explicitly)
+                    let mut ex = produced.clone();
+                    ex.push(epi_fold_read.to_string());
+                    note_inputs(epi, &ex, &mut inputs);
                 }
                 last_out = out;
                 last_axes = output_axes(epilogue_node.as_ref().unwrap_or(fold_node));
@@ -1322,10 +1411,11 @@ pub fn emit_schedule_metal_over(
             | Stage::Sequential { output, exec, .. } => {
                 note_inputs(exec, &produced, &mut inputs);
                 let kname = format!("k_{}", san(output));
-                let k = emit_pointwise_metal(&kname, exec, ext);
+                let mut k = emit_pointwise_metal(&kname, exec, ext);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
+                let argbuf = bindless_argbuf(&mut k, output, &mut bufsizes);
                 let kname = dedup(&k, &mut msl, &mut canon);
                 note_buffer(output, grid_of(exec, ext).1, &mut bufsizes);
                 stages.push(MetalStageInfo {
@@ -1333,6 +1423,7 @@ pub fn emit_schedule_metal_over(
                     inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),
                     output: output.clone(),
                     grid_size: k.grid_size,
+                    argbuf,
                 });
                 produced.push(output.clone());
                 last_out = output.clone();
@@ -1343,6 +1434,11 @@ pub fn emit_schedule_metal_over(
             }
         }
     }
+
+    // An in-place update writes a weight's own buffer: its output name is also a
+    // program input (uploaded, persistent). Don't also allocate it as scratch —
+    // that would shadow the uploaded weight with a fresh zero buffer.
+    bufsizes.retain(|(n, _)| !inputs.iter().any(|(m, _)| m == n));
 
     MetalProgram {
         msl,

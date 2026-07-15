@@ -1237,6 +1237,7 @@ kernel void proto_moe_gate(
                 inputs: st.inputs.iter().map(|n| bufs[n].clone()).collect(),
                 output: g.alloc_f32(out_elems),
                 grid,
+                argbuf: None,
             }
         };
         let protos = [
@@ -1260,6 +1261,7 @@ kernel void proto_moe_gate(
                     inputs: st.inputs.iter().map(|n| bufs[n].clone()).collect(),
                     output: bufs[&st.output].clone(),
                     grid: 8192,
+                    argbuf: None,
                 };
                 subbed += 1;
             }

@@ -68,6 +68,7 @@ fn run_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Tensor) 
         inputs,
         output: output.clone(),
         grid: kernel.grid_size,
+        argbuf: None,
     }]);
     let got = dev.read_f32(&output, kernel.grid_size);
     let expected = reference.permuted_to(&kernel.grid);
@@ -896,12 +897,14 @@ fn split_reduction_runs_on_gpu() {
             inputs,
             output: partials_buf.clone(),
             grid: partial.grid_size,
+            argbuf: None,
         },
         Dispatch {
             pipe: pipes.get(&combine.name),
             inputs: vec![partials_buf],
             output: out_buf.clone(),
             grid: combine.grid_size,
+            argbuf: None,
         },
     ]);
     let got = dev.read_f32(&out_buf, combine.grid_size);
@@ -998,6 +1001,7 @@ fn bf16_matvec_runs_on_gpu() {
         inputs,
         output: out.clone(),
         grid: kernel.grid_size,
+        argbuf: None,
     }]);
     let got = dev.read_f32(&out, kernel.grid_size);
     let expected = reference.permuted_to(&kernel.grid);
@@ -1104,6 +1108,7 @@ fn w4_grouped_matvec_runs_on_gpu() {
         inputs,
         output: out.clone(),
         grid: kernel.grid_size,
+        argbuf: None,
     }]);
     let got = dev.read_f32(&out, kernel.grid_size);
     let expected = reference.permuted_to(&kernel.grid);
@@ -1284,6 +1289,7 @@ fn run_coop_on_gpu(
         inputs,
         output: output.clone(),
         grid: kernel.grid_size,
+        argbuf: None,
     }]);
     let got = dev.read_f32(&output, out_n);
     let expected = reference.permuted_to(&kernel.grid);
@@ -1550,6 +1556,7 @@ fn coop_chunked_w4_matvec_matches_oracle() {
         inputs,
         output: out.clone(),
         grid: kernel.grid_size,
+        argbuf: None,
     }]);
     let got = dev.read_f32(&out, n_out);
     let expected = reference.permuted_to(&kernel.grid);
@@ -1731,6 +1738,7 @@ kernel void zc_add(
             inputs: vec![a.clone(), b.clone()],
             output: out.clone(),
             grid: n,
+            argbuf: None,
         }]);
         dev.read_f32(&out, n)
     };

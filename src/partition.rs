@@ -27,7 +27,7 @@
 //!
 //! Stages come out in execution order (producers first).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
@@ -51,9 +51,15 @@ pub enum Stage {
         /// is what the interpreter drives to *execute* the derived kernel.
         fold_node: Node,
         /// When an epilogue was fused on, the elementwise node that turns the
-        /// fold's output (read as `input(output_name, …)`) plus the epilogue
+        /// fold's output (read as `input(epi_fold_read, …)`) plus the epilogue
         /// inputs into the final result. `None` when the fold output is final.
         epilogue_node: Option<Node>,
+        /// The name the epilogue reads the fold's OWN output under. Normally the
+        /// output name, but for an in-place update (`w = w − lr·∇w`, output
+        /// named `w`) the epilogue also reads the weight `w`, so the fold output
+        /// gets the fold's distinct temp name instead — otherwise the two reads
+        /// alias and `w` is replaced by `∇w`.
+        epi_fold_read: &'static str,
     },
     /// A maximal elementwise cone — one pass over the output grid, no fold.
     Elementwise {
@@ -127,10 +133,120 @@ pub fn partition_many(
         p.done.insert(Rc::as_ptr(r), landed);
         outputs.push(landed.to_string());
     }
-    Schedule {
-        stages: p.stages,
-        outputs,
+    // In-place updates: a root named after a graph input (`w = w − lr·∇w`)
+    // writes that weight's own buffer. Order every reader of the weight before
+    // its writer so the new value never overwrites the old mid-step — no shadow
+    // buffer, half the weight/optimizer VRAM. A no-op unless a name aliases.
+    let graph_inputs: HashSet<String> =
+        roots.iter().flat_map(|(r, _)| leaf_names(r)).map(|s| s.to_string()).collect();
+    let stages = order_in_place(p.stages, &graph_inputs);
+    Schedule { stages, outputs }
+}
+
+fn stage_output(s: &Stage) -> &str {
+    match s {
+        Stage::Fused { spec, .. } => &spec.output_name,
+        Stage::Elementwise { output, .. }
+        | Stage::Gather { output, .. }
+        | Stage::Sequential { output, .. }
+        | Stage::Infeasible { output, .. } => output,
     }
+}
+
+/// Every buffer name a single stage reads (its fold/cone leaves, minus its own
+/// fused-output read).
+fn stage_reads(s: &Stage) -> Vec<&'static str> {
+    match s {
+        Stage::Fused { spec, fold_node, epilogue_node, epi_fold_read, .. } => {
+            let mut r = leaf_names(fold_node);
+            if let Some(epi) = epilogue_node {
+                for n in leaf_names(epi) {
+                    if !r.contains(&n) {
+                        r.push(n);
+                    }
+                }
+            }
+            // neither the fold's own output name nor the epilogue's read of it
+            // is an external read
+            r.retain(|n| *n != spec.output_name.as_str() && *n != *epi_fold_read);
+            r
+        }
+        Stage::Elementwise { inputs, .. }
+        | Stage::Gather { inputs, .. }
+        | Stage::Sequential { inputs, .. } => inputs.clone(),
+        Stage::Infeasible { .. } => Vec::new(),
+    }
+}
+
+/// Stable topological reorder enforcing the in-place write-after-read rule:
+/// when a stage's output names a `graph_input` (a weight updated in place),
+/// every stage reading that buffer is ordered before the writer. Data
+/// dependencies (producer before consumer) are honored throughout, and an
+/// in-place writer is NOT treated as the producer of that name — readers take
+/// the pre-update value from the external input, not the writer's output.
+/// Panics on a write-after-read cycle (mutually-recursive in-place updates).
+fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Stage> {
+    let n = stages.len();
+    let out: Vec<String> = stages.iter().map(|s| stage_output(s).to_string()).collect();
+    let reads: Vec<Vec<&'static str>> = stages.iter().map(stage_reads).collect();
+    let inplace: Vec<bool> = out.iter().map(|o| graph_inputs.contains(o)).collect();
+    // producers of genuine intermediates only (an in-place writer's readers
+    // read the external weight, so it must NOT create a producer→reader edge)
+    let mut producer: HashMap<String, usize> = HashMap::new();
+    for i in 0..n {
+        if !inplace[i] {
+            producer.insert(out[i].clone(), i);
+        }
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indeg = vec![0usize; n];
+    let edge = |a: usize, b: usize, adj: &mut Vec<Vec<usize>>, indeg: &mut Vec<usize>| {
+        if a != b && !adj[a].contains(&b) {
+            adj[a].push(b);
+            indeg[b] += 1;
+        }
+    };
+    for i in 0..n {
+        for r in &reads[i] {
+            if let Some(&j) = producer.get(*r) {
+                edge(j, i, &mut adj, &mut indeg);
+            }
+        }
+    }
+    for i in 0..n {
+        if !inplace[i] {
+            continue;
+        }
+        let o = out[i].as_str();
+        for k in 0..n {
+            if reads[k].iter().any(|r| *r == o) {
+                edge(k, i, &mut adj, &mut indeg);
+            }
+        }
+    }
+    // stable Kahn: smallest original index first, so an already-topological
+    // input (no in-place aliasing) comes back byte-for-byte unchanged.
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<Reverse<usize>> = (0..n).filter(|&i| indeg[i] == 0).map(Reverse).collect();
+    let mut order = Vec::with_capacity(n);
+    while let Some(Reverse(i)) = heap.pop() {
+        order.push(i);
+        for j in adj[i].clone() {
+            indeg[j] -= 1;
+            if indeg[j] == 0 {
+                heap.push(Reverse(j));
+            }
+        }
+    }
+    assert_eq!(
+        order.len(),
+        n,
+        "in-place update created a write-after-read cycle: two weights' updates each read \
+         the other, so neither can run last — materialize one gradient to a temp to break it"
+    );
+    let mut slots: Vec<Option<Stage>> = stages.into_iter().map(Some).collect();
+    order.into_iter().map(|i| slots[i].take().unwrap()).collect()
 }
 
 struct Partitioner<'a> {
@@ -801,6 +917,7 @@ impl Partitioner<'_> {
                     epilogue_inputs: Vec::new(),
                     fold_node: cut_graph.clone(),
                     epilogue_node: None,
+                    epi_fold_read: leak(out),
                 });
             }
             // Legal but UNPLANNABLE: a deferred coupling can price a
@@ -887,19 +1004,23 @@ impl Partitioner<'_> {
                     epilogue,
                     epilogue_inputs,
                     epilogue_node,
+                    epi_fold_read,
                     ..
                 }) = self.stages.last_mut()
                 && spec.output_name == landed
                 && epilogue.is_empty()
             {
                 // The fold now writes the final output name; the epilogue reads
-                // that same buffer (`input(out)`), the other producers'
-                // materializations, and its extra plain inputs, producing the
-                // final result in place.
-                subs.push((
-                    producer.clone(),
-                    input(leak(out), &output_axes(&producer)),
-                ));
+                // that buffer, the other producers' materializations, and its
+                // extra plain inputs, producing the final result in place.
+                // In-place update: if the cone ALREADY reads a leaf named `out`
+                // (the weight `w` in `w − lr·∇w`), the fold's own output must be
+                // read under a distinct name (its temp `landed`) — otherwise the
+                // weight read and the fold-output read alias and `w` becomes `∇w`.
+                let leaked_out = leak(out);
+                let sentinel =
+                    if leaf_names(node).iter().any(|n| *n == leaked_out) { landed } else { leaked_out };
+                subs.push((producer.clone(), input(sentinel, &output_axes(&producer))));
                 let epi = replace_many(node, &subs, &mut HashMap::new());
                 spec.output_name = out.to_string();
                 *epilogue = ops;
@@ -907,6 +1028,7 @@ impl Partitioner<'_> {
                 all_inputs.extend(extra);
                 *epilogue_inputs = all_inputs;
                 *epilogue_node = Some(epi);
+                *epi_fold_read = sentinel;
                 return leak(out);
             }
             // The producer didn't land as a fused kernel — keep the map stage,
@@ -1212,6 +1334,7 @@ impl Schedule {
                     spec,
                     fold_node,
                     epilogue_node,
+                    epi_fold_read,
                     ..
                 } => {
                     let name = leak(&spec.output_name);
@@ -1220,8 +1343,10 @@ impl Schedule {
                     let result = match epilogue_node {
                         None => folded,
                         Some(epi) => {
-                            // expose the fold output so the epilogue can read it
-                            env.insert(name, folded);
+                            // expose the fold output under its read name so the
+                            // epilogue can read it — distinct from `name` for an
+                            // in-place update, so the weight `name` stays intact
+                            env.insert(leak(epi_fold_read), folded);
                             eval(epi, env, extents)
                         }
                     };

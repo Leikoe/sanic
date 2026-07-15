@@ -4,8 +4,9 @@
 //! `grad` — the whole backward pass are ONE dataflow graph; the SGD update
 //! `w ← w − lr·∇w` rides each gradient's fold as an epilogue, so one
 //! partitioned schedule computes the loss and every new weight together. It
-//! lowers to MSL, dispatches on Metal, and commits weights by buffer swap
-//! between steps (the KV-cache discipline, on optimizer state).
+//! lowers to MSL and dispatches on Metal, updating each weight IN PLACE —
+//! `partition` orders every read of a weight before its update, so the new
+//! value overwrites the old with no shadow buffer (half the weight VRAM).
 //!
 //! ```text
 //! cargo run --release --example shakespeare
@@ -195,8 +196,10 @@ fn main() {
     let grads = grad(&loss, &names, &ext);
     let mut roots: Vec<(Node, &'static str)> = vec![(logits.clone(), "logits"), (loss.clone(), "loss")];
     for (name, axes) in &params {
+        // the update is named after the weight itself — it writes `w` in place
+        // (partition orders it after every reader), so no shadow buffer.
         let upd = map(MapOp::Sub, vec![input(name, axes), map(MapOp::Mul, vec![konst(lr), grads[name].clone()])]);
-        roots.push((upd, leak(format!("{name}_next"))));
+        roots.push((upd, name));
     }
     // training-time algebraic simplification: the winner-mask cancels and the
     // softmax backward reuses the forward's log-sum-exp (composed-LSE parity).
@@ -240,15 +243,6 @@ fn main() {
         dev.write_f64(&bufs["ids"], ids);
         dev.write_f64(&bufs["tgt"], tgt);
         dev.run(&program_dispatches(&program, bufs, &pipes));
-    };
-    // swap each weight with the fused `w_next` the schedule just wrote.
-    let commit = |bufs: &mut HashMap<String, MetalBuf>| {
-        for (name, _) in &params {
-            let next = format!("{name}_next");
-            let new = bufs[&next].clone();
-            let old = bufs.insert(name.to_string(), new).unwrap();
-            bufs.insert(next, old);
-        }
     };
 
     // ── sampling: temperature-softmax autoregressive generation from a seed ──
@@ -296,8 +290,7 @@ fn main() {
             ids[j] = data[i + j] as f64;
             tgt[j] = data[i + j + 1] as f64;
         }
-        run_window(&bufs, &ids, &tgt);
-        commit(&mut bufs);
+        run_window(&bufs, &ids, &tgt); // updates every weight in place
         if step < 8 || step % 250 == 0 || step == steps - 1 {
             let loss = dev.read_f32(&bufs["loss"], 1)[0];
             println!("  step {step:>5}  loss {loss:.3}  ({:.0} steps/s)", (step + 1) as f32 / t0.elapsed().as_secs_f32());
