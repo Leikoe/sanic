@@ -185,6 +185,34 @@ fn stage_reads(s: &Stage) -> Vec<&'static str> {
     }
 }
 
+/// Every name a stage's cone reads, keeping a GENUINE read of its own output
+/// name (the signature of an in-place update `w = f(w, …)`, which [`stage_reads`]
+/// strips) but dropping the epilogue's read of the fold's OWN output under
+/// `epi_fold_read` — that is ordinary epilogue fusion, not a self-read. This is
+/// what separates a real in-place update (reads the weight under a name ≠
+/// `epi_fold_read`) from a materialized cut (`xd{l+1} = block(xd{l})`), whose
+/// only read of its output name IS the fold-output read.
+fn stage_reads_self(s: &Stage) -> Vec<&'static str> {
+    match s {
+        Stage::Fused { fold_node, epilogue_node, epi_fold_read, .. } => {
+            let mut r = leaf_names(fold_node);
+            if let Some(epi) = epilogue_node {
+                for n in leaf_names(epi) {
+                    if !r.contains(&n) {
+                        r.push(n);
+                    }
+                }
+            }
+            r.retain(|n| *n != *epi_fold_read);
+            r
+        }
+        Stage::Elementwise { inputs, .. }
+        | Stage::Gather { inputs, .. }
+        | Stage::Sequential { inputs, .. } => inputs.clone(),
+        Stage::Infeasible { .. } => Vec::new(),
+    }
+}
+
 /// Stable topological reorder enforcing the in-place write-after-read rule:
 /// when a stage's output names a `graph_input` (a weight updated in place),
 /// every stage reading that buffer is ordered before the writer. Data
@@ -196,7 +224,14 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
     let n = stages.len();
     let out: Vec<String> = stages.iter().map(|s| stage_output(s).to_string()).collect();
     let reads: Vec<Vec<&'static str>> = stages.iter().map(stage_reads).collect();
-    let inplace: Vec<bool> = out.iter().map(|o| graph_inputs.contains(o)).collect();
+    // A stage is an in-place update only if its output names a graph input AND
+    // its cone reads that same name (`w = f(w, …)`). A materialized cut whose
+    // output shares a graph-input name but does NOT read it (`xd{l+1} =
+    // block(xd{l})`, the decode residual stream) is a genuine producer — dropping
+    // its producer→reader edge would let a block read the stale cut buffer.
+    let inplace: Vec<bool> = (0..n)
+        .map(|i| graph_inputs.contains(&out[i]) && stage_reads_self(&stages[i]).iter().any(|r| *r == out[i]))
+        .collect();
     // producers of genuine intermediates only (an in-place writer's readers
     // read the external weight, so it must NOT create a producer→reader edge)
     let mut producer: HashMap<String, usize> = HashMap::new();
