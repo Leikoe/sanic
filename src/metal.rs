@@ -35,10 +35,10 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
-    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption,
-    MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
+    MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 use crate::emit_metal::MetalProgram;
@@ -423,9 +423,14 @@ impl MetalDevice {
 /// independent stages still overlap while dependent ones order correctly.
 pub struct MetalGraph {
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
-    /// Every distinct buffer the commands touch — declared resident at
-    /// replay (`useResource`) and retained so the ICB never dangles.
-    resources: Vec<MetalBuf>,
+    /// Explicit residency for the ICB's buffers AND pipeline states. An ICB does
+    /// not make its referenced allocations resident at replay, and on Apple7/8
+    /// (M1/M2) a non-resident *pipeline* faults the GPU after enough replays. A
+    /// residency set is the first-class fix: `MTLBuffer` and
+    /// `MTLComputePipelineState` both conform to `MTLAllocation`, so one set
+    /// covers them — no dummy-dispatch trick, no per-replay `useResource` sweep.
+    /// It also strong-references every allocation, so they outlive the graph.
+    residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     len: usize,
 }
 
@@ -454,12 +459,18 @@ impl MetalDevice {
 
         let mut resources: Vec<MetalBuf> = Vec::new();
         let mut seen: HashSet<usize> = HashSet::new();
+        // distinct pipeline states, to make resident alongside the buffers
+        let mut pipelines: Vec<Pipeline> = Vec::new();
+        let mut seen_pipe: HashSet<usize> = HashSet::new();
         // buffers written since the last barrier: touching one forces a
         // barrier on the toucher (which fences everything before it)
         let mut written: HashSet<usize> = HashSet::new();
         for (i, d) in dispatches.iter().enumerate() {
             let cmd = unsafe { icb.indirectComputeCommandAtIndex(i) };
             cmd.setComputePipelineState(&d.pipe);
+            if seen_pipe.insert(Retained::as_ptr(&d.pipe) as usize) {
+                pipelines.push(d.pipe.clone());
+            }
             for (bi, b) in d.inputs.iter().enumerate() {
                 unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, b.1, bi) };
                 if seen.insert(Retained::as_ptr(&b.0) as usize) {
@@ -494,9 +505,23 @@ impl MetalDevice {
                 },
             );
         }
+        // One residency set over every buffer and pipeline the ICB references.
+        let residency = self
+            .dev
+            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+            .expect("residency set");
+        for b in &resources {
+            residency.addAllocation(ProtocolObject::from_ref(&*b.0));
+        }
+        for p in &pipelines {
+            residency.addAllocation(ProtocolObject::from_ref(&**p));
+        }
+        residency.commit();
+        residency.requestResidency();
+
         MetalGraph {
             icb,
-            resources,
+            residency,
             len: dispatches.len(),
         }
     }
@@ -505,11 +530,8 @@ impl MetalDevice {
     /// one execute call.
     pub fn run_graph(&self, g: &MetalGraph) {
         let cb = self.queue.commandBuffer().expect("command buffer");
+        cb.useResidencySet(&g.residency); // buffers + pipelines resident for this replay
         let enc = cb.computeCommandEncoder().expect("compute encoder");
-        for b in &g.resources {
-            let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
-            enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
-        }
         // objc2-metal 0.3 has no binding for the compute encoder's
         // `executeCommandsInBuffer:withRange:` (macOS 11+); raw message.
         let range = NSRange {
@@ -526,11 +548,8 @@ impl MetalDevice {
     /// [`Self::run_timed`]).
     pub fn run_graph_timed(&self, g: &MetalGraph) -> f64 {
         let cb = self.queue.commandBuffer().expect("command buffer");
+        cb.useResidencySet(&g.residency);
         let enc = cb.computeCommandEncoder().expect("compute encoder");
-        for b in &g.resources {
-            let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
-            enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
-        }
         let range = NSRange {
             location: 0,
             length: g.len,
