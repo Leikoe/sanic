@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! cargo run --release --example shakespeare
-//! cargo run --release --example shakespeare -- --steps 4000 --lr 0.05
+//! cargo run --release --example shakespeare -- --steps 4000 --lr 0.05 --batch 32
 //! ```
 //!
 //! Data (not checked in) — fetch once:
@@ -136,6 +136,7 @@ fn main() {
     let lr = argf("--lr", 0.05);
     let steps = argf("--steps", 4000.0) as usize;
     let n_layer = argf("--layers", 2.0) as usize; // ≥3 exercises the bindless path
+    let batch = argf("--batch", 32.0) as usize; // seqs/step — amortizes weight loads, lifts MFU
 
     if !std::path::Path::new("data/shakespeare.txt").exists() {
         eprintln!("tinyshakespeare not found — fetch it first (see the module doc)");
@@ -143,11 +144,16 @@ fn main() {
     }
     let (data, vocab) = load_data();
     let vsize = vocab.itos.len();
-    println!("tinyshakespeare: {} chars, vocab {vsize} — {n_layer}L {D}d {S}ctx", data.len());
+    println!("tinyshakespeare: {} chars, vocab {vsize} — {n_layer}L {D}d {S}ctx ×{batch}b", data.len());
 
     // ── axes ──
     let (s, dm, vv, pp) = (axis("s"), axis("dm"), axis("v"), axis("p"));
-    let mut ext: Extents = [(s, S), (dm, D), (vv, vsize), (pp, S)].into_iter().collect();
+    // batch is one more parallel axis threaded through every activation; weights
+    // carry no `b`, so they stay shared and their gradients sum over the batch.
+    let bb = axis("b");
+    let bs = axis("bs"); // batch·seq flattened — the embedding gather wants a 1-axis index
+    let mut ext: Extents =
+        [(s, S), (dm, D), (vv, vsize), (pp, S), (bb, batch), (bs, batch * S)].into_iter().collect();
     let per_layer: Vec<[Axis; 4]> = (0..n_layer).map(|_| [axis("dk"), axis("dv"), axis("t"), axis("f")]).collect();
     for [dk, dv, t, f] in &per_layer {
         ext.insert(*dk, D);
@@ -157,8 +163,11 @@ fn main() {
     }
 
     // ── forward graph: embed → blocks → final norm → tied logits ──
-    let tok = gather(input("wte", &[vv, dm]), input("ids", &[s]), vv); // [dm, s]
-    let pos = gather(input("wpe", &[pp, dm]), iota(s), pp); // [dm, s]
+    // ids is a flat [b·s] index (single-axis, as the gather's scatter-add
+    // backward requires); split the gathered rows back to [b, s].
+    let tok_flat = gather(input("wte", &[vv, dm]), input("ids", &[bs]), vv); // [dm, bs]
+    let tok = split(tok_flat, bs, bb, s, S); // [dm, b, s]
+    let pos = gather(input("wpe", &[pp, dm]), iota(s), pp); // [dm, s] — shared across the batch
     let mut x = map(MapOp::Add, vec![tok, pos]);
     for (l, [dk, dv, t, f]) in per_layer.iter().enumerate() {
         let (dk, dv, t, f) = (*dk, *dv, *t, *f);
@@ -187,8 +196,13 @@ fn main() {
     let mmax = reduce(logits.clone(), vv, BinOp::Monoid(Monoid::Max));
     let sh = map(MapOp::Exp, vec![map(MapOp::Sub, vec![logits.clone(), mmax.clone()])]);
     let lse = map(MapOp::Add, vec![mmax, map(MapOp::Log, vec![reduce(sh, vv, add_r())])]); // [s]
-    let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[s]))]), vv, add_r());
-    let loss = map(MapOp::Mul, vec![reduce(map(MapOp::Sub, vec![lse, picked]), s, add_r()), konst(1.0 / S as f64)]);
+    let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[bb, s]))]), vv, add_r());
+    // mean over every token in the batch: fold positions AND batch, scale by
+    // 1/(B·S). Keeping it a mean (not a sum) holds the gradient scale — and thus
+    // `lr` — invariant to batch size, and the scalar keeps `grad` happy.
+    let per_tok = map(MapOp::Sub, vec![lse, picked]); // [b, s]
+    let summed = reduce(reduce(per_tok, s, add_r()), bb, add_r()); // scalar
+    let loss = map(MapOp::Mul, vec![summed, konst(1.0 / (S * batch) as f64)]);
 
     // ── one schedule: logits, loss, and every fused SGD update ──
     let params = weight_list(dm, vv, pp, &per_layer);
@@ -240,6 +254,14 @@ fn main() {
         bufs.insert(name.clone(), dev.alloc_f32(*size));
     }
 
+    // One compute encoder per dispatch, all in one command buffer per step —
+    // NOT the captured-graph replay (`capture`/`run_graph`) the decode examples
+    // use. That path replays a frozen indirect command buffer, and on Apple7/8 a
+    // reused ICB whose bound weights are mutated IN PLACE across replays
+    // accumulates stale GPU state and corrupts (tinygrad avoids this by updating
+    // weights functionally, not in place). The per-dispatch encoders re-bind
+    // every step, so in-place training is correct — and batching, not the graph,
+    // is what lifts MFU here.
     let run_window = |bufs: &HashMap<String, MetalBuf>, ids: &[f64], tgt: &[f64]| {
         dev.write_f64(&bufs["ids"], ids);
         dev.write_f64(&bufs["tgt"], tgt);
@@ -247,21 +269,23 @@ fn main() {
     };
 
     // ── sampling: temperature-softmax autoregressive generation from a seed ──
-    // logits are [s, v] row-major, so position p's row is logits[p*vsize .. ].
+    // logits are [b, s, v] row-major; we drive batch lane 0 and read its block,
+    // where position p's row is logits[p*vsize .. ] (lane 0 starts at offset 0).
     let mut srng = Rng(0x5EED_C0DE);
     let temp = 0.8f32;
     let mut sample = |bufs: &HashMap<String, MetalBuf>, seed: &str, n: usize| -> String {
         let mut ctx: Vec<usize> = seed.chars().map(|c| vocab.stoi[&c]).collect();
         let mut out = String::from(seed);
         for _ in 0..n {
-            let mut win = vec![0f64; S];
+            // feed the window as batch lane 0; the other B−1 lanes idle at zero.
+            let mut win = vec![0f64; batch * S];
             let start = ctx.len().saturating_sub(S);
             let last = ctx.len() - start; // number of real tokens in the window
             for (i, &id) in ctx[start..].iter().enumerate() {
                 win[i] = id as f64;
             }
-            run_window(bufs, &win, &vec![0f64; S]);
-            let lg = dev.read_f32(&bufs["logits"], S * vsize);
+            run_window(bufs, &win, &vec![0f64; batch * S]);
+            let lg = dev.read_f32(&bufs["logits"], S * vsize); // lane 0's [s, v] block
             let row = &lg[(last - 1) * vsize..last * vsize];
             let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let ps: Vec<f32> = row.iter().map(|z| ((z - mx) / temp).exp()).collect();
@@ -282,21 +306,25 @@ fn main() {
 
     // ── model FLOPs / step, for MFU (PaLM formula): 6N counts every weight
     // matmul forward+backward, 12·L·H·Q·T the attention score/value matmuls
-    // (H=1 head, Q=D head dim, T=S). One step is one seq (batch 1) of S tokens.
+    // (H=1 head, Q=D head dim, T=S). Per token that is 6N + 12·L·D·S; one step
+    // is B seqs of S tokens, so B·S tokens.
     let n_params: usize = params.iter().map(|(_, ax)| ax.iter().map(|a| ext[a]).product::<usize>()).sum();
-    let flops_per_step = ((6 * n_params + 12 * n_layer * D * S) * S) as f64;
+    let flops_per_step = ((6 * n_params + 12 * n_layer * D * S) * S * batch) as f64;
     let peak_flops = Device::m1_pro().peak_flops;
 
     // ── training loop: SGD on next-token prediction ──
     println!("training {steps} steps (lr {lr}) — {n_params} params, {:.0} MFLOP/step…", flops_per_step / 1e6);
     let t0 = std::time::Instant::now();
-    let mut ids = vec![0f64; S];
-    let mut tgt = vec![0f64; S];
+    let mut ids = vec![0f64; batch * S];
+    let mut tgt = vec![0f64; batch * S];
     for step in 0..steps {
-        let i = rng.below(data.len() - S - 1);
-        for j in 0..S {
-            ids[j] = data[i + j] as f64;
-            tgt[j] = data[i + j + 1] as f64;
+        // B independent windows, laid out [b, s] row-major (b outer, s inner).
+        for b in 0..batch {
+            let i = rng.below(data.len() - S - 1);
+            for j in 0..S {
+                ids[b * S + j] = data[i + j] as f64;
+                tgt[b * S + j] = data[i + j + 1] as f64;
+            }
         }
         run_window(&bufs, &ids, &tgt); // updates every weight in place
         if step < 8 || step % 250 == 0 || step == steps - 1 {
