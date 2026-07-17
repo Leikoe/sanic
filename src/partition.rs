@@ -160,23 +160,36 @@ fn stage_output(s: &Stage) -> &str {
     }
 }
 
+/// The buffer names a Fused stage reads: its fold leaves plus any epilogue
+/// leaves, deduped, with the epilogue's read of the fold's OWN output
+/// (`epi_fold_read`) dropped — that is ordinary epilogue fusion, not an
+/// external read. The fold's output NAME is kept, so a caller that needs to spot
+/// a genuine in-place self-read (`w = f(w, …)`) still sees it.
+fn fused_leaf_reads(
+    fold_node: &Node,
+    epilogue_node: &Option<Node>,
+    epi_fold_read: &'static str,
+) -> Vec<&'static str> {
+    let mut reads = leaf_names(fold_node);
+    if let Some(epi) = epilogue_node {
+        for n in leaf_names(epi) {
+            if !reads.contains(&n) {
+                reads.push(n);
+            }
+        }
+    }
+    reads.retain(|n| *n != epi_fold_read);
+    reads
+}
+
 /// Every buffer name a single stage reads (its fold/cone leaves, minus its own
 /// fused-output read).
 fn stage_reads(s: &Stage) -> Vec<&'static str> {
     match s {
         Stage::Fused { spec, fold_node, epilogue_node, epi_fold_read, .. } => {
-            let mut r = leaf_names(fold_node);
-            if let Some(epi) = epilogue_node {
-                for n in leaf_names(epi) {
-                    if !r.contains(&n) {
-                        r.push(n);
-                    }
-                }
-            }
-            // neither the fold's own output name nor the epilogue's read of it
-            // is an external read
-            r.retain(|n| *n != spec.output_name.as_str() && *n != *epi_fold_read);
-            r
+            let mut reads = fused_leaf_reads(fold_node, epilogue_node, epi_fold_read);
+            reads.retain(|n| *n != spec.output_name.as_str()); // its own output is not an external read
+            reads
         }
         Stage::Elementwise { inputs, .. }
         | Stage::Gather { inputs, .. }
@@ -195,16 +208,7 @@ fn stage_reads(s: &Stage) -> Vec<&'static str> {
 fn stage_reads_self(s: &Stage) -> Vec<&'static str> {
     match s {
         Stage::Fused { fold_node, epilogue_node, epi_fold_read, .. } => {
-            let mut r = leaf_names(fold_node);
-            if let Some(epi) = epilogue_node {
-                for n in leaf_names(epi) {
-                    if !r.contains(&n) {
-                        r.push(n);
-                    }
-                }
-            }
-            r.retain(|n| *n != *epi_fold_read);
-            r
+            fused_leaf_reads(fold_node, epilogue_node, epi_fold_read)
         }
         Stage::Elementwise { inputs, .. }
         | Stage::Gather { inputs, .. }
@@ -661,45 +665,14 @@ impl Partitioner<'_> {
                 }
             }
             NodeKind::Gather { src, index, axis: g } => {
-                // A stream-varying index touches a different `g`-slice of the
-                // source every step: below the gather, that variation lives
-                // on the gathered axis.
-                let ia = all_axes(index);
-                let mut sa = axes.to_vec();
-                if axes.iter().any(|a| ia.contains(a)) && !sa.contains(g) {
-                    sa.push(*g);
-                }
-                self.leaf_cuts(src, &sa, out);
+                self.leaf_cuts(src, &stream_below_gather(axes, index, *g), out);
                 self.leaf_cuts(index, axes, out);
             }
             NodeKind::View { src, groups } => {
-                // Below a flatten the stream lives on the group members.
-                let mut sa: Vec<Axis> = Vec::new();
-                for &a in axes {
-                    match groups.iter().find(|(_, to)| *to == a) {
-                        Some((members, _)) => sa.extend(members.iter().copied()),
-                        None => sa.push(a),
-                    }
-                }
-                self.leaf_cuts(src, &sa, out)
+                self.leaf_cuts(src, &stream_below_view(axes, groups), out)
             }
             NodeKind::Reindex { src, map, .. } => {
-                // Below a split/window, the stream lives on the mapped source
-                // axes its terms drive.
-                let mut sa: Vec<Axis> = Vec::new();
-                for &a in axes {
-                    let mut driving = map
-                        .iter()
-                        .filter(|(_, terms, _)| terms.iter().any(|(_, t)| *t == a))
-                        .map(|(m, _, _)| *m)
-                        .peekable();
-                    if driving.peek().is_none() {
-                        sa.push(a);
-                    } else {
-                        sa.extend(driving);
-                    }
-                }
-                self.leaf_cuts(src, &sa, out)
+                self.leaf_cuts(src, &stream_below_reindex(axes, map), out)
             }
             _ => push(node, out),
         }
@@ -745,39 +718,13 @@ impl Partitioner<'_> {
                 }
                 hot
             }
-            NodeKind::Gather { src, index, axis: g } => {
-                let ia = all_axes(index);
-                let mut sa = axes.to_vec();
-                if axes.iter().any(|a| ia.contains(a)) && !sa.contains(g) {
-                    sa.push(*g);
-                }
-                max(self.hot_volume(src, &sa), self.hot_volume(index, axes))
-            }
-            NodeKind::View { src, groups } => {
-                let mut sa: Vec<Axis> = Vec::new();
-                for &a in axes {
-                    match groups.iter().find(|(_, to)| *to == a) {
-                        Some((members, _)) => sa.extend(members.iter().copied()),
-                        None => sa.push(a),
-                    }
-                }
-                self.hot_volume(src, &sa)
-            }
+            NodeKind::Gather { src, index, axis: g } => max(
+                self.hot_volume(src, &stream_below_gather(axes, index, *g)),
+                self.hot_volume(index, axes),
+            ),
+            NodeKind::View { src, groups } => self.hot_volume(src, &stream_below_view(axes, groups)),
             NodeKind::Reindex { src, map, .. } => {
-                let mut sa: Vec<Axis> = Vec::new();
-                for &a in axes {
-                    let mut driving = map
-                        .iter()
-                        .filter(|(_, terms, _)| terms.iter().any(|(_, t)| *t == a))
-                        .map(|(m, _, _)| *m)
-                        .peekable();
-                    if driving.peek().is_none() {
-                        sa.push(a);
-                    } else {
-                        sa.extend(driving);
-                    }
-                }
-                self.hot_volume(src, &sa)
+                self.hot_volume(src, &stream_below_reindex(axes, map))
             }
             // Fold-bearing subtrees are pushed whole by `leaf_cuts` — their
             // interior is not this cut's concern. Free sources carry no work.
@@ -1169,6 +1116,54 @@ fn cheap_op(op: MapOp) -> bool {
         op,
         MapOp::Exp | MapOp::Log | MapOp::Sqrt | MapOp::Tanh | MapOp::Sin | MapOp::Cos
     )
+}
+
+/// Translate a streamed axis set DOWN through one structural boundary — the
+/// rule [`Partitioner::leaf_cuts`] and [`Partitioner::hot_volume`] share as they
+/// descend. Below a flatten the stream lives on the group members; below a
+/// split/window, on the mapped source axes its terms drive; a gather whose
+/// index varies with the stream spreads it onto the gathered axis. Anything the
+/// boundary doesn't touch passes through. ([`Partitioner::entanglers`] and
+/// [`crate::analyze::structure`] translate a single axis the same way, but also
+/// stop at an axis *consumed* below the boundary, so they don't reuse this.)
+/// Without the translation everything under a flattened fold looks
+/// stream-invariant, and a SwiGLU's exp stays in-body of the down projection —
+/// recomputed once per output row instead of once per element.
+fn stream_below_view(axes: &[Axis], groups: &[(Vec<Axis>, Axis)]) -> Vec<Axis> {
+    let mut below = Vec::new();
+    for &a in axes {
+        match groups.iter().find(|(_, to)| *to == a) {
+            Some((members, _)) => below.extend(members.iter().copied()),
+            None => below.push(a),
+        }
+    }
+    below
+}
+
+fn stream_below_reindex(axes: &[Axis], map: &[(Axis, Vec<(i64, Axis)>, i64)]) -> Vec<Axis> {
+    let mut below = Vec::new();
+    for &a in axes {
+        let mut driving = map
+            .iter()
+            .filter(|(_, terms, _)| terms.iter().any(|(_, t)| *t == a))
+            .map(|(m, _, _)| *m)
+            .peekable();
+        if driving.peek().is_none() {
+            below.push(a);
+        } else {
+            below.extend(driving);
+        }
+    }
+    below
+}
+
+fn stream_below_gather(axes: &[Axis], index: &Node, gathered: Axis) -> Vec<Axis> {
+    let index_axes = all_axes(index);
+    let mut below = axes.to_vec();
+    if axes.iter().any(|a| index_axes.contains(a)) && !below.contains(&gathered) {
+        below.push(gathered);
+    }
+    below
 }
 
 /// The smallest-volume normalizer APPLICATION site in the graph — a `Div`,
