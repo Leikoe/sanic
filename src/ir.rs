@@ -8,69 +8,40 @@
 //! vocabulary is a *closed* enum of scalar primitives, so the deriver can be
 //! total over it — there is no open set of named ops to special-case.
 //!
-//! Axes are variables, not strings: an [`Axis`] is a fresh integer identity
-//! with a label used only for printing. `Reduce` binds its axis; `View`
-//! re-binds names (rename) or merges index spaces (flatten) without moving
-//! data. Because axes are host-language values, Rust's own lexical scoping
-//! is the axis scoping — pass the same `Axis` where two tensors share an
-//! index space, mint a fresh one where they don't.
+//! An [`Axis`] is a named index space with a size — plain data, structural
+//! identity, no hidden state. Because the axis carries its extent, every
+//! shape is derivable from any graph and no side tables exist anywhere.
+//! `Reduce` binds its axis; `View` re-binds names (rename) or merges index
+//! spaces (flatten) without moving data. Axes are host-language values:
+//! write the same axis where two tensors share an index space, a
+//! differently-named one where they don't.
 
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 pub type Node = Rc<NodeKind>;
 
 // ── axes ─────────────────────────────────────────────────────────────────────
 
-/// An axis variable. Identity is the id; the label is only for printing —
-/// two calls to `axis("s")` make two *different* variables.
-#[derive(Clone, Copy, Debug)]
+/// An axis: a named index space with a size — plain data, no hidden id (the
+/// way a tinygrad shape is just numbers). Identity is structural: two axes
+/// with the same name and extent ARE the same axis wherever they were
+/// written. So use one name per index space and a fresh name where spaces
+/// must differ (`t` vs `t2`) — equal name + equal extent unifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Axis {
-    id: u32,
-    label: &'static str,
+    pub name: &'static str,
+    pub extent: usize,
 }
 
-static NEXT_AXIS: AtomicU32 = AtomicU32::new(0);
-
-/// Mint a fresh axis variable with a printing label.
-pub fn axis(label: &'static str) -> Axis {
-    Axis {
-        id: NEXT_AXIS.fetch_add(1, Ordering::Relaxed),
-        label,
-    }
+/// An axis, briefly: `axis("s", 512)`.
+pub fn axis(name: &'static str, extent: usize) -> Axis {
+    Axis { name, extent }
 }
 
-impl Axis {
-    pub fn label(self) -> &'static str {
-        self.label
-    }
-}
-
-impl PartialEq for Axis {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-impl Eq for Axis {}
-impl std::hash::Hash for Axis {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-impl PartialOrd for Axis {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Axis {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id.cmp(&other.id)
-    }
-}
 impl fmt::Display for Axis {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.label)
+        write!(f, "{}", self.name)
     }
 }
 
@@ -128,7 +99,11 @@ pub enum BinOp {
     /// into a 2k-slot carrier; each rank projects a slot. This is what makes
     /// top-k routing k independent single-kernel folds instead of k rounds
     /// of (max, mask-the-winner) chained through materialized cuts.
-    TopK { k: u8, rank: u8, idx: bool },
+    TopK {
+        k: u8,
+        rank: u8,
+        idx: bool,
+    },
     /// A non-associative step, e.g. `tanh(W·h + x)`. No legal fold exists; an
     /// axis governed by one of these is strictly serial.
     NonAssoc(&'static str),
@@ -427,12 +402,11 @@ pub fn pad(src: Node, from: Axis, to: Axis, lo: usize) -> Node {
 }
 
 /// Split one axis into `(outer, inner)` — the inverse of [`flatten`]:
-/// `out[o, i] = src[o·inner_extent + i]`. `inner_extent` must equal the
-/// declared extent of `inner`.
-pub fn split(src: Node, from: Axis, outer: Axis, inner: Axis, inner_extent: usize) -> Node {
+/// `out[o, i] = src[o·extent(inner) + i]`.
+pub fn split(src: Node, from: Axis, outer: Axis, inner: Axis) -> Node {
     reindex(
         src,
-        vec![(from, vec![(inner_extent as i64, outer), (1, inner)], 0)],
+        vec![(from, vec![(inner.extent as i64, outer), (1, inner)], 0)],
         false,
     )
 }
@@ -469,15 +443,25 @@ pub fn output_axes(node: &Node) -> Vec<Axis> {
 /// extents (`1` for a scalar). This is the size a materialized buffer for the
 /// node needs; a stage's dispatch grid may be smaller (a packed fold writes
 /// several elements per thread), so allocation keys off THIS, never the grid.
-pub fn volume(node: &Node, ext: &std::collections::HashMap<Axis, usize>) -> usize {
-    output_axes(node).iter().map(|a| ext[a]).product::<usize>().max(1)
+pub fn volume(node: &Node) -> usize {
+    output_axes(node)
+        .iter()
+        .map(|a| a.extent)
+        .product::<usize>()
+        .max(1)
 }
 
-fn output_axes_memo(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Vec<Axis> {
+fn output_axes_memo(
+    node: &Node,
+    cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>,
+) -> Vec<Axis> {
     (*output_axes_rc(node, cache)).clone()
 }
 
-fn output_axes_rc(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Rc<Vec<Axis>> {
+fn output_axes_rc(
+    node: &Node,
+    cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>,
+) -> Rc<Vec<Axis>> {
     let key = Rc::as_ptr(node);
     if let Some(v) = cache.get(&key) {
         return v.clone();

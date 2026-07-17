@@ -30,7 +30,7 @@
 
 use sanic::cost::Device;
 use sanic::grad::grad;
-use sanic::interp::{Extents, Tensor};
+use sanic::interp::Value;
 use sanic::ir::*;
 use sanic::partition::partition_many;
 
@@ -135,7 +135,7 @@ impl Rng {
 
 /// Glorot-uniform for a weight, zeros for a bias — sized from the layer's
 /// fan-in/out, keyed by name.
-fn init_param(name: &str, axes: &[Axis], ext: &Extents, hid: usize, rng: &mut Rng) -> Tensor {
+fn init_param(name: &str, axes: &[Axis], hid: usize, rng: &mut Rng) -> Value {
     let fan = match name {
         "W1" => Some((DIN, hid)),
         "W2" => Some((hid, CLS)),
@@ -144,9 +144,9 @@ fn init_param(name: &str, axes: &[Axis], ext: &Extents, hid: usize, rng: &mut Rn
     match fan {
         Some((fin, fout)) => {
             let lim = (6.0 / (fin + fout) as f64).sqrt();
-            Tensor::from_fn(axes, ext, |_| rng.unit() * lim)
+            Value::from_fn(axes, |_| rng.unit() * lim)
         }
-        None => Tensor::from_fn(axes, ext, |_| 0.0),
+        None => Value::from_fn(axes, |_| 0.0),
     }
 }
 
@@ -236,10 +236,12 @@ fn main() {
     println!("MNIST: {ntrain} train, {} test — {DIN} → {hid} → {CLS}", test_y.len());
 
     // ── build the training graph: loss + logits + the fused SGD updates ──
-    let (b, din, hidx, cls) = (axis("b"), axis("din"), axis("hid"), axis("cls"));
-    let ext: Extents = [(b, batch), (din, DIN), (hidx, hid), (cls, CLS)]
-        .into_iter()
-        .collect();
+    let (b, din, hidx, cls) = (
+        axis("b", batch),
+        axis("din", DIN),
+        axis("hid", hid),
+        axis("cls", CLS),
+    );
 
     let logits = mlp(b, din, hidx, cls);
     let loss = cross_entropy(logits.clone(), b, cls, batch);
@@ -250,7 +252,7 @@ fn main() {
         ("W2", vec![cls, hidx]),
         ("b2", vec![cls]),
     ];
-    let grads = grad(&loss, &["W1", "b1", "W2", "b2"], &ext);
+    let grads = grad(&loss, &["W1", "b1", "W2", "b2"]);
     // one schedule, many outputs: the logits (for accuracy), the loss, and each
     // post-step weight `w − lr·∇w` — the update rides its gradient's kernel.
     // Logits first so it is materialized before the cross-entropy's logsumexp,
@@ -277,10 +279,9 @@ fn main() {
     let roots: Vec<(Node, &'static str)> =
         nodes.into_iter().zip(&roots).map(|(n, (_, name))| (n, *name)).collect();
 
-    let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let t0 = std::time::Instant::now();
-    let sched = partition_many(&roots, &Device::toy(), &ext_f);
-    let program = sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &sched, &ext);
+    let sched = partition_many(&roots, &Device::toy());
+    let program = sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &sched);
     println!(
         "training step: {} kernels, partitioned + lowered to MSL in {:.2}s",
         program.stages.len(),
@@ -297,13 +298,13 @@ fn main() {
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
     for (name, axes) in &program.inputs {
-        let size = axes.iter().map(|a| ext[a]).product::<usize>().max(1);
+        let size = axes.iter().map(|a| a.extent).product::<usize>().max(1);
         if *name == "X" || *name == "y" {
             let expect: Vec<Axis> = if *name == "X" { vec![b, din] } else { vec![b] };
             assert_eq!(axes, &expect, "`{name}` uploaded assuming declared axis order");
             bufs.insert(name.to_string(), dev.alloc_f32(size));
         } else {
-            let init = init_param(name, axes, &ext, hid, &mut rng);
+            let init = init_param(name, axes, hid, &mut rng);
             bufs.insert(name.to_string(), dev.from_f64(&init.data));
         }
     }

@@ -11,10 +11,8 @@
 //! preserve the semantics — on a real multi-head transformer block, not a
 //! single kernel in isolation.
 
-use std::collections::HashMap;
-
 use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::partition::partition;
 
@@ -30,11 +28,11 @@ impl Lcg {
     }
 }
 
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
-fn assert_close(x: &Tensor, y: &Tensor) {
+fn assert_close(x: &Value, y: &Value) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(x.shape, y.shape, "shape: {:?} vs {:?}", x.axes, y.axes);
     let mut worst = 0.0f64;
@@ -42,11 +40,6 @@ fn assert_close(x: &Tensor, y: &Tensor) {
         worst = worst.max((a - b).abs() / (1.0 + a.abs().max(b.abs())));
     }
     assert!(worst < 1e-9, "max relative error {worst:e}");
-}
-
-/// f64 extents (for the planner) from usize extents (for execution).
-fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
-    ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
 }
 
 fn add_r() -> BinOp {
@@ -63,17 +56,20 @@ fn rmsnorm(x: Node, g: Node, n: f64, ax: Axis) -> Node {
 // ── a focused case: flash attention + residual epilogue + output GEMM ────────
 #[test]
 fn attention_block_schedule_executes_to_reference() {
-    let (s, t, dm, dk, dv) = (axis("s"), axis("t"), axis("dm"), axis("dk"), axis("dv"));
-    let ext: Extents = [(s, 4), (t, 4), (dm, 6), (dk, 5), (dv, 6)]
-        .into_iter()
-        .collect();
+    let (s, t, dm, dk, dv) = (
+        axis("s", 4),
+        axis("t", 4),
+        axis("dm", 6),
+        axis("dk", 5),
+        axis("dv", 6),
+    );
     let mut rng = Lcg(0xBEEF);
     let env: Env = [
-        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
-        ("Wq", rand_tensor(&[dk, dm], &ext, &mut rng)),
-        ("Wk", rand_tensor(&[dk, dm], &ext, &mut rng)),
-        ("Wv", rand_tensor(&[dv, dm], &ext, &mut rng)),
-        ("Wo", rand_tensor(&[dm, dv], &ext, &mut rng)),
+        ("X", rand_tensor(&[s, dm], &mut rng)),
+        ("Wq", rand_tensor(&[dk, dm], &mut rng)),
+        ("Wk", rand_tensor(&[dk, dm], &mut rng)),
+        ("Wv", rand_tensor(&[dv, dm], &mut rng)),
+        ("Wo", rand_tensor(&[dm, dv], &mut rng)),
     ]
     .into_iter()
     .collect();
@@ -87,9 +83,9 @@ fn attention_block_schedule_executes_to_reference() {
     let o = matmul(attn, input("Wo", &[dm, dv]), dv); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
-    let sched = partition(&y, &Device::toy(), &as_f64(&ext));
-    let executed = sched.execute(&env, &ext);
-    let reference = eval(&y, &env, &ext);
+    let sched = partition(&y, &Device::toy());
+    let executed = sched.execute(&env);
+    let reference = eval(&y, &env);
     assert_close(&executed, &reference);
 }
 
@@ -100,44 +96,31 @@ fn attention_block_schedule_executes_to_reference() {
 #[test]
 fn full_transformer_block_schedule_executes_to_reference() {
     let (v, s, t, dm, h, dk, dv, dmv, f) = (
-        axis("v"),
-        axis("s"),
-        axis("t"),
-        axis("dm"),
-        axis("h"),
-        axis("dk"),
-        axis("dv"),
-        axis("dmv"),
-        axis("f"),
+        axis("v", 16),
+        axis("s", 4),
+        axis("t", 4),
+        axis("dm", 8),
+        axis("h", 2),
+        axis("dk", 4),
+        axis("dv", 4),
+        axis("dmv", 8), // h · dv
+        axis("f", 12),
     );
-    let ext: Extents = [
-        (v, 16),
-        (s, 4),
-        (t, 4),
-        (dm, 8),
-        (h, 2),
-        (dk, 4),
-        (dv, 4),
-        (dmv, 8), // h · dv
-        (f, 12),
-    ]
-    .into_iter()
-    .collect();
-    let n = ext[&dm] as f64;
+    let n = dm.extent as f64;
 
     let mut rng = Lcg(0x5A5A_1234);
     let env: Env = [
-        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
-        ("g1", rand_tensor(&[dm], &ext, &mut rng)),
-        ("g2", rand_tensor(&[dm], &ext, &mut rng)),
-        ("Wq", rand_tensor(&[h, dk, dm], &ext, &mut rng)),
-        ("Wk", rand_tensor(&[h, dk, dm], &ext, &mut rng)),
-        ("Wv", rand_tensor(&[h, dv, dm], &ext, &mut rng)),
-        ("Wo", rand_tensor(&[dmv, dm], &ext, &mut rng)),
-        ("Wg", rand_tensor(&[f, dm], &ext, &mut rng)),
-        ("Wu", rand_tensor(&[f, dm], &ext, &mut rng)),
-        ("Wd", rand_tensor(&[f, dm], &ext, &mut rng)),
-        ("W_lm", rand_tensor(&[v, dm], &ext, &mut rng)),
+        ("X", rand_tensor(&[s, dm], &mut rng)),
+        ("g1", rand_tensor(&[dm], &mut rng)),
+        ("g2", rand_tensor(&[dm], &mut rng)),
+        ("Wq", rand_tensor(&[h, dk, dm], &mut rng)),
+        ("Wk", rand_tensor(&[h, dk, dm], &mut rng)),
+        ("Wv", rand_tensor(&[h, dv, dm], &mut rng)),
+        ("Wo", rand_tensor(&[dmv, dm], &mut rng)),
+        ("Wg", rand_tensor(&[f, dm], &mut rng)),
+        ("Wu", rand_tensor(&[f, dm], &mut rng)),
+        ("Wd", rand_tensor(&[f, dm], &mut rng)),
+        ("W_lm", rand_tensor(&[v, dm], &mut rng)),
     ]
     .into_iter()
     .collect();
@@ -153,7 +136,7 @@ fn full_transformer_block_schedule_executes_to_reference() {
     let scores = matmul(q, k, dk); // [s, h, t]
     let scaled = map(
         MapOp::Mul,
-        vec![scores, konst(1.0 / (ext[&dk] as f64).sqrt())],
+        vec![scores, konst(1.0 / (dk.extent as f64).sqrt())],
     );
     let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
     let attn = matmul(softmax(masked, t), vv, t); // [s, h, dv]
@@ -175,12 +158,12 @@ fn full_transformer_block_schedule_executes_to_reference() {
 
     let logits = matmul(yb, input("W_lm", &[v, dm]), dm); // [s, v]
 
-    let sched = partition(&logits, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&logits, &Device::toy());
     assert!(
         sched.kernel_count() >= 10,
         "expected a multi-kernel schedule"
     );
-    let executed = sched.execute(&env, &ext);
-    let reference = eval(&logits, &env, &ext);
+    let executed = sched.execute(&env);
+    let reference = eval(&logits, &env);
     assert_close(&executed, &reference);
 }

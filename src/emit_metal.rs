@@ -16,11 +16,10 @@
 use std::collections::HashMap;
 
 use crate::codegen::{
-    Gen, Lang, LaneBody, buffers, carrier_expr, carrier_expr_map, grid_of, offset, san,
+    Gen, LaneBody, Lang, buffers, carrier_expr, carrier_expr_map, grid_of, offset, san,
     thread_grid_decode, thread_grid_decode_from, value,
 };
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::interp::Extents;
 use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, NodeKind, input_dtypes, output_axes, volume};
 use crate::partition::{Schedule, Stage};
 use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
@@ -178,10 +177,7 @@ pub struct MetalKernel {
     pub grid_size: usize,
 }
 
-fn signature(
-    bufs: &[(&'static str, Vec<Axis>)],
-    dtypes: &HashMap<&'static str, Dtype>,
-) -> String {
+fn signature(bufs: &[(&'static str, Vec<Axis>)], dtypes: &HashMap<&'static str, Dtype>) -> String {
     let mut params: Vec<String> = bufs
         .iter()
         .enumerate()
@@ -257,8 +253,10 @@ fn make_bindless(k: &MetalKernel) -> String {
 
     // keep every non-buffer param (the `[[thread_position…]]`/simd builtins);
     // replace the buffer params with the argument buffer + the output at 1.
-    let builtins: Vec<&str> =
-        k.msl[sig_start..sig_end].split(",\n    ").filter(|p| !p.contains("[[buffer(")).collect();
+    let builtins: Vec<&str> = k.msl[sig_start..sig_end]
+        .split(",\n    ")
+        .filter(|p| !p.contains("[[buffer("))
+        .collect();
     let mut params = vec![
         format!("constant {strct}& _ab [[buffer(0)]]"),
         "device float* outb [[buffer(1)]]".to_string(),
@@ -267,8 +265,11 @@ fn make_bindless(k: &MetalKernel) -> String {
     let new_sig = params.join(",\n    ");
 
     // alias each input back to the name the body reads
-    let aliases: String =
-        k.inputs.iter().map(|(n, _)| format!("    {} {} = _ab.{};\n", field(n), san(n), san(n))).collect();
+    let aliases: String = k
+        .inputs
+        .iter()
+        .map(|(n, _)| format!("    {} {} = _ab.{};\n", field(n), san(n), san(n)))
+        .collect();
 
     let mut out = String::with_capacity(k.msl.len() + def.len() + aliases.len());
     out.push_str(&k.msl[..MSL_HEADER.len()]); // shared header (stripped later)
@@ -286,7 +287,11 @@ fn make_bindless(k: &MetalKernel) -> String {
 /// address — 2×f32 — per input). Returns the table's name, or `None` when `k`
 /// fits the direct-bind path. Runs before dedup so isomorphic wide kernels
 /// still share one entry point.
-fn bindless_argbuf(k: &mut MetalKernel, out: &str, bufsizes: &mut Vec<(String, usize)>) -> Option<String> {
+fn bindless_argbuf(
+    k: &mut MetalKernel,
+    out: &str,
+    bufsizes: &mut Vec<(String, usize)>,
+) -> Option<String> {
     if k.inputs.len() + 1 <= METAL_MAX_BUFFERS {
         return None;
     }
@@ -339,7 +344,11 @@ fn replace_ident(src: &str, from: &str, to: &str) -> String {
 }
 
 /// Which items and accumulator slots a carrier expression reads.
-fn expr_refs(e: &Expr, items: &mut std::collections::HashSet<usize>, slots: &mut std::collections::HashSet<usize>) {
+fn expr_refs(
+    e: &Expr,
+    items: &mut std::collections::HashSet<usize>,
+    slots: &mut std::collections::HashSet<usize>,
+) {
     match e {
         Expr::Const(_) => {}
         Expr::Item(i) => {
@@ -393,9 +402,12 @@ fn prefix_mask_edge(carrier: &Carrier, stream: Axis) -> Option<usize> {
         .map(|(j, _)| j)
         .collect();
     let [ms] = max_slots[..] else { return None };
-    if !carrier.kinds.iter().enumerate().all(|(j, k)| {
-        j == ms || matches!(k, SlotKind::ExpShifted { max_slot } if *max_slot == ms)
-    }) {
+    if !carrier
+        .kinds
+        .iter()
+        .enumerate()
+        .all(|(j, k)| j == ms || matches!(k, SlotKind::ExpShifted { max_slot } if *max_slot == ms))
+    {
         return None;
     }
     fn edge_of(e: &Expr, carrier: &Carrier, stream: Axis) -> Option<usize> {
@@ -417,9 +429,7 @@ fn prefix_mask_edge(carrier: &Carrier, stream: Axis) -> Option<usize> {
             | Expr::Div(a, b)
             | Expr::Max(a, b)
             | Expr::Min(a, b)
-            | Expr::Lt(a, b) => {
-                edge_of(a, carrier, stream).or_else(|| edge_of(b, carrier, stream))
-            }
+            | Expr::Lt(a, b) => edge_of(a, carrier, stream).or_else(|| edge_of(b, carrier, stream)),
             Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
                 edge_of(a, carrier, stream)
             }
@@ -439,9 +449,8 @@ pub fn emit_fused_metal(
     carrier: &Carrier,
     stream: Axis,
     fold_node: &Node,
-    ext: &Extents,
 ) -> MetalKernel {
-    emit_fused_metal_with(name, carrier, stream, fold_node, ext, None)
+    emit_fused_metal_with(name, carrier, stream, fold_node, None)
 }
 
 /// [`emit_fused_metal`] with an optional fused EPILOGUE: an elementwise node
@@ -454,7 +463,6 @@ pub fn emit_fused_metal_with(
     carrier: &Carrier,
     stream: Axis,
     fold_node: &Node,
-    ext: &Extents,
     epi: Option<(&Node, &str)>,
 ) -> MetalKernel {
     assert_eq!(
@@ -462,7 +470,7 @@ pub fn emit_fused_metal_with(
         1,
         "metal kernel needs a scalar projection"
     );
-    let (grid, grid_size) = grid_of(fold_node, ext);
+    let (grid, grid_size) = grid_of(fold_node);
     let mut bufs = buffers(fold_node);
     let mut dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
     if let Some((e, out_name)) = epi {
@@ -477,7 +485,7 @@ pub fn emit_fused_metal_with(
     let mut g = Gen::new();
     g.dtypes = dtypes.clone();
     let mut body: Vec<String> = vec![format!("if (gid >= {grid_size}) return;")];
-    let coord = thread_grid_decode(&METAL, &grid, ext, &mut g, &mut body);
+    let coord = thread_grid_decode(&METAL, &grid, &mut g, &mut body);
 
     let slots = carrier.slots;
     let ident = carrier
@@ -492,15 +500,15 @@ pub fn emit_fused_metal_with(
     // (bit-identical — the masked tail is an exact f32 no-op)
     let s_bound = match prefix_mask_edge(carrier, stream) {
         Some(p) => {
-            let e = value(&METAL, &carrier.leaves[p], &coord, ext, &mut g, &mut body);
+            let e = value(&METAL, &carrier.leaves[p], &coord, &mut g, &mut body);
             let v = g.fresh("hi");
             body.push(format!(
                 "uint {v} = min({}u, (uint)({e} + 0.5f) + 1u);",
-                ext[&stream]
+                stream.extent
             ));
             v
         }
-        None => format!("{}", ext[&stream]),
+        None => format!("{}", stream.extent),
     };
 
     let sv = g.fresh("s");
@@ -510,11 +518,9 @@ pub fn emit_fused_metal_with(
     let items: Vec<String> = carrier
         .leaves
         .iter()
-        .map(|l| value(&METAL, l, &cs, ext, &mut g, &mut sbody))
+        .map(|l| value(&METAL, l, &cs, &mut g, &mut sbody))
         .collect();
-    body.push(format!(
-        "for (uint {sv} = 0; {sv} < {s_bound}; {sv}++) {{"
-    ));
+    body.push(format!("for (uint {sv} = 0; {sv} < {s_bound}; {sv}++) {{"));
     body.extend(sbody.into_iter().map(|s| format!("    {s}")));
     body.push(format!(
         "    float x[{}] = {{ {} }};",
@@ -563,7 +569,7 @@ pub fn emit_fused_metal_with(
             !crate::ir::all_axes(leaf).contains(&stream),
             "a projection may only read stream-invariant leaves"
         );
-        let e = value(&METAL, leaf, &coord, ext, &mut g, &mut body);
+        let e = value(&METAL, leaf, &coord, &mut g, &mut body);
         let v = g.fresh("pv");
         body.push(format!("float {v} = {e};"));
         pv.insert(i, v);
@@ -581,13 +587,16 @@ pub fn emit_fused_metal_with(
             let fv = g.fresh("fv");
             body.push(format!("float {fv} = {proj};"));
             g.local_inputs.insert(out_name.to_string(), fv);
-            value(&METAL, e, &coord, ext, &mut g, &mut body)
+            value(&METAL, e, &coord, &mut g, &mut body)
         }
     };
-    body.push(format!("outb[{}] = {stored};", offset(&grid, &coord, ext)));
+    body.push(format!("outb[{}] = {stored};", offset(&grid, &coord)));
 
     MetalKernel {
-        msl: format!("{MSL_HEADER}{}", wrap(name, signature(&bufs, &dtypes), body)),
+        msl: format!(
+            "{MSL_HEADER}{}",
+            wrap(name, signature(&bufs, &dtypes), body)
+        ),
         name: name.to_string(),
         inputs: bufs,
         dtypes,
@@ -610,10 +619,9 @@ pub fn emit_fused_metal_sched(
     carrier: &Carrier,
     stream: Axis,
     fold_node: &Node,
-    ext: &Extents,
     sched: FoldSched,
 ) -> MetalKernel {
-    emit_fused_metal_sched_with(name, carrier, stream, fold_node, ext, sched, None)
+    emit_fused_metal_sched_with(name, carrier, stream, fold_node, sched, None)
 }
 
 /// [`emit_fused_metal_sched`] with an optional fused epilogue (see
@@ -623,12 +631,11 @@ pub fn emit_fused_metal_sched_with(
     carrier: &Carrier,
     stream: Axis,
     fold_node: &Node,
-    ext: &Extents,
     sched: FoldSched,
     epi: Option<(&Node, &str)>,
 ) -> MetalKernel {
     use std::collections::HashSet;
-    let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, ext, epi);
+    let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, epi);
     if sched.is_scalar()
         || !mergeable_out_of_order(carrier)
         || carrier.project.len() != 1
@@ -636,21 +643,29 @@ pub fn emit_fused_metal_sched_with(
     {
         return scalar();
     }
-    let s_ext = ext[&stream];
-    let f_split = if sched.lane_stream { SIMD * sched.sgs } else { sched.sgs };
+    let s_ext = stream.extent;
+    let f_split = if sched.lane_stream {
+        SIMD * sched.sgs
+    } else {
+        sched.sgs
+    };
     if f_split > s_ext || (sched.lane_stream && sched.lane_axis.is_some()) {
         return scalar();
     }
-    let (grid, _) = grid_of(fold_node, ext);
+    let (grid, _) = grid_of(fold_node);
     if let Some(a) = sched.lane_axis
-        && (!grid.contains(&a) || ext[&a] % SIMD != 0)
+        && (!grid.contains(&a) || a.extent % SIMD != 0)
     {
         return scalar();
     }
 
     let slots = carrier.slots;
     let sliced_slot: Vec<bool> = (0..slots)
-        .map(|j| sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a)))
+        .map(|j| {
+            sched
+                .lane_axis
+                .is_some_and(|a| carrier.spans[j].contains(&a))
+        })
         .collect();
     let sliced_leaf: Vec<bool> = carrier
         .leaves
@@ -686,17 +701,17 @@ pub fn emit_fused_metal_sched_with(
 
     let tgt = sched.tg_threads();
     let sgs = sched.sgs;
-    let e_a = sched.lane_axis.map(|a| ext[&a]).unwrap_or(1);
+    let e_a = sched.lane_axis.map(|a| a.extent).unwrap_or(1);
     let v_cnt = e_a / SIMD; // 0 only when lane_axis is None (e_a = 1)
     let tg_grid: Vec<Axis> = grid
         .iter()
         .copied()
         .filter(|ax| Some(*ax) != sched.lane_axis)
         .collect();
-    let n_tgs: usize = tg_grid.iter().map(|a| ext[a]).product::<usize>().max(1);
+    let n_tgs: usize = tg_grid.iter().map(|a| a.extent).product::<usize>().max(1);
 
     let mut body: Vec<String> = vec![format!("uint tg_ = gid / {tgt}u;")];
-    let coord = thread_grid_decode_from(&METAL, "tg_", &tg_grid, ext, &mut g, &mut body);
+    let coord = thread_grid_decode_from(&METAL, "tg_", &tg_grid, &mut g, &mut body);
     if sgs > 1 {
         // threadgroup partial arrays, declared at kernel scope
         body.push(format!("threadgroup float tgu[{}];", slots * sgs));
@@ -752,7 +767,7 @@ pub fn emit_fused_metal_sched_with(
         // costs work, never correctness.
         let s_bound = match prefix_mask_edge(carrier, stream) {
             Some(p) => {
-                let e = value(&METAL, &carrier.leaves[p], &coord, ext, &mut g, &mut body);
+                let e = value(&METAL, &carrier.leaves[p], &coord, &mut g, &mut body);
                 let v = g.fresh("hi");
                 body.push(format!(
                     "uint {v} = min({s_ext}u, max((uint)({e} + 0.5f) + 1u, {f_split}u));"
@@ -794,7 +809,7 @@ pub fn emit_fused_metal_sched_with(
                 continue;
             }
             let mut stmts = Vec::new();
-            let v = value(&METAL, l, &cs, ext, &mut g, &mut stmts);
+            let v = value(&METAL, l, &cs, &mut g, &mut stmts);
             inner.extend(stmts);
             inner.push(format!("float xu_{i}_{jj} = {v};"));
         }
@@ -820,7 +835,13 @@ pub fn emit_fused_metal_sched_with(
             }
             inner.push(format!(
                 "float elu_{j}_{jj} = {};",
-                carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, false), &a_at, &b_el)
+                carrier_expr_map(
+                    &METAL,
+                    &carrier.into[j],
+                    &|i| item_at(i, false),
+                    &a_at,
+                    &b_el
+                )
             ));
         }
         for j in 0..slots {
@@ -829,7 +850,13 @@ pub fn emit_fused_metal_sched_with(
             }
             inner.push(format!(
                 "float nau_{j}_{jj} = {};",
-                carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, false), &a_at, &b_el)
+                carrier_expr_map(
+                    &METAL,
+                    &carrier.combine[j],
+                    &|i| item_at(i, false),
+                    &a_at,
+                    &b_el
+                )
             ));
         }
         if sliced_slot.iter().any(|&s| s) || sliced_leaf.iter().any(|&s| s) {
@@ -843,7 +870,7 @@ pub fn emit_fused_metal_sched_with(
                     continue;
                 }
                 let mut stmts = Vec::new();
-                let v = value(&METAL, l, &cv, ext, &mut g, &mut stmts);
+                let v = value(&METAL, l, &cv, &mut g, &mut stmts);
                 vstmts.extend(stmts);
                 vstmts.push(format!("float xs_{i} = {v};"));
             }
@@ -853,7 +880,13 @@ pub fn emit_fused_metal_sched_with(
                 }
                 vstmts.push(format!(
                     "float els_{j} = {};",
-                    carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, true), &a_at, &b_el)
+                    carrier_expr_map(
+                        &METAL,
+                        &carrier.into[j],
+                        &|i| item_at(i, true),
+                        &a_at,
+                        &b_el
+                    )
                 ));
             }
             for j in 0..slots {
@@ -862,7 +895,13 @@ pub fn emit_fused_metal_sched_with(
                 }
                 vstmts.push(format!(
                     "float nas_{j} = {};",
-                    carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, true), &a_at, &b_el)
+                    carrier_expr_map(
+                        &METAL,
+                        &carrier.combine[j],
+                        &|i| item_at(i, true),
+                        &a_at,
+                        &b_el
+                    )
                 ));
             }
             for j in 0..slots {
@@ -886,7 +925,10 @@ pub fn emit_fused_metal_sched_with(
     // ── merges: the carrier's combine at each level ──────────────────────────
     let no_item = |_i: usize| "(0.0f)".to_string(); // combine is item-free (split stage 2 relies on it too)
     if sched.lane_stream {
-        body.push(format!("for (uint off_ = {}; off_ > 0; off_ >>= 1) {{", SIMD / 2));
+        body.push(format!(
+            "for (uint off_ = {}; off_ > 0; off_ >>= 1) {{",
+            SIMD / 2
+        ));
         body.push(format!("    float elb[{slots}];"));
         body.push(format!(
             "    for (uint j_ = 0; j_ < {slots}u; j_++) elb[j_] = simd_shuffle_xor(accu[j_], off_);"
@@ -894,9 +936,13 @@ pub fn emit_fused_metal_sched_with(
         for j in 0..slots {
             body.push(format!(
                 "    float nab_{j} = {};",
-                carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &|k| format!("accu[{k}]"), &|k| {
-                    format!("elb[{k}]")
-                })
+                carrier_expr_map(
+                    &METAL,
+                    &carrier.combine[j],
+                    &no_item,
+                    &|k| format!("accu[{k}]"),
+                    &|k| { format!("elb[{k}]") }
+                )
             ));
         }
         for j in 0..slots {
@@ -920,7 +966,10 @@ pub fn emit_fused_metal_sched_with(
             }
         }
         body.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
-        body.push(format!("for (uint off_ = {}; off_ > 0; off_ >>= 1) {{", sgs / 2));
+        body.push(format!(
+            "for (uint off_ = {}; off_ > 0; off_ >>= 1) {{",
+            sgs / 2
+        ));
         body.push("    if (sgid < off_) {".into());
         for j in 0..slots {
             if !sliced_slot[j] {
@@ -930,10 +979,18 @@ pub fn emit_fused_metal_sched_with(
             }
         }
         let a_tg = |k: usize| -> String {
-            if sliced_slot[k] { format!("as_{k}") } else { format!("au_{k}") }
+            if sliced_slot[k] {
+                format!("as_{k}")
+            } else {
+                format!("au_{k}")
+            }
         };
         let b_tg = |k: usize| -> String {
-            if sliced_slot[k] { format!("bs_{k}") } else { format!("bu_{k}") }
+            if sliced_slot[k] {
+                format!("bs_{k}")
+            } else {
+                format!("bu_{k}")
+            }
         };
         if sliced_slot.iter().any(|&s| s) {
             body.push(format!("        for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
@@ -955,7 +1012,9 @@ pub fn emit_fused_metal_sched_with(
             }
             for j in 0..slots {
                 if sliced_slot[j] {
-                    body.push(format!("            tgs_{j}[sgid * {e_a}u + la_] = nms_{j};"));
+                    body.push(format!(
+                        "            tgs_{j}[sgid * {e_a}u + la_] = nms_{j};"
+                    ));
                 }
             }
             body.push("        }".into());
@@ -994,25 +1053,19 @@ pub fn emit_fused_metal_sched_with(
     });
     // an epilogue renders in the same kernel: projection → register, the
     // epilogue's read of the fold's own output resolves to it
-    let store = |wc: &HashMap<Axis, String>,
-                     g: &mut Gen,
-                     out: &mut Vec<String>,
-                     indent: &str| {
+    let store = |wc: &HashMap<Axis, String>, g: &mut Gen, out: &mut Vec<String>, indent: &str| {
         let stored = match epi {
             None => proj.clone(),
             Some((e, out_name)) => {
                 let fv = g.fresh("fv");
                 let mut tmp = vec![format!("float {fv} = {proj};")];
                 g.local_inputs.insert(out_name.to_string(), fv);
-                let ev = value(&METAL, e, wc, ext, g, &mut tmp);
+                let ev = value(&METAL, e, wc, g, &mut tmp);
                 out.extend(tmp.into_iter().map(|s| format!("{indent}{s}")));
                 ev
             }
         };
-        out.push(format!(
-            "{indent}outb[{}] = {stored};",
-            offset(&grid, wc, ext)
-        ));
+        out.push(format!("{indent}outb[{}] = {stored};", offset(&grid, wc)));
     };
     if sched.lane_axis.is_some() {
         body.push("if (sgid == 0) {".into());
@@ -1060,7 +1113,6 @@ pub fn emit_split_metal(
     carrier: &Carrier,
     stream: Axis,
     fold_node: &Node,
-    ext: &Extents,
     blocks: usize,
 ) -> (MetalKernel, MetalKernel) {
     assert!(
@@ -1082,15 +1134,15 @@ pub fn emit_split_metal(
          a leaf-reading projection needs the single-kernel form"
     );
     assert!(
-        blocks >= 1 && blocks <= ext[&stream],
+        blocks >= 1 && blocks <= stream.extent,
         "blocks must not exceed the streamed extent (empty chunks would merge \
          identity partials — the −∞ rescale edge)"
     );
-    let (grid, grid_size) = grid_of(fold_node, ext);
+    let (grid, grid_size) = grid_of(fold_node);
     let bufs = buffers(fold_node);
     let dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
     let slots = carrier.slots;
-    let n = ext[&stream];
+    let n = stream.extent;
     let ident = carrier
         .identity
         .iter()
@@ -1107,7 +1159,7 @@ pub fn emit_split_metal(
         format!("uint blk = gid % {blocks};"),
         format!("uint gpt = gid / {blocks};"),
     ];
-    let coord = thread_grid_decode_from(&METAL, "gpt", &grid, ext, &mut g, &mut body);
+    let coord = thread_grid_decode_from(&METAL, "gpt", &grid, &mut g, &mut body);
     body.push(format!("float acc[{slots}] = {{ {ident} }};"));
     let sv = g.fresh("s");
     let mut cs = coord.clone();
@@ -1116,7 +1168,7 @@ pub fn emit_split_metal(
     let items: Vec<String> = carrier
         .leaves
         .iter()
-        .map(|l| value(&METAL, l, &cs, ext, &mut g, &mut sbody))
+        .map(|l| value(&METAL, l, &cs, &mut g, &mut sbody))
         .collect();
     body.push(format!("uint lo = (blk * {n}u) / {blocks}u;"));
     body.push(format!("uint hi = ((blk + 1) * {n}u) / {blocks}u;"));
@@ -1216,22 +1268,25 @@ pub fn emit_split_metal(
 
 /// A straight-line (elementwise / gather / reduce) MSL kernel: one thread per
 /// output point, writing [`value`] of the spliced graph. No carrier.
-pub fn emit_pointwise_metal(name: &str, exec: &Node, ext: &Extents) -> MetalKernel {
-    let (grid, grid_size) = grid_of(exec, ext);
+pub fn emit_pointwise_metal(name: &str, exec: &Node) -> MetalKernel {
+    let (grid, grid_size) = grid_of(exec);
     let bufs = buffers(exec);
     let dtypes: HashMap<&'static str, Dtype> = input_dtypes(exec).into_iter().collect();
 
     let mut g = Gen::new();
     g.dtypes = dtypes.clone();
     let mut body: Vec<String> = vec![format!("if (gid >= {grid_size}) return;")];
-    let coord = thread_grid_decode(&METAL, &grid, ext, &mut g, &mut body);
+    let coord = thread_grid_decode(&METAL, &grid, &mut g, &mut body);
     let mut vbody = Vec::new();
-    let v = value(&METAL, exec, &coord, ext, &mut g, &mut vbody);
+    let v = value(&METAL, exec, &coord, &mut g, &mut vbody);
     body.extend(vbody);
-    body.push(format!("outb[{}] = {v};", offset(&grid, &coord, ext)));
+    body.push(format!("outb[{}] = {v};", offset(&grid, &coord)));
 
     MetalKernel {
-        msl: format!("{MSL_HEADER}{}", wrap(name, signature(&bufs, &dtypes), body)),
+        msl: format!(
+            "{MSL_HEADER}{}",
+            wrap(name, signature(&bufs, &dtypes), body)
+        ),
         name: name.to_string(),
         inputs: bufs,
         dtypes,
@@ -1275,19 +1330,15 @@ pub struct MetalProgram {
 
 /// Lower a whole schedule to a Metal program (the GPU analog of
 /// [`crate::rustgen::emit_schedule`]).
-pub fn emit_schedule_metal(sched: &Schedule, ext: &Extents) -> MetalProgram {
-    emit_schedule_metal_on(&crate::cost::Device::toy(), sched, ext)
+pub fn emit_schedule_metal(sched: &Schedule) -> MetalProgram {
+    emit_schedule_metal_on(&crate::cost::Device::toy(), sched)
 }
 
 /// [`emit_schedule_metal`] with fold schedules priced against a specific
 /// device — the Metal examples pass [`crate::cost::Device::m1_pro`], the
 /// machine the kernels actually run on.
-pub fn emit_schedule_metal_on(
-    dev: &crate::cost::Device,
-    sched: &Schedule,
-    ext: &Extents,
-) -> MetalProgram {
-    emit_schedule_metal_over(dev, sched, ext, &HashMap::new())
+pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule) -> MetalProgram {
+    emit_schedule_metal_over(dev, sched, &HashMap::new())
 }
 
 /// [`emit_schedule_metal_on`] with per-stage schedule OVERRIDES (keyed by
@@ -1296,10 +1347,8 @@ pub fn emit_schedule_metal_on(
 pub fn emit_schedule_metal_over(
     dev: &crate::cost::Device,
     sched: &Schedule,
-    ext: &Extents,
     overrides: &HashMap<String, FoldSched>,
 ) -> MetalProgram {
-    let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let mut msl = String::from(MSL_HEADER);
     let mut all_dtypes: HashMap<String, Dtype> = HashMap::new();
     let mut stages: Vec<MetalStageInfo> = Vec::new();
@@ -1360,7 +1409,7 @@ pub fn emit_schedule_metal_over(
                 let out = spec.output_name.clone();
                 let kname = format!("k_{}_fold", san(&out));
                 let sched = overrides.get(&out).copied().unwrap_or_else(|| {
-                    fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f)
+                    fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev)
                 });
                 // an epilogue renders INSIDE the fold kernel (one dispatch):
                 // the projection lands in a register and the epilogue's read
@@ -1370,7 +1419,6 @@ pub fn emit_schedule_metal_over(
                     &spec.carrier,
                     spec.streaming_axis,
                     fold_node,
-                    ext,
                     sched,
                     epilogue_node.as_ref().map(|e| (e, *epi_fold_read)),
                 );
@@ -1384,7 +1432,7 @@ pub fn emit_schedule_metal_over(
                 // threads than it writes elements (each thread projects a lane
                 // strip), so `grid_size` undercounts the allocation — the
                 // weight-gradient folds (dWf/dWp) write 16 elements per thread.
-                let out_vol = volume(epilogue_node.as_ref().unwrap_or(fold_node), ext);
+                let out_vol = volume(epilogue_node.as_ref().unwrap_or(fold_node));
                 note_buffer(&out, out_vol, &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
@@ -1411,13 +1459,13 @@ pub fn emit_schedule_metal_over(
             | Stage::Sequential { output, exec, .. } => {
                 note_inputs(exec, &produced, &mut inputs);
                 let kname = format!("k_{}", san(output));
-                let mut k = emit_pointwise_metal(&kname, exec, ext);
+                let mut k = emit_pointwise_metal(&kname, exec);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
                 let argbuf = bindless_argbuf(&mut k, output, &mut bufsizes);
                 let kname = dedup(&k, &mut msl, &mut canon);
-                note_buffer(output, volume(exec, ext), &mut bufsizes);
+                note_buffer(output, volume(exec), &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,
                     inputs: k.inputs.iter().map(|(n, _)| n.to_string()).collect(),

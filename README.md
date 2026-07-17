@@ -70,18 +70,16 @@ SGD loop that converges, and split reductions.
 ## Run it
 
 ```
-cargo run --example derive   # print structure maps + derived carriers
-cargo run --example mha      # naive multi-head attention → FlashAttention
-cargo run --example mla      # DeepSeek MLA, standard & absorbed → same kernel
-cargo run --example llm      # a transformer block, split into 13 kernels
-cargo run --release --example gpt2 --prompt "…"   # GPT-2 on the GPU
-cargo run --release --example trinity             # 5.5B MoE on a laptop
-cargo run --release --example mnist  # train an MLP on MNIST end to end, on the GPU
-cargo test                   # 153 tests (incl. rustc-compiled and GPU-dispatched)
+cargo run --example llama3   # current Llama 3 graph-builder fixture
+cargo test                   # the full suite (incl. rustc-compiled and GPU-dispatched)
 ```
 
-`cargo run --example derive` prints the streaming carrier it reconstructs for
-attention — no template involved:
+The frontend API is churning, so ONE example is kept current — `llama3` — and
+the rest (GPT-2 on the GPU, the 5.5B MoE, GPU training, and the guided tours)
+are parked in `examples/attic/` until the surface settles. `llama3` is the
+modeling fixture for iterating on graph-builder ergonomics; it builds a compact
+Llama 3 decoder graph with grouped-query attention, RMSNorm, SwiGLU, and logits.
+The engine still derives the streaming attention carrier from its naive graph:
 
 ```
 structure map

@@ -60,6 +60,45 @@ page is substrate we need so the moat is usable on real workloads.
 - **`emit_rust`** — the derived kernel as compilable Rust (scalar + tiled), for
   a single carrier (superseded by `rustgen` for whole schedules).
 
+- **Axes are plain data; extents live IN the graph** *(2026-07-17)* — the
+  deepest simplification since the IR landed. `Axis { name, extent }`:
+  structural identity (same name + same extent = the same axis; no hidden id
+  counter, no global state), the extent written ONCE at the mint
+  (`axis("s", 512)`) — so every shape is derivable from any graph and the
+  `Extents` side-tables are GONE from the whole pipeline. `eval(node, env)`,
+  `partition(node, dev)`, `plan(node, dev)`, `grad(loss, wrt)`,
+  `Schedule::execute(env)`, `Session::new()`, `Value::from_fn(axes, f)`,
+  `volume(node)` — every extents/f64-map parameter deleted crate-wide (the
+  dual usize/f64 map wart with it). The convention structural identity asks
+  for — distinct index spaces get distinct names (`t` vs `t2`) — is one the
+  code already followed everywhere (audited: no same-name-same-extent pair
+  in one graph meant as two spaces). `Extent::Dynamic` considered and
+  DEFERRED, stated: no consumer exists (interp/plan/emitters all need
+  concrete sizes; runtime dynamism is data-dependent bounds inside fixed
+  shapes — the honest-window pattern); the enum is a mechanical widening
+  when the first dynamic-shape workload lands.
+
+- **Explicit graph frontend (`src/tensor.rs`)** *(new, 2026-07-17)* — the
+  graph-building surface separates symbolic `TensorExpr` from concrete
+  `Tensor` data. `GraphBuilder::input` allocates dense `InputId`s; ordinary
+  Rust functions compose expressions; `finish(outputs)` freezes a reusable
+  `Graph`; `Graph::run([tensors])` binds concrete buffers by input order.
+  Axes still carry extents, and operators broadcast by axis identity. The
+  frontend delegates graph semantics to the IR; `tests/tensor.rs` covers
+  reusable execution, dense IDs, multiple outputs, and foreign-graph
+  rejection. `examples/llama3.rs` is the current frontend fixture.
+
+- **One-example policy while the API churns** *(2026-07-17)* — migrating
+  every example on every surface change is too costly, so `llama3.rs` is the
+  ONE example kept current. It is the graph-builder fixture: a compact Llama
+  3 decoder graph used to iterate on modeling ergonomics. Everything
+  else — gpt2, trinity, mnist, shakespeare, and the guided tours — is parked
+  UNMIGRATED in `examples/attic/` (cargo doesn't build it; see its README for
+  the revival recipe). The TESTS are the API-correctness net and stay fully
+  green — the capstone claims those examples established (HF-matching logits,
+  tok/s ladders) are history in this file, not things re-verified per commit.
+  Revive the attic in one batch when the surface settles.
+
 - **Movement ops (`Reindex`)** *(new)* — slice / zero-pad / reshape-split /
   windows as ONE affine-reindex operator beside `View`. Convolution is
   `window + flatten + matmul` — **one implicit-GEMM kernel, no im2col

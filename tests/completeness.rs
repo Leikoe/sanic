@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 
 use sanic::derive::derive;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 
 // ── streams over a quantized alphabet ────────────────────────────────────────
@@ -99,7 +99,7 @@ fn run_h(build: Build, xs: &[f64]) -> f64 {
     collect_axes(&g, &mut ext, xs.len());
     ext.insert(n, xs.len());
     let x = xs.to_vec();
-    let env: Env = [("X", Tensor::from_fn(&[n], &ext, |c| x[c[&n]]))]
+    let env: Env = [("X", Value::from_fn(&[n], &ext, |c| x[c[&n]]))]
         .into_iter()
         .collect();
     eval(&g, &env, &ext).data[0]

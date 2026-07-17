@@ -21,7 +21,7 @@ use sanic::cost::Device;
 use sanic::metal::{Dispatch, MetalBuf, MetalDevice, program_dispatches};
 use sanic::derive::derive;
 use sanic::emit_metal::{MetalKernel, MetalProgram, emit_fused_metal, emit_schedule_metal};
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 use sanic::partition::partition;
 
@@ -36,8 +36,8 @@ impl Lcg {
         ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
+fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, ext, |_| rng.f())
 }
 fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
     ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
@@ -53,7 +53,7 @@ fn max_rel_err(got: &[f32], expected: &[f64]) -> f64 {
 
 /// Run one fused kernel on the GPU and check it against the oracle.
 /// `None` = clean skip (no Metal device).
-fn run_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Tensor) -> Option<String> {
+fn run_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Value) -> Option<String> {
     let dev = MetalDevice::open()?;
     let pipes = dev.compile(&kernel.msl);
     let pipe = pipes.get(&kernel.name);
@@ -83,7 +83,7 @@ fn run_schedule_on_gpu(
     label: &str,
     program: &MetalProgram,
     env: &Env,
-    reference: &Tensor,
+    reference: &Value,
 ) -> Option<String> {
     let dev = MetalDevice::open()?;
     let pipes = dev.compile(&program.msl);
@@ -268,13 +268,13 @@ fn quantized_matmul_runs_on_gpu() {
     let (s, dm, o) = (axis("s"), axis("dm"), axis("o"));
     let ext: Extents = [(s, 8), (dm, 32), (o, 16)].into_iter().collect();
     let mut rng = Lcg(0x9114A7);
-    let qw = Tensor::from_fn(&[o, dm], &ext, |_| (rng.f() * 8.0).round());
+    let qw = Value::from_fn(&[o, dm], &ext, |_| (rng.f() * 8.0).round());
     let env: Env = [
         ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
         ("qW", qw),
         (
             "scale",
-            Tensor::from_fn(&[o], &ext, |_| 0.05 * (rng.f() + 1.5)),
+            Value::from_fn(&[o], &ext, |_| 0.05 * (rng.f() + 1.5)),
         ),
     ]
     .into_iter()
@@ -364,7 +364,7 @@ fn greedy_decode_step_runs_on_gpu() {
     let env: Env = [
         (
             "ids",
-            Tensor::from_fn(&[s], &ext, |c| [1.0, 7.0, 3.0, 12.0][c[&s]]),
+            Value::from_fn(&[s], &ext, |c| [1.0, 7.0, 3.0, 12.0][c[&s]]),
         ),
         ("E", rand_tensor(&[vv, dm], &ext, &mut rng)),
         ("g1", rand_tensor(&[dm], &ext, &mut rng)),
@@ -923,7 +923,7 @@ fn split_reduction_runs_on_gpu() {
 fn tanh_survives_large_arguments_on_gpu() {
     let n = axis("n");
     let ext: Extents = [(n, 6)].into_iter().collect();
-    let x = Tensor::from_fn(&[n], &ext, |c| [-2000.0, -50.0, -1.0, 1.0, 50.0, 2000.0][c[&n]]);
+    let x = Value::from_fn(&[n], &ext, |c| [-2000.0, -50.0, -1.0, 1.0, 50.0, 2000.0][c[&n]]);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let t = map(MapOp::Tanh, vec![input("X", &[n])]);
@@ -964,7 +964,7 @@ fn bf16_matvec_runs_on_gpu() {
         .collect();
 
     let env: Env = [
-        ("W", Tensor::from_fn(&[o, k], &ext, |c| wvals[c[&o] * 96 + c[&k]])),
+        ("W", Value::from_fn(&[o, k], &ext, |c| wvals[c[&o] * 96 + c[&k]])),
         ("x", rand_tensor(&[k], &ext, &mut rng)),
     ]
     .into_iter()
@@ -1052,13 +1052,13 @@ fn w4_grouped_matvec_runs_on_gpu() {
     let env: Env = [
         (
             "Wq",
-            Tensor::from_fn(&[o, gq, r], &ext, |cd| {
+            Value::from_fn(&[o, gq, r], &ext, |cd| {
                 q[cd[&o] * n_in + cd[&gq] * n_r + cd[&r]] as f64
             }),
         ),
         (
             "S",
-            Tensor::from_fn(&[o, gq], &ext, |cd| scales[cd[&o] * n_g + cd[&gq]]),
+            Value::from_fn(&[o, gq], &ext, |cd| scales[cd[&o] * n_g + cd[&gq]]),
         ),
         ("x", rand_tensor(&[gq, r], &ext, &mut rng)),
     ]
@@ -1132,7 +1132,7 @@ fn topk_kbest_folds_run_on_gpu() {
     vals[110] = m; // duplicate of the max, later position
     let env: Env = [(
         "X",
-        Tensor::from_fn(&[n], &ext, |c| vals[c[&n]]),
+        Value::from_fn(&[n], &ext, |c| vals[c[&n]]),
     )]
     .into_iter()
     .collect();
@@ -1167,7 +1167,7 @@ fn topk_all_single_fold_runs_on_gpu() {
     vals[110] = m;
     let env: Env = [(
         "X",
-        Tensor::from_fn(&[n], &ext, |c| vals[c[&n]]),
+        Value::from_fn(&[n], &ext, |c| vals[c[&n]]),
     )]
     .into_iter()
     .collect();
@@ -1269,7 +1269,7 @@ fn run_coop_on_gpu(
     label: &str,
     kernel: &MetalKernel,
     env: &Env,
-    reference: &Tensor,
+    reference: &Value,
     ext: &Extents,
 ) -> Option<String> {
     let dev = MetalDevice::open()?;
@@ -1497,13 +1497,13 @@ fn coop_chunked_w4_matvec_matches_oracle() {
     let env: Env = [
         (
             "Wq",
-            Tensor::from_fn(&[o, gq, r], &ext, |cd| {
+            Value::from_fn(&[o, gq, r], &ext, |cd| {
                 q[cd[&o] * n_in + cd[&gq] * n_r + cd[&r]] as f64
             }),
         ),
         (
             "S",
-            Tensor::from_fn(&[o, gq], &ext, |cd| scales[cd[&o] * n_g + cd[&gq]]),
+            Value::from_fn(&[o, gq], &ext, |cd| scales[cd[&o] * n_g + cd[&gq]]),
         ),
         ("x", rand_tensor(&[gq, r], &ext, &mut rng)),
     ]
@@ -1603,7 +1603,7 @@ fn honest_window_flash_matches_full_oracle() {
         let mut env = base_env.clone();
         env.insert(
             "pos",
-            Tensor::from_fn(&[], &ext, |_| pos as f64),
+            Value::from_fn(&[], &ext, |_| pos as f64),
         );
         let reference = eval(&attn, &env, &ext);
 

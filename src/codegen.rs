@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 
 use crate::derive::Expr;
-use crate::interp::Extents;
 use crate::ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node, NodeKind, output_axes};
 
 // ── fresh names ──────────────────────────────────────────────────────────────
@@ -114,13 +113,13 @@ pub fn buffers(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
 /// The row-major flat offset of `axes` at the loop-variable coordinate, with
 /// concrete extents baked in as literals. Language-agnostic (integer index
 /// arithmetic is the same in Rust and MSL).
-pub fn offset(axes: &[Axis], coord: &HashMap<Axis, String>, ext: &Extents) -> String {
+pub fn offset(axes: &[Axis], coord: &HashMap<Axis, String>) -> String {
     if axes.is_empty() {
         return "0".into();
     }
     let mut terms = Vec::new();
     for (k, a) in axes.iter().enumerate() {
-        let stride: usize = axes[k + 1..].iter().map(|x| ext[x]).product();
+        let stride: usize = axes[k + 1..].iter().map(|x| x.extent).product();
         let iv = &coord[a];
         if stride == 1 {
             terms.push(iv.clone());
@@ -207,7 +206,6 @@ pub fn value<L: Lang>(
     lang: &L,
     node: &Node,
     coord: &HashMap<Axis, String>,
-    ext: &Extents,
     g: &mut Gen,
     out: &mut Vec<String>,
 ) -> String {
@@ -219,12 +217,12 @@ pub fn value<L: Lang>(
                 return v.clone();
             }
             let dt = g.dtypes.get(name).copied();
-            lang.buffer_load(name, &offset(axes, coord, ext), dt)
+            lang.buffer_load(name, &offset(axes, coord), dt)
         }
         NodeKind::Map { op, inputs } => {
             let a: Vec<String> = inputs
                 .iter()
-                .map(|i| value(lang, i, coord, ext, g, out))
+                .map(|i| value(lang, i, coord, g, out))
                 .collect();
             lang.map_op(*op, &a)
         }
@@ -239,7 +237,7 @@ pub fn value<L: Lang>(
             let mut coord2 = coord.clone();
             coord2.insert(*axis, lv.clone());
             let mut body = Vec::new();
-            let ev = value(lang, src, &coord2, ext, g, &mut body);
+            let ev = value(lang, src, &coord2, g, &mut body);
             // Lane-split the contraction when the scheduled emitter asked
             // for it and it is sound here: every monoid is commutative, so
             // a strided lane partition + shuffle merge equals the serial
@@ -249,13 +247,17 @@ pub fn value<L: Lang>(
                 let lane = lang.lane_var()?;
                 let uniform = lb.avoid_axis.is_none_or(|a| !output_axes(src).contains(&a));
                 let merge = lang.simd_lane_merge(&acc, m, lb.simd_width)?;
-                (ext[axis] % lb.simd_width == 0 && uniform).then_some((lane, lb.simd_width, merge))
+                (axis.extent % lb.simd_width == 0 && uniform).then_some((
+                    lane,
+                    lb.simd_width,
+                    merge,
+                ))
             });
             match lane_split {
                 Some((lane, w, merge)) => {
                     out.push(format!(
                         "for (uint {lv} = {lane}; {lv} < {}; {lv} += {w}) {{",
-                        ext[axis]
+                        axis.extent
                     ));
                     out.extend(body);
                     out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
@@ -263,7 +265,7 @@ pub fn value<L: Lang>(
                     out.extend(merge);
                 }
                 None => {
-                    out.push(lang.for_open(&lv, ext[axis]));
+                    out.push(lang.for_open(&lv, axis.extent));
                     out.extend(body);
                     out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
                     out.push("}".into());
@@ -272,12 +274,12 @@ pub fn value<L: Lang>(
             acc
         }
         NodeKind::Gather { src, index, axis } => {
-            let ie = value(lang, index, coord, ext, g, out);
+            let ie = value(lang, index, coord, g, out);
             let gi = g.fresh("gi");
             out.push(lang.round_index(&gi, &ie));
             let mut coord2 = coord.clone();
             coord2.insert(*axis, gi);
-            value(lang, src, &coord2, ext, g, out)
+            value(lang, src, &coord2, g, out)
         }
         NodeKind::View { src, groups } => {
             let mut coord2 = coord.clone();
@@ -292,13 +294,13 @@ pub fn value<L: Lang>(
                     out.push(lang.index_decl(&rem, &coord[to], true));
                     for m in members.iter().rev() {
                         let iv = g.fresh("m");
-                        out.push(lang.index_decl(&iv, &format!("{rem} % {}", ext[m]), false));
-                        out.push(format!("{rem} /= {};", ext[m]));
+                        out.push(lang.index_decl(&iv, &format!("{rem} % {}", m.extent), false));
+                        out.push(format!("{rem} /= {};", m.extent));
                         coord2.insert(*m, iv);
                     }
                 }
             }
-            value(lang, src, &coord2, ext, g, out)
+            value(lang, src, &coord2, g, out)
         }
         // Affine reindexing: compute each mapped source axis's signed index;
         // padded reads clamp the index (so any setup statements below stay in
@@ -329,7 +331,7 @@ pub fn value<L: Lang>(
                 };
                 let ri = g.fresh("ri");
                 out.push(lang.signed_index_decl(&ri, &val));
-                let n = ext[m];
+                let n = m.extent;
                 let ci = g.fresh("ci");
                 if *padded {
                     guards.push(format!("{ri} >= 0 && {ri} < {n}"));
@@ -339,7 +341,7 @@ pub fn value<L: Lang>(
                 }
                 coord2.insert(*m, ci);
             }
-            let v = value(lang, src, &coord2, ext, g, out);
+            let v = value(lang, src, &coord2, g, out);
             if guards.is_empty() {
                 v
             } else {
@@ -368,7 +370,7 @@ pub fn value<L: Lang>(
             let mut coord2 = coord.clone();
             coord2.insert(*axis, lv.clone());
             let mut body = Vec::new();
-            let ev = value(lang, src, &coord2, ext, g, &mut body);
+            let ev = value(lang, src, &coord2, g, &mut body);
             out.push(lang.for_open_upto(&lv, &coord[axis]));
             out.extend(body);
             out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
@@ -382,9 +384,13 @@ pub fn value<L: Lang>(
 /// `acc[i]`, `B(i)` → `el[i]` (identical in both targets); operators route
 /// through the language's [`Lang::map_op`].
 pub fn carrier_expr<L: Lang>(lang: &L, e: &Expr) -> String {
-    carrier_expr_map(lang, e, &|i| format!("x[{i}]"), &|i| format!("acc[{i}]"), &|i| {
-        format!("el[{i}]")
-    })
+    carrier_expr_map(
+        lang,
+        e,
+        &|i| format!("x[{i}]"),
+        &|i| format!("acc[{i}]"),
+        &|i| format!("el[{i}]"),
+    )
 }
 
 /// [`carrier_expr`] with the leaf renderers supplied by the caller — a
@@ -427,11 +433,10 @@ pub fn carrier_expr_map<L: Lang>(
 pub fn thread_grid_decode<L: Lang>(
     lang: &L,
     grid: &[Axis],
-    ext: &Extents,
     g: &mut Gen,
     out: &mut Vec<String>,
 ) -> HashMap<Axis, String> {
-    thread_grid_decode_from(lang, "gid", grid, ext, g, out)
+    thread_grid_decode_from(lang, "gid", grid, g, out)
 }
 
 /// [`thread_grid_decode`] against an arbitrary index variable — a split-
@@ -440,18 +445,20 @@ pub fn thread_grid_decode_from<L: Lang>(
     _lang: &L,
     gid_var: &str,
     grid: &[Axis],
-    ext: &Extents,
     g: &mut Gen,
     out: &mut Vec<String>,
 ) -> HashMap<Axis, String> {
     let mut coord = HashMap::new();
     for (k, &a) in grid.iter().enumerate() {
-        let stride: usize = grid[k + 1..].iter().map(|x| ext[x]).product();
+        let stride: usize = grid[k + 1..].iter().map(|x| x.extent).product();
         let iv = format!("i_{}", g.fresh("g"));
         if stride == 1 {
-            out.push(format!("uint {iv} = {gid_var} % {};", ext[&a]));
+            out.push(format!("uint {iv} = {gid_var} % {};", a.extent));
         } else {
-            out.push(format!("uint {iv} = ({gid_var} / {stride}) % {};", ext[&a]));
+            out.push(format!(
+                "uint {iv} = ({gid_var} / {stride}) % {};",
+                a.extent
+            ));
         }
         coord.insert(a, iv);
     }
@@ -459,6 +466,6 @@ pub fn thread_grid_decode_from<L: Lang>(
 }
 
 /// The output grid (free axes) and its flattened size for a kernel node.
-pub fn grid_of(node: &Node, ext: &Extents) -> (Vec<Axis>, usize) {
-    (output_axes(node), crate::ir::volume(node, ext))
+pub fn grid_of(node: &Node) -> (Vec<Axis>, usize) {
+    (output_axes(node), crate::ir::volume(node))
 }

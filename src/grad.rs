@@ -33,7 +33,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::interp::Extents;
 use crate::ir::{
     Axis, BinOp, MapOp, Monoid, Node, NodeKind, iota, konst, map, output_axes, reduce, reindex,
     scatter_add, view,
@@ -41,13 +40,7 @@ use crate::ir::{
 
 /// d(loss)/d(each named input), as graphs. `loss` must be a scalar (no free
 /// axes). Inputs that the loss does not depend on are absent from the result.
-/// `extents` is used only to *check* structural transposes (a split's inner
-/// extent), never baked into the returned graphs.
-pub fn grad(
-    loss: &Node,
-    wrt: &[&'static str],
-    extents: &Extents,
-) -> HashMap<&'static str, Node> {
+pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
     assert!(
         output_axes(loss).is_empty(),
         "grad: the loss must be a scalar (reduce it first); got free axes {:?}",
@@ -147,10 +140,7 @@ pub fn grad(
                         BinOp::Monoid(Monoid::Add) | BinOp::Monoid(Monoid::LogSumExp)
                     )
                 {
-                    let n = extents.get(axis).copied().unwrap_or_else(|| {
-                        panic!("grad: reduce over absent axis {axis} needs its extent")
-                    });
-                    contrib = map(MapOp::Mul, vec![contrib, konst(n as f64)]);
+                    contrib = map(MapOp::Mul, vec![contrib, konst(axis.extent as f64)]);
                 }
                 add_adj(&mut adj, src, contrib);
             }
@@ -177,13 +167,7 @@ pub fn grad(
                         2 => {
                             // flatten ⟵ split (row-major: first member most
                             // significant, inner extent = the second member's)
-                            let ne = extents.get(&members[1]).copied().unwrap_or_else(|| {
-                                panic!(
-                                    "grad: flatten backward needs the extent of {}",
-                                    members[1]
-                                )
-                            });
-                            crate::ir::split(inv, *to, members[0], members[1], ne)
+                            crate::ir::split(inv, *to, members[0], members[1])
                         }
                         n => panic!("grad: view backward for {n}-member groups not implemented"),
                     };
@@ -194,7 +178,7 @@ pub fn grad(
             NodeKind::Reindex { src, map: rmap, .. } => {
                 let mut inv = g.clone();
                 for (m, terms, off) in rmap {
-                    inv = transpose_axis_map(inv, *m, terms, *off, extents);
+                    inv = transpose_axis_map(inv, *m, terms, *off);
                 }
                 add_adj(&mut adj, src, inv);
             }
@@ -210,11 +194,9 @@ pub fn grad(
                 axis,
                 op: BinOp::Monoid(Monoid::Add),
             } => {
-                let n = extents.get(axis).copied().unwrap_or_else(|| {
-                    panic!("grad: scan backward needs the extent of {axis}")
-                });
                 let rev = |x: Node| {
-                    crate::ir::reindex(x, vec![(*axis, vec![(-1, *axis)], (n - 1) as i64)], false)
+                    let flip = (axis.extent - 1) as i64;
+                    crate::ir::reindex(x, vec![(*axis, vec![(-1, *axis)], flip)], false)
                 };
                 let contrib = rev(crate::ir::scan(
                     rev(g.clone()),
@@ -236,13 +218,7 @@ pub fn grad(
 
 /// The transpose of one affine axis map: the cotangent `g` (over the map's
 /// term axes) pushed back to the source axis `m`.
-fn transpose_axis_map(
-    g: Node,
-    m: Axis,
-    terms: &[(i64, Axis)],
-    off: i64,
-    extents: &Extents,
-) -> Node {
+fn transpose_axis_map(g: Node, m: Axis, terms: &[(i64, Axis)], off: i64) -> Node {
     match terms {
         // constant index: the whole cotangent lands on position `off`
         [] => map(
@@ -252,9 +228,7 @@ fn transpose_axis_map(
         // slice / pad: a = m − off, out-of-range contributes nothing
         [(1, a)] => reindex(g, vec![(*a, vec![(1, m)], -off)], true),
         // split: the exact inverse is a flatten view (row-major, checked)
-        [(c1, a1), (1, a2)]
-            if off == 0 && extents.get(a2).map(|&n| n as i64) == Some(*c1) =>
-        {
+        [(c1, a1), (1, a2)] if off == 0 && a2.extent as i64 == *c1 => {
             view(g, vec![(vec![*a1, *a2], m)])
         }
         // stride-1 window: overlap-add — read the cotangent at the mirrored
@@ -294,7 +268,11 @@ fn transpose_axis_map(
             );
             let sel = crate::ir::one_hot(m, target);
             reduce(
-                reduce(map(MapOp::Mul, vec![g, sel]), *a2, BinOp::Monoid(Monoid::Add)),
+                reduce(
+                    map(MapOp::Mul, vec![g, sel]),
+                    *a2,
+                    BinOp::Monoid(Monoid::Add),
+                ),
                 *a1,
                 BinOp::Monoid(Monoid::Add),
             )
@@ -340,8 +318,14 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
             (m(MapOp::Neg, vec![g.clone()]), &inputs[1]),
         ],
         MapOp::Mul => vec![
-            (m(MapOp::Mul, vec![g.clone(), inputs[1].clone()]), &inputs[0]),
-            (m(MapOp::Mul, vec![g.clone(), inputs[0].clone()]), &inputs[1]),
+            (
+                m(MapOp::Mul, vec![g.clone(), inputs[1].clone()]),
+                &inputs[0],
+            ),
+            (
+                m(MapOp::Mul, vec![g.clone(), inputs[0].clone()]),
+                &inputs[1],
+            ),
         ],
         MapOp::Div => {
             let (a, b) = (&inputs[0], &inputs[1]);
@@ -404,7 +388,10 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
             ),
             &inputs[0],
         )],
-        MapOp::Log => vec![(m(MapOp::Div, vec![g.clone(), inputs[0].clone()]), &inputs[0])],
+        MapOp::Log => vec![(
+            m(MapOp::Div, vec![g.clone(), inputs[0].clone()]),
+            &inputs[0],
+        )],
         MapOp::Sqrt => {
             let x = &inputs[0];
             let d = m(
@@ -452,14 +439,8 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
         )],
         MapOp::Where => {
             let c = &inputs[0];
-            let da = m(
-                MapOp::Where,
-                vec![c.clone(), g.clone(), konst(0.0)],
-            );
-            let db = m(
-                MapOp::Where,
-                vec![c.clone(), konst(0.0), g.clone()],
-            );
+            let da = m(MapOp::Where, vec![c.clone(), g.clone(), konst(0.0)]);
+            let db = m(MapOp::Where, vec![c.clone(), konst(0.0), g.clone()]);
             vec![(da, &inputs[1]), (db, &inputs[2])] // the condition gets none
         }
     }

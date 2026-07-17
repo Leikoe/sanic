@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use sanic::cost::Device;
 #[cfg(target_os = "macos")]
 use sanic::metal::{MetalBuf, MetalDevice, MetalGraph, program_dispatches};
-use sanic::interp::{Env, Extents, Tensor};
+use sanic::interp::{Env, Value};
 use sanic::ir::*;
 use sanic::partition::{Schedule, partition_many};
 use sanic::safetensors::{Json, RawTensor, bf16_roundtrip, load, parse_json};
@@ -150,7 +150,7 @@ fn load_weights(path: &str, bf16: bool) -> Weights {
             .map(|(k, (_shape, data))| {
                 (
                     k,
-                    Tensor {
+                    Value {
                         axes: Vec::new(), // filled by `bind_axes`
                         shape: Vec::new(),
                         data,
@@ -162,11 +162,11 @@ fn load_weights(path: &str, bf16: bool) -> Weights {
 }
 
 /// Attach graph axes to a loaded blob (shapes come from the axes' extents).
-fn bind_axes(env: &mut Env, name: &str, axes: &[Axis], ext: &Extents) {
+fn bind_axes(env: &mut Env, name: &str, axes: &[Axis]) {
     let t = env
         .get_mut(name)
         .unwrap_or_else(|| panic!("no blob {name}"));
-    let shape: Vec<usize> = axes.iter().map(|a| ext[a]).collect();
+    let shape: Vec<usize> = axes.iter().map(|a| a.extent).collect();
     assert_eq!(
         shape.iter().product::<usize>(),
         t.data.len(),
@@ -238,7 +238,6 @@ fn gelu_new(h: Node) -> Node {
 
 struct Gpt2 {
     sched: Schedule,
-    ext: Extents,
     env: Env,
     logits_axes: (Axis, Axis), // (s, vocab)
 }
@@ -937,7 +936,7 @@ fn main() {
             let mut env = pre.env.clone();
             env.insert(
                 "ids",
-                Tensor {
+                Value {
                     axes: vec![pre.logits_axes.0],
                     shape: vec![prompt_ids.len()],
                     data: prompt_ids.iter().map(|&i| i as f64).collect(),

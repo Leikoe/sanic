@@ -243,7 +243,7 @@ impl Report {
                 Parallelism::Opaque => "runtime gather",
                 Parallelism::Sequential => "serial — no fold",
             };
-            out += &format!("  {:<4} {:<18} → {}\n", a.axis.label(), tag, action);
+            out += &format!("  {:<4} {:<18} → {}\n", a.axis.name, tag, action);
             if let Some(c) = &a.carrier {
                 for line in c.render().lines() {
                     out += &format!("         {line}\n");

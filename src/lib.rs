@@ -6,8 +6,13 @@
 //!
 //! * [`ir`] — five compute node kinds plus two structural operators: `View`
 //!   (rename / flatten) and `Reindex` (slice / pad / split / windows — affine
-//!   index maps; axes are scoped variables). Matmul, softmax, attention,
-//!   convolution, argmax, top-k and scatter-add are compositions
+//!   index maps). An axis is a named index space carrying its extent, so
+//!   every shape is derivable from any graph and nothing takes a shape map.
+//!   Matmul, softmax, attention, convolution, argmax, top-k and scatter-add
+//!   are compositions
+//! * [`tensor`] — the explicit graph-building frontend: symbolic
+//!   [`TensorExpr`] values become a reusable [`Graph`] through
+//!   [`GraphBuilder`], while [`Tensor`] is concrete bound data
 //! * [`analyze`] — classify every (node, axis): FREE / MONOIDAL / OPAQUE /
 //!   SEQUENTIAL, and build the structure map
 //! * [`derive`] — turn each foldable axis into a concrete accumulator
@@ -56,10 +61,12 @@ pub mod runtime;
 pub mod rustgen;
 pub mod safetensors;
 pub mod simplify;
+pub mod tensor;
 
 pub use analyze::{
     AxisReport, Parallelism, Report, Structure, analyze, analyze_all, streamable, structure,
 };
 pub use derive::{Carrier, Expr, SlotKind, derive};
-pub use interp::{Env, Extents, Tensor, eval, run_carrier};
+pub use interp::{Env, Value, eval, run_carrier};
 pub use ir::*;
+pub use tensor::{Graph, GraphBuilder, InputId, Tensor, TensorExpr};

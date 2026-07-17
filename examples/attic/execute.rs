@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 use sanic::partition::partition;
 
@@ -63,7 +63,7 @@ fn main() {
     let n = ext[&dm] as f64;
 
     let mut rng = Lcg(0xADE1A1DE);
-    let mut r = |axes: &[Axis]| Tensor::from_fn(axes, &ext, |_| rng.f());
+    let mut r = |axes: &[Axis]| Value::from_fn(axes, &ext, |_| rng.f());
     let env: Env = [
         ("X", r(&[s, dm])),
         ("g1", r(&[dm])),

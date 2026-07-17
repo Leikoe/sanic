@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use sanic::cost::{Device, feasible, kernel_time};
 use sanic::derive;
 use sanic::emit_metal::emit_schedule_metal;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 use sanic::partition::{Stage, partition_many};
 use sanic::plan::plan_axis;
@@ -315,7 +315,7 @@ fn main() {
     .into_iter()
     .collect();
     let mut rng = Lcg(0x5EED_1234_ABCD);
-    let mut r = |axes: &[Axis]| Tensor::from_fn(axes, &verify, |_| rng.f());
+    let mut r = |axes: &[Axis]| Value::from_fn(axes, &verify, |_| rng.f());
     let env: Env = [
         ("q", r(&[batch, q_heads, seq_len, head_dim])),
         ("k", r(&[batch, kv_heads, kv_seq_len, head_dim])),

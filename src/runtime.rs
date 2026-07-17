@@ -25,7 +25,7 @@
 //! steps equal one full-attention prefill — on the interpreter and on
 //! compiled Rust with buffers persisting across a real host loop.
 
-use crate::interp::{Env, Extents, Tensor};
+use crate::interp::{Env, Value};
 use crate::partition::Schedule;
 
 /// A stateful execution session: named persistent buffers plus step
@@ -35,28 +35,24 @@ pub struct Session {
     /// intermediates (`t0`, `t1`, …), which are scratch: a later schedule may
     /// overwrite them.
     pub env: Env,
-    pub extents: Extents,
 }
 
 impl Session {
-    pub fn new(extents: Extents) -> Session {
-        Session {
-            env: Env::new(),
-            extents,
-        }
+    pub fn new() -> Session {
+        Session { env: Env::new() }
     }
 
     /// Create or replace a buffer (weights at load time, caches at init).
-    pub fn bind(&mut self, name: &'static str, t: Tensor) {
+    pub fn bind(&mut self, name: &'static str, t: Value) {
         self.env.insert(name, t);
     }
 
     /// A 0-dimensional buffer — how a step is fed its position.
     pub fn bind_scalar(&mut self, name: &'static str, v: f64) {
-        self.env.insert(name, Tensor::scalar(v));
+        self.env.insert(name, Value::scalar(v));
     }
 
-    pub fn get(&self, name: &str) -> &Tensor {
+    pub fn get(&self, name: &str) -> &Value {
         self.env
             .get(name)
             .unwrap_or_else(|| panic!("session has no buffer `{name}`"))
@@ -82,7 +78,7 @@ impl Session {
             // a previous step's uncommitted result under this name is stale
             self.env.remove(out.as_str());
         }
-        sched.execute_env(&mut self.env, &self.extents);
+        sched.execute_env(&mut self.env);
         for (from, dest) in commits {
             let produced = self
                 .env

@@ -57,7 +57,7 @@ fn check(car: &Carrier, items: &[Vec<f64>], reference: &[f64]) {
 // ── matmul tags i,j FREE and k MONOIDAL + linear ─────────────────────────────
 #[test]
 fn matmul_axis_tags() {
-    let (i, j, k) = (axis("i"), axis("j"), axis("k"));
+    let (i, j, k) = (axis("i", 5), axis("j", 6), axis("k", 8));
     let a = input("A", &[i, k]);
     let b = input("B", &[k, j]);
     let mm = matmul(a, b, k);
@@ -74,7 +74,7 @@ fn matmul_axis_tags() {
 // ── the dot-product carrier reproduces a contraction ─────────────────────────
 #[test]
 fn dot_product_carrier() {
-    let k = axis("k");
+    let k = axis("k", 17);
     let a = input("A", &[k]);
     let b = input("B", &[k]);
     let mm = matmul(a, b, k);
@@ -96,7 +96,7 @@ fn dot_product_carrier() {
 // (softmax is Exp(x − max), not a fused special form).
 #[test]
 fn renders_derived_flash_attention() {
-    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
     let q = input("Q", &[sq, d]);
     let kk = input("K", &[k, d]);
     let v = input("V", &[k, e]);
@@ -112,7 +112,7 @@ fn renders_derived_flash_attention() {
 // axis and attaches the derived accumulator to the foldable ones.
 #[test]
 fn structure_map_for_attention() {
-    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
     let q = input("Q", &[sq, d]);
     let kk = input("K", &[k, d]);
     let v = input("V", &[k, e]);
@@ -136,7 +136,7 @@ fn structure_map_for_attention() {
 // (folds one level down — no carrier here), and the grid axes sq, e.
 #[test]
 fn structure_map_auto_discovers_axes() {
-    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
     let q = input("Q", &[sq, d]);
     let kk = input("K", &[k, d]);
     let v = input("V", &[k, e]);
@@ -169,7 +169,7 @@ fn structure_map_auto_discovers_axes() {
 fn carrier_knows_its_accumulator_size() {
     use std::collections::BTreeSet;
 
-    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
     let q = input("Q", &[sq, d]);
     let kk = input("K", &[k, d]);
     let v = input("V", &[k, e]);
@@ -201,12 +201,12 @@ fn carrier_knows_its_accumulator_size() {
 #[test]
 fn multi_head_attention_derives_identically_to_single_head() {
     let (b, h, sq, k, d, e) = (
-        axis("b"),
-        axis("h"),
-        axis("sq"),
-        axis("k"),
-        axis("d"),
-        axis("e"),
+        axis("b", 2),
+        axis("h", 3),
+        axis("sq", 8),
+        axis("k", 16),
+        axis("d", 64),
+        axis("e", 64),
     );
     let mha = attention(
         input("Q", &[b, h, sq, d]),
@@ -239,7 +239,7 @@ fn multi_head_attention_derives_identically_to_single_head() {
 // ── attention: sq FREE, k MONOIDAL, derives Acc = (m, ℓ, o), proj = o/ℓ ──────
 #[test]
 fn attention_axis_tags_and_carrier() {
-    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 23), axis("d", 64), axis("e", 64));
     let q = input("Q", &[sq, d]);
     let kk = input("K", &[k, d]);
     let v = input("V", &[k, e]);
@@ -273,7 +273,7 @@ fn attention_axis_tags_and_carrier() {
 #[test]
 fn mean_carrier() {
     // mean = (Σ x) / (Σ 1) — the count is a fold over a literal 1.
-    let a = axis("a");
+    let a = axis("a", 31);
     let x = input("X", &[a]);
     let sum = reduce(x.clone(), a, add_r());
     let count = reduce(konst(1.0), a, add_r());
@@ -294,7 +294,7 @@ fn mean_carrier() {
 #[test]
 fn variance_carrier() {
     // var = E[x²] − E[x]²  =  Σx²/n − (Σx/n)²
-    let a = axis("a");
+    let a = axis("a", 40);
     let x = input("X", &[a]);
     let sumx2 = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), a, add_r());
     let sumx = reduce(x.clone(), a, add_r());
@@ -319,7 +319,7 @@ fn variance_carrier() {
 #[test]
 fn logsumexp_carrier() {
     // lse(x) = log(Σ exp(x − m)) + m,   m = max x
-    let a = axis("a");
+    let a = axis("a", 29);
     let x = input("X", &[a]);
     let m = reduce(x.clone(), a, max_r());
     let e = map(
@@ -346,7 +346,7 @@ fn logsumexp_carrier() {
 // still the same 3-slot FlashAttention accumulator.
 #[test]
 fn masked_scaled_attention_derives() {
-    let (s, k, e) = (axis("s"), axis("k"), axis("e"));
+    let (s, k, e) = (axis("s", 8), axis("k", 21), axis("e", 64));
     let scores = input("S", &[s, k]);
     let scale = input("scale", &[]);
     let mask = input("M", &[s, k]);
@@ -382,7 +382,7 @@ fn masked_scaled_attention_derives() {
 // still the 3-slot flash accumulator.
 #[test]
 fn computed_causal_mask_derives() {
-    let (s, t, e) = (axis("s"), axis("t"), axis("e"));
+    let (s, t, e) = (axis("s", 8), axis("t", 12), axis("e", 64));
     let scores = input("S", &[s, t]);
     let v = input("V", &[t, e]);
     let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
@@ -411,7 +411,7 @@ fn computed_causal_mask_derives() {
 // Σ_f silu(gate_f)·up_f·w_f — an activation-fused GEMM, derived not matched.
 #[test]
 fn silu_fuses_into_a_contraction() {
-    let f = axis("f");
+    let f = axis("f", 27);
     let gate = input("G", &[f]);
     let up = input("U", &[f]);
     let w = input("Wd", &[f]);
@@ -438,7 +438,7 @@ fn silu_fuses_into_a_contraction() {
 // second slot plus a deferred normalizer — Σ(x·g·w) / √(Σx²/n + ε), one pass.
 #[test]
 fn rmsnorm_fused_projection_carrier() {
-    let d = axis("d");
+    let d = axis("d", 16);
     let x = input("X", &[d]);
     let g = input("G", &[d]);
     let w = input("W", &[d]);
@@ -467,7 +467,13 @@ fn rmsnorm_fused_projection_carrier() {
 #[test]
 fn view_scoping_rules() {
     // rename: the same values under a new position variable.
-    let (s, t, dm, f, sf) = (axis("s"), axis("t"), axis("dm"), axis("f"), axis("sf"));
+    let (s, t, dm, f, sf) = (
+        axis("s", 4),
+        axis("t", 4),
+        axis("dm", 8),
+        axis("f", 6),
+        axis("sf", 24),
+    );
     let x = input("X", &[s, dm]);
     let xt = rename(x.clone(), s, t);
     assert_eq!(output_axes(&xt), vec![t, dm]);
@@ -493,7 +499,7 @@ fn view_scoping_rules() {
 #[test]
 fn fold_through_a_flattened_view() {
     // out = Σ_dmv flat[dmv]·w[dmv], where flat reindexes a *computed* [h, dv]
-    let (h, dv, dmv) = (axis("h"), axis("dv"), axis("dmv"));
+    let (h, dv, dmv) = (axis("h", 4), axis("dv", 6), axis("dmv", 24));
     let a = input("A", &[h, dv]);
     let b = input("B", &[h, dv]);
     let prod = map(MapOp::Mul, vec![a, b]); // computed, not a raw input
@@ -516,7 +522,7 @@ fn fold_through_a_flattened_view() {
 // ── tanh-RNN time axis SEQUENTIAL, no accumulator ────────────────────────────
 #[test]
 fn tanh_rnn_is_sequential() {
-    let (t, h) = (axis("t"), axis("h"));
+    let (t, h) = (axis("t", 8), axis("h", 16));
     let x = input("X", &[t, h]);
     let rnn = tanh_rnn(x, t);
     assert_eq!(structure(&rnn, t).level, Parallelism::Sequential);
@@ -530,7 +536,7 @@ fn tanh_rnn_is_sequential() {
 // ── linear/SSM scan time axis MONOIDAL, affine-map carrier ───────────────────
 #[test]
 fn ssm_scan_is_monoidal() {
-    let t = axis("t");
+    let t = axis("t", 19);
     let params = input("AB", &[t]); // each step carries its (A_t, b_t)
     let ssm = ssm_scan(params, t);
     assert_eq!(structure(&ssm, t).level, Parallelism::Monoidal);
@@ -555,7 +561,7 @@ fn ssm_scan_is_monoidal() {
 // ── embedding / gather axis OPAQUE ───────────────────────────────────────────
 #[test]
 fn embedding_is_opaque() {
-    let (vocab, d, seq) = (axis("vocab"), axis("d"), axis("seq"));
+    let (vocab, d, seq) = (axis("vocab", 32), axis("d", 16), axis("seq", 8));
     let table = input("E", &[vocab, d]);
     let ids = input("ids", &[seq]);
     let emb = embedding(table, ids, vocab);
@@ -572,7 +578,7 @@ fn per_node_axis_double_gemm() {
     // contraction of GEMM-2 — the same axis, two structures, distinguished
     // only because the analysis is per (node, axis) rather than collapsed
     // onto the output.
-    let (i, a, m, j) = (axis("i"), axis("a"), axis("m"), axis("j"));
+    let (i, a, m, j) = (axis("i", 4), axis("a", 5), axis("m", 6), axis("j", 7));
     let x = input("X", &[i, a]);
     let y = input("Y", &[a, m]);
     let g1 = matmul(x, y, a); // contracts a → output [i, m]
@@ -589,7 +595,7 @@ fn per_node_axis_double_gemm() {
 // accumulator level via the public `fold_acc` / `merge` / `project`.
 #[test]
 fn flash_attention_associative_all_splits() {
-    let (sq, k, d, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 12), axis("d", 64), axis("e", 64));
     let q = input("Q", &[sq, d]);
     let kk = input("K", &[k, d]);
     let v = input("V", &[k, e]);
@@ -616,7 +622,7 @@ fn flash_attention_associative_all_splits() {
 fn multi_value_attention_generalizes() {
     // Σ softmax(scores)·V1 and Σ softmax(scores)·V2, summed — the coupling
     // with two deferred linear reductions sharing one (m, s).
-    let k = axis("k");
+    let k = axis("k", 15);
     let scores = input("S", &[k]);
     let v1 = input("V1", &[k]);
     let v2 = input("V2", &[k]);
@@ -679,7 +685,13 @@ fn ctc_forward_battle_test() {
     }
 
     // axes: b=batch, t=time, s=state, pred=predecessor (2–3 states), v=vocab
-    let (b, t, s, pred, v) = (axis("b"), axis("t"), axis("s"), axis("pred"), axis("v"));
+    let (b, t, s, pred, v) = (
+        axis("b", 2),
+        axis("t", 8),
+        axis("s", 7),
+        axis("pred", 6),
+        axis("v", 32),
+    );
     let logp = input("logp", &[b, t, v]);
     let labels = input("labels", &[s]);
     let emit = gather(logp, labels, v); // logp_t[ℓ(s)] — index vocab by label
@@ -752,12 +764,12 @@ fn ctc_forward_battle_test() {
 fn soft_attention_over_logspace_dp() {
     // gather-indexed score: K is selected from a table by a runtime label.
     let (b, d, idx, k, h, t) = (
-        axis("b"),
-        axis("d"),
-        axis("idx"),
-        axis("k"),
-        axis("h"),
-        axis("t"),
+        axis("b", 2),
+        axis("d", 8),
+        axis("idx", 4),
+        axis("k", 20),
+        axis("h", 14),
+        axis("t", 6),
     );
     let q = input("Q", &[b, d]);
     let ktable = input("Ktable", &[idx, k, d]);
@@ -852,50 +864,91 @@ fn soft_attention_over_logspace_dp() {
 /// exactly where a wrong defer-scale would lie.
 #[test]
 fn probe_discovered_laws_are_sound() {
-    use sanic::interp::{Env, Extents, Tensor, eval, run_carrier};
+    use sanic::interp::{Env, Value, eval, run_carrier};
 
-    let n = axis("n");
-    let x = || input("X", &[n]);
-    let coll = |op: BinOp| reduce(x(), n, op);
-    let mul = |a: Node, b: Node| map(MapOp::Mul, vec![a, b]);
-    let add = |a: Node, b: Node| map(MapOp::Add, vec![a, b]);
-    let subn = |a: Node, b: Node| map(MapOp::Sub, vec![a, b]);
-    let mx = |a: Node, b: Node| map(MapOp::Max, vec![a, b]);
-    let mn = |a: Node, b: Node| map(MapOp::Min, vec![a, b]);
+    fn x(n: Axis) -> Node {
+        input("X", &[n])
+    }
+    fn coll(n: Axis, op: BinOp) -> Node {
+        reduce(x(n), n, op)
+    }
+    fn mul(a: Node, b: Node) -> Node {
+        map(MapOp::Mul, vec![a, b])
+    }
+    fn add(a: Node, b: Node) -> Node {
+        map(MapOp::Add, vec![a, b])
+    }
+    fn subn(a: Node, b: Node) -> Node {
+        map(MapOp::Sub, vec![a, b])
+    }
+    fn mx(a: Node, b: Node) -> Node {
+        map(MapOp::Max, vec![a, b])
+    }
+    fn mn(a: Node, b: Node) -> Node {
+        map(MapOp::Min, vec![a, b])
+    }
 
-    let programs: Vec<(&str, Node)> = vec![
+    // Each program is a builder: the axis carries its extent, so every trial
+    // length below mints its own `n` and rebuilds the graph around it.
+    let programs: Vec<(&str, fn(Axis) -> Node)> = vec![
         // invariant reductions: Σ/max/min/lse over a same-axis collapsed value
-        ("sum_of_sum", reduce(coll(add_r()), n, add_r())),
-        ("max_of_sum", reduce(coll(add_r()), n, max_r())),
-        ("lse_of_max", reduce(coll(max_r()), n, lse_r())),
-        (
-            "sum_of_scaled_max",
-            reduce(mul(coll(max_r()), konst(-1.5)), n, add_r()),
-        ),
+        ("sum_of_sum", |n| reduce(coll(n, add_r()), n, add_r())),
+        ("max_of_sum", |n| reduce(coll(n, add_r()), n, max_r())),
+        ("lse_of_max", |n| reduce(coll(n, max_r()), n, lse_r())),
+        ("sum_of_scaled_max", |n| {
+            reduce(mul(coll(n, max_r()), konst(-1.5)), n, add_r())
+        }),
         // lattice coupling: reduce_m(max/min(pe, coll)) for m ∈ {Max, Min}
-        ("min_of_max_pe_coll", reduce(mx(subn(iota(n), x()), coll(add_r())), n, BinOp::Monoid(Monoid::Min))),
-        ("max_of_max_coll_pe", reduce(mx(coll(add_r()), x()), n, max_r())),
-        ("max_of_min_pe_coll", reduce(mn(x(), coll(add_r())), n, max_r())),
-        ("min_of_min_coll_pe", reduce(mn(coll(max_r()), x()), n, BinOp::Monoid(Monoid::Min))),
+        ("min_of_max_pe_coll", |n| {
+            reduce(
+                mx(subn(iota(n), x(n)), coll(n, add_r())),
+                n,
+                BinOp::Monoid(Monoid::Min),
+            )
+        }),
+        ("max_of_max_coll_pe", |n| {
+            reduce(mx(coll(n, add_r()), x(n)), n, max_r())
+        }),
+        ("max_of_min_pe_coll", |n| {
+            reduce(mn(x(n), coll(n, add_r())), n, max_r())
+        }),
+        ("min_of_min_coll_pe", |n| {
+            reduce(mn(coll(n, max_r()), x(n)), n, BinOp::Monoid(Monoid::Min))
+        }),
         // additive deferral: pe ± coll under Max/Min/Add
-        ("max_of_pe_plus_coll", reduce(add(iota(n), coll(max_r())), n, max_r())),
-        ("min_of_coll_minus_pe", reduce(subn(coll(max_r()), x()), n, BinOp::Monoid(Monoid::Min))),
-        ("sum_of_pe_plus_coll", reduce(add(x(), coll(max_r())), n, add_r())),
+        ("max_of_pe_plus_coll", |n| {
+            reduce(add(iota(n), coll(n, max_r())), n, max_r())
+        }),
+        ("min_of_coll_minus_pe", |n| {
+            reduce(subn(coll(n, max_r()), x(n)), n, BinOp::Monoid(Monoid::Min))
+        }),
+        ("sum_of_pe_plus_coll", |n| {
+            reduce(add(x(n), coll(n, max_r())), n, add_r())
+        }),
         // signed defer-scale: extremum of coll·pe dispatches on the sign
-        ("min_of_scaled_pe", reduce(mul(add(x(), konst(0.5)), coll(max_r())), n, BinOp::Monoid(Monoid::Min))),
-        ("max_of_scaled_iota", reduce(mul(mul(iota(n), coll(max_r())), coll(add_r())), n, max_r())),
+        ("min_of_scaled_pe", |n| {
+            reduce(
+                mul(add(x(n), konst(0.5)), coll(n, max_r())),
+                n,
+                BinOp::Monoid(Monoid::Min),
+            )
+        }),
+        ("max_of_scaled_iota", |n| {
+            reduce(mul(mul(iota(n), coll(n, max_r())), coll(n, add_r())), n, max_r())
+        }),
         // k-best values and indices at every rank
-        ("top3_v0", reduce(x(), n, BinOp::TopK { k: 3, rank: 0, idx: false })),
-        ("top3_v2", reduce(x(), n, BinOp::TopK { k: 3, rank: 2, idx: false })),
-        ("top3_i1", reduce(x(), n, BinOp::TopK { k: 3, rank: 1, idx: true })),
+        ("top3_v0", |n| reduce(x(n), n, BinOp::TopK { k: 3, rank: 0, idx: false })),
+        ("top3_v2", |n| reduce(x(n), n, BinOp::TopK { k: 3, rank: 2, idx: false })),
+        ("top3_i1", |n| reduce(x(n), n, BinOp::TopK { k: 3, rank: 1, idx: true })),
     ];
 
     let mut rng = Lcg::new(0xD15C0);
-    for (name, g) in programs {
-        let c = derive(&g, n).unwrap_or_else(|| panic!("{name}: must derive"));
+    for (name, build) in programs {
         for trial in 0..6 {
             let len = 3 + trial;
-            let ext: Extents = [(n, len)].into_iter().collect();
+            let n = axis("n", len);
+            let g = build(n);
+            let c = derive(&g, n).unwrap_or_else(|| panic!("{name}: must derive"));
             // mixed signs, planted ties: the adversarial cases for these laws
             let vals: Vec<f64> = (0..len)
                 .map(|i| {
@@ -903,14 +956,11 @@ fn probe_discovered_laws_are_sound() {
                     (v.round() / 4.0) * if i % 3 == 2 { -1.0 } else { 1.0 }
                 })
                 .collect();
-            let env: Env = [(
-                "X",
-                Tensor::from_fn(&[n], &ext, |c| vals[c[&n]]),
-            )]
-            .into_iter()
-            .collect();
-            let want = eval(&g, &env, &ext).data[0];
-            let got = run_carrier(&g, n, &c, &env, &ext).data[0];
+            let env: Env = [("X", Value::from_fn(&[n], |c| vals[c[&n]]))]
+                .into_iter()
+                .collect();
+            let want = eval(&g, &env).data[0];
+            let got = run_carrier(&g, n, &c, &env).data[0];
             assert!(
                 (want - got).abs() <= 1e-9 * (1.0 + want.abs()),
                 "{name} (len {len}): eval={want} run_carrier={got}\nvals={vals:?}"

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use sanic::derive::derive;
-use sanic::interp::{Env, Extents, Tensor, eval, run_carrier};
+use sanic::interp::{Env, Extents, Value, eval, run_carrier};
 use sanic::ir::*;
 
 /// A computed RoPE rotation matrix `R[pos, p, j, i]` (extent 2 on i, j): the
@@ -57,13 +57,13 @@ impl Lcg {
     }
 }
 
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
+fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, ext, |_| rng.f())
 }
 
 /// Assert two tensors are equal up to floating tolerance, regardless of axis
 /// storage order.
-fn assert_close(x: &Tensor, y: &Tensor) {
+fn assert_close(x: &Value, y: &Value) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(
         x.shape, y.shape,
@@ -174,13 +174,13 @@ fn quantized_matmul_dequant_fuses() {
     let ext: Extents = [(s, 4), (dm, 12), (o, 6)].into_iter().collect();
     let mut rng = Lcg(0x9114A7);
     // integer-valued quantized weights (int4-ish range), per-channel scale
-    let qw = Tensor::from_fn(&[o, dm], &ext, |_| (rng.f() * 8.0).round());
+    let qw = Value::from_fn(&[o, dm], &ext, |_| (rng.f() * 8.0).round());
     let env: Env = [
         ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
         ("qW", qw),
         (
             "scale",
-            Tensor::from_fn(&[o], &ext, |_| 0.05 * (rng.f() + 1.5)),
+            Value::from_fn(&[o], &ext, |_| 0.05 * (rng.f() + 1.5)),
         ),
     ]
     .into_iter()
@@ -233,7 +233,7 @@ fn argmax_matches_hand() {
     let am = argmax(input("L", &[r, v]), v);
     let got = eval(&am, &env, &ext);
 
-    let want = Tensor::from_fn(&[r], &ext, |c| {
+    let want = Value::from_fn(&[r], &ext, |c| {
         let ri = c[&r];
         let (mut best, mut arg) = (f64::NEG_INFINITY, 0);
         for vi in 0..20 {
@@ -263,7 +263,7 @@ fn kv_cache_write_matches_hand() {
     let env: Env = [
         ("cache", cache.clone()),
         ("new_k", new_k.clone()),
-        ("pos", Tensor::scalar(pos as f64)),
+        ("pos", Value::scalar(pos as f64)),
     ]
     .into_iter()
     .collect();
@@ -286,7 +286,7 @@ fn kv_cache_write_matches_hand() {
     );
     let got = eval(&updated, &env, &ext);
 
-    let want = Tensor::from_fn(&[t, d], &ext, |c| {
+    let want = Value::from_fn(&[t, d], &ext, |c| {
         if c[&t] == pos {
             new_k.at(&HashMap::from([(d, c[&d])]))
         } else {
@@ -312,7 +312,7 @@ fn rope_rotation_is_correct() {
     let got = eval(&qr, &env, &ext);
 
     // hand reference: rotate each pair by θ = s·exp(p·c)
-    let want = Tensor::from_fn(&[s, p, j], &ext, |cd| {
+    let want = Value::from_fn(&[s, p, j], &ext, |cd| {
         let (si, pi, ji) = (cd[&s], cd[&p], cd[&j]);
         let theta = si as f64 * (pi as f64 * c).exp();
         let q0 = q.at(&HashMap::from([(s, si), (p, pi), (i, 0)]));

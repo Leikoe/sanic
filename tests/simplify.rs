@@ -4,11 +4,9 @@
 //! no stop-gradient. The winner-mask of the stabilizing max-shift cancels, and
 //! cross-root CSE lets the backward reuse the forward's logsumexp carrier.
 
-use std::collections::HashMap;
-
 use sanic::cost::Device;
 use sanic::grad::grad;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::partition::partition_many;
 use sanic::simplify::simplify_many;
@@ -24,11 +22,8 @@ impl Lcg {
         ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
-}
-fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
-    ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
 /// Softmax cross-entropy over `[b, c]`, `logsumexp − logit[y]`. `primitive`
@@ -57,22 +52,21 @@ fn cross_entropy(logits: &Node, b: Axis, c: Axis, primitive: bool) -> Node {
 /// really does cancel, `exp(z − lse)` really is `softmax`).
 #[test]
 fn simplify_preserves_the_gradient() {
-    let (b, c) = (axis("b"), axis("c"));
-    let ext: Extents = [(b, 8), (c, 5)].into_iter().collect();
+    let (b, c) = (axis("b", 8), axis("c", 5));
     let mut rng = Lcg(0x5117);
     let env: Env = [
-        ("Z", rand_tensor(&[b, c], &ext, &mut rng)),
-        ("y", Tensor::from_fn(&[b], &ext, |crd| (crd[&b] % 5) as f64)),
+        ("Z", rand_tensor(&[b, c], &mut rng)),
+        ("y", Value::from_fn(&[b], |crd| (crd[&b] % 5) as f64)),
     ]
     .into_iter()
     .collect();
 
     let loss = cross_entropy(&input("Z", &[b, c]), b, c, false);
-    let dz = grad(&loss, &["Z"], &ext)["Z"].clone();
+    let dz = grad(&loss, &["Z"])["Z"].clone();
     let simplified = simplify_many(&[loss, dz.clone()]).pop().unwrap();
 
-    let raw = eval(&dz, &env, &ext);
-    let simp = eval(&simplified, &env, &ext).permuted_to(&raw.axes);
+    let raw = eval(&dz, &env);
+    let simp = eval(&simplified, &env).permuted_to(&raw.axes);
     assert_eq!(raw.shape, simp.shape);
     for (a, b) in raw.data.iter().zip(&simp.data) {
         assert!(
@@ -88,16 +82,14 @@ fn simplify_preserves_the_gradient() {
 /// is needed to match it.
 #[test]
 fn composed_logsumexp_backward_matches_the_primitive() {
-    let (b, c) = (axis("b"), axis("c"));
-    let ext: Extents = [(b, 100), (c, 10)].into_iter().collect();
+    let (b, c) = (axis("b", 100), axis("c", 10));
     let kernels = |primitive: bool| {
         let loss = cross_entropy(&input("Z", &[b, c]), b, c, primitive);
-        let dz = grad(&loss, &["Z"], &ext)["Z"].clone();
+        let dz = grad(&loss, &["Z"])["Z"].clone();
         let roots = simplify_many(&[loss, dz]);
         partition_many(
             &[(roots[0].clone(), "loss"), (roots[1].clone(), "dZ")],
             &Device::toy(),
-            &as_f64(&ext),
         )
         .stages
         .len()
