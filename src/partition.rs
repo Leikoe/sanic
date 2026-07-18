@@ -112,6 +112,8 @@ pub fn partition(node: &Node, dev: &Device) -> Schedule {
 /// root reachable from a *later* root is reused through its materialization
 /// (so put producers before consumers). Each root lands under its given name.
 pub fn partition_many(roots: &[(Node, &'static str)], dev: &Device) -> Schedule {
+    let graph_roots: Vec<Node> = roots.iter().map(|(root, _)| root.clone()).collect();
+    crate::verify::assert_valid_many(&graph_roots);
     let mut parents = HashMap::new();
     for (r, _) in roots {
         count_parents(r, &mut parents);
@@ -1174,7 +1176,7 @@ fn stream_below_view(axes: &[Axis], groups: &[(Vec<Axis>, Axis)]) -> Vec<Axis> {
     below
 }
 
-fn stream_below_reindex(axes: &[Axis], map: &[(Axis, Vec<(i64, Axis)>, i64)]) -> Vec<Axis> {
+fn stream_below_reindex(axes: &[Axis], map: &[crate::ir::AffineIndex]) -> Vec<Axis> {
     let mut below = Vec::new();
     for &a in axes {
         let mut driving = map

@@ -215,6 +215,7 @@ impl<'a> Coord<'a> {
 /// (by node identity), so a DAG with residuals and a reused normalizer costs
 /// what its distinct nodes cost, not its unfolded tree.
 pub fn eval(node: &Node, env: &Env) -> Value {
+    crate::verify::assert_valid(node);
     let mut cache: HashMap<*const NodeKind, Rc<Value>> = HashMap::new();
     (*eval_rc(node, env, &mut cache)).clone()
 }

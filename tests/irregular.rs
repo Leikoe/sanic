@@ -2,8 +2,9 @@
 //! existing basis (no new node kinds), verified against hand references and
 //! through the partitioned pipeline.
 //!
-//! * `topk` — k rounds of (max, mask-the-winner). Small k is all sampling
-//!   and MoE routing ever need, and each round is an ordinary fold.
+//! * `topk` — one singleton-insert streaming fold over the raw scores per
+//!   requested rank. Small k is all sampling and MoE routing ever need; a
+//!   full two-list merge is still required before tree/split execution.
 //! * `scatter_add` — the inverse of gather as a one-hot contraction,
 //!   add-combining collisions. Order-free (deterministic in parallel), and
 //!   exactly the backward of `gather`, which autodiff (M8) leans on.

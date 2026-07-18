@@ -24,8 +24,10 @@
 //!   pulled out of a linear reduction by distributivity and is applied once,
 //!   at the end.
 //! * `k-best` — an index-carrying selection ([`BinOp::ArgMax`] /
-//!   [`BinOp::TopK`]): sorted (value, index) lists of length ≤ k form a
-//!   tuple monoid, so argmax and every top-k rank are single folds.
+//!   [`BinOp::TopK`]): argmax has a true pair monoid; top-k's current carrier
+//!   inserts one streamed item into a sorted list, so every rank is one
+//!   sequential fold but tree/split execution remains disabled until combine
+//!   implements a full two-list merge.
 //! * `invariant` — a reduction over an axis its operand does not vary along:
 //!   `Σ = n·value` (the count is itself a slot), `max/min/lse = value (+ln n)`.
 //! * `lattice` — `reduce_m(max/min(z, c))` for m ∈ {Max, Min} and `c`

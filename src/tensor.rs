@@ -228,9 +228,11 @@ impl GraphBuilder {
                 );
             }
         }
+        let outputs: Vec<Node> = outputs.into_iter().map(|output| output.node).collect();
+        crate::verify::assert_valid_many(&outputs);
         Graph {
             inputs: self.inputs,
-            outputs: outputs.into_iter().map(|output| output.node).collect(),
+            outputs,
         }
     }
 }

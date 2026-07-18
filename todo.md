@@ -21,7 +21,9 @@ page is substrate we need so the moat is usable on real workloads.
 
 - **`derive`** — the core. Reconstructs online-softmax (rescale), deferred
   normalizers (defer-div), fused elementwise, multi-slot tuples, affine/SSM
-  scans. 25 law tests: `tree_fold == fold == reference`.
+  scans. Associative carrier families are checked with
+  `tree_fold == fold == reference`; k-best's current sequential-only insertion
+  carrier is checked against the reference separately.
 - **`analyze` / `plan` / `cost` / `partition`** — classify axes, pick tiles by
   analytical roofline, split a whole graph at the derive frontier. A full
   transformer block + logits head lowers to 13 kernels with the attention core
@@ -294,11 +296,12 @@ Decided per op, decomposition over new node kinds in every case:
   argmax is **one kernel**. Replaced the original `Σ i·[x == max]`
   composition (two kernels, and unsound to fuse: it differs on ties).
 - **top-k** — `BinOp::TopK`: sorted (value, index) lists of length ≤ k form
-  a tuple monoid (merge-take-k; streaming-side combine is the singleton
-  insert), so EVERY rank's value or index is one independent fold over the
-  raw scores — no mask-the-winner chain, first-max-wins across the whole
-  selection, GPU-verified with planted exact ties. Split reductions decline
-  (the singleton insert is not a two-list merge; guarded).
+  a tuple monoid under merge-take-k, but the current carrier implements only
+  singleton insertion. EVERY rank's value or index is still one independent
+  sequential fold over the raw scores — no mask-the-winner chain,
+  first-max-wins across the whole selection, GPU-verified with planted exact
+  ties. Tree and split reductions decline until combine handles two full
+  lists (guarded).
 - **scatter-add** — `ir::scatter_add`, a one-hot contraction: the inverse of
   gather with order-free collision handling — exactly gather's adjoint,
   which M8 leans on. Dense O(n·m) as a graph; atomics are a backend concern.
@@ -521,7 +524,8 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   views/reindexes/gathers with the AXIS TRANSLATED at each boundary
   (below a flatten the entanglement lives on the members), placing retry
   cuts as deep as the algebra allows. The count ladder then continued on
-  theory, not tuning: `BinOp::ArgMax` and `BinOp::TopK` (tuple monoids —
+  theory, not tuning: `BinOp::ArgMax` and `BinOp::TopK` (pair monoid and
+  sequential k-best insertion, respectively —
   the old `Σ i·[x == max]` spelling is tie-unsound to fuse, and the
   mask-the-winner chain wasted a fold per rank) collapsed routing to a
   score fold + 8 independent rank folds; sharing stopped being a fusion

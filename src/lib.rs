@@ -16,6 +16,8 @@
 //!   [`GraphBuilder`], while [`Tensor`] is concrete bound data
 //! * [`analyze`] — classify every (node, axis): FREE / MONOIDAL / OPAQUE /
 //!   SEQUENTIAL, and build the structure map
+//! * [`verify`] — check arity, axis scope, input declarations and movement
+//!   bounds before a graph reaches analysis or code generation
 //! * [`derive`] — turn each foldable axis into a concrete accumulator
 //! * [`cost`] — device model, feasibility, roofline; ranks, never validates
 //!   (legality is already settled)
@@ -40,9 +42,12 @@
 //!
 //! The headline: given naive `softmax(QKᵀ)·V` as a dataflow graph, `derive`
 //! reconstructs the FlashAttention `(m, ℓ, o)` running accumulator from
-//! composition rules alone. The property tests in `tests/laws.rs` hold every
-//! derivation to `tree_fold == fold == reference` on random data — the
-//! associativity and correctness certificates in one assertion.
+//! composition rules alone. The property tests in `tests/laws.rs` hold each
+//! associative carrier family to `tree_fold == fold == reference` on random
+//! data — the associativity and correctness certificates in one assertion.
+//! K-best's current singleton-insert carrier is reference-checked as a
+//! sequential fold and explicitly excluded from tree/split execution until it
+//! grows a true two-list merge.
 
 pub mod analyze;
 pub mod bpe;
@@ -63,6 +68,7 @@ pub mod rustgen;
 pub mod safetensors;
 pub mod simplify;
 pub mod tensor;
+pub mod verify;
 
 pub use analyze::{
     AxisReport, Parallelism, Report, Structure, analyze, analyze_all, streamable, structure,

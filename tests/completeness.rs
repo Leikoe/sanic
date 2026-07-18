@@ -404,7 +404,9 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
                 );
                 argmax(masked, n)
             },
-            CoveredElsewhere("BinOp::TopK — the k-best tuple monoid"),
+            CoveredElsewhere(
+                "BinOp::TopK — sequential k-best insertion (full monoid merge TODO)",
+            ),
         ),
         // ── genuinely outside constant-state streaming ───────────────────────
         (

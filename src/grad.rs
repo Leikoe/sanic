@@ -41,6 +41,7 @@ use crate::ir::{
 /// d(loss)/d(each named input), as graphs. `loss` must be a scalar (no free
 /// axes). Inputs that the loss does not depend on are absent from the result.
 pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
+    crate::verify::assert_valid(loss);
     assert!(
         output_axes(loss).is_empty(),
         "grad: the loss must be a scalar (reduce it first); got free axes {:?}",

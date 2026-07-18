@@ -3,8 +3,11 @@
 //! Reconstructing the FlashAttention `(m, ℓ, o)` accumulator from the
 //! composition rules — not a stored template — is the primary criterion.
 //!
-//! Every derived carrier is held to `tree_fold == fold == reference` on
-//! random data: associativity and correctness in one assertion.
+//! Every associative carrier family is held to
+//! `tree_fold == fold == reference` on random data: associativity and
+//! correctness in one assertion. K-best's singleton-insert carrier is checked
+//! against the reference oracle separately and is forbidden from tree/split
+//! execution.
 
 use sanic::ir::*;
 use sanic::{Carrier, Expr, Parallelism, analyze, analyze_all, derive, streamable, structure};

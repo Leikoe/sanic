@@ -1117,9 +1117,10 @@ fn w4_grouped_matvec_runs_on_gpu() {
     eprintln!("W4A16 grouped matvec on GPU (packed int4 + f16 scales): GPU OK {maxrel:e}");
 }
 
-/// The k-best tuple monoid on real hardware: every rank's value AND index of
-/// a top-8 selection — including planted exact ties, where first-max-wins is
-/// the contract — derived as single folds and dispatched on the GPU.
+/// The k-best streaming carrier on real hardware: every rank's value AND index
+/// of a top-8 selection — including planted exact ties, where first-max-wins
+/// is the contract — derived as single folds and dispatched on the GPU. This
+/// exercises singleton insertion, not the still-missing two-list merge.
 #[test]
 fn topk_kbest_folds_run_on_gpu() {
     let n = axis("n");

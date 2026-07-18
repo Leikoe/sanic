@@ -21,6 +21,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type Node = Rc<NodeKind>;
 
+/// One affine source-axis index:
+/// `(source axis, (coefficient, output axis) terms, offset)`.
+pub type AffineIndex = (Axis, Vec<(i64, Axis)>, i64);
+
 // ── axes ─────────────────────────────────────────────────────────────────────
 
 /// A stable, human-readable name for an axis.
@@ -204,11 +208,10 @@ pub enum BinOp {
     ArgMax,
     /// One projection of a k-best selection: the `rank`-th largest value
     /// (`idx: false`) or its position (`idx: true`), first-max-wins on ties.
-    /// The k sorted (value, index) pairs form a tuple monoid — sorted lists
-    /// of length ≤ k under merge-take-k — so the whole selection is ONE fold
-    /// into a 2k-slot carrier; each rank projects a slot. This is what makes
-    /// top-k routing k independent single-kernel folds instead of k rounds
-    /// of (max, mask-the-winner) chained through materialized cuts.
+    /// Semantically, sorted lists of length ≤ k form a tuple monoid under
+    /// merge-take-k. The current carrier implements only its singleton-insert
+    /// streaming path: each rank is one kernel over the raw scores, but
+    /// tree/split execution must decline until combine merges two full lists.
     TopK {
         k: u8,
         rank: u8,
@@ -390,7 +393,7 @@ pub enum NodeKind {
     Reindex {
         src: Node,
         /// (source axis, terms over output axes, constant offset).
-        map: Vec<(Axis, Vec<(i64, Axis)>, i64)>,
+        map: Vec<AffineIndex>,
         padded: bool,
     },
 }
@@ -495,7 +498,7 @@ pub fn flatten(src: Node, group: &[Axis], to: Axis) -> Node {
     view(src, vec![(group.to_vec(), to)])
 }
 
-pub fn reindex(src: Node, map: Vec<(Axis, Vec<(i64, Axis)>, i64)>, padded: bool) -> Node {
+pub fn reindex(src: Node, map: Vec<AffineIndex>, padded: bool) -> Node {
     Rc::new(NodeKind::Reindex { src, map, padded })
 }
 
@@ -914,14 +917,14 @@ pub fn argmax(x: Node, axis: Axis) -> Node {
     reduce(x, axis, BinOp::ArgMax)
 }
 
-/// Top-k along `axis` by repeated (max, mask-the-winner): k `(value, index)`
-/// pairs, largest first. Each pair is one [`BinOp::TopK`] fold — the k-best
-/// tuple monoid — so every value/index is a single kernel over the raw
-/// scores, with no mask-the-winner chain between ranks and first-max-wins
-/// ties across the WHOLE selection (the old round decomposition left ties
-/// within a round undefined). A full sort stays out of the supported
-/// fragment on purpose: it is a data-movement network, not a fold, and
-/// nothing in an inference pipeline needs one.
+/// Top-k along `axis`: k `(value, index)` pairs, largest first. Each projection
+/// is one [`BinOp::TopK`] streaming fold over the raw scores, with no
+/// mask-the-winner chain between ranks and first-max-wins ties across the
+/// whole selection. The current carrier inserts one item at a time and is not
+/// valid for tree/split execution until it implements the semantic
+/// merge-take-k operation over two full lists. A full sort stays out of the
+/// supported fragment on purpose: it is a data-movement network, not a fold,
+/// and nothing in an inference pipeline needs one.
 pub fn topk(x: Node, axis: Axis, k: usize) -> Vec<(Node, Node)> {
     let q = |rank: usize, idx: bool| {
         reduce(
