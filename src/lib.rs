@@ -69,4 +69,4 @@ pub use analyze::{
 pub use derive::{Carrier, Expr, SlotKind, derive};
 pub use interp::{Env, Value, eval, run_carrier};
 pub use ir::*;
-pub use tensor::{Graph, GraphBuilder, InputId, Tensor, TensorExpr};
+pub use tensor::{Bindings, Graph, GraphBuilder, Tensor, TensorExpr};

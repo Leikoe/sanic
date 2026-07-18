@@ -1,4 +1,13 @@
+use std::collections::HashMap;
+
 use sanic::{GraphBuilder, Tensor, TensorExpr, axis};
+
+fn bindings(inputs: impl IntoIterator<Item = (&'static str, Tensor)>) -> HashMap<String, Tensor> {
+    inputs
+        .into_iter()
+        .map(|(name, tensor)| (name.to_owned(), tensor))
+        .collect()
+}
 
 fn linear(
     x: TensorExpr,
@@ -17,9 +26,9 @@ fn linear(
 fn function_builds_a_reusable_graph() {
     let (batch, input, output) = (axis("batch", 2), axis("input", 3), axis("output", 2));
     let mut builder = GraphBuilder::new();
-    let x = builder.input(&[batch, input]);
-    let weight = builder.input(&[output, input]);
-    let bias = builder.input(&[output]);
+    let x = builder.input("x", &[batch, input]);
+    let weight = builder.input("weight", &[output, input]);
+    let bias = builder.input("bias", &[output]);
     let graph = builder.finish([linear(x, weight, Some(bias), input)]);
 
     assert_eq!(graph.input_count(), 3);
@@ -37,8 +46,16 @@ fn function_builds_a_reusable_graph() {
         [[1.0, 1.0, 1.0], [4.0, 0.0, -2.0]][coord[&batch]][coord[&input]]
     });
 
-    let first = graph.run([first, weights.clone(), bias.clone()]);
-    let second = graph.run([second, weights, bias]);
+    let first = graph.run(&bindings([
+        ("x", first),
+        ("weight", weights.clone()),
+        ("bias", bias.clone()),
+    ]));
+    let second = graph.run(&bindings([
+        ("x", second),
+        ("weight", weights),
+        ("bias", bias),
+    ]));
 
     assert_eq!(first[0].shape, vec![2, 2]);
     assert_eq!(first[0].data, vec![-2.75, 6.5, -5.75, 25.0]);
@@ -46,31 +63,51 @@ fn function_builds_a_reusable_graph() {
 }
 
 #[test]
-fn input_ids_are_dense_and_follow_construction_order() {
+#[should_panic(expected = "declared more than once")]
+fn input_names_must_be_unique() {
     let a = axis("a", 2);
     let mut builder = GraphBuilder::new();
-    let first = builder.input(&[a]);
-    let second = builder.input(&[a]);
-    let third = builder.input(&[a]);
-
-    assert_eq!(first.input_id().unwrap().index(), 0);
-    assert_eq!(second.input_id().unwrap().index(), 1);
-    assert_eq!(third.input_id().unwrap().index(), 2);
-    assert!(first.clone().exp().input_id().is_none());
+    let _ = builder.input("x", &[a]);
+    let _ = builder.input("x", &[a]);
 }
 
 #[test]
 fn graph_keeps_multiple_declared_outputs() {
     let n = axis("n", 3);
     let mut builder = GraphBuilder::new();
-    let x = builder.input(&[n]);
+    let x = builder.input("x", &[n]);
     let graph = builder.finish([x.sum(n), x.prod(n)]);
     let input = Tensor::from_fn(&[n], |coord| [2.0, 3.0, 5.0][coord[&n]]);
 
-    let outputs = graph.run([input]);
+    let outputs = graph.run(&bindings([("x", input)]));
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0].data, vec![10.0]);
     assert_eq!(outputs[1].data, vec![30.0]);
+}
+
+#[test]
+#[should_panic(expected = "was not bound")]
+fn run_reports_missing_named_bindings() {
+    let n = axis("n", 2);
+    let mut builder = GraphBuilder::new();
+    let x = builder.input("x", &[n]);
+    let y = builder.input("y", &[n]);
+    let graph = builder.finish([x + y]);
+    let x = Tensor::from_fn(&[n], |coord| coord[&n] as f64);
+
+    let _ = graph.run(&bindings([("x", x)]));
+}
+
+#[test]
+#[should_panic(expected = "has no input named")]
+fn run_rejects_unknown_named_bindings() {
+    let n = axis("n", 2);
+    let mut builder = GraphBuilder::new();
+    let x = builder.input("x", &[n]);
+    let graph = builder.finish([x]);
+    let input = Tensor::from_fn(&[n], |coord| coord[&n] as f64);
+
+    let _ = graph.run(&bindings([("unknown", input)]));
 }
 
 #[test]
@@ -78,9 +115,23 @@ fn graph_keeps_multiple_declared_outputs() {
 fn finish_rejects_a_foreign_input() {
     let n = axis("n", 2);
     let mut left = GraphBuilder::new();
-    let x = left.input(&[n]);
+    let x = left.input("x", &[n]);
     let mut right = GraphBuilder::new();
-    let y = right.input(&[n]);
+    let y = right.input("x", &[n]);
 
     let _ = left.finish([x + y]);
+}
+
+#[test]
+fn flip_is_an_affine_view_over_one_axis() {
+    let n = axis("n", 4);
+    let mut builder = GraphBuilder::new();
+    let x = builder.input("x", &[n]);
+    let graph = builder.finish([x.flip(n)]);
+
+    let input = Tensor::from_fn(&[n], |coord| [2.0, 3.0, 5.0, 7.0][coord[&n]]);
+    assert_eq!(
+        graph.run(&bindings([("x", input)]))[0].data,
+        vec![7.0, 5.0, 3.0, 2.0]
+    );
 }

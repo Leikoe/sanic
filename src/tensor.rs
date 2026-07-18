@@ -2,8 +2,8 @@
 //!
 //! [`TensorExpr`] is a symbolic tensor-valued expression. [`Tensor`] is the
 //! concrete data bound when a finished [`Graph`] runs. A [`GraphBuilder`]
-//! assigns input IDs during construction; [`GraphBuilder::finish`] freezes
-//! the output expressions into a reusable graph.
+//! assigns each input a binding name; [`GraphBuilder::finish`] freezes the
+//! output expressions into a reusable graph.
 //!
 //! One deep difference from tinygrad: axes are named, not positional. Two
 //! operands align where they mention the same axis and broadcast everywhere
@@ -16,9 +16,9 @@
 //!
 //! let (s, t, d) = (axis("s", 128), axis("t", 128), axis("d", 64));
 //! let mut graph = GraphBuilder::new();
-//! let q = graph.input(&[s, d]);
-//! let k = graph.input(&[t, d]);
-//! let v = graph.input(&[t, d]);
+//! let q = graph.input("q", &[s, d]);
+//! let k = graph.input("k", &[t, d]);
+//! let v = graph.input("v", &[t, d]);
 //!
 //! // Naive attention, the textbook three-step form. `derive` reconstructs
 //! // the FlashAttention streaming accumulator from this graph.
@@ -27,6 +27,7 @@
 //! assert_eq!(graph.input_count(), 3);
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::derive::Carrier;
@@ -36,27 +37,20 @@ use crate::ir::{self, Axis, BinOp, Dtype, MapOp, Monoid, Node, axis, leaf_names,
 /// Concrete tensor data bound to a graph input at execution time.
 pub type Tensor = Value;
 
-/// Dense, per-graph input index. It is intentionally not a global name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct InputId(usize);
-
-impl InputId {
-    pub fn index(self) -> usize {
-        self.0
-    }
-}
+/// Concrete buffers keyed by their graph input names.
+pub type Bindings = HashMap<String, Tensor>;
 
 #[derive(Clone, Debug)]
 struct InputSpec {
-    id: InputId,
-    name: &'static str,
+    binding_name: String,
+    leaf_name: &'static str,
     axes: Vec<Axis>,
     dtype: Option<Dtype>,
 }
 
 static NEXT_GRAPH: AtomicUsize = AtomicUsize::new(0);
 
-/// Mutable construction context. It owns the dense input order for one graph.
+/// Mutable construction context. It owns the named inputs for one graph.
 pub struct GraphBuilder {
     graph_id: usize,
     inputs: Vec<InputSpec>,
@@ -76,26 +70,43 @@ impl GraphBuilder {
         }
     }
 
-    /// Add a bindable f64-semantic input. Inputs are bound in this call order.
-    pub fn input(&mut self, axes: &[Axis]) -> TensorExpr {
-        self.input_impl(axes, None)
+    /// Add a bindable f64-semantic input with a caller-visible binding name.
+    pub fn input(&mut self, name: impl Into<String>, axes: &[Axis]) -> TensorExpr {
+        self.input_impl(name.into(), axes, None)
     }
 
     /// Add an input with an explicit storage dtype.
-    pub fn input_dt(&mut self, axes: &[Axis], dtype: Dtype) -> TensorExpr {
-        self.input_impl(axes, Some(dtype))
+    pub fn input_dt(&mut self, name: impl Into<String>, axes: &[Axis], dtype: Dtype) -> TensorExpr {
+        self.input_impl(name.into(), axes, Some(dtype))
     }
 
-    fn input_impl(&mut self, axes: &[Axis], dtype: Option<Dtype>) -> TensorExpr {
-        let id = InputId(self.inputs.len());
-        let name = Box::leak(format!("__sanic_g{}_input{}", self.graph_id, id.0).into_boxed_str());
+    fn input_impl(
+        &mut self,
+        binding_name: String,
+        axes: &[Axis],
+        dtype: Option<Dtype>,
+    ) -> TensorExpr {
+        assert!(
+            !binding_name.is_empty(),
+            "input binding names cannot be empty"
+        );
+        assert!(
+            !self
+                .inputs
+                .iter()
+                .any(|input| input.binding_name == binding_name),
+            "input `{binding_name}` was declared more than once"
+        );
+        let input_index = self.inputs.len();
+        let leaf_name =
+            Box::leak(format!("__sanic_g{}_input{input_index}", self.graph_id).into_boxed_str());
         self.inputs.push(InputSpec {
-            id,
-            name,
+            binding_name,
+            leaf_name,
             axes: axes.to_vec(),
             dtype,
         });
-        TensorExpr::input_node(name, axes, dtype, id)
+        TensorExpr::input_node(leaf_name, axes, dtype)
     }
 
     /// A scalar expression in the graph being built.
@@ -118,7 +129,7 @@ impl GraphBuilder {
         for output in &outputs {
             for name in leaf_names(&output.node) {
                 assert!(
-                    self.inputs.iter().any(|input| input.name == name),
+                    self.inputs.iter().any(|input| input.leaf_name == name),
                     "output reads `{name}`, an input from a different GraphBuilder"
                 );
             }
@@ -145,26 +156,27 @@ impl Graph {
         self.outputs.len()
     }
 
-    /// Run the finished graph with buffers in [`InputId`] order.
-    pub fn run(&self, inputs: impl AsRef<[Tensor]>) -> Vec<Tensor> {
-        let inputs = inputs.as_ref();
-        assert_eq!(
-            inputs.len(),
-            self.inputs.len(),
-            "graph expects {} input buffers, received {}",
-            self.inputs.len(),
-            inputs.len()
-        );
+    /// Run the finished graph with buffers keyed by their declared names.
+    pub fn run(&self, inputs: &Bindings) -> Vec<Tensor> {
+        for name in inputs.keys() {
+            assert!(
+                self.inputs.iter().any(|input| input.binding_name == *name),
+                "graph has no input named `{name}`"
+            );
+        }
         let mut env = Env::new();
-        for (spec, tensor) in self.inputs.iter().zip(inputs) {
+        for spec in &self.inputs {
+            let tensor = inputs
+                .get(&spec.binding_name)
+                .unwrap_or_else(|| panic!("graph input `{}` was not bound", spec.binding_name));
             let expected: Vec<usize> = spec.axes.iter().map(|axis| axis.extent).collect();
             assert_eq!(
                 tensor.shape, expected,
-                "input {} has shape {:?}; graph expects {:?}",
-                spec.id.0, tensor.shape, expected
+                "input `{}` has shape {:?}; graph expects {:?}",
+                spec.binding_name, tensor.shape, expected
             );
             let _ = spec.dtype;
-            env.insert(spec.name, tensor.clone());
+            env.insert(spec.leaf_name, tensor.clone());
         }
         self.outputs
             .iter()
@@ -181,31 +193,21 @@ impl Graph {
 #[derive(Clone, Debug)]
 pub struct TensorExpr {
     node: Node,
-    input_id: Option<InputId>,
 }
 
 fn wrap(node: Node) -> TensorExpr {
-    TensorExpr {
-        node,
-        input_id: None,
-    }
+    TensorExpr { node }
 }
 
 impl TensorExpr {
     // ── constructors ─────────────────────────────────────────────────────────
 
-    fn input_node(
-        name: &'static str,
-        axes: &[Axis],
-        dtype: Option<Dtype>,
-        input_id: InputId,
-    ) -> TensorExpr {
+    fn input_node(name: &'static str, axes: &[Axis], dtype: Option<Dtype>) -> TensorExpr {
         TensorExpr {
             node: match dtype {
                 Some(dtype) => ir::input_dt(name, axes, dtype),
                 None => ir::input(name, axes),
             },
-            input_id: Some(input_id),
         }
     }
 
@@ -228,10 +230,6 @@ impl TensorExpr {
     /// `1.0` where `iota(a) == v`, else `0.0` — a computed one-hot.
     pub fn one_hot(a: Axis, v: &TensorExpr) -> TensorExpr {
         wrap(ir::one_hot(a, v.node.clone()))
-    }
-
-    pub fn input_id(&self) -> Option<InputId> {
-        self.input_id
     }
 
     // ── shape ────────────────────────────────────────────────────────────────
@@ -430,6 +428,17 @@ impl TensorExpr {
             from.extent, to.extent
         );
         wrap(ir::rename(self.node.clone(), from, to))
+    }
+
+    /// Reverse the values along `axis`, without moving storage. This is an
+    /// affine reindex, useful for pairwise transforms such as RoPE.
+    pub fn flip(&self, axis: Axis) -> TensorExpr {
+        self.expect_axis(axis, "flip");
+        wrap(ir::reindex(
+            self.node.clone(),
+            vec![(axis, vec![(-1, axis)], axis.extent as i64 - 1)],
+            false,
+        ))
     }
 
     /// Merge a group of axes into one fresh axis (returned; extent = the

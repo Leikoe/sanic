@@ -2,7 +2,7 @@
 //!
 //! Model helpers consume and return `TensorExpr`: they build a graph, never
 //! execute data. `GraphBuilder::finish` freezes the output roots into a
-//! reusable `Graph`, whose inputs are later bound by dense input ID order.
+//! reusable `Graph`, whose inputs are later bound by their declared names.
 //!
 //!     cargo run --example llama3
 
@@ -13,7 +13,7 @@ struct Llama3Config {
     vocab_size: usize,
     sequence_length: usize,
     layers: usize,
-    model_width: usize,
+    hidden_dim: usize,
     query_heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -27,7 +27,7 @@ impl Llama3Config {
             sequence_length: 2_048,
             // The graph has two layers while frontend ergonomics settles.
             layers: 2,
-            model_width: 4_096,
+            hidden_dim: 4_096,
             query_heads: 32,
             kv_heads: 8,
             head_dim: 128,
@@ -41,7 +41,7 @@ struct Llama3 {
     vocab: Axis,
     sequence: Axis,
     key_sequence: Axis,
-    model: Axis,
+    hidden_dim: Axis,
     kv_head: Axis,
     query_group: Axis,
     head_dim: Axis,
@@ -51,13 +51,13 @@ struct Llama3 {
 impl Llama3 {
     fn new(config: Llama3Config) -> Self {
         assert_eq!(config.query_heads % config.kv_heads, 0);
-        assert_eq!(config.model_width, config.query_heads * config.head_dim);
+        assert_eq!(config.hidden_dim, config.query_heads * config.head_dim);
 
         Llama3 {
             vocab: axis("vocab", config.vocab_size),
             sequence: axis("sequence", config.sequence_length),
             key_sequence: axis("key_sequence", config.sequence_length),
-            model: axis("model", config.model_width),
+            hidden_dim: axis("hidden_dim", config.hidden_dim),
             kv_head: axis("kv_head", config.kv_heads),
             query_group: axis("query_group", config.query_heads / config.kv_heads),
             head_dim: axis("head_dim", config.head_dim),
@@ -66,17 +66,26 @@ impl Llama3 {
         }
     }
 
-    fn parameter(&self, graph: &mut GraphBuilder, axes: &[Axis]) -> TensorExpr {
-        graph.input(axes)
+    fn parameter(
+        &self,
+        graph: &mut GraphBuilder,
+        name: impl Into<String>,
+        axes: &[Axis],
+    ) -> TensorExpr {
+        graph.input(name, axes)
     }
 
     fn rms_norm(&self, x: TensorExpr, gain: TensorExpr) -> TensorExpr {
-        let mean_square = (&x * &x).sum(self.model) / self.model.extent as f64;
+        let mean_square = (&x * &x).sum(self.hidden_dim) / self.hidden_dim.extent as f64;
         (x * gain) / (mean_square + 1e-5).sqrt()
     }
 
-    fn block(&self, graph: &mut GraphBuilder, x: TensorExpr) -> TensorExpr {
-        let attn_norm = self.rms_norm(x.clone(), self.parameter(graph, &[self.model]));
+    fn block(&self, graph: &mut GraphBuilder, layer: usize, x: TensorExpr) -> TensorExpr {
+        let name = |suffix: &str| format!("layers.{layer}.{suffix}");
+        let attn_norm = self.rms_norm(
+            x.clone(),
+            self.parameter(graph, name("input_norm"), &[self.hidden_dim]),
+        );
         let attn_kv = attn_norm.rename(self.sequence, self.key_sequence);
 
         // A K/V head and its query-head group are distinct named axes, so GQA
@@ -84,17 +93,31 @@ impl Llama3 {
         let q = attn_norm.matmul(
             &self.parameter(
                 graph,
-                &[self.kv_head, self.query_group, self.head_dim, self.model],
+                name("q_proj"),
+                &[
+                    self.kv_head,
+                    self.query_group,
+                    self.head_dim,
+                    self.hidden_dim,
+                ],
             ),
-            self.model,
+            self.hidden_dim,
         );
         let k = attn_kv.clone().matmul(
-            &self.parameter(graph, &[self.kv_head, self.head_dim, self.model]),
-            self.model,
+            &self.parameter(
+                graph,
+                name("k_proj"),
+                &[self.kv_head, self.head_dim, self.hidden_dim],
+            ),
+            self.hidden_dim,
         );
         let v = attn_kv.matmul(
-            &self.parameter(graph, &[self.kv_head, self.head_dim, self.model]),
-            self.model,
+            &self.parameter(
+                graph,
+                name("v_proj"),
+                &[self.kv_head, self.head_dim, self.hidden_dim],
+            ),
+            self.hidden_dim,
         );
         let scores = q.matmul(&k, self.head_dim) / (self.head_dim.extent as f64).sqrt();
         let attention = (scores + graph.causal_mask(self.sequence, self.key_sequence))
@@ -105,31 +128,52 @@ impl Llama3 {
             &[self.kv_head, self.query_group, self.head_dim],
             "attention_packed",
         );
-        let attention_out = attention.matmul(&self.parameter(graph, &[self.model, packed]), packed);
+        let attention_out = attention.matmul(
+            &self.parameter(graph, name("o_proj"), &[self.hidden_dim, packed]),
+            packed,
+        );
         let residual = attention_out + x;
 
-        let mlp_norm = self.rms_norm(residual.clone(), self.parameter(graph, &[self.model]));
-        let gate = mlp_norm.matmul(&self.parameter(graph, &[self.ffn, self.model]), self.model);
-        let up = mlp_norm.matmul(&self.parameter(graph, &[self.ffn, self.model]), self.model);
-        let down =
-            (gate.silu() * up).matmul(&self.parameter(graph, &[self.model, self.ffn]), self.ffn);
+        let mlp_norm = self.rms_norm(
+            residual.clone(),
+            self.parameter(graph, name("post_attention_norm"), &[self.hidden_dim]),
+        );
+        let gate = mlp_norm.matmul(
+            &self.parameter(graph, name("gate_proj"), &[self.ffn, self.hidden_dim]),
+            self.hidden_dim,
+        );
+        let up = mlp_norm.matmul(
+            &self.parameter(graph, name("up_proj"), &[self.ffn, self.hidden_dim]),
+            self.hidden_dim,
+        );
+        let down = (gate.silu() * up).matmul(
+            &self.parameter(graph, name("down_proj"), &[self.hidden_dim, self.ffn]),
+            self.ffn,
+        );
         down + residual
     }
 
     fn build(&self) -> Graph {
         let mut graph = GraphBuilder::new();
-        let tokens = graph.input(&[self.sequence]);
-        let embedding = self.parameter(&mut graph, &[self.vocab, self.model]);
+        let tokens = graph.input("tokens", &[self.sequence]);
+        let embedding = self.parameter(
+            &mut graph,
+            "embed_tokens.weight",
+            &[self.vocab, self.hidden_dim],
+        );
         let mut x = embedding.gather(&tokens, self.vocab);
 
-        for _ in 0..self.config.layers {
-            x = self.block(&mut graph, x);
+        for layer in 0..self.config.layers {
+            x = self.block(&mut graph, layer, x);
         }
 
-        let x = self.rms_norm(x, self.parameter(&mut graph, &[self.model]));
+        let x = self.rms_norm(
+            x,
+            self.parameter(&mut graph, "norm.weight", &[self.hidden_dim]),
+        );
         let logits = x.matmul(
-            &self.parameter(&mut graph, &[self.vocab, self.model]),
-            self.model,
+            &self.parameter(&mut graph, "lm_head.weight", &[self.vocab, self.hidden_dim]),
+            self.hidden_dim,
         );
         graph.finish([logits])
     }
