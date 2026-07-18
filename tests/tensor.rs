@@ -86,6 +86,53 @@ fn graph_keeps_multiple_declared_outputs() {
 }
 
 #[test]
+fn composed_operations_build_from_tensor_expr_receivers() {
+    let (vocab, sequence, feature) = (axis("vocab", 4), axis("sequence", 2), axis("feature", 2));
+    let mut builder = GraphBuilder::new();
+    let table = builder.input("table", &[vocab, feature]);
+    let ids = builder.input("ids", &[sequence]);
+    let scores = builder.input("scores", &[vocab]);
+    let embedding = table.embedding(&ids, vocab);
+    let one_hot = ids.one_hot(vocab);
+    let (best, best_index) = scores.topk(vocab, 1).pop().unwrap();
+    let graph = builder.finish([embedding, one_hot, best, best_index]);
+
+    let table = Tensor::from_fn(&[vocab, feature], |coord| {
+        [[1.0, 2.0], [3.0, 5.0], [7.0, 11.0], [13.0, 17.0]][coord[&vocab]][coord[&feature]]
+    });
+    let ids = Tensor::from_fn(&[sequence], |coord| [2.0, 0.0][coord[&sequence]]);
+    let scores = Tensor::from_fn(&[vocab], |coord| [1.0, 9.0, 9.0, 2.0][coord[&vocab]]);
+    let outputs = graph.run(&bindings([
+        ("table", table),
+        ("ids", ids),
+        ("scores", scores),
+    ]));
+
+    assert_eq!(outputs[0].data, vec![7.0, 1.0, 11.0, 2.0]);
+    assert_eq!(
+        outputs[1].data,
+        vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(outputs[2].data, vec![9.0]);
+    assert_eq!(outputs[3].data, vec![1.0]);
+}
+
+#[test]
+fn sigmoid_is_composed_from_tensor_expr_operations() {
+    let n = axis("n", 3);
+    let mut builder = GraphBuilder::new();
+    let x = builder.input("x", &[n]);
+    let graph = builder.finish([x.sigmoid()]);
+    let input = Tensor::from_fn(&[n], |coord| [-1.0, 0.0, 1.0][coord[&n]]);
+
+    let output = graph.run(&bindings([("x", input)]));
+    let expected = [0.268_941_421_369_995_1, 0.5, 0.731_058_578_630_004_9];
+    for (got, expected) in output[0].data.iter().zip(expected) {
+        assert!((got - expected).abs() < 1e-12);
+    }
+}
+
+#[test]
 #[should_panic(expected = "was not bound")]
 fn run_reports_missing_named_bindings() {
     let n = axis("n", 2);

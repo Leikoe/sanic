@@ -100,9 +100,9 @@ fn rms_norm(x: TensorExpr, weight: TensorExpr, hidden_dim: Axis) -> TensorExpr {
     x * weight / (mean_square + EPS).sqrt()
 }
 
-fn llama3_inv_freq(graph: &GraphBuilder, frequency: Axis) -> TensorExpr {
+fn llama3_inv_freq(frequency: Axis) -> TensorExpr {
     let inv_freq =
-        (graph.iota(frequency) * (-(ROPE_THETA.ln()) / (frequency.extent * 2) as f64)).exp();
+        (TensorExpr::iota(frequency) * (-(ROPE_THETA.ln()) / (frequency.extent * 2) as f64)).exp();
     let wave_length = (2.0 * std::f64::consts::PI) / inv_freq.clone();
     let low_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_LOW_FREQ_FACTOR;
     let high_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_HIGH_FREQ_FACTOR;
@@ -113,20 +113,20 @@ fn llama3_inv_freq(graph: &GraphBuilder, frequency: Axis) -> TensorExpr {
 
     // HF's `llama3` RoPE scaling: low frequencies are divided by 32, high
     // frequencies are unchanged, and the band between them is interpolated.
-    graph.scalar(low_wave_length).lt(&wave_length).select(
+    TensorExpr::scalar(low_wave_length).lt(&wave_length).select(
         &scaled,
         &wave_length
-            .lt(&graph.scalar(high_wave_length))
+            .lt(&TensorExpr::scalar(high_wave_length))
             .select(&inv_freq, &blended),
     )
 }
 
-fn rope(graph: &GraphBuilder, x: TensorExpr, position: Axis, head_dim: Axis) -> TensorExpr {
+fn rope(x: TensorExpr, position: Axis, head_dim: Axis) -> TensorExpr {
     let (x, half, frequency) =
         x.split(head_dim, "rope_half", "rope_frequency", head_dim.extent / 2);
-    let inv_freq = llama3_inv_freq(graph, frequency);
-    let angle = graph.iota(position) * inv_freq;
-    let sign = graph.iota(half) * 2.0 - 1.0;
+    let inv_freq = llama3_inv_freq(frequency);
+    let angle = TensorExpr::iota(position) * inv_freq;
+    let sign = TensorExpr::iota(half) * 2.0 - 1.0;
     let rotated = x.flip(half) * sign;
     let rotated = x * angle.clone().cos() + rotated * angle.sin();
     rotated.flatten(&[half, frequency], "head_dim").0
@@ -162,7 +162,6 @@ fn block(
         ],
     );
     let q = rope(
-        graph,
         attn_input.matmul(&q_weight, axes.hidden_dim),
         axes.sequence,
         axes.head_dim,
@@ -175,7 +174,6 @@ fn block(
         &[axes.kv_head, axes.head_dim, axes.hidden_dim],
     );
     let k = rope(
-        graph,
         key_input.clone().matmul(&k_weight, axes.hidden_dim),
         axes.key_sequence,
         axes.head_dim,
@@ -190,7 +188,7 @@ fn block(
         axes.hidden_dim,
     );
     let scores = q.matmul(&k, axes.head_dim) / (axes.head_dim.extent as f64).sqrt();
-    let attention = (scores + graph.causal_mask(axes.sequence, axes.key_sequence))
+    let attention = (scores + TensorExpr::causal_mask(axes.sequence, axes.key_sequence))
         .softmax(axes.key_sequence)
         .matmul(&v, axes.key_sequence);
     let (attention, packed_heads) = attention.flatten(
@@ -261,7 +259,7 @@ impl Llama3_2 {
             "model.embed_tokens.weight",
             &[axes.vocab, axes.hidden_dim],
         );
-        let mut x = embedding.gather(&tokens, axes.vocab);
+        let mut x = embedding.embedding(&tokens, axes.vocab);
         for layer in 0..config.layers {
             x = block(&mut graph, &mut bindings, &axes, layer, x);
         }

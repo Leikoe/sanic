@@ -120,7 +120,7 @@ impl Llama3 {
             self.hidden_dim,
         );
         let scores = q.matmul(&k, self.head_dim) / (self.head_dim.extent as f64).sqrt();
-        let attention = (scores + graph.causal_mask(self.sequence, self.key_sequence))
+        let attention = (scores + TensorExpr::causal_mask(self.sequence, self.key_sequence))
             .softmax(self.key_sequence)
             .matmul(&v, self.key_sequence);
 
@@ -161,7 +161,7 @@ impl Llama3 {
             "embed_tokens.weight",
             &[self.vocab, self.hidden_dim],
         );
-        let mut x = embedding.gather(&tokens, self.vocab);
+        let mut x = embedding.embedding(&tokens, self.vocab);
 
         for layer in 0..self.config.layers {
             x = self.block(&mut graph, layer, x);

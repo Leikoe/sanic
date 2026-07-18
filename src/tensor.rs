@@ -109,19 +109,6 @@ impl GraphBuilder {
         TensorExpr::input_node(leaf_name, axes, dtype)
     }
 
-    /// A scalar expression in the graph being built.
-    pub fn scalar(&self, value: f64) -> TensorExpr {
-        TensorExpr::scalar(value)
-    }
-
-    pub fn iota(&self, axis: Axis) -> TensorExpr {
-        TensorExpr::iota(axis)
-    }
-
-    pub fn causal_mask(&self, query: Axis, key: Axis) -> TensorExpr {
-        TensorExpr::causal_mask(query, key)
-    }
-
     /// Freeze the reachable expressions as the graph's ordered outputs.
     pub fn finish(self, outputs: impl IntoIterator<Item = TensorExpr>) -> Graph {
         let outputs: Vec<TensorExpr> = outputs.into_iter().collect();
@@ -195,10 +182,6 @@ pub struct TensorExpr {
     node: Node,
 }
 
-fn wrap(node: Node) -> TensorExpr {
-    TensorExpr { node }
-}
-
 impl TensorExpr {
     // ── constructors ─────────────────────────────────────────────────────────
 
@@ -211,25 +194,49 @@ impl TensorExpr {
         }
     }
 
-    /// A literal scalar.
-    fn scalar(v: f64) -> TensorExpr {
-        wrap(ir::konst(v))
+    /// A literal scalar expression.
+    pub fn scalar(v: f64) -> TensorExpr {
+        TensorExpr { node: ir::konst(v) }
     }
 
     /// The index along an axis, as a value (0, 1, 2, …) — free to compute.
-    fn iota(a: Axis) -> TensorExpr {
-        wrap(ir::iota(a))
+    pub fn iota(a: Axis) -> TensorExpr {
+        TensorExpr { node: ir::iota(a) }
     }
 
     /// A causal mask computed from indices (0 where key ≤ query, −LARGE
     /// after) — costs no memory traffic.
-    fn causal_mask(query: Axis, key: Axis) -> TensorExpr {
-        wrap(ir::causal_mask(query, key))
+    pub fn causal_mask(query: Axis, key: Axis) -> TensorExpr {
+        TensorExpr {
+            node: ir::map(
+                MapOp::Where,
+                vec![
+                    ir::map(MapOp::Lt, vec![ir::iota(query), ir::iota(key)]),
+                    ir::konst(-1e30),
+                    ir::konst(0.0),
+                ],
+            ),
+        }
     }
 
     /// `1.0` where `iota(a) == v`, else `0.0` — a computed one-hot.
-    pub fn one_hot(a: Axis, v: &TensorExpr) -> TensorExpr {
-        wrap(ir::one_hot(a, v.node.clone()))
+    pub fn one_hot(&self, axis: Axis) -> TensorExpr {
+        let iota = ir::iota(axis);
+        TensorExpr {
+            node: ir::map(
+                MapOp::Sub,
+                vec![
+                    ir::map(
+                        MapOp::Sub,
+                        vec![
+                            ir::konst(1.0),
+                            ir::map(MapOp::Lt, vec![iota.clone(), self.node.clone()]),
+                        ],
+                    ),
+                    ir::map(MapOp::Lt, vec![self.node.clone(), iota]),
+                ],
+            ),
+        }
     }
 
     // ── shape ────────────────────────────────────────────────────────────────
@@ -255,11 +262,15 @@ impl TensorExpr {
     // ── elementwise ──────────────────────────────────────────────────────────
 
     fn unary(&self, op: MapOp) -> TensorExpr {
-        wrap(ir::map(op, vec![self.node.clone()]))
+        TensorExpr {
+            node: ir::map(op, vec![self.node.clone()]),
+        }
     }
 
     fn binary(&self, op: MapOp, other: &TensorExpr) -> TensorExpr {
-        wrap(ir::map(op, vec![self.node.clone(), other.node.clone()]))
+        TensorExpr {
+            node: ir::map(op, vec![self.node.clone(), other.node.clone()]),
+        }
     }
 
     pub fn exp(&self) -> TensorExpr {
@@ -284,6 +295,25 @@ impl TensorExpr {
         self.unary(MapOp::Recip)
     }
 
+    /// `sigmoid(x) = 1 / (1 + exp(-x))`.
+    pub fn sigmoid(&self) -> TensorExpr {
+        TensorExpr {
+            node: ir::map(
+                MapOp::Recip,
+                vec![ir::map(
+                    MapOp::Add,
+                    vec![
+                        ir::konst(1.0),
+                        ir::map(
+                            MapOp::Exp,
+                            vec![ir::map(MapOp::Neg, vec![self.node.clone()])],
+                        ),
+                    ],
+                )],
+            ),
+        }
+    }
+
     /// Elementwise max (the reduction over an axis is [`TensorExpr::max`]).
     pub fn maximum(&self, other: &TensorExpr) -> TensorExpr {
         self.binary(MapOp::Max, other)
@@ -299,20 +329,42 @@ impl TensorExpr {
     }
     /// `self != 0 ? if_true : if_false`, elementwise; `self` is the condition.
     pub fn select(&self, if_true: &TensorExpr, if_false: &TensorExpr) -> TensorExpr {
-        wrap(ir::map(
-            MapOp::Where,
-            vec![
-                self.node.clone(),
-                if_true.node.clone(),
-                if_false.node.clone(),
-            ],
-        ))
+        TensorExpr {
+            node: ir::map(
+                MapOp::Where,
+                vec![
+                    self.node.clone(),
+                    if_true.node.clone(),
+                    if_false.node.clone(),
+                ],
+            ),
+        }
     }
 
     /// `silu(x) = x · sigmoid(x)` — a composition, so it fuses into whatever
     /// consumes it.
     pub fn silu(&self) -> TensorExpr {
-        wrap(ir::silu(self.node.clone()))
+        self * self.sigmoid()
+    }
+
+    /// Associative affine recurrence over `time`.
+    pub fn ssm_scan(&self, time: Axis) -> TensorExpr {
+        self.expect_axis(time, "ssm_scan");
+        TensorExpr {
+            node: ir::scan(self.node.clone(), time, BinOp::AffineCompose),
+        }
+    }
+
+    /// Sequential `tanh` recurrence over `time`.
+    pub fn tanh_rnn(&self, time: Axis) -> TensorExpr {
+        self.expect_axis(time, "tanh_rnn");
+        TensorExpr {
+            node: ir::scan(
+                ir::map(MapOp::Tanh, vec![self.node.clone()]),
+                time,
+                BinOp::NonAssoc("tanh_recur"),
+            ),
+        }
     }
 
     // ── reductions ───────────────────────────────────────────────────────────
@@ -320,7 +372,9 @@ impl TensorExpr {
     /// Fold `a` with `op`; the result no longer carries `a`.
     pub fn reduce(&self, a: Axis, op: BinOp) -> TensorExpr {
         self.expect_axis(a, "reduce");
-        wrap(ir::reduce(self.node.clone(), a, op))
+        TensorExpr {
+            node: ir::reduce(self.node.clone(), a, op),
+        }
     }
 
     pub fn sum(&self, a: Axis) -> TensorExpr {
@@ -356,14 +410,70 @@ impl TensorExpr {
     ) -> (TensorExpr, Axis) {
         self.expect_axis(a, "topk_all");
         let rank = axis(rank_name, k);
-        (wrap(ir::topk_all(self.node.clone(), a, k, rank, idx)), rank)
+        assert!(k > 0, "topk_all requires k >= 1");
+        let mut output = None;
+        for index in 0..k {
+            let ranked = ir::reduce(
+                self.node.clone(),
+                a,
+                BinOp::TopK {
+                    k: k as u8,
+                    rank: index as u8,
+                    idx,
+                },
+            );
+            let term = ir::map(
+                MapOp::Mul,
+                vec![TensorExpr::scalar(index as f64).one_hot(rank).node, ranked],
+            );
+            output = Some(match output {
+                Some(output) => ir::map(MapOp::Add, vec![output, term]),
+                None => term,
+            });
+        }
+        (
+            TensorExpr {
+                node: output.unwrap(),
+            },
+            rank,
+        )
+    }
+
+    /// The top `k` values and their first-max-wins indices along `axis`.
+    pub fn topk(&self, axis: Axis, k: usize) -> Vec<(TensorExpr, TensorExpr)> {
+        self.expect_axis(axis, "topk");
+        (0..k)
+            .map(|rank| {
+                let value = ir::reduce(
+                    self.node.clone(),
+                    axis,
+                    BinOp::TopK {
+                        k: k as u8,
+                        rank: rank as u8,
+                        idx: false,
+                    },
+                );
+                let index = ir::reduce(
+                    self.node.clone(),
+                    axis,
+                    BinOp::TopK {
+                        k: k as u8,
+                        rank: rank as u8,
+                        idx: true,
+                    },
+                );
+                (TensorExpr { node: value }, TensorExpr { node: index })
+            })
+            .collect()
     }
 
     /// Prefix recurrence over `a` (the axis is kept); foldable iff `op` is
     /// associative.
     pub fn scan(&self, a: Axis, op: BinOp) -> TensorExpr {
         self.expect_axis(a, "scan");
-        wrap(ir::scan(self.node.clone(), a, op))
+        TensorExpr {
+            node: ir::scan(self.node.clone(), a, op),
+        }
     }
 
     // ── contractions and friends ─────────────────────────────────────────────
@@ -375,45 +485,61 @@ impl TensorExpr {
     pub fn matmul(&self, other: &TensorExpr, contract: Axis) -> TensorExpr {
         self.expect_axis(contract, "matmul (left operand)");
         other.expect_axis(contract, "matmul (right operand)");
-        wrap(ir::matmul(self.node.clone(), other.node.clone(), contract))
+        TensorExpr {
+            node: ir::reduce(
+                ir::map(MapOp::Mul, vec![self.node.clone(), other.node.clone()]),
+                contract,
+                BinOp::Monoid(Monoid::Add),
+            ),
+        }
     }
 
     /// Softmax over `a` as the textbook dataflow — max, shift, exp, sum,
     /// divide — from which `derive` reconstructs the online form.
     pub fn softmax(&self, a: Axis) -> TensorExpr {
         self.expect_axis(a, "softmax");
-        wrap(ir::softmax(self.node.clone(), a))
+        let maximum = self.max(a);
+        let shifted = self - maximum;
+        let exponent = shifted.exp();
+        let normalizer = exponent.sum(a);
+        exponent / normalizer
     }
 
     /// `softmax(self·kᵀ over d)·v`, normalized over `keys` — naive attention,
     /// the graph FlashAttention is derived from.
     pub fn attention(&self, k: &TensorExpr, v: &TensorExpr, d: Axis, keys: Axis) -> TensorExpr {
-        wrap(ir::attention(
-            self.node.clone(),
-            k.node.clone(),
-            v.node.clone(),
-            d,
-            keys,
-        ))
+        self.matmul(k, d).softmax(keys).matmul(v, keys)
     }
 
     /// `self[index[…]]` — data-dependent access along `a` (embedding lookup,
     /// expert selection).
     pub fn gather(&self, index: &TensorExpr, a: Axis) -> TensorExpr {
         self.expect_axis(a, "gather");
-        wrap(ir::gather(self.node.clone(), index.node.clone(), a))
+        TensorExpr {
+            node: ir::gather(self.node.clone(), index.node.clone(), a),
+        }
+    }
+
+    /// Look up `ids` in a table along its vocabulary axis.
+    pub fn embedding(&self, ids: &TensorExpr, vocabulary: Axis) -> TensorExpr {
+        self.expect_axis(vocabulary, "embedding");
+        TensorExpr {
+            node: ir::gather(self.node.clone(), ids.node.clone(), vocabulary),
+        }
     }
 
     /// Scatter-add along `from` into buckets over `to` (gather's adjoint;
     /// collisions add).
     pub fn scatter_add(&self, index: &TensorExpr, from: Axis, to: Axis) -> TensorExpr {
         self.expect_axis(from, "scatter_add");
-        wrap(ir::scatter_add(
-            self.node.clone(),
-            index.node.clone(),
-            from,
-            to,
-        ))
+        let one_hot = index.one_hot(to);
+        TensorExpr {
+            node: ir::reduce(
+                ir::map(MapOp::Mul, vec![one_hot.node, self.node.clone()]),
+                from,
+                BinOp::Monoid(Monoid::Add),
+            ),
+        }
     }
 
     // ── movement ─────────────────────────────────────────────────────────────
@@ -427,18 +553,22 @@ impl TensorExpr {
             "rename: `{from}` has extent {} but `{to}` has {}",
             from.extent, to.extent
         );
-        wrap(ir::rename(self.node.clone(), from, to))
+        TensorExpr {
+            node: ir::rename(self.node.clone(), from, to),
+        }
     }
 
     /// Reverse the values along `axis`, without moving storage. This is an
     /// affine reindex, useful for pairwise transforms such as RoPE.
     pub fn flip(&self, axis: Axis) -> TensorExpr {
         self.expect_axis(axis, "flip");
-        wrap(ir::reindex(
-            self.node.clone(),
-            vec![(axis, vec![(-1, axis)], axis.extent as i64 - 1)],
-            false,
-        ))
+        TensorExpr {
+            node: ir::reindex(
+                self.node.clone(),
+                vec![(axis, vec![(-1, axis)], axis.extent as i64 - 1)],
+                false,
+            ),
+        }
     }
 
     /// Merge a group of axes into one fresh axis (returned; extent = the
@@ -448,7 +578,12 @@ impl TensorExpr {
             self.expect_axis(*a, "flatten");
         }
         let to = axis(name, group.iter().map(|a| a.extent).product());
-        (wrap(ir::flatten(self.node.clone(), group, to)), to)
+        (
+            TensorExpr {
+                node: ir::flatten(self.node.clone(), group, to),
+            },
+            to,
+        )
     }
 
     /// Split one axis into (outer, inner) fresh axes (returned) — the inverse
@@ -470,7 +605,9 @@ impl TensorExpr {
         let outer = axis(outer_name, from.extent / inner_extent);
         let inner = axis(inner_name, inner_extent);
         (
-            wrap(ir::split(self.node.clone(), from, outer, inner)),
+            TensorExpr {
+                node: ir::split(self.node.clone(), from, outer, inner),
+            },
             outer,
             inner,
         )
@@ -493,7 +630,12 @@ impl TensorExpr {
             from.extent
         );
         let to = axis(name, len);
-        (wrap(ir::slice(self.node.clone(), from, to, start)), to)
+        (
+            TensorExpr {
+                node: ir::slice(self.node.clone(), from, to, start),
+            },
+            to,
+        )
     }
 
     /// Zero-pad along `from` by `lo` below and `hi` above, as a fresh axis
@@ -501,7 +643,12 @@ impl TensorExpr {
     pub fn pad(&self, from: Axis, lo: usize, hi: usize, name: &'static str) -> (TensorExpr, Axis) {
         self.expect_axis(from, "pad");
         let to = axis(name, lo + from.extent + hi);
-        (wrap(ir::pad(self.node.clone(), from, to, lo)), to)
+        (
+            TensorExpr {
+                node: ir::pad(self.node.clone(), from, to, lo),
+            },
+            to,
+        )
     }
 
     /// Sliding windows along `from`: output `(out, k)` reads
@@ -525,14 +672,9 @@ impl TensorExpr {
             "window: last read index {last_read} exceeds `{from}` (extent {}) — pad first?",
             from.extent
         );
-        wrap(ir::window(
-            self.node.clone(),
-            from,
-            out,
-            k,
-            stride,
-            dilation,
-        ))
+        TensorExpr {
+            node: ir::window(self.node.clone(), from, out, k, stride, dilation),
+        }
     }
 
     // ── the pipeline ─────────────────────────────────────────────────────────
