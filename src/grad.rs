@@ -140,7 +140,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
                         BinOp::Monoid(Monoid::Add) | BinOp::Monoid(Monoid::LogSumExp)
                     )
                 {
-                    contrib = map(MapOp::Mul, vec![contrib, konst(axis.extent as f64)]);
+                    contrib = map(MapOp::Mul, vec![contrib, konst(axis.extent() as f64)]);
                 }
                 add_adj(&mut adj, src, contrib);
             }
@@ -195,7 +195,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
                 op: BinOp::Monoid(Monoid::Add),
             } => {
                 let rev = |x: Node| {
-                    let flip = (axis.extent - 1) as i64;
+                    let flip = (axis.extent() - 1) as i64;
                     crate::ir::reindex(x, vec![(*axis, vec![(-1, *axis)], flip)], false)
                 };
                 let contrib = rev(crate::ir::scan(
@@ -228,7 +228,7 @@ fn transpose_axis_map(g: Node, m: Axis, terms: &[(i64, Axis)], off: i64) -> Node
         // slice / pad: a = m − off, out-of-range contributes nothing
         [(1, a)] => reindex(g, vec![(*a, vec![(1, m)], -off)], true),
         // split: the exact inverse is a flatten view (row-major, checked)
-        [(c1, a1), (1, a2)] if off == 0 && a2.extent as i64 == *c1 => {
+        [(c1, a1), (1, a2)] if off == 0 && a2.extent() as i64 == *c1 => {
             view(g, vec![(vec![*a1, *a2], m)])
         }
         // stride-1 window: overlap-add — read the cotangent at the mirrored

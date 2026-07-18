@@ -61,7 +61,7 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
     ); // [t, dv]
 
     // attention over the updated cache; positions beyond `pos` masked out
-    let scale = konst(1.0 / (dk.extent as f64).sqrt());
+    let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(MapOp::Mul, vec![matmul(q, ck.clone(), dk), scale]); // [t]
     let future = map(MapOp::Lt, vec![pos, iota(t)]); // t > pos
     let masked = map(
@@ -98,7 +98,7 @@ fn prefill_logits(
     let q = matmul(x, input("Wq", &[dk, dm]), dm); // [s, dk]
     let k = matmul(xt.clone(), input("Wk", &[dk, dm]), dm); // [t2, dk]
     let vv = matmul(xt, input("Wv", &[dv, dm]), dm); // [t2, dv]
-    let scale = konst(1.0 / (dk.extent as f64).sqrt());
+    let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(MapOp::Mul, vec![matmul(q, k, dk), scale]);
     let masked = map(MapOp::Add, vec![scores, causal_mask(s, t2)]);
     let att = softmax(masked, t2);
@@ -168,7 +168,7 @@ fn incremental_decode_equals_prefill() {
         );
 
         let logits = sess.get("logits");
-        for vi in 0..v.extent {
+        for vi in 0..v.extent() {
             let got = logits.at(&[(v, vi)].into_iter().collect());
             let want = reference.at(&[(s, p), (v, vi)].into_iter().collect());
             let tol = 1e-9 * (1.0 + got.abs().max(want.abs()));
@@ -190,7 +190,7 @@ fn incremental_decode_equals_prefill() {
     );
     let ck = sess.get("cache_k");
     for ti in 0..steps {
-        for ki in 0..dk.extent {
+        for ki in 0..dk.extent() {
             let c: HashMap<Axis, usize> = [(t, ti), (dk, ki)].into_iter().collect();
             let (a, b) = (ck.at(&c), k_ref.at(&c));
             assert!((a - b).abs() <= 1e-9 * (1.0 + a.abs()), "cache_k[{ti},{ki}]");
@@ -230,7 +230,7 @@ fn incremental_decode_compiles_and_equals_prefill() {
     let reference = prefill_logits(s, t2, dm, dk, dv, v, &prefill_env);
     let expected: Vec<f64> = (0..steps)
         .flat_map(|p| {
-            (0..v.extent)
+            (0..v.extent())
                 .map(|vi| reference.at(&[(s, p), (v, vi)].into_iter().collect()))
                 .collect::<Vec<f64>>()
         })
@@ -274,17 +274,17 @@ fn incremental_decode_compiles_and_equals_prefill() {
     ));
     main.push_str(&format!(
         "    let mut b_cache_k: Vec<f64> = vec![0.0; {}];\n",
-        steps * dk.extent
+        steps * dk.extent()
     ));
     main.push_str(&format!(
         "    let mut b_cache_v: Vec<f64> = vec![0.0; {}];\n",
-        steps * dv.extent
+        steps * dv.extent()
     ));
     main.push_str("    let mut got: Vec<f64> = Vec::new();\n");
     main.push_str(&format!("    for p in 0..{steps} {{\n"));
     main.push_str(&format!(
         "        let b_x: Vec<f64> = xs[p*{dm_n}..(p+1)*{dm_n}].to_vec();\n",
-        dm_n = dm.extent
+        dm_n = dm.extent()
     ));
     main.push_str("        let b_pos: Vec<f64> = vec![p as f64];\n");
     let args: Vec<String> = program

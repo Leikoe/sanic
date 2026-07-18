@@ -504,11 +504,11 @@ pub fn emit_fused_metal_with(
             let v = g.fresh("hi");
             body.push(format!(
                 "uint {v} = min({}u, (uint)({e} + 0.5f) + 1u);",
-                stream.extent
+                stream.extent()
             ));
             v
         }
-        None => format!("{}", stream.extent),
+        None => format!("{}", stream.extent()),
     };
 
     let sv = g.fresh("s");
@@ -643,7 +643,7 @@ pub fn emit_fused_metal_sched_with(
     {
         return scalar();
     }
-    let s_ext = stream.extent;
+    let s_ext = stream.extent();
     let f_split = if sched.lane_stream {
         SIMD * sched.sgs
     } else {
@@ -654,7 +654,7 @@ pub fn emit_fused_metal_sched_with(
     }
     let (grid, _) = grid_of(fold_node);
     if let Some(a) = sched.lane_axis
-        && (!grid.contains(&a) || a.extent % SIMD != 0)
+        && (!grid.contains(&a) || a.extent() % SIMD != 0)
     {
         return scalar();
     }
@@ -701,14 +701,14 @@ pub fn emit_fused_metal_sched_with(
 
     let tgt = sched.tg_threads();
     let sgs = sched.sgs;
-    let e_a = sched.lane_axis.map(|a| a.extent).unwrap_or(1);
+    let e_a = sched.lane_axis.map(|a| a.extent()).unwrap_or(1);
     let v_cnt = e_a / SIMD; // 0 only when lane_axis is None (e_a = 1)
     let tg_grid: Vec<Axis> = grid
         .iter()
         .copied()
         .filter(|ax| Some(*ax) != sched.lane_axis)
         .collect();
-    let n_tgs: usize = tg_grid.iter().map(|a| a.extent).product::<usize>().max(1);
+    let n_tgs: usize = tg_grid.iter().map(|a| a.extent()).product::<usize>().max(1);
 
     let mut body: Vec<String> = vec![format!("uint tg_ = gid / {tgt}u;")];
     let coord = thread_grid_decode_from(&METAL, "tg_", &tg_grid, &mut g, &mut body);
@@ -1134,7 +1134,7 @@ pub fn emit_split_metal(
          a leaf-reading projection needs the single-kernel form"
     );
     assert!(
-        blocks >= 1 && blocks <= stream.extent,
+        blocks >= 1 && blocks <= stream.extent(),
         "blocks must not exceed the streamed extent (empty chunks would merge \
          identity partials — the −∞ rescale edge)"
     );
@@ -1142,7 +1142,7 @@ pub fn emit_split_metal(
     let bufs = buffers(fold_node);
     let dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
     let slots = carrier.slots;
-    let n = stream.extent;
+    let n = stream.extent();
     let ident = carrier
         .identity
         .iter()

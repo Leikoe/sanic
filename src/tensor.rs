@@ -12,13 +12,17 @@
 //! works, and reducing an axis simply removes it from the shape.
 //!
 //! ```
-//! use sanic::{GraphBuilder, axis};
+//! use sanic::{Dtype, Extent, GraphBuilder, axis};
 //!
-//! let (s, t, d) = (axis("s", 128), axis("t", 128), axis("d", 64));
+//! let (s, t, d) = (
+//!     axis("s", Extent::Dynamic),
+//!     axis("t", Extent::Dynamic),
+//!     axis("d", 64),
+//! );
 //! let mut graph = GraphBuilder::new();
-//! let q = graph.input("q", &[s, d]);
-//! let k = graph.input("k", &[t, d]);
-//! let v = graph.input("v", &[t, d]);
+//! let q = graph.input("q", [s, d], Dtype::F32);
+//! let k = graph.input("k", [t, d], Dtype::F32);
+//! let v = graph.input("v", [t, d], Dtype::F32);
 //!
 //! // Naive attention, the textbook three-step form. `derive` reconstructs
 //! // the FlashAttention streaming accumulator from this graph.
@@ -28,11 +32,14 @@
 //! ```
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::derive::Carrier;
 use crate::interp::{Env, Value};
-use crate::ir::{self, Axis, BinOp, Dtype, MapOp, Monoid, Node, axis, leaf_names, output_axes};
+use crate::ir::{
+    self, Axis, BinOp, Dtype, Extent, MapOp, Monoid, Node, NodeKind, axis, leaf_names, output_axes,
+};
 
 /// Concrete tensor data bound to a graph input at execution time.
 pub type Tensor = Value;
@@ -40,12 +47,67 @@ pub type Tensor = Value;
 /// Concrete buffers keyed by their graph input names.
 pub type Bindings = HashMap<String, Tensor>;
 
+/// The ordered axes describing a tensor expression.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Shape(Vec<Axis>);
+
+impl Shape {
+    pub fn new(axes: impl IntoIterator<Item = Axis>) -> Self {
+        Shape(axes.into_iter().collect())
+    }
+
+    pub fn axes(&self) -> &[Axis] {
+        &self.0
+    }
+
+    pub fn rank(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn element_count(&self) -> Option<usize> {
+        self.0.iter().try_fold(1usize, |count, axis| {
+            axis.extent
+                .static_value()
+                .and_then(|extent| count.checked_mul(extent))
+        })
+    }
+}
+
+impl<const N: usize> From<[Axis; N]> for Shape {
+    fn from(axes: [Axis; N]) -> Self {
+        Shape(axes.into())
+    }
+}
+
+impl<const N: usize> From<&[Axis; N]> for Shape {
+    fn from(axes: &[Axis; N]) -> Self {
+        Shape(axes.to_vec())
+    }
+}
+
+impl From<&[Axis]> for Shape {
+    fn from(axes: &[Axis]) -> Self {
+        Shape(axes.to_vec())
+    }
+}
+
+impl From<Vec<Axis>> for Shape {
+    fn from(axes: Vec<Axis>) -> Self {
+        Shape(axes)
+    }
+}
+
+impl AsRef<[Axis]> for Shape {
+    fn as_ref(&self) -> &[Axis] {
+        self.axes()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct InputSpec {
     binding_name: String,
     leaf_name: &'static str,
-    axes: Vec<Axis>,
-    dtype: Option<Dtype>,
+    shape: Shape,
 }
 
 static NEXT_GRAPH: AtomicUsize = AtomicUsize::new(0);
@@ -70,22 +132,15 @@ impl GraphBuilder {
         }
     }
 
-    /// Add a bindable f64-semantic input with a caller-visible binding name.
-    pub fn input(&mut self, name: impl Into<String>, axes: &[Axis]) -> TensorExpr {
-        self.input_impl(name.into(), axes, None)
-    }
-
-    /// Add an input with an explicit storage dtype.
-    pub fn input_dt(&mut self, name: impl Into<String>, axes: &[Axis], dtype: Dtype) -> TensorExpr {
-        self.input_impl(name.into(), axes, Some(dtype))
-    }
-
-    fn input_impl(
+    /// Add a named input with its storage dtype.
+    pub fn input(
         &mut self,
-        binding_name: String,
-        axes: &[Axis],
-        dtype: Option<Dtype>,
+        name: impl Into<String>,
+        shape: impl Into<Shape>,
+        dtype: Dtype,
     ) -> TensorExpr {
+        let binding_name = name.into();
+        let shape = shape.into();
         assert!(
             !binding_name.is_empty(),
             "input binding names cannot be empty"
@@ -103,10 +158,9 @@ impl GraphBuilder {
         self.inputs.push(InputSpec {
             binding_name,
             leaf_name,
-            axes: axes.to_vec(),
-            dtype,
+            shape: shape.clone(),
         });
-        TensorExpr::input_node(leaf_name, axes, dtype)
+        TensorExpr::input_node(leaf_name, shape.axes(), dtype)
     }
 
     /// Freeze the reachable expressions as the graph's ordered outputs.
@@ -151,29 +205,173 @@ impl Graph {
                 "graph has no input named `{name}`"
             );
         }
-        let mut env = Env::new();
+
+        let mut resolved = HashMap::new();
         for spec in &self.inputs {
             let tensor = inputs
                 .get(&spec.binding_name)
                 .unwrap_or_else(|| panic!("graph input `{}` was not bound", spec.binding_name));
-            let expected: Vec<usize> = spec.axes.iter().map(|axis| axis.extent).collect();
             assert_eq!(
-                tensor.shape, expected,
-                "input `{}` has shape {:?}; graph expects {:?}",
-                spec.binding_name, tensor.shape, expected
+                tensor.shape.len(),
+                spec.shape.rank(),
+                "input `{}` has rank {}; graph expects rank {}",
+                spec.binding_name,
+                tensor.shape.len(),
+                spec.shape.rank()
             );
-            let _ = spec.dtype;
-            env.insert(spec.leaf_name, tensor.clone());
+            let elements = tensor.shape.iter().product::<usize>().max(1);
+            assert_eq!(
+                tensor.data.len(),
+                elements,
+                "input `{}` shape {:?} requires {elements} values, received {}",
+                spec.binding_name,
+                tensor.shape,
+                tensor.data.len()
+            );
+            for (&axis, &actual) in spec.shape.axes().iter().zip(&tensor.shape) {
+                match axis.extent {
+                    Extent::Static(expected) => assert_eq!(
+                        actual, expected,
+                        "input `{}` axis `{}` has extent {actual}; graph expects {expected}",
+                        spec.binding_name, axis.name
+                    ),
+                    Extent::Dynamic => {
+                        let previous = resolved.entry(axis).or_insert(actual);
+                        assert_eq!(
+                            *previous, actual,
+                            "dynamic axis `{}` resolved to both {} and {actual}",
+                            axis.name, *previous
+                        );
+                    }
+                }
+            }
         }
+
+        let mut env = Env::new();
+        for spec in &self.inputs {
+            let tensor = &inputs[&spec.binding_name];
+            env.insert(
+                spec.leaf_name,
+                Tensor {
+                    axes: spec
+                        .shape
+                        .axes()
+                        .iter()
+                        .map(|&axis| concretize_axis(axis, &resolved))
+                        .collect(),
+                    shape: tensor.shape.clone(),
+                    data: tensor.data.clone(),
+                },
+            );
+        }
+
+        let mut memo = HashMap::new();
         self.outputs
             .iter()
-            .map(|output| crate::interp::eval(output, &env))
+            .map(|output| {
+                let output = concretize_node(output, &resolved, &mut memo);
+                crate::interp::eval(&output, &env)
+            })
             .collect()
     }
 
-    pub fn output_shapes(&self) -> Vec<Vec<Axis>> {
-        self.outputs.iter().map(output_axes).collect()
+    pub fn output_shapes(&self) -> Vec<Shape> {
+        self.outputs
+            .iter()
+            .map(|output| Shape(output_axes(output)))
+            .collect()
     }
+}
+
+fn concretize_axis(axis: Axis, resolved: &HashMap<Axis, usize>) -> Axis {
+    match axis.extent {
+        Extent::Static(_) => axis,
+        Extent::Dynamic => Axis {
+            name: axis.name,
+            extent: Extent::Static(*resolved.get(&axis).unwrap_or_else(|| {
+                panic!(
+                    "dynamic axis `{}` cannot be inferred from any graph input",
+                    axis.name
+                )
+            })),
+        },
+    }
+}
+
+fn concretize_node(
+    node: &Node,
+    resolved: &HashMap<Axis, usize>,
+    memo: &mut HashMap<*const NodeKind, Node>,
+) -> Node {
+    let pointer = Rc::as_ptr(node);
+    if let Some(node) = memo.get(&pointer) {
+        return node.clone();
+    }
+    let concrete_axis = |axis| concretize_axis(axis, resolved);
+    let concrete = match node.as_ref() {
+        NodeKind::Input { name, axes, dtype } => Rc::new(NodeKind::Input {
+            name,
+            axes: axes.iter().copied().map(concrete_axis).collect(),
+            dtype: *dtype,
+        }),
+        NodeKind::Const { v } => Rc::new(NodeKind::Const { v: *v }),
+        NodeKind::Iota { axis } => Rc::new(NodeKind::Iota {
+            axis: concrete_axis(*axis),
+        }),
+        NodeKind::Map { op, inputs } => Rc::new(NodeKind::Map {
+            op: *op,
+            inputs: inputs
+                .iter()
+                .map(|input| concretize_node(input, resolved, memo))
+                .collect(),
+        }),
+        NodeKind::Reduce { src, axis, op } => Rc::new(NodeKind::Reduce {
+            src: concretize_node(src, resolved, memo),
+            axis: concrete_axis(*axis),
+            op: *op,
+        }),
+        NodeKind::Scan { src, axis, op } => Rc::new(NodeKind::Scan {
+            src: concretize_node(src, resolved, memo),
+            axis: concrete_axis(*axis),
+            op: *op,
+        }),
+        NodeKind::Gather { src, index, axis } => Rc::new(NodeKind::Gather {
+            src: concretize_node(src, resolved, memo),
+            index: concretize_node(index, resolved, memo),
+            axis: concrete_axis(*axis),
+        }),
+        NodeKind::View { src, groups } => Rc::new(NodeKind::View {
+            src: concretize_node(src, resolved, memo),
+            groups: groups
+                .iter()
+                .map(|(members, output)| {
+                    (
+                        members.iter().copied().map(concrete_axis).collect(),
+                        concrete_axis(*output),
+                    )
+                })
+                .collect(),
+        }),
+        NodeKind::Reindex { src, map, padded } => Rc::new(NodeKind::Reindex {
+            src: concretize_node(src, resolved, memo),
+            map: map
+                .iter()
+                .map(|(source, terms, offset)| {
+                    (
+                        concrete_axis(*source),
+                        terms
+                            .iter()
+                            .map(|(coefficient, axis)| (*coefficient, concrete_axis(*axis)))
+                            .collect(),
+                        *offset,
+                    )
+                })
+                .collect(),
+            padded: *padded,
+        }),
+    };
+    memo.insert(pointer, concrete.clone());
+    concrete
 }
 
 /// A symbolic tensor-valued expression. It has no concrete data or storage.
@@ -185,12 +383,9 @@ pub struct TensorExpr {
 impl TensorExpr {
     // ── constructors ─────────────────────────────────────────────────────────
 
-    fn input_node(name: &'static str, axes: &[Axis], dtype: Option<Dtype>) -> TensorExpr {
+    fn input_node(name: &'static str, axes: &[Axis], dtype: Dtype) -> TensorExpr {
         TensorExpr {
-            node: match dtype {
-                Some(dtype) => ir::input_dt(name, axes, dtype),
-                None => ir::input(name, axes),
-            },
+            node: ir::input_dt(name, axes, dtype),
         }
     }
 
@@ -243,8 +438,8 @@ impl TensorExpr {
 
     /// The output axes, in the graph's axis order — each carrying its extent.
     /// A scalar has none.
-    pub fn shape(&self) -> Vec<Axis> {
-        output_axes(&self.node)
+    pub fn shape(&self) -> Shape {
+        Shape(output_axes(&self.node))
     }
 
     fn expect_axis(&self, a: Axis, op: &str) {
@@ -252,8 +447,9 @@ impl TensorExpr {
             output_axes(&self.node).contains(&a),
             "{op}: axis `{a}` is not an output axis of this tensor (shape [{}])",
             self.shape()
+                .axes()
                 .iter()
-                .map(|a| a.name)
+                .map(|a| a.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -549,9 +745,11 @@ impl TensorExpr {
     pub fn rename(&self, from: Axis, to: Axis) -> TensorExpr {
         self.expect_axis(from, "rename");
         assert_eq!(
-            from.extent, to.extent,
+            from.extent(),
+            to.extent(),
             "rename: `{from}` has extent {} but `{to}` has {}",
-            from.extent, to.extent
+            from.extent(),
+            to.extent()
         );
         TensorExpr {
             node: ir::rename(self.node.clone(), from, to),
@@ -565,7 +763,7 @@ impl TensorExpr {
         TensorExpr {
             node: ir::reindex(
                 self.node.clone(),
-                vec![(axis, vec![(-1, axis)], axis.extent as i64 - 1)],
+                vec![(axis, vec![(-1, axis)], axis.extent() as i64 - 1)],
                 false,
             ),
         }
@@ -577,7 +775,7 @@ impl TensorExpr {
         for a in group {
             self.expect_axis(*a, "flatten");
         }
-        let to = axis(name, group.iter().map(|a| a.extent).product());
+        let to = axis(name, group.iter().map(|a| a.extent()).product::<usize>());
         (
             TensorExpr {
                 node: ir::flatten(self.node.clone(), group, to),
@@ -587,7 +785,7 @@ impl TensorExpr {
     }
 
     /// Split one axis into (outer, inner) fresh axes (returned) — the inverse
-    /// of [`TensorExpr::flatten`]; `inner_extent` must divide `from.extent`.
+    /// of [`TensorExpr::flatten`]; `inner_extent` must divide `from.extent()`.
     pub fn split(
         &self,
         from: Axis,
@@ -597,12 +795,12 @@ impl TensorExpr {
     ) -> (TensorExpr, Axis, Axis) {
         self.expect_axis(from, "split");
         assert_eq!(
-            from.extent % inner_extent,
+            from.extent() % inner_extent,
             0,
             "split: {inner_extent} does not divide `{from}` (extent {})",
-            from.extent
+            from.extent()
         );
-        let outer = axis(outer_name, from.extent / inner_extent);
+        let outer = axis(outer_name, from.extent() / inner_extent);
         let inner = axis(inner_name, inner_extent);
         (
             TensorExpr {
@@ -624,10 +822,10 @@ impl TensorExpr {
     ) -> (TensorExpr, Axis) {
         self.expect_axis(from, "slice");
         assert!(
-            start + len <= from.extent,
+            start + len <= from.extent(),
             "slice: [{start}, {}) exceeds `{from}` (extent {})",
             start + len,
-            from.extent
+            from.extent()
         );
         let to = axis(name, len);
         (
@@ -642,7 +840,7 @@ impl TensorExpr {
     /// (returned; extent = lo + from + hi).
     pub fn pad(&self, from: Axis, lo: usize, hi: usize, name: &'static str) -> (TensorExpr, Axis) {
         self.expect_axis(from, "pad");
-        let to = axis(name, lo + from.extent + hi);
+        let to = axis(name, lo + from.extent() + hi);
         (
             TensorExpr {
                 node: ir::pad(self.node.clone(), from, to, lo),
@@ -666,11 +864,11 @@ impl TensorExpr {
         dilation: usize,
     ) -> TensorExpr {
         self.expect_axis(from, "window");
-        let last_read = (out.extent - 1) * stride + (k.extent - 1) * dilation;
+        let last_read = (out.extent() - 1) * stride + (k.extent() - 1) * dilation;
         assert!(
-            last_read < from.extent,
+            last_read < from.extent(),
             "window: last read index {last_read} exceeds `{from}` (extent {}) — pad first?",
-            from.extent
+            from.extent()
         );
         TensorExpr {
             node: ir::window(self.node.clone(), from, out, k, stride, dilation),

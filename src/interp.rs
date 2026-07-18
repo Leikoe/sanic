@@ -65,11 +65,44 @@ impl Value {
         }
     }
 
+    /// A concrete tensor from runtime shape and row-major data. Dynamic axis
+    /// extents are supplied by `shape`; static extents are validated.
+    pub fn from_data(axes: &[Axis], shape: Vec<usize>, data: Vec<f64>) -> Value {
+        assert_eq!(
+            axes.len(),
+            shape.len(),
+            "tensor rank {} does not match {} axes",
+            shape.len(),
+            axes.len()
+        );
+        for (&axis, &actual) in axes.iter().zip(&shape) {
+            if let crate::ir::Extent::Static(expected) = axis.extent {
+                assert_eq!(
+                    actual, expected,
+                    "axis `{}` has extent {actual}; expected {expected}",
+                    axis.name
+                );
+            }
+        }
+        let elements = shape.iter().product::<usize>().max(1);
+        assert_eq!(
+            data.len(),
+            elements,
+            "shape {shape:?} requires {elements} values, received {}",
+            data.len()
+        );
+        Value {
+            axes: axes.to_vec(),
+            shape,
+            data,
+        }
+    }
+
     /// A tensor over the given axes (shape read off their extents), filled by
     /// a closure over the per-axis coordinate (a map from each axis to its
     /// index).
     pub fn from_fn(axes: &[Axis], mut f: impl FnMut(&HashMap<Axis, usize>) -> f64) -> Value {
-        let shape: Vec<usize> = axes.iter().map(|a| a.extent).collect();
+        let shape: Vec<usize> = axes.iter().map(|a| a.extent()).collect();
         let total: usize = shape.iter().product();
         let mut data = Vec::with_capacity(total);
         let mut coord = Coord::new(axes, &shape);
@@ -201,7 +234,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
                 // axes *positionally* — renames preserve dimension order, so
                 // this is a pure relabel, valid exactly when the extents line
                 // up position-for-position.
-                let want: Vec<usize> = axes.iter().map(|a| a.extent).collect();
+                let want: Vec<usize> = axes.iter().map(|a| a.extent()).collect();
                 assert_eq!(
                     t.shape, want,
                     "input `{name}`: buffer shape {:?} cannot be rebound to axes {axes:?}",
@@ -231,7 +264,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
         NodeKind::Reduce { src, axis, op } => {
             let s = eval_rc(src, env, cache);
             let oaxes: Vec<Axis> = s.axes.iter().copied().filter(|a| a != axis).collect();
-            let n = axis.extent;
+            let n = axis.extent();
             // k-best: stable descending sort = first-max-wins ranks
             if let BinOp::TopK { k: _, rank, idx } = op {
                 let (rank, idx) = (*rank as usize, *idx);
@@ -296,7 +329,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
             let s = eval_rc(src, env, cache);
             let idx = eval_rc(index, env, cache);
             let oaxes = output_axes(node);
-            let bound = axis.extent;
+            let bound = axis.extent();
             Value::from_fn(&oaxes, |c| {
                 let i = idx.at(c).round() as usize;
                 assert!(i < bound, "gather index {i} out of bounds for axis {axis}");
@@ -360,7 +393,7 @@ fn eval_scan(
         );
     };
     let s = eval_rc(src, env, cache);
-    let n = axis.extent;
+    let n = axis.extent();
     Value::from_fn(&s.axes.clone(), |c| {
         // prefix fold up to and including this coordinate's position on `axis`
         let upto = c[&axis];
@@ -393,7 +426,11 @@ fn eval_view(s: &Value, groups: &[(Vec<Axis>, Axis)], node: &Node) -> Value {
     // Cross-check against each output axis's declared extent: a flatten whose
     // target axis was minted with the wrong product dies here, named.
     for (i, &a) in oaxes.iter().enumerate() {
-        assert_eq!(a.extent, out_shape[i], "view output extent mismatch on {a}");
+        assert_eq!(
+            a.extent(),
+            out_shape[i],
+            "view output extent mismatch on {a}"
+        );
     }
 
     let mut out = Value {
@@ -435,7 +472,7 @@ fn src_extent(s: &Value, axis: Axis) -> usize {
         .iter()
         .position(|a| *a == axis)
         .map(|k| s.shape[k])
-        .unwrap_or_else(|| axis.extent)
+        .unwrap_or_else(|| axis.extent())
 }
 
 fn sorted(axes: &[Axis]) -> Vec<Axis> {
@@ -558,7 +595,7 @@ pub fn run_carrier_split(
     );
 
     let grid = output_axes(node); // the free axes — the kernel's parallel grid
-    let n = axis.extent;
+    let n = axis.extent();
     assert!(
         blocks == 1
             || !carrier.kinds.iter().any(|k| matches!(

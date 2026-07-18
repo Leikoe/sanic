@@ -704,7 +704,10 @@ impl Partitioner<'_> {
     /// Elements this node materializes to (the product of its output axes'
     /// extents).
     fn volume(&self, node: &Node) -> f64 {
-        output_axes(node).iter().map(|a| a.extent as f64).product()
+        output_axes(node)
+            .iter()
+            .map(|a| a.extent() as f64)
+            .product()
     }
 
     /// The largest volume among stream-varying transcendental maps in the
@@ -1226,7 +1229,10 @@ fn smallest_div(node: &Node) -> Option<Node> {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
             NodeKind::Map { inputs, .. } => {
                 if is_site(node) {
-                    let vol: f64 = output_axes(node).iter().map(|a| a.extent as f64).product();
+                    let vol: f64 = output_axes(node)
+                        .iter()
+                        .map(|a| a.extent() as f64)
+                        .product();
                     if best.as_ref().is_none_or(|(b, _)| vol < *b) {
                         *best = Some((vol, node.clone()));
                     }
@@ -1468,7 +1474,8 @@ impl Schedule {
                         block += &format!(" col {}\u{d7}{}", c.name, spec.tile_c);
                     }
                     if !spec.batch_axes.is_empty() {
-                        let labels: Vec<&str> = spec.batch_axes.iter().map(|a| a.name).collect();
+                        let labels: Vec<&str> =
+                            spec.batch_axes.iter().map(|a| a.name.as_str()).collect();
                         block += &format!(" grid {{{}}}", labels.join(","));
                     }
                     if block.is_empty() {

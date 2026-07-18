@@ -23,20 +23,87 @@ pub type Node = Rc<NodeKind>;
 
 // ── axes ─────────────────────────────────────────────────────────────────────
 
-/// An axis: a named index space with a size — plain data, no hidden id (the
+/// A stable, human-readable name for an axis.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AxisName(&'static str);
+
+impl AxisName {
+    pub const fn new(name: &'static str) -> Self {
+        AxisName(name)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl fmt::Display for AxisName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl fmt::Debug for AxisName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The cardinality of an axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Extent {
+    Static(usize),
+    Dynamic,
+}
+
+impl Extent {
+    pub const fn static_value(self) -> Option<usize> {
+        match self {
+            Extent::Static(value) => Some(value),
+            Extent::Dynamic => None,
+        }
+    }
+
+    pub fn expect_static(self, axis: AxisName) -> usize {
+        self.static_value()
+            .unwrap_or_else(|| panic!("axis `{axis}` has a dynamic extent"))
+    }
+}
+
+impl From<usize> for Extent {
+    fn from(value: usize) -> Self {
+        Extent::Static(value)
+    }
+}
+
+/// An axis: a named index space with an extent — plain data, no hidden id (the
 /// way a tinygrad shape is just numbers). Identity is structural: two axes
 /// with the same name and extent ARE the same axis wherever they were
 /// written. So use one name per index space and a fresh name where spaces
 /// must differ (`t` vs `t2`) — equal name + equal extent unifies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Axis {
-    pub name: &'static str,
-    pub extent: usize,
+    pub name: AxisName,
+    pub extent: Extent,
 }
 
 /// An axis, briefly: `axis("s", 512)`.
-pub fn axis(name: &'static str, extent: usize) -> Axis {
-    Axis { name, extent }
+pub fn axis(name: &'static str, extent: impl Into<Extent>) -> Axis {
+    Axis {
+        name: AxisName::new(name),
+        extent: extent.into(),
+    }
+}
+
+impl Axis {
+    /// The concrete extent required by core interpretation and compilation.
+    pub fn extent(self) -> usize {
+        self.extent.expect_static(self.name)
+    }
+
+    pub const fn is_dynamic(self) -> bool {
+        matches!(self.extent, Extent::Dynamic)
+    }
 }
 
 impl fmt::Display for Axis {
@@ -406,7 +473,7 @@ pub fn pad(src: Node, from: Axis, to: Axis, lo: usize) -> Node {
 pub fn split(src: Node, from: Axis, outer: Axis, inner: Axis) -> Node {
     reindex(
         src,
-        vec![(from, vec![(inner.extent as i64, outer), (1, inner)], 0)],
+        vec![(from, vec![(inner.extent() as i64, outer), (1, inner)], 0)],
         false,
     )
 }
@@ -446,7 +513,7 @@ pub fn output_axes(node: &Node) -> Vec<Axis> {
 pub fn volume(node: &Node) -> usize {
     output_axes(node)
         .iter()
-        .map(|a| a.extent)
+        .map(|a| a.extent())
         .product::<usize>()
         .max(1)
 }

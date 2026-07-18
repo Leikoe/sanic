@@ -106,7 +106,7 @@ fn full_transformer_block_schedule_executes_to_reference() {
         axis("dmv", 8), // h · dv
         axis("f", 12),
     );
-    let n = dm.extent as f64;
+    let n = dm.extent() as f64;
 
     let mut rng = Lcg(0x5A5A_1234);
     let env: Env = [
@@ -136,7 +136,7 @@ fn full_transformer_block_schedule_executes_to_reference() {
     let scores = matmul(q, k, dk); // [s, h, t]
     let scaled = map(
         MapOp::Mul,
-        vec![scores, konst(1.0 / (dk.extent as f64).sqrt())],
+        vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())],
     );
     let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
     let attn = matmul(softmax(masked, t), vv, t); // [s, h, dv]

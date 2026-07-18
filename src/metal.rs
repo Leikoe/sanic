@@ -637,7 +637,7 @@ pub fn tune_schedules(
         let mut entries: Vec<(FoldSched, crate::emit_metal::MetalKernel, String)> = Vec::new();
         for (ci, c) in cands.into_iter().enumerate() {
             if c.sgs > 1 {
-                let e_a = c.lane_axis.map(|a| a.extent).unwrap_or(1);
+                let e_a = c.lane_axis.map(|a| a.extent()).unwrap_or(1);
                 let sliced: usize = (0..spec.carrier.slots)
                     .filter(|&j| {
                         c.lane_axis
@@ -683,7 +683,7 @@ pub fn tune_schedules(
         // preference; it is reported and never chosen.
         let out_elems: usize = crate::ir::output_axes(fold_node)
             .iter()
-            .map(|a| a.extent)
+            .map(|a| a.extent())
             .product::<usize>()
             .max(1);
         let mut reference: Option<Vec<f32>> = None;

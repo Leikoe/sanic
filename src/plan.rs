@@ -163,7 +163,7 @@ pub fn plan_axis(
     // intermediate tile resident (tile_m × tile_c × TILE_N).
     let has_inner_contraction = has_contraction(node, streaming_axis, &out_set);
 
-    let output_vol: f64 = out_axes.iter().map(|ax| ax.extent as f64).product();
+    let output_vol: f64 = out_axes.iter().map(|ax| ax.extent() as f64).product();
     let total_flops = count_flops(node);
 
     // ── structure choice: no heuristics — price every assignment ────────────
@@ -180,7 +180,7 @@ pub fn plan_axis(
     // enumerate everything and let the roofline rank. Iteration order breaks
     // cost ties toward simple structures: large row axes first, no col tile
     // first, most batching first.
-    let ext = |ax: Axis| ax.extent as f64;
+    let ext = |ax: Axis| ax.extent() as f64;
     let pows = |limit: f64| {
         let mut v = Vec::new();
         let mut t = 1.0f64;
@@ -393,10 +393,10 @@ pub fn split_factor(
     let bytes = dev.dtype_bytes;
     let grid_vol: f64 = output_axes(node)
         .iter()
-        .map(|ax| ax.extent as f64)
+        .map(|ax| ax.extent() as f64)
         .product();
     let slots = carrier.slots as f64;
-    let n = streaming_axis.extent as f64;
+    let n = streaming_axis.extent() as f64;
 
     let mut best: Option<(usize, f64)> = None;
     let mut b = 2usize;
@@ -523,7 +523,7 @@ fn expr_ops(e: &Expr) -> f64 {
 /// recompute is paid in issue slots; pricing it at one flop per element is
 /// what made one-thread-per-output look cheap.
 fn count_issue_ops(node: &Node) -> f64 {
-    let vol = |n: &Node| -> f64 { output_axes(n).iter().map(|ax| ax.extent as f64).product() };
+    let vol = |n: &Node| -> f64 { output_axes(n).iter().map(|ax| ax.extent() as f64).product() };
     match node.as_ref() {
         NodeKind::Const { .. } => 0.0,
         NodeKind::Iota { .. } => vol(node),
@@ -562,7 +562,7 @@ fn count_issue_ops(node: &Node) -> f64 {
 /// instead of being issued redundantly by each.
 fn has_simd_reduce(node: &Node) -> bool {
     match node.as_ref() {
-        NodeKind::Reduce { src, axis, .. } => axis.extent % SIMD == 0 || has_simd_reduce(src),
+        NodeKind::Reduce { src, axis, .. } => axis.extent() % SIMD == 0 || has_simd_reduce(src),
         NodeKind::Map { inputs, .. } => inputs.iter().any(|i| has_simd_reduce(i)),
         NodeKind::Gather { src, index, .. } => has_simd_reduce(src) || has_simd_reduce(index),
         NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } | NodeKind::Scan { src, .. } => {
@@ -593,7 +593,7 @@ pub fn fold_sched(
     {
         return FoldSched::scalar();
     }
-    let ext = |ax: Axis| ax.extent as f64;
+    let ext = |ax: Axis| ax.extent() as f64;
     let s_ext = ext(streaming_axis);
     let out_axes = output_axes(fold_node);
     let out_vol: f64 = out_axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
@@ -753,7 +753,7 @@ pub fn fold_sched_candidates(
     {
         return cands;
     }
-    let ext = |ax: Axis| ax.extent as f64;
+    let ext = |ax: Axis| ax.extent() as f64;
     let s_ext = ext(streaming_axis) as usize;
     let out_axes = output_axes(fold_node);
     let packed = input_dtypes(fold_node)
@@ -841,7 +841,7 @@ fn count_flops_memo(
             .entry(std::rc::Rc::as_ptr(n))
             .or_insert_with(|| output_axes(n))
             .clone();
-        axes.iter().map(|ax| ax.extent as f64).product()
+        axes.iter().map(|ax| ax.extent() as f64).product()
     };
     let f = match node.as_ref() {
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => 0.0,

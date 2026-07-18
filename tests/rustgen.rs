@@ -277,7 +277,7 @@ fn transformer_block_compiles_and_matches() {
         axis("dmv", 8),
         axis("f", 10),
     );
-    let n = dm.extent as f64;
+    let n = dm.extent() as f64;
     let mut rng = Lcg(0x7A11);
     let env: Env = [
         ("X", rand_tensor(&[s, dm], &mut rng)),
@@ -311,7 +311,7 @@ fn transformer_block_compiles_and_matches() {
     let scores = matmul(q, k, dk);
     let scaled = map(
         MapOp::Mul,
-        vec![scores, konst(1.0 / (dk.extent as f64).sqrt())],
+        vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())],
     );
     let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
     let attn = matmul(softmax(masked, t), vv, t);

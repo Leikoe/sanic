@@ -127,7 +127,7 @@ fn grid_loops(
     for &a in grid {
         let iv = g.fresh("i");
         coord.insert(a, iv.clone());
-        open.push(format!("for {iv} in 0..{} {{", a.extent));
+        open.push(format!("for {iv} in 0..{} {{", a.extent()));
     }
     (open, grid.iter().map(|_| "}".to_string()).collect())
 }
@@ -147,7 +147,7 @@ fn emit_fused(
         "rustgen fused kernel needs a scalar projection"
     );
     let grid = output_axes(fold_node);
-    let grid_ext: usize = grid.iter().map(|a| a.extent).product::<usize>().max(1);
+    let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(fold_node);
 
     let mut g = Gen::new();
@@ -177,7 +177,7 @@ fn emit_fused(
         .iter()
         .map(|l| value(&RUST, l, &cs, &mut g, &mut sbody))
         .collect();
-    src.push(format!("for {sv} in 0..{} {{", stream.extent));
+    src.push(format!("for {sv} in 0..{} {{", stream.extent()));
     src.extend(sbody);
     src.push(format!("let x = [{}];", items.join(", ")));
     src.push(format!(
@@ -239,7 +239,7 @@ fn emit_fused(
 /// grid over the output axes, write [`value`] of the spliced graph.
 fn emit_pointwise(fname: &str, exec: &Node) -> (String, Vec<&'static str>) {
     let grid = output_axes(exec);
-    let grid_ext: usize = grid.iter().map(|a| a.extent).product::<usize>().max(1);
+    let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(exec);
 
     let mut g = Gen::new();

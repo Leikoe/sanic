@@ -119,7 +119,7 @@ pub fn offset(axes: &[Axis], coord: &HashMap<Axis, String>) -> String {
     }
     let mut terms = Vec::new();
     for (k, a) in axes.iter().enumerate() {
-        let stride: usize = axes[k + 1..].iter().map(|x| x.extent).product();
+        let stride: usize = axes[k + 1..].iter().map(|x| x.extent()).product();
         let iv = &coord[a];
         if stride == 1 {
             terms.push(iv.clone());
@@ -247,7 +247,7 @@ pub fn value<L: Lang>(
                 let lane = lang.lane_var()?;
                 let uniform = lb.avoid_axis.is_none_or(|a| !output_axes(src).contains(&a));
                 let merge = lang.simd_lane_merge(&acc, m, lb.simd_width)?;
-                (axis.extent % lb.simd_width == 0 && uniform).then_some((
+                (axis.extent() % lb.simd_width == 0 && uniform).then_some((
                     lane,
                     lb.simd_width,
                     merge,
@@ -257,7 +257,7 @@ pub fn value<L: Lang>(
                 Some((lane, w, merge)) => {
                     out.push(format!(
                         "for (uint {lv} = {lane}; {lv} < {}; {lv} += {w}) {{",
-                        axis.extent
+                        axis.extent()
                     ));
                     out.extend(body);
                     out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
@@ -265,7 +265,7 @@ pub fn value<L: Lang>(
                     out.extend(merge);
                 }
                 None => {
-                    out.push(lang.for_open(&lv, axis.extent));
+                    out.push(lang.for_open(&lv, axis.extent()));
                     out.extend(body);
                     out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
                     out.push("}".into());
@@ -294,8 +294,8 @@ pub fn value<L: Lang>(
                     out.push(lang.index_decl(&rem, &coord[to], true));
                     for m in members.iter().rev() {
                         let iv = g.fresh("m");
-                        out.push(lang.index_decl(&iv, &format!("{rem} % {}", m.extent), false));
-                        out.push(format!("{rem} /= {};", m.extent));
+                        out.push(lang.index_decl(&iv, &format!("{rem} % {}", m.extent()), false));
+                        out.push(format!("{rem} /= {};", m.extent()));
                         coord2.insert(*m, iv);
                     }
                 }
@@ -331,7 +331,7 @@ pub fn value<L: Lang>(
                 };
                 let ri = g.fresh("ri");
                 out.push(lang.signed_index_decl(&ri, &val));
-                let n = m.extent;
+                let n = m.extent();
                 let ci = g.fresh("ci");
                 if *padded {
                     guards.push(format!("{ri} >= 0 && {ri} < {n}"));
@@ -450,14 +450,14 @@ pub fn thread_grid_decode_from<L: Lang>(
 ) -> HashMap<Axis, String> {
     let mut coord = HashMap::new();
     for (k, &a) in grid.iter().enumerate() {
-        let stride: usize = grid[k + 1..].iter().map(|x| x.extent).product();
+        let stride: usize = grid[k + 1..].iter().map(|x| x.extent()).product();
         let iv = format!("i_{}", g.fresh("g"));
         if stride == 1 {
-            out.push(format!("uint {iv} = {gid_var} % {};", a.extent));
+            out.push(format!("uint {iv} = {gid_var} % {};", a.extent()));
         } else {
             out.push(format!(
                 "uint {iv} = ({gid_var} / {stride}) % {};",
-                a.extent
+                a.extent()
             ));
         }
         coord.insert(a, iv);

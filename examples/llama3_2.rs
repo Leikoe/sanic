@@ -1,15 +1,9 @@
-//! Llama 3.2 1B: explicit graph construction and checkpoint binding.
+//! Llama 3.2 1B graph construction.
 //!
 //! ```text
 //! cargo run --example llama3_2
 //! ```
 //!
-//! By default the example finds the checkpoint in Hugging Face's cache. Set
-//! `SANIC_LLAMA3_2_DIR` to point at a different snapshot directory.
-
-use std::path::{Path, PathBuf};
-
-use sanic::safetensors::StFile;
 use sanic::{Axis, Dtype, Graph, GraphBuilder, TensorExpr, axis};
 
 const EPS: f64 = 1e-5;
@@ -42,14 +36,8 @@ impl Config {
     };
 }
 
-struct Binding {
-    checkpoint_name: String,
-    axes: Vec<Axis>,
-}
-
 struct Llama3_2 {
     graph: Graph,
-    bindings: Vec<Binding>,
 }
 
 struct Axes {
@@ -80,29 +68,15 @@ impl Axes {
     }
 }
 
-fn parameter(
-    graph: &mut GraphBuilder,
-    bindings: &mut Vec<Binding>,
-    checkpoint_name: impl Into<String>,
-    axes: &[Axis],
-) -> TensorExpr {
-    let checkpoint_name = checkpoint_name.into();
-    let tensor = graph.input_dt(checkpoint_name.clone(), axes, Dtype::BF16);
-    bindings.push(Binding {
-        checkpoint_name,
-        axes: axes.to_vec(),
-    });
-    tensor
-}
-
 fn rms_norm(x: TensorExpr, weight: TensorExpr, hidden_dim: Axis) -> TensorExpr {
-    let mean_square = (&x * &x).sum(hidden_dim) / hidden_dim.extent as f64;
+    let mean_square = (&x * &x).sum(hidden_dim) / hidden_dim.extent() as f64;
     x * weight / (mean_square + EPS).sqrt()
 }
 
 fn llama3_inv_freq(frequency: Axis) -> TensorExpr {
-    let inv_freq =
-        (TensorExpr::iota(frequency) * (-(ROPE_THETA.ln()) / (frequency.extent * 2) as f64)).exp();
+    let inv_freq = (TensorExpr::iota(frequency)
+        * (-(ROPE_THETA.ln()) / (frequency.extent() * 2) as f64))
+        .exp();
     let wave_length = (2.0 * std::f64::consts::PI) / inv_freq.clone();
     let low_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_LOW_FREQ_FACTOR;
     let high_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_HIGH_FREQ_FACTOR;
@@ -122,8 +96,12 @@ fn llama3_inv_freq(frequency: Axis) -> TensorExpr {
 }
 
 fn rope(x: TensorExpr, position: Axis, head_dim: Axis) -> TensorExpr {
-    let (x, half, frequency) =
-        x.split(head_dim, "rope_half", "rope_frequency", head_dim.extent / 2);
+    let (x, half, frequency) = x.split(
+        head_dim,
+        "rope_half",
+        "rope_frequency",
+        head_dim.extent() / 2,
+    );
     let inv_freq = llama3_inv_freq(frequency);
     let angle = TensorExpr::iota(position) * inv_freq;
     let sign = TensorExpr::iota(half) * 2.0 - 1.0;
@@ -132,34 +110,26 @@ fn rope(x: TensorExpr, position: Axis, head_dim: Axis) -> TensorExpr {
     rotated.flatten(&[half, frequency], "head_dim").0
 }
 
-fn block(
-    graph: &mut GraphBuilder,
-    bindings: &mut Vec<Binding>,
-    axes: &Axes,
-    layer: usize,
-    x: TensorExpr,
-) -> TensorExpr {
+fn block(graph: &mut GraphBuilder, axes: &Axes, layer: usize, x: TensorExpr) -> TensorExpr {
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     let attn_input = rms_norm(
         x.clone(),
-        parameter(
-            graph,
-            bindings,
+        graph.input(
             name("input_layernorm.weight"),
-            &[axes.hidden_dim],
+            [axes.hidden_dim],
+            Dtype::BF16,
         ),
         axes.hidden_dim,
     );
-    let q_weight = parameter(
-        graph,
-        bindings,
+    let q_weight = graph.input(
         name("self_attn.q_proj.weight"),
-        &[
+        [
             axes.kv_head,
             axes.query_group,
             axes.head_dim,
             axes.hidden_dim,
         ],
+        Dtype::BF16,
     );
     let q = rope(
         attn_input.matmul(&q_weight, axes.hidden_dim),
@@ -167,11 +137,10 @@ fn block(
         axes.head_dim,
     );
     let key_input = attn_input.rename(axes.sequence, axes.key_sequence);
-    let k_weight = parameter(
-        graph,
-        bindings,
+    let k_weight = graph.input(
         name("self_attn.k_proj.weight"),
-        &[axes.kv_head, axes.head_dim, axes.hidden_dim],
+        [axes.kv_head, axes.head_dim, axes.hidden_dim],
+        Dtype::BF16,
     );
     let k = rope(
         key_input.clone().matmul(&k_weight, axes.hidden_dim),
@@ -179,15 +148,14 @@ fn block(
         axes.head_dim,
     );
     let v = key_input.matmul(
-        &parameter(
-            graph,
-            bindings,
+        &graph.input(
             name("self_attn.v_proj.weight"),
-            &[axes.kv_head, axes.head_dim, axes.hidden_dim],
+            [axes.kv_head, axes.head_dim, axes.hidden_dim],
+            Dtype::BF16,
         ),
         axes.hidden_dim,
     );
-    let scores = q.matmul(&k, axes.head_dim) / (axes.head_dim.extent as f64).sqrt();
+    let scores = q.matmul(&k, axes.head_dim) / (axes.head_dim.extent() as f64).sqrt();
     let attention = (scores + TensorExpr::causal_mask(axes.sequence, axes.key_sequence))
         .softmax(axes.key_sequence)
         .matmul(&v, axes.key_sequence);
@@ -196,11 +164,10 @@ fn block(
         "packed_heads",
     );
     let attention = attention.matmul(
-        &parameter(
-            graph,
-            bindings,
+        &graph.input(
             name("self_attn.o_proj.weight"),
-            &[axes.hidden_dim, packed_heads],
+            [axes.hidden_dim, packed_heads],
+            Dtype::BF16,
         ),
         packed_heads,
     );
@@ -208,38 +175,34 @@ fn block(
 
     let mlp_input = rms_norm(
         residual.clone(),
-        parameter(
-            graph,
-            bindings,
+        graph.input(
             name("post_attention_layernorm.weight"),
-            &[axes.hidden_dim],
+            [axes.hidden_dim],
+            Dtype::BF16,
         ),
         axes.hidden_dim,
     );
     let gate = mlp_input.matmul(
-        &parameter(
-            graph,
-            bindings,
+        &graph.input(
             name("mlp.gate_proj.weight"),
-            &[axes.intermediate, axes.hidden_dim],
+            [axes.intermediate, axes.hidden_dim],
+            Dtype::BF16,
         ),
         axes.hidden_dim,
     );
     let up = mlp_input.matmul(
-        &parameter(
-            graph,
-            bindings,
+        &graph.input(
             name("mlp.up_proj.weight"),
-            &[axes.intermediate, axes.hidden_dim],
+            [axes.intermediate, axes.hidden_dim],
+            Dtype::BF16,
         ),
         axes.hidden_dim,
     );
     let down = (gate.silu() * up).matmul(
-        &parameter(
-            graph,
-            bindings,
+        &graph.input(
             name("mlp.down_proj.weight"),
-            &[axes.hidden_dim, axes.intermediate],
+            [axes.hidden_dim, axes.intermediate],
+            Dtype::BF16,
         ),
         axes.intermediate,
     );
@@ -251,26 +214,19 @@ impl Llama3_2 {
         let config = Config::LLAMA_3_2_1B;
         let axes = Axes::new(config, sequence_length);
         let mut graph = GraphBuilder::new();
-        let tokens = graph.input("tokens", &[axes.sequence]);
-        let mut bindings = Vec::new();
-        let embedding = parameter(
-            &mut graph,
-            &mut bindings,
+        let tokens = graph.input("tokens", &[axes.sequence], Dtype::F32);
+        let embedding = graph.input(
             "model.embed_tokens.weight",
-            &[axes.vocab, axes.hidden_dim],
+            [axes.vocab, axes.hidden_dim],
+            Dtype::BF16,
         );
         let mut x = embedding.embedding(&tokens, axes.vocab);
         for layer in 0..config.layers {
-            x = block(&mut graph, &mut bindings, &axes, layer, x);
+            x = block(&mut graph, &axes, layer, x);
         }
         let x = rms_norm(
             x,
-            parameter(
-                &mut graph,
-                &mut bindings,
-                "model.norm.weight",
-                &[axes.hidden_dim],
-            ),
+            graph.input("model.norm.weight", [axes.hidden_dim], Dtype::BF16),
             axes.hidden_dim,
         );
 
@@ -279,66 +235,16 @@ impl Llama3_2 {
         let logits = x.matmul(&embedding, axes.hidden_dim);
         Self {
             graph: graph.finish([logits]),
-            bindings,
         }
     }
-
-    fn verify_checkpoint(&self, checkpoint: &StFile) {
-        for binding in &self.bindings {
-            let (dtype, shape) = checkpoint.meta(&binding.checkpoint_name);
-            let expected_elements: usize = binding.axes.iter().map(|axis| axis.extent).product();
-            let actual_elements: usize = shape.iter().product();
-            assert_eq!(
-                dtype, "BF16",
-                "{} has unexpected dtype",
-                binding.checkpoint_name
-            );
-            assert_eq!(
-                actual_elements, expected_elements,
-                "{} has an incompatible shape {:?}",
-                binding.checkpoint_name, shape
-            );
-        }
-    }
-}
-
-fn default_model_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SANIC_LLAMA3_2_DIR") {
-        return dir.into();
-    }
-    let cache = std::env::var_os("HF_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/huggingface"))
-        })
-        .expect("set HF_HOME or HOME so the Hugging Face cache can be found");
-    let snapshots = cache
-        .join("hub")
-        .join("models--meta-llama--Llama-3.2-1B")
-        .join("snapshots");
-    std::fs::read_dir(&snapshots)
-        .unwrap_or_else(|_| panic!("no Llama 3.2 1B snapshot in {}", snapshots.display()))
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.join("model.safetensors").is_file())
-        .expect("no snapshot contains model.safetensors")
 }
 
 fn main() {
-    let model_dir = default_model_dir();
-    let checkpoint_path = model_dir.join("model.safetensors");
-    let checkpoint = StFile::open(Path::new(&checkpoint_path)).expect("open Llama 3.2 checkpoint");
     let model = Llama3_2::build(1);
-    model.verify_checkpoint(&checkpoint);
 
     println!(
-        "Llama 3.2 1B: {} graph inputs ({} checkpoint parameters), output {:?}",
+        "Llama 3.2 1B: {} graph inputs, output {:?}",
         model.graph.input_count(),
-        model.bindings.len(),
         model.graph.output_shapes()
-    );
-    println!(
-        "checkpoint bindings verified at {}",
-        checkpoint_path.display()
     );
 }
