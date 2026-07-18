@@ -5,33 +5,28 @@
 //! assigns each input a binding name; [`GraphBuilder::finish`] freezes the
 //! output expressions into a reusable graph.
 //!
-//! One deep difference from tinygrad: axes are named, not positional. Two
-//! operands align where they mention the same axis and broadcast everywhere
-//! else, so there is no positional broadcasting, no reshape-to-align, no
-//! `keepdim` — `x + b` with `x` over `[s, dm]` and `b` over `[dm]` just
-//! works, and reducing an axis simply removes it from the shape.
+//! Dimensions are positional, following Torch conventions. Elementwise
+//! operations broadcast trailing dimensions, reductions take a dimension
+//! index, and matrix multiplication contracts `(m, k) @ (k, n)`. Dimension
+//! names are optional diagnostic labels and never determine semantics.
 //!
 //! ```
-//! use sanic::{Dtype, Extent, GraphBuilder, axis};
+//! use sanic::{Dtype, Extent, GraphBuilder};
 //!
-//! let (s, t, d) = (
-//!     axis("s", Extent::Dynamic),
-//!     axis("t", Extent::Dynamic),
-//!     axis("d", 64),
-//! );
 //! let mut graph = GraphBuilder::new();
-//! let q = graph.input("q", [s, d], Dtype::F32);
-//! let k = graph.input("k", [t, d], Dtype::F32);
-//! let v = graph.input("v", [t, d], Dtype::F32);
+//! let q = graph.input("q", [Extent::Dynamic, Extent::Static(64)], Dtype::F32);
+//! let k = graph.input("k", [Extent::Static(64), Extent::Dynamic], Dtype::F32);
+//! let v = graph.input("v", [Extent::Dynamic, Extent::Static(64)], Dtype::F32);
 //!
 //! // Naive attention, the textbook three-step form. `derive` reconstructs
 //! // the FlashAttention streaming accumulator from this graph.
-//! let out = q.matmul(&k, d).softmax(t).matmul(&v, t);
+//! let out = q.matmul(&k).softmax(-1).matmul(&v);
 //! let graph = graph.finish([out]);
 //! assert_eq!(graph.input_count(), 3);
 //! ```
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -48,7 +43,7 @@ pub type Tensor = Value;
 pub type Bindings = HashMap<String, Tensor>;
 
 /// The ordered axes describing a tensor expression.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Shape(Vec<Axis>);
 
 impl Shape {
@@ -58,6 +53,10 @@ impl Shape {
 
     pub fn axes(&self) -> &[Axis] {
         &self.0
+    }
+
+    pub fn extents(&self) -> impl ExactSizeIterator<Item = Extent> + '_ {
+        self.0.iter().map(|dimension| dimension.extent)
     }
 
     pub fn rank(&self) -> usize {
@@ -73,9 +72,42 @@ impl Shape {
     }
 }
 
+impl PartialEq for Shape {
+    fn eq(&self, other: &Self) -> bool {
+        self.extents().eq(other.extents())
+    }
+}
+
+impl Eq for Shape {}
+
+impl Hash for Shape {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.rank().hash(state);
+        for extent in self.extents() {
+            extent.hash(state);
+        }
+    }
+}
+
+fn unnamed_axis(extent: impl Into<Extent>) -> Axis {
+    axis("", extent)
+}
+
 impl<const N: usize> From<[Axis; N]> for Shape {
     fn from(axes: [Axis; N]) -> Self {
         Shape(axes.into())
+    }
+}
+
+impl<const N: usize> From<[usize; N]> for Shape {
+    fn from(extents: [usize; N]) -> Self {
+        Shape(extents.into_iter().map(unnamed_axis).collect())
+    }
+}
+
+impl<const N: usize> From<[Extent; N]> for Shape {
+    fn from(extents: [Extent; N]) -> Self {
+        Shape(extents.into_iter().map(unnamed_axis).collect())
     }
 }
 
@@ -94,6 +126,18 @@ impl From<&[Axis]> for Shape {
 impl From<Vec<Axis>> for Shape {
     fn from(axes: Vec<Axis>) -> Self {
         Shape(axes)
+    }
+}
+
+impl From<Vec<usize>> for Shape {
+    fn from(extents: Vec<usize>) -> Self {
+        Shape(extents.into_iter().map(unnamed_axis).collect())
+    }
+}
+
+impl From<Vec<Extent>> for Shape {
+    fn from(extents: Vec<Extent>) -> Self {
+        Shape(extents.into_iter().map(unnamed_axis).collect())
     }
 }
 
@@ -155,6 +199,15 @@ impl GraphBuilder {
         let input_index = self.inputs.len();
         let leaf_name =
             Box::leak(format!("__sanic_g{}_input{input_index}", self.graph_id).into_boxed_str());
+        // Every input owns its positional dimensions. Reusing a diagnostic
+        // label (or even the same shape descriptor) never aliases dimensions
+        // across tensors.
+        let shape = Shape::new(
+            shape
+                .axes()
+                .iter()
+                .map(|dimension| axis(dimension.name.as_str(), dimension.extent)),
+        );
         self.inputs.push(InputSpec {
             binding_name,
             leaf_name,
@@ -286,15 +339,14 @@ impl Graph {
 fn concretize_axis(axis: Axis, resolved: &HashMap<Axis, usize>) -> Axis {
     match axis.extent {
         Extent::Static(_) => axis,
-        Extent::Dynamic => Axis {
-            name: axis.name,
-            extent: Extent::Static(*resolved.get(&axis).unwrap_or_else(|| {
+        Extent::Dynamic => {
+            axis.with_extent(Extent::Static(*resolved.get(&axis).unwrap_or_else(|| {
                 panic!(
                     "dynamic axis `{}` cannot be inferred from any graph input",
                     axis.name
                 )
-            })),
-        },
+            })))
+        }
     }
 }
 
@@ -345,10 +397,15 @@ fn concretize_node(
             groups: groups
                 .iter()
                 .map(|(members, output)| {
-                    (
-                        members.iter().copied().map(concrete_axis).collect(),
-                        concrete_axis(*output),
-                    )
+                    let members: Vec<Axis> = members.iter().copied().map(concrete_axis).collect();
+                    let output = if output.is_dynamic() && !resolved.contains_key(output) {
+                        output.with_extent(Extent::Static(
+                            members.iter().map(|member| member.extent()).product(),
+                        ))
+                    } else {
+                        concrete_axis(*output)
+                    };
+                    (members, output)
                 })
                 .collect(),
         }),
@@ -394,14 +451,17 @@ impl TensorExpr {
         TensorExpr { node: ir::konst(v) }
     }
 
-    /// The index along an axis, as a value (0, 1, 2, …) — free to compute.
-    pub fn iota(a: Axis) -> TensorExpr {
-        TensorExpr { node: ir::iota(a) }
+    /// `0, 1, 2, …, length - 1`.
+    pub fn arange(length: usize) -> TensorExpr {
+        TensorExpr {
+            node: ir::iota(axis("arange", length)),
+        }
     }
 
-    /// A causal mask computed from indices (0 where key ≤ query, −LARGE
-    /// after) — costs no memory traffic.
-    pub fn causal_mask(query: Axis, key: Axis) -> TensorExpr {
+    /// A `(query_length, key_length)` causal mask.
+    pub fn causal_mask(query_length: usize, key_length: usize) -> TensorExpr {
+        let query = axis("query", query_length);
+        let key = axis("key", key_length);
         TensorExpr {
             node: ir::map(
                 MapOp::Where,
@@ -414,9 +474,10 @@ impl TensorExpr {
         }
     }
 
-    /// `1.0` where `iota(a) == v`, else `0.0` — a computed one-hot.
-    pub fn one_hot(&self, axis: Axis) -> TensorExpr {
-        let iota = ir::iota(axis);
+    /// Append a class dimension and encode integer values as one-hot rows.
+    pub fn one_hot(&self, classes: usize) -> TensorExpr {
+        let class = axis("class", classes);
+        let iota = ir::iota(class);
         TensorExpr {
             node: ir::map(
                 MapOp::Sub,
@@ -442,17 +503,110 @@ impl TensorExpr {
         Shape(output_axes(&self.node))
     }
 
-    fn expect_axis(&self, a: Axis, op: &str) {
+    fn axis(&self, dimension: isize, op: &str) -> Axis {
+        let axes = output_axes(&self.node);
+        let rank = axes.len() as isize;
+        let index = if dimension < 0 {
+            rank + dimension
+        } else {
+            dimension
+        };
         assert!(
-            output_axes(&self.node).contains(&a),
-            "{op}: axis `{a}` is not an output axis of this tensor (shape [{}])",
-            self.shape()
-                .axes()
-                .iter()
-                .map(|a| a.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            (0..rank).contains(&index),
+            "{op}: dimension {dimension} is out of range for a rank-{} tensor",
+            axes.len()
         );
+        axes[index as usize]
+    }
+
+    fn static_extent(axis: Axis, op: &str) -> usize {
+        axis.extent.static_value().unwrap_or_else(|| {
+            panic!("{op}: dynamic dimensions are resolved only when the graph runs")
+        })
+    }
+
+    /// Rebind `node` positionally to `target`, applying size-one broadcasting.
+    fn broadcast_node(node: Node, target: &[Axis], op: &str) -> Node {
+        let source = output_axes(&node);
+        assert!(
+            source.len() <= target.len(),
+            "{op}: cannot broadcast rank {} to rank {}",
+            source.len(),
+            target.len()
+        );
+        let offset = target.len() - source.len();
+        let mut node = node;
+        for (index, &from) in source.iter().enumerate() {
+            let to = target[offset + index];
+            if from == to {
+                continue;
+            }
+            match (from.extent, to.extent) {
+                (Extent::Static(1), _) => {
+                    node = ir::reduce(node, from, BinOp::Monoid(Monoid::Add));
+                }
+                (left, right) if left == right => {
+                    node = ir::rename(node, from, to);
+                }
+                _ => panic!(
+                    "{op}: dimensions with extents {:?} and {:?} cannot broadcast",
+                    from.extent, to.extent
+                ),
+            }
+        }
+
+        if output_axes(&node) == target {
+            return node;
+        }
+
+        Self::with_axis_order(node, target)
+    }
+
+    fn with_axis_order(node: Node, target: &[Axis]) -> Node {
+        if output_axes(&node) == target {
+            return node;
+        }
+        // Putting a zero expression first establishes the exact Torch output
+        // order without making diagnostic labels semantic.
+        let mut zero = ir::konst(0.0);
+        for &axis in target {
+            zero = ir::map(
+                MapOp::Add,
+                vec![
+                    zero,
+                    ir::map(MapOp::Mul, vec![ir::iota(axis), ir::konst(0.0)]),
+                ],
+            );
+        }
+        ir::map(MapOp::Add, vec![zero, node])
+    }
+
+    fn broadcast_axes(left: &[Axis], right: &[Axis], op: &str) -> Vec<Axis> {
+        let rank = left.len().max(right.len());
+        let mut output = Vec::with_capacity(rank);
+        for output_index in 0..rank {
+            let left_axis = output_index
+                .checked_sub(rank - left.len())
+                .map(|index| left[index]);
+            let right_axis = output_index
+                .checked_sub(rank - right.len())
+                .map(|index| right[index]);
+            let axis = match (left_axis, right_axis) {
+                (Some(left), Some(right)) => match (left.extent, right.extent) {
+                    (Extent::Static(1), _) => right,
+                    (_, Extent::Static(1)) => left,
+                    (left_extent, right_extent) if left_extent == right_extent => left,
+                    _ => panic!(
+                        "{op}: dimensions with extents {:?} and {:?} cannot broadcast",
+                        left.extent, right.extent
+                    ),
+                },
+                (Some(axis), None) | (None, Some(axis)) => axis,
+                (None, None) => unreachable!(),
+            };
+            output.push(axis);
+        }
+        output
     }
 
     // ── elementwise ──────────────────────────────────────────────────────────
@@ -464,8 +618,17 @@ impl TensorExpr {
     }
 
     fn binary(&self, op: MapOp, other: &TensorExpr) -> TensorExpr {
+        let left_axes = output_axes(&self.node);
+        let right_axes = output_axes(&other.node);
+        let axes = Self::broadcast_axes(&left_axes, &right_axes, "elementwise operation");
         TensorExpr {
-            node: ir::map(op, vec![self.node.clone(), other.node.clone()]),
+            node: ir::map(
+                op,
+                vec![
+                    Self::broadcast_node(self.node.clone(), &axes, "elementwise operation"),
+                    Self::broadcast_node(other.node.clone(), &axes, "elementwise operation"),
+                ],
+            ),
         }
     }
 
@@ -525,13 +688,21 @@ impl TensorExpr {
     }
     /// `self != 0 ? if_true : if_false`, elementwise; `self` is the condition.
     pub fn select(&self, if_true: &TensorExpr, if_false: &TensorExpr) -> TensorExpr {
+        let condition_axes = output_axes(&self.node);
+        let true_axes = output_axes(&if_true.node);
+        let false_axes = output_axes(&if_false.node);
+        let axes = Self::broadcast_axes(
+            &Self::broadcast_axes(&condition_axes, &true_axes, "where"),
+            &false_axes,
+            "where",
+        );
         TensorExpr {
             node: ir::map(
                 MapOp::Where,
                 vec![
-                    self.node.clone(),
-                    if_true.node.clone(),
-                    if_false.node.clone(),
+                    Self::broadcast_node(self.node.clone(), &axes, "where"),
+                    Self::broadcast_node(if_true.node.clone(), &axes, "where"),
+                    Self::broadcast_node(if_false.node.clone(), &axes, "where"),
                 ],
             ),
         }
@@ -544,16 +715,16 @@ impl TensorExpr {
     }
 
     /// Associative affine recurrence over `time`.
-    pub fn ssm_scan(&self, time: Axis) -> TensorExpr {
-        self.expect_axis(time, "ssm_scan");
+    pub fn ssm_scan(&self, dimension: isize) -> TensorExpr {
+        let time = self.axis(dimension, "ssm_scan");
         TensorExpr {
             node: ir::scan(self.node.clone(), time, BinOp::AffineCompose),
         }
     }
 
     /// Sequential `tanh` recurrence over `time`.
-    pub fn tanh_rnn(&self, time: Axis) -> TensorExpr {
-        self.expect_axis(time, "tanh_rnn");
+    pub fn tanh_rnn(&self, dimension: isize) -> TensorExpr {
+        let time = self.axis(dimension, "tanh_rnn");
         TensorExpr {
             node: ir::scan(
                 ir::map(MapOp::Tanh, vec![self.node.clone()]),
@@ -565,33 +736,33 @@ impl TensorExpr {
 
     // ── reductions ───────────────────────────────────────────────────────────
 
-    /// Fold `a` with `op`; the result no longer carries `a`.
-    pub fn reduce(&self, a: Axis, op: BinOp) -> TensorExpr {
-        self.expect_axis(a, "reduce");
+    /// Fold one dimension; the result no longer carries it.
+    pub fn reduce(&self, dimension: isize, op: BinOp) -> TensorExpr {
+        let axis = self.axis(dimension, "reduce");
         TensorExpr {
-            node: ir::reduce(self.node.clone(), a, op),
+            node: ir::reduce(self.node.clone(), axis, op),
         }
     }
 
-    pub fn sum(&self, a: Axis) -> TensorExpr {
-        self.reduce(a, BinOp::Monoid(Monoid::Add))
+    pub fn sum(&self, dimension: isize) -> TensorExpr {
+        self.reduce(dimension, BinOp::Monoid(Monoid::Add))
     }
-    pub fn prod(&self, a: Axis) -> TensorExpr {
-        self.reduce(a, BinOp::Monoid(Monoid::Mul))
+    pub fn prod(&self, dimension: isize) -> TensorExpr {
+        self.reduce(dimension, BinOp::Monoid(Monoid::Mul))
     }
-    pub fn max(&self, a: Axis) -> TensorExpr {
-        self.reduce(a, BinOp::Monoid(Monoid::Max))
+    pub fn max(&self, dimension: isize) -> TensorExpr {
+        self.reduce(dimension, BinOp::Monoid(Monoid::Max))
     }
-    pub fn min(&self, a: Axis) -> TensorExpr {
-        self.reduce(a, BinOp::Monoid(Monoid::Min))
+    pub fn min(&self, dimension: isize) -> TensorExpr {
+        self.reduce(dimension, BinOp::Monoid(Monoid::Min))
     }
-    pub fn logsumexp(&self, a: Axis) -> TensorExpr {
-        self.reduce(a, BinOp::Monoid(Monoid::LogSumExp))
+    pub fn logsumexp(&self, dimension: isize) -> TensorExpr {
+        self.reduce(dimension, BinOp::Monoid(Monoid::LogSumExp))
     }
     /// The index of the first maximum along `a`, as a value — one
     /// index-carrying fold, matching every framework's tie convention.
-    pub fn argmax(&self, a: Axis) -> TensorExpr {
-        self.reduce(a, BinOp::ArgMax)
+    pub fn argmax(&self, dimension: isize) -> TensorExpr {
+        self.reduce(dimension, BinOp::ArgMax)
     }
 
     /// All k ranks of the top-k selection along `a` as ONE tensor over a
@@ -599,45 +770,53 @@ impl TensorExpr {
     /// positions instead of values.
     pub fn topk_all(
         &self,
-        a: Axis,
+        dimension: isize,
         k: usize,
         rank_name: &'static str,
         idx: bool,
-    ) -> (TensorExpr, Axis) {
-        self.expect_axis(a, "topk_all");
+    ) -> TensorExpr {
+        let reduction_axis = self.axis(dimension, "topk_all");
         let rank = axis(rank_name, k);
         assert!(k > 0, "topk_all requires k >= 1");
         let mut output = None;
         for index in 0..k {
             let ranked = ir::reduce(
                 self.node.clone(),
-                a,
+                reduction_axis,
                 BinOp::TopK {
                     k: k as u8,
                     rank: index as u8,
                     idx,
                 },
             );
-            let term = ir::map(
-                MapOp::Mul,
-                vec![TensorExpr::scalar(index as f64).one_hot(rank).node, ranked],
+            let rank_iota = ir::iota(rank);
+            let selector = ir::map(
+                MapOp::Sub,
+                vec![
+                    ir::map(
+                        MapOp::Sub,
+                        vec![
+                            ir::konst(1.0),
+                            ir::map(MapOp::Lt, vec![rank_iota.clone(), ir::konst(index as f64)]),
+                        ],
+                    ),
+                    ir::map(MapOp::Lt, vec![ir::konst(index as f64), rank_iota]),
+                ],
             );
+            let term = ir::map(MapOp::Mul, vec![selector, ranked]);
             output = Some(match output {
                 Some(output) => ir::map(MapOp::Add, vec![output, term]),
                 None => term,
             });
         }
-        (
-            TensorExpr {
-                node: output.unwrap(),
-            },
-            rank,
-        )
+        TensorExpr {
+            node: output.unwrap(),
+        }
     }
 
     /// The top `k` values and their first-max-wins indices along `axis`.
-    pub fn topk(&self, axis: Axis, k: usize) -> Vec<(TensorExpr, TensorExpr)> {
-        self.expect_axis(axis, "topk");
+    pub fn topk(&self, dimension: isize, k: usize) -> Vec<(TensorExpr, TensorExpr)> {
+        let axis = self.axis(dimension, "topk");
         (0..k)
             .map(|rank| {
                 let value = ir::reduce(
@@ -665,26 +844,56 @@ impl TensorExpr {
 
     /// Prefix recurrence over `a` (the axis is kept); foldable iff `op` is
     /// associative.
-    pub fn scan(&self, a: Axis, op: BinOp) -> TensorExpr {
-        self.expect_axis(a, "scan");
+    pub fn scan(&self, dimension: isize, op: BinOp) -> TensorExpr {
+        let axis = self.axis(dimension, "scan");
         TensorExpr {
-            node: ir::scan(self.node.clone(), a, op),
+            node: ir::scan(self.node.clone(), axis, op),
         }
     }
 
     // ── contractions and friends ─────────────────────────────────────────────
 
-    /// Contract `contract` between `self` and `other`:
-    /// `Reduce(Map(×, a, b), contract, Add)`. Every other shared axis is
-    /// batched; every unshared one broadcasts — matmul, matvec, and batched
-    /// attention contractions are all this one call.
-    pub fn matmul(&self, other: &TensorExpr, contract: Axis) -> TensorExpr {
-        self.expect_axis(contract, "matmul (left operand)");
-        other.expect_axis(contract, "matmul (right operand)");
+    /// Torch-style matrix multiplication: `(m, k) @ (k, n)`.
+    ///
+    /// Leading dimensions use trailing-dimension broadcasting.
+    pub fn matmul(&self, other: &TensorExpr) -> TensorExpr {
+        let left = output_axes(&self.node);
+        let right = output_axes(&other.node);
+        assert!(
+            left.len() >= 2 && right.len() >= 2,
+            "matmul requires tensors with rank >= 2; received ranks {} and {}",
+            left.len(),
+            right.len()
+        );
+        let left_k = left[left.len() - 1];
+        let right_k = right[right.len() - 2];
+        assert_eq!(
+            left_k.extent, right_k.extent,
+            "matmul: left k dimension {:?} does not match right k dimension {:?}",
+            left_k.extent, right_k.extent
+        );
+
+        let batch = Self::broadcast_axes(
+            &left[..left.len() - 2],
+            &right[..right.len() - 2],
+            "matmul batch dimensions",
+        );
+        let mut left_target = batch.clone();
+        left_target.extend([left[left.len() - 2], left_k]);
+        let mut right_target = batch;
+        // `n` is an output dimension of this matmul, not the semantic axis
+        // carried by the right operand. In particular, `x @ x.T` must produce
+        // `(m, n)`, even though both dimensions originate from the same input
+        // position.
+        let right_n = right[right.len() - 1];
+        let output_n = axis(right_n.name.as_str(), right_n.extent);
+        right_target.extend([left_k, output_n]);
+        let left = Self::broadcast_node(self.node.clone(), &left_target, "matmul");
+        let right = Self::broadcast_node(other.node.clone(), &right_target, "matmul");
         TensorExpr {
             node: ir::reduce(
-                ir::map(MapOp::Mul, vec![self.node.clone(), other.node.clone()]),
-                contract,
+                ir::map(MapOp::Mul, vec![left, right]),
+                left_k,
                 BinOp::Monoid(Monoid::Add),
             ),
         }
@@ -692,43 +901,55 @@ impl TensorExpr {
 
     /// Softmax over `a` as the textbook dataflow — max, shift, exp, sum,
     /// divide — from which `derive` reconstructs the online form.
-    pub fn softmax(&self, a: Axis) -> TensorExpr {
-        self.expect_axis(a, "softmax");
-        let maximum = self.max(a);
-        let shifted = self - maximum;
-        let exponent = shifted.exp();
-        let normalizer = exponent.sum(a);
-        exponent / normalizer
+    pub fn softmax(&self, dimension: isize) -> TensorExpr {
+        let axis = self.axis(dimension, "softmax");
+        let maximum = ir::reduce(self.node.clone(), axis, BinOp::Monoid(Monoid::Max));
+        let exponent = ir::map(
+            MapOp::Exp,
+            vec![ir::map(MapOp::Sub, vec![self.node.clone(), maximum])],
+        );
+        let normalizer = ir::reduce(exponent.clone(), axis, BinOp::Monoid(Monoid::Add));
+        TensorExpr {
+            node: ir::map(MapOp::Div, vec![exponent, normalizer]),
+        }
     }
 
     /// `softmax(self·kᵀ over d)·v`, normalized over `keys` — naive attention,
     /// the graph FlashAttention is derived from.
-    pub fn attention(&self, k: &TensorExpr, v: &TensorExpr, d: Axis, keys: Axis) -> TensorExpr {
-        self.matmul(k, d).softmax(keys).matmul(v, keys)
+    pub fn attention(&self, k: &TensorExpr, v: &TensorExpr) -> TensorExpr {
+        self.matmul(k).softmax(-1).matmul(v)
     }
 
     /// `self[index[…]]` — data-dependent access along `a` (embedding lookup,
     /// expert selection).
-    pub fn gather(&self, index: &TensorExpr, a: Axis) -> TensorExpr {
-        self.expect_axis(a, "gather");
+    pub fn gather(&self, index: &TensorExpr, dimension: isize) -> TensorExpr {
+        let axis = self.axis(dimension, "gather");
         TensorExpr {
-            node: ir::gather(self.node.clone(), index.node.clone(), a),
+            node: ir::gather(self.node.clone(), index.node.clone(), axis),
         }
     }
 
     /// Look up `ids` in a table along its vocabulary axis.
-    pub fn embedding(&self, ids: &TensorExpr, vocabulary: Axis) -> TensorExpr {
-        self.expect_axis(vocabulary, "embedding");
+    pub fn embedding(&self, ids: &TensorExpr) -> TensorExpr {
+        let vocabulary = self.axis(0, "embedding");
+        let gathered = ir::gather(self.node.clone(), ids.node.clone(), vocabulary);
+        let mut axes = output_axes(&ids.node);
+        axes.extend(output_axes(&self.node).into_iter().skip(1));
         TensorExpr {
-            node: ir::gather(self.node.clone(), ids.node.clone(), vocabulary),
+            node: Self::with_axis_order(gathered, &axes),
         }
     }
 
     /// Scatter-add along `from` into buckets over `to` (gather's adjoint;
     /// collisions add).
-    pub fn scatter_add(&self, index: &TensorExpr, from: Axis, to: Axis) -> TensorExpr {
-        self.expect_axis(from, "scatter_add");
-        let one_hot = index.one_hot(to);
+    pub fn scatter_add(
+        &self,
+        index: &TensorExpr,
+        dimension: isize,
+        output_size: usize,
+    ) -> TensorExpr {
+        let from = self.axis(dimension, "scatter_add");
+        let one_hot = index.one_hot(output_size);
         TensorExpr {
             node: ir::reduce(
                 ir::map(MapOp::Mul, vec![one_hot.node, self.node.clone()]),
@@ -740,26 +961,76 @@ impl TensorExpr {
 
     // ── movement ─────────────────────────────────────────────────────────────
 
-    /// The same values under a different axis — how two tensors come to share
-    /// (or stop sharing) an index space. Extents must match.
-    pub fn rename(&self, from: Axis, to: Axis) -> TensorExpr {
-        self.expect_axis(from, "rename");
+    /// Reorder dimensions. `dimensions` must be a permutation of the rank.
+    pub fn permute(&self, dimensions: &[isize]) -> TensorExpr {
+        let axes = output_axes(&self.node);
         assert_eq!(
-            from.extent(),
-            to.extent(),
-            "rename: `{from}` has extent {} but `{to}` has {}",
-            from.extent(),
-            to.extent()
+            dimensions.len(),
+            axes.len(),
+            "permute: expected {} dimensions, received {}",
+            axes.len(),
+            dimensions.len()
+        );
+        let target: Vec<Axis> = dimensions
+            .iter()
+            .map(|&dimension| self.axis(dimension, "permute"))
+            .collect();
+        let mut unique = target.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            axes.len(),
+            "permute: dimensions must not repeat"
         );
         TensorExpr {
-            node: ir::rename(self.node.clone(), from, to),
+            node: Self::with_axis_order(self.node.clone(), &target),
         }
     }
 
-    /// Reverse the values along `axis`, without moving storage. This is an
+    pub fn transpose(&self, first: isize, second: isize) -> TensorExpr {
+        let rank = output_axes(&self.node).len();
+        let mut dimensions: Vec<isize> = (0..rank as isize).collect();
+        let normalize = |dimension: isize| {
+            if dimension < 0 {
+                (rank as isize + dimension) as usize
+            } else {
+                dimension as usize
+            }
+        };
+        let first = normalize(first);
+        let second = normalize(second);
+        assert!(
+            first < rank && second < rank,
+            "transpose: dimension out of range for rank {rank}"
+        );
+        dimensions.swap(first, second);
+        self.permute(&dimensions)
+    }
+
+    /// Insert a size-one dimension.
+    pub fn unsqueeze(&self, dimension: isize) -> TensorExpr {
+        let mut axes = output_axes(&self.node);
+        let rank = axes.len() as isize;
+        let index = if dimension < 0 {
+            rank + dimension + 1
+        } else {
+            dimension
+        };
+        assert!(
+            (0..=rank).contains(&index),
+            "unsqueeze: dimension {dimension} is out of range for rank {rank}"
+        );
+        axes.insert(index as usize, axis("singleton", 1));
+        TensorExpr {
+            node: Self::with_axis_order(self.node.clone(), &axes),
+        }
+    }
+
+    /// Reverse the values along `dimension`, without moving storage. This is an
     /// affine reindex, useful for pairwise transforms such as RoPE.
-    pub fn flip(&self, axis: Axis) -> TensorExpr {
-        self.expect_axis(axis, "flip");
+    pub fn flip(&self, dimension: isize) -> TensorExpr {
+        let axis = self.axis(dimension, "flip");
         TensorExpr {
             node: ir::reindex(
                 self.node.clone(),
@@ -769,101 +1040,85 @@ impl TensorExpr {
         }
     }
 
-    /// Merge a group of axes into one fresh axis (returned; extent = the
-    /// product), row-major in the group's order. No data moves.
-    pub fn flatten(&self, group: &[Axis], name: &'static str) -> (TensorExpr, Axis) {
-        for a in group {
-            self.expect_axis(*a, "flatten");
+    /// Flatten the inclusive dimension range in row-major order.
+    pub fn flatten(&self, start_dimension: isize, end_dimension: isize) -> TensorExpr {
+        let axes = output_axes(&self.node);
+        let start = self.axis(start_dimension, "flatten");
+        let end = self.axis(end_dimension, "flatten");
+        let start = axes.iter().position(|axis| *axis == start).unwrap();
+        let end = axes.iter().position(|axis| *axis == end).unwrap();
+        assert!(
+            start <= end,
+            "flatten: start dimension follows end dimension"
+        );
+        let group = &axes[start..=end];
+        let extent: usize = group
+            .iter()
+            .map(|axis| Self::static_extent(*axis, "flatten"))
+            .product();
+        let output = axis("flattened", extent);
+        TensorExpr {
+            node: ir::flatten(self.node.clone(), group, output),
         }
-        let to = axis(name, group.iter().map(|a| a.extent()).product::<usize>());
-        (
-            TensorExpr {
-                node: ir::flatten(self.node.clone(), group, to),
-            },
-            to,
-        )
     }
 
     /// Split one axis into (outer, inner) fresh axes (returned) — the inverse
     /// of [`TensorExpr::flatten`]; `inner_extent` must divide `from.extent()`.
-    pub fn split(
-        &self,
-        from: Axis,
-        outer_name: &'static str,
-        inner_name: &'static str,
-        inner_extent: usize,
-    ) -> (TensorExpr, Axis, Axis) {
-        self.expect_axis(from, "split");
+    pub fn split(&self, dimension: isize, inner_extent: usize) -> TensorExpr {
+        let from = self.axis(dimension, "split");
         assert_eq!(
             from.extent() % inner_extent,
             0,
             "split: {inner_extent} does not divide `{from}` (extent {})",
             from.extent()
         );
-        let outer = axis(outer_name, from.extent() / inner_extent);
-        let inner = axis(inner_name, inner_extent);
-        (
-            TensorExpr {
-                node: ir::split(self.node.clone(), from, outer, inner),
-            },
-            outer,
-            inner,
-        )
+        let outer = axis("outer", from.extent() / inner_extent);
+        let inner = axis("inner", inner_extent);
+        TensorExpr {
+            node: ir::split(self.node.clone(), from, outer, inner),
+        }
     }
 
     /// A contiguous slice `[start, start + len)` along `from`, as a fresh
     /// axis (returned).
-    pub fn slice(
-        &self,
-        from: Axis,
-        start: usize,
-        len: usize,
-        name: &'static str,
-    ) -> (TensorExpr, Axis) {
-        self.expect_axis(from, "slice");
+    pub fn slice(&self, dimension: isize, start: usize, len: usize) -> TensorExpr {
+        let from = self.axis(dimension, "slice");
         assert!(
             start + len <= from.extent(),
             "slice: [{start}, {}) exceeds `{from}` (extent {})",
             start + len,
             from.extent()
         );
-        let to = axis(name, len);
-        (
-            TensorExpr {
-                node: ir::slice(self.node.clone(), from, to, start),
-            },
-            to,
-        )
+        let to = axis("slice", len);
+        TensorExpr {
+            node: ir::slice(self.node.clone(), from, to, start),
+        }
     }
 
     /// Zero-pad along `from` by `lo` below and `hi` above, as a fresh axis
     /// (returned; extent = lo + from + hi).
-    pub fn pad(&self, from: Axis, lo: usize, hi: usize, name: &'static str) -> (TensorExpr, Axis) {
-        self.expect_axis(from, "pad");
-        let to = axis(name, lo + from.extent() + hi);
-        (
-            TensorExpr {
-                node: ir::pad(self.node.clone(), from, to, lo),
-            },
-            to,
-        )
+    pub fn pad(&self, dimension: isize, lo: usize, hi: usize) -> TensorExpr {
+        let from = self.axis(dimension, "pad");
+        let to = axis("padded", lo + from.extent() + hi);
+        TensorExpr {
+            node: ir::pad(self.node.clone(), from, to, lo),
+        }
     }
 
-    /// Sliding windows along `from`: output `(out, k)` reads
-    /// `from[out·stride + k·dilation]`. `out` and `k` are caller-supplied
-    /// because `out` may deliberately be an *existing* axis to share an index
-    /// space (sliding-window attention rides the query axis). Convolution and
-    /// pooling are this followed by a contraction / max over `k`; compose
-    /// with [`TensorExpr::pad`] for SAME-style windows.
+    /// Sliding windows along one dimension. The result replaces it with
+    /// `(output_size, kernel_size)` and reads
+    /// `source[output·stride + kernel·dilation]`.
     pub fn window(
         &self,
-        from: Axis,
-        out: Axis,
-        k: Axis,
+        dimension: isize,
+        output_size: usize,
+        kernel_size: usize,
         stride: usize,
         dilation: usize,
     ) -> TensorExpr {
-        self.expect_axis(from, "window");
+        let from = self.axis(dimension, "window");
+        let out = axis("window", output_size);
+        let k = axis("kernel", kernel_size);
         let last_read = (out.extent() - 1) * stride + (k.extent() - 1) * dilation;
         assert!(
             last_read < from.extent(),
@@ -879,8 +1134,8 @@ impl TensorExpr {
 
     /// Derive the streaming accumulator for folding `a` — None where no legal
     /// fold exists.
-    pub fn derive(&self, a: Axis) -> Option<Carrier> {
-        crate::derive::derive(&self.node, a)
+    pub fn derive(&self, dimension: isize) -> Option<Carrier> {
+        crate::derive::derive(&self.node, self.axis(dimension, "derive"))
     }
 }
 

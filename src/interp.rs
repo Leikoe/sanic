@@ -45,9 +45,10 @@ pub type Env = HashMap<&'static str, Value>;
 /// A dense, row-major tensor tagged with the axis each dimension ranges over —
 /// the interpreter's value domain: what a graph *means* on concrete data.
 /// (The graph-building handle is [`crate::tensor::TensorExpr`]; this is data.)
-/// Axes are the semantic identity; the position in `axes` is just the storage
-/// order. Two tensors with the same axes in different orders denote the same
-/// mathematical object (see [`Value::permuted_to`]).
+/// Lowered axes are opaque semantic identities; their labels are diagnostic.
+/// The position in `axes` is the storage order. Two values with the same
+/// internal axes in different orders denote the same lowered object (see
+/// [`Value::permuted_to`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Value {
     pub axes: Vec<Axis>,
@@ -63,6 +64,16 @@ impl Value {
             shape: Vec::new(),
             data: vec![v],
         }
+    }
+
+    /// A row-major tensor described only by its positional shape.
+    pub fn from_shape(shape: impl AsRef<[usize]>, data: Vec<f64>) -> Value {
+        let shape = shape.as_ref().to_vec();
+        let axes: Vec<Axis> = shape
+            .iter()
+            .map(|&extent| crate::ir::axis("", extent))
+            .collect();
+        Value::from_data(&axes, shape, data)
     }
 
     /// A concrete tensor from runtime shape and row-major data. Dynamic axis

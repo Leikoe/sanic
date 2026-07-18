@@ -8,16 +8,16 @@
 //! vocabulary is a *closed* enum of scalar primitives, so the deriver can be
 //! total over it — there is no open set of named ops to special-case.
 //!
-//! An [`Axis`] is a named index space with a size — plain data, structural
-//! identity, no hidden state. Because the axis carries its extent, every
-//! shape is derivable from any graph and no side tables exist anywhere.
-//! `Reduce` binds its axis; `View` re-binds names (rename) or merges index
-//! spaces (flatten) without moving data. Axes are host-language values:
-//! write the same axis where two tensors share an index space, a
-//! differently-named one where they don't.
+//! An [`Axis`] is an opaque internal index space with a size and an optional
+//! diagnostic label. Labels never participate in identity. The public tensor
+//! frontend resolves positional shape indices into these internal axes before
+//! lowering. Because an axis carries its extent, every IR shape is derivable
+//! from the graph and no side tables exist.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type Node = Rc<NodeKind>;
 
@@ -76,20 +76,23 @@ impl From<usize> for Extent {
     }
 }
 
-/// An axis: a named index space with an extent — plain data, no hidden id (the
-/// way a tinygrad shape is just numbers). Identity is structural: two axes
-/// with the same name and extent ARE the same axis wherever they were
-/// written. So use one name per index space and a fresh name where spaces
-/// must differ (`t` vs `t2`) — equal name + equal extent unifies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// An internal index space used by the lowered IR.
+///
+/// `name` is diagnostic metadata only. It deliberately does not participate
+/// in equality, hashing, or ordering.
+#[derive(Clone, Copy)]
 pub struct Axis {
+    id: usize,
     pub name: AxisName,
     pub extent: Extent,
 }
 
-/// An axis, briefly: `axis("s", 512)`.
+static NEXT_AXIS: AtomicUsize = AtomicUsize::new(0);
+
+/// Mint an internal axis with a diagnostic label.
 pub fn axis(name: &'static str, extent: impl Into<Extent>) -> Axis {
     Axis {
+        id: NEXT_AXIS.fetch_add(1, Ordering::Relaxed),
         name: AxisName::new(name),
         extent: extent.into(),
     }
@@ -103,6 +106,46 @@ impl Axis {
 
     pub const fn is_dynamic(self) -> bool {
         matches!(self.extent, Extent::Dynamic)
+    }
+
+    pub(crate) const fn with_extent(self, extent: Extent) -> Axis {
+        Axis { extent, ..self }
+    }
+}
+
+impl PartialEq for Axis {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Axis {}
+
+impl Hash for Axis {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl PartialOrd for Axis {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Axis {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
+impl fmt::Debug for Axis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Axis")
+            .field("index", &self.id)
+            .field("name", &self.name)
+            .field("extent", &self.extent)
+            .finish()
     }
 }
 

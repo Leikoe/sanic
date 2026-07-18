@@ -6,8 +6,9 @@
 //!
 //! * [`ir`] — five compute node kinds plus two structural operators: `View`
 //!   (rename / flatten) and `Reindex` (slice / pad / split / windows — affine
-//!   index maps). An axis is a named index space carrying its extent, so
-//!   every shape is derivable from any graph and nothing takes a shape map.
+//!   index maps). Internal axes carry their extents and diagnostic labels;
+//!   labels are never identity, so every shape is derivable from any graph
+//!   and nothing takes a shape map.
 //!   Matmul, softmax, attention, convolution, argmax, top-k and scatter-add
 //!   are compositions
 //! * [`tensor`] — the explicit graph-building frontend: symbolic
