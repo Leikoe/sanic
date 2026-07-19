@@ -11,7 +11,7 @@ use crate::analyze::{Parallelism, analyze_all};
 use crate::cost::{Device, Kernel, feasible, kernel_time, schedule_time};
 use crate::derive::{Carrier, Expr, SlotKind};
 use crate::ir::{
-    Axis, Dtype, Node, NodeKind, all_axes, input_axes, input_dtypes, leaf_names, output_axes,
+    Axis, Dtype, Node as NodeKind, NodeRef as Node, all_axes, input_axes, input_dtypes, leaf_names,
 };
 
 /// Elements streamed per step along the folded axis.
@@ -98,7 +98,7 @@ pub fn plan_axis(
     let tn = TILE_N as f64;
 
     // ── axis roles, read off the carrier and the IR ──────────────────────────
-    let out_axes = output_axes(node);
+    let out_axes = node.shape();
     let out_set: HashSet<Axis> = out_axes.iter().copied().collect();
 
     // Contract axes: in the graph, but neither streamed nor in the output.
@@ -150,14 +150,19 @@ pub fn plan_axis(
             .filter(|(n, _)| seen.insert(*n))
             .collect()
     };
-    // Per-input storage bytes: a declared dtype (int-quantized weights)
-    // prices its true width; everything else moves at the device's compute
-    // dtype. This is where int8/int4 weights earn their bandwidth win.
+    // Per-input storage bytes. Every input declares its representation, so
+    // int8/int4 weights earn their bandwidth win without a device-dependent
+    // fallback.
     let declared: HashMap<&'static str, f64> = input_dtypes(node)
         .into_iter()
         .map(|(n, d)| (n, d.bytes()))
         .collect();
-    let in_bytes = |name: &'static str| declared.get(name).copied().unwrap_or(b_bytes);
+    let in_bytes = |name: &'static str| {
+        declared
+            .get(name)
+            .copied()
+            .expect("every input must declare a storage dtype")
+    };
 
     // An inner contraction (matmul inside the fold) keeps a scores-like
     // intermediate tile resident (tile_m × tile_c × TILE_N).
@@ -391,10 +396,7 @@ pub fn split_factor(
     let spec = plan_axis(node, streaming_axis, carrier, dev)?;
     let single = spec.cost;
     let bytes = dev.dtype_bytes;
-    let grid_vol: f64 = output_axes(node)
-        .iter()
-        .map(|ax| ax.extent() as f64)
-        .product();
+    let grid_vol: f64 = node.shape().iter().map(|ax| ax.extent() as f64).product();
     let slots = carrier.slots as f64;
     let n = streaming_axis.extent() as f64;
 
@@ -523,7 +525,7 @@ fn expr_ops(e: &Expr) -> f64 {
 /// recompute is paid in issue slots; pricing it at one flop per element is
 /// what made one-thread-per-output look cheap.
 fn count_issue_ops(node: &Node) -> f64 {
-    let vol = |n: &Node| -> f64 { output_axes(n).iter().map(|ax| ax.extent() as f64).product() };
+    let vol = |n: &Node| -> f64 { n.shape().iter().map(|ax| ax.extent() as f64).product() };
     match node.as_ref() {
         NodeKind::Const { .. } => 0.0,
         NodeKind::Iota { .. } => vol(node),
@@ -595,7 +597,7 @@ pub fn fold_sched(
     }
     let ext = |ax: Axis| ax.extent() as f64;
     let s_ext = ext(streaming_axis);
-    let out_axes = output_axes(fold_node);
+    let out_axes = fold_node.shape();
     let out_vol: f64 = out_axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
     let b_bytes = 4.0f64; // the Metal backend computes in f32
 
@@ -611,7 +613,10 @@ pub fn fold_sched(
         .filter(|(n, _)| seen.insert(*n))
         .map(|(n, axes)| {
             let vol: f64 = axes.iter().map(|&a| ext(a)).product();
-            vol * declared.get(n).copied().unwrap_or(b_bytes)
+            vol * declared
+                .get(n)
+                .copied()
+                .expect("every input must declare a storage dtype")
         })
         .sum::<f64>()
         + out_vol * b_bytes;
@@ -621,7 +626,7 @@ pub fn fold_sched(
         .leaves
         .iter()
         .map(|l| {
-            let axes = output_axes(l);
+            let axes = l.shape();
             let vol: f64 = axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
             let per_eval = count_issue_ops(l) / vol;
             (per_eval, axes, has_simd_reduce(l))
@@ -755,7 +760,7 @@ pub fn fold_sched_candidates(
     }
     let ext = |ax: Axis| ax.extent() as f64;
     let s_ext = ext(streaming_axis) as usize;
-    let out_axes = output_axes(fold_node);
+    let out_axes = fold_node.shape();
     let packed = input_dtypes(fold_node)
         .iter()
         .any(|(_, d)| matches!(d, Dtype::I4));
@@ -839,7 +844,7 @@ fn count_flops_memo(
     let vol = |n: &Node, oa: &mut HashMap<*const NodeKind, Vec<Axis>>| -> f64 {
         let axes = oa
             .entry(std::rc::Rc::as_ptr(n))
-            .or_insert_with(|| output_axes(n))
+            .or_insert_with(|| n.shape())
             .clone();
         axes.iter().map(|ax| ax.extent() as f64).product()
     };
@@ -882,9 +887,9 @@ mod tests {
             axis("e", 64),
         );
         let attn = attention(
-            input("Q", &[b, h, sq, d]),
-            input("K", &[b, h, k, d]),
-            input("V", &[b, h, k, e]),
+            input("Q", &[b, h, sq, d], Dtype::F32),
+            input("K", &[b, h, k, d], Dtype::F32),
+            input("V", &[b, h, k, e], Dtype::F32),
             d,
             k,
         );
@@ -908,7 +913,7 @@ mod tests {
     fn sum_schedules_with_tile_1() {
         // Reduce(X[n], n, Add) → scalar output; no row axis.
         let n = axis("n", 4096);
-        let x = input("X", &[n]);
+        let x = input("X", &[n], Dtype::F32);
         let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
         let c = derive(&s, n).unwrap();
         let dev = Device::toy();
@@ -928,9 +933,9 @@ mod tests {
             axis("e", 64),
         );
         let attn = attention(
-            input("Q", &[sq, d]),
-            input("K", &[k, d]),
-            input("V", &[k, e]),
+            input("Q", &[sq, d], Dtype::F32),
+            input("K", &[k, d], Dtype::F32),
+            input("V", &[k, e], Dtype::F32),
             d,
             k,
         );
@@ -945,7 +950,7 @@ mod tests {
     #[test]
     fn sum_plans_to_single_kernel() {
         let n = axis("n", 65536);
-        let x = input("X", &[n]);
+        let x = input("X", &[n], Dtype::F32);
         let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
         let dev = Device::toy();
 
@@ -964,17 +969,17 @@ mod tests {
         let (s, d, f) = (axis("s", 4), axis("d", 4096), axis("f", 4096));
         let dev = Device::toy();
 
-        let cost_of = |w: Node| {
-            let g = matmul(input("X", &[s, d]), w, d);
+        let cost_of = |w: NodeRef| {
+            let g = matmul(input("X", &[s, d], Dtype::F32), w, d);
             let c = derive(&g, d).unwrap();
             plan_axis(&g, d, &c, &dev).unwrap().cost
         };
-        let full = cost_of(input("W", &[f, d]));
-        let int8 = cost_of(input_dt("W8", &[f, d], Dtype::I8));
-        let int4 = cost_of(input_dt("W4", &[f, d], Dtype::I4));
+        let full = cost_of(input("W", &[f, d], Dtype::F32));
+        let int8 = cost_of(input("W8", &[f, d], Dtype::I8));
+        let int4 = cost_of(input("W4", &[f, d], Dtype::I4));
         assert!(
             int8 < full,
-            "int8 weights must price below f16: {int8} vs {full}"
+            "int8 weights must price below f32: {int8} vs {full}"
         );
         assert!(int4 < int8, "int4 must price below int8: {int4} vs {int8}");
     }

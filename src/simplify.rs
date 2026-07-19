@@ -46,8 +46,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ir::{
-    Axis, BinOp, MapOp, Monoid, Node, NodeKind, gather, konst, map, output_axes, reduce, reindex,
-    scan, view,
+    Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node, gather, konst, map, reduce,
+    reindex, scan, view,
 };
 
 /// Simplify `node` in two phases, each to a fixpoint.
@@ -113,7 +113,10 @@ fn pass(
             hashcons(node.clone(), cse)
         }
         NodeKind::Map { op, inputs } => {
-            let ins: Vec<Node> = inputs.iter().map(|i| pass(i, reconstruct, cse, memo, changed)).collect();
+            let ins: Vec<Node> = inputs
+                .iter()
+                .map(|i| pass(i, reconstruct, cse, memo, changed))
+                .collect();
             let rebuilt = match map_rule(*op, &ins, reconstruct) {
                 Some(r) => {
                     *changed = true;
@@ -138,7 +141,11 @@ fn pass(
         }
         NodeKind::Scan { src, axis, op } => {
             let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if Rc::ptr_eq(&s, src) { node.clone() } else { scan(s, *axis, *op) };
+            let rebuilt = if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                scan(s, *axis, *op)
+            };
             hashcons(rebuilt, cse)
         }
         NodeKind::Gather { src, index, axis } => {
@@ -153,10 +160,18 @@ fn pass(
         }
         NodeKind::View { src, groups } => {
             let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if Rc::ptr_eq(&s, src) { node.clone() } else { view(s, groups.clone()) };
+            let rebuilt = if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                view(s, groups.clone())
+            };
             hashcons(rebuilt, cse)
         }
-        NodeKind::Reindex { src, map: m, padded } => {
+        NodeKind::Reindex {
+            src,
+            map: m,
+            padded,
+        } => {
             let s = pass(src, reconstruct, cse, memo, changed);
             let rebuilt = if Rc::ptr_eq(&s, src) {
                 node.clone()
@@ -264,7 +279,10 @@ fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
                 if let Some(inner) = as_map(a, MapOp::Sub) {
                     return Some(map(
                         MapOp::Sub,
-                        vec![inner[0].clone(), map(MapOp::Add, vec![inner[1].clone(), b.clone()])],
+                        vec![
+                            inner[0].clone(),
+                            map(MapOp::Add, vec![inner[1].clone(), b.clone()]),
+                        ],
                     ));
                 }
             }
@@ -362,11 +380,17 @@ fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
     // Σ(k · x) → k · Σx when k is invariant along the axis (defer-scale)
     if let Some(m) = as_map(s, MapOp::Mul) {
         let (l, r) = (&m[0], &m[1]);
-        if !output_axes(l).contains(&axis) {
-            return Some(map(MapOp::Mul, vec![l.clone(), reduce(r.clone(), axis, op)]));
+        if !l.shape().contains(&axis) {
+            return Some(map(
+                MapOp::Mul,
+                vec![l.clone(), reduce(r.clone(), axis, op)],
+            ));
         }
-        if !output_axes(r).contains(&axis) {
-            return Some(map(MapOp::Mul, vec![r.clone(), reduce(l.clone(), axis, op)]));
+        if !r.shape().contains(&axis) {
+            return Some(map(
+                MapOp::Mul,
+                vec![r.clone(), reduce(l.clone(), axis, op)],
+            ));
         }
     }
     // Σ(−x) → −Σx

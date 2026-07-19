@@ -133,7 +133,7 @@ page is substrate we need so the moat is usable on real workloads.
   splits, a 1024² flash does not (`tests/group.rs`). The cost model now
   distinguishes latency-hiding occupancy (compute) from memory-level
   parallelism (bandwidth: `lanes_per_block`, `Device::mem_lanes`).
-- **Storage dtypes, priced AND real** *(new)* — `input_dt(name, axes,
+- **Storage dtypes, priced AND real** *(new)* — `input(name, axes,
   Dtype::I4)` declares a buffer's storage width; the planner bills each
   input's true bytes (int4 < int8 < f16 for the same GEMV), and the Metal
   backend now reads **typed device buffers**: `half` widens on load, packed
@@ -253,7 +253,7 @@ Additive to the IR, no algebra changes:
   scale, dequantized *inside* the GEMM lift automatically (elementwise fuses
   into the contraction). One fused kernel, no materialized dequant weight,
   no new op — verified interp / compiled Rust / GPU.
-- **Storage dtype → cost** — [done]. `input_dt(…, Dtype::I8/I4)` declares a
+- **Storage dtype → cost** — [done]. `input(…, Dtype::I8/I4)` declares a
   buffer's storage width; the planner prices each input's true bytes, so
   int-quantized weights earn their bandwidth win in the ranking
   (int4 < int8 < f16 on a memory-bound GEMV, `plan::tests`).

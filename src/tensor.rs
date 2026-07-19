@@ -7,8 +7,8 @@
 //!
 //! Dimensions are positional, following Torch conventions. Elementwise
 //! operations broadcast trailing dimensions, reductions take a dimension
-//! index, and matrix multiplication contracts `(m, k) @ (k, n)`. Dimension
-//! names are optional diagnostic labels and never determine semantics.
+//! index, and matrix multiplication contracts `(m, k) @ (k, n)`. A shape is
+//! only an ordered list of extents; its axes are identified by their indices.
 //!
 //! ```
 //! use sanic::{Dtype, Extent, GraphBuilder};
@@ -26,14 +26,15 @@
 //! ```
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::ops::Index;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::derive::Carrier;
 use crate::interp::{Env, Value};
 use crate::ir::{
-    self, Axis, BinOp, Dtype, Extent, MapOp, Monoid, Node, NodeKind, axis, leaf_names, output_axes,
+    self, Axis, BinOp, Dtype, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, axis,
+    leaf_names,
 };
 
 /// Concrete tensor data bound to a graph input at execution time.
@@ -42,21 +43,29 @@ pub type Tensor = Value;
 /// Concrete buffers keyed by their graph input names.
 pub type Bindings = HashMap<String, Tensor>;
 
-/// The ordered axes describing a tensor expression.
-#[derive(Clone, Debug)]
-pub struct Shape(Vec<Axis>);
+/// The ordered dimensions of a tensor expression.
+///
+/// Dimensions have no identity independent of this list. An axis is the
+/// integer index of its extent in the shape.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Shape(Vec<Extent>);
 
 impl Shape {
-    pub fn new(axes: impl IntoIterator<Item = Axis>) -> Self {
-        Shape(axes.into_iter().collect())
+    pub fn new(shape: impl Into<Shape>) -> Self {
+        shape.into()
     }
 
-    pub fn axes(&self) -> &[Axis] {
+    pub fn dimensions(&self) -> &[Extent] {
         &self.0
     }
 
     pub fn extents(&self) -> impl ExactSizeIterator<Item = Extent> + '_ {
-        self.0.iter().map(|dimension| dimension.extent)
+        self.0.iter().copied()
+    }
+
+    /// The extent of the axis at `index`.
+    pub fn extent(&self, index: usize) -> Extent {
+        self.0[index]
     }
 
     pub fn rank(&self) -> usize {
@@ -64,86 +73,50 @@ impl Shape {
     }
 
     pub fn element_count(&self) -> Option<usize> {
-        self.0.iter().try_fold(1usize, |count, axis| {
-            axis.extent
-                .static_value()
-                .and_then(|extent| count.checked_mul(extent))
-        })
+        self.0
+            .iter()
+            .try_fold(1usize, |count, extent| match extent {
+                Extent::Static(extent) => count.checked_mul(*extent),
+                Extent::Dynamic => None,
+            })
     }
 }
 
-impl PartialEq for Shape {
-    fn eq(&self, other: &Self) -> bool {
-        self.extents().eq(other.extents())
-    }
-}
+impl Index<usize> for Shape {
+    type Output = Extent;
 
-impl Eq for Shape {}
-
-impl Hash for Shape {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.rank().hash(state);
-        for extent in self.extents() {
-            extent.hash(state);
-        }
-    }
-}
-
-fn unnamed_axis(extent: impl Into<Extent>) -> Axis {
-    axis("", extent)
-}
-
-impl<const N: usize> From<[Axis; N]> for Shape {
-    fn from(axes: [Axis; N]) -> Self {
-        Shape(axes.into())
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
     }
 }
 
 impl<const N: usize> From<[usize; N]> for Shape {
     fn from(extents: [usize; N]) -> Self {
-        Shape(extents.into_iter().map(unnamed_axis).collect())
+        Shape(extents.into_iter().map(Extent::from).collect())
     }
 }
 
 impl<const N: usize> From<[Extent; N]> for Shape {
     fn from(extents: [Extent; N]) -> Self {
-        Shape(extents.into_iter().map(unnamed_axis).collect())
-    }
-}
-
-impl<const N: usize> From<&[Axis; N]> for Shape {
-    fn from(axes: &[Axis; N]) -> Self {
-        Shape(axes.to_vec())
-    }
-}
-
-impl From<&[Axis]> for Shape {
-    fn from(axes: &[Axis]) -> Self {
-        Shape(axes.to_vec())
-    }
-}
-
-impl From<Vec<Axis>> for Shape {
-    fn from(axes: Vec<Axis>) -> Self {
-        Shape(axes)
+        Shape(extents.into())
     }
 }
 
 impl From<Vec<usize>> for Shape {
     fn from(extents: Vec<usize>) -> Self {
-        Shape(extents.into_iter().map(unnamed_axis).collect())
+        Shape(extents.into_iter().map(Extent::from).collect())
     }
 }
 
 impl From<Vec<Extent>> for Shape {
     fn from(extents: Vec<Extent>) -> Self {
-        Shape(extents.into_iter().map(unnamed_axis).collect())
+        Shape(extents)
     }
 }
 
-impl AsRef<[Axis]> for Shape {
-    fn as_ref(&self) -> &[Axis] {
-        self.axes()
+impl AsRef<[Extent]> for Shape {
+    fn as_ref(&self) -> &[Extent] {
+        self.dimensions()
     }
 }
 
@@ -152,6 +125,7 @@ struct InputSpec {
     binding_name: String,
     leaf_name: &'static str,
     shape: Shape,
+    axes: Vec<Axis>,
 }
 
 static NEXT_GRAPH: AtomicUsize = AtomicUsize::new(0);
@@ -176,7 +150,7 @@ impl GraphBuilder {
         }
     }
 
-    /// Add a named input with its storage dtype.
+    /// Add a named input with its positional shape and storage dtype.
     pub fn input(
         &mut self,
         name: impl Into<String>,
@@ -199,21 +173,17 @@ impl GraphBuilder {
         let input_index = self.inputs.len();
         let leaf_name =
             Box::leak(format!("__sanic_g{}_input{input_index}", self.graph_id).into_boxed_str());
-        // Every input owns its positional dimensions. Reusing a diagnostic
-        // label (or even the same shape descriptor) never aliases dimensions
-        // across tensors.
-        let shape = Shape::new(
-            shape
-                .axes()
-                .iter()
-                .map(|dimension| axis(dimension.name.as_str(), dimension.extent)),
-        );
+        // The lowered algebra still needs tokens to correlate dimensions
+        // across subexpressions. They are private implementation details:
+        // every input gets one token per shape index.
+        let axes: Vec<Axis> = shape.extents().map(|extent| axis("", extent)).collect();
         self.inputs.push(InputSpec {
             binding_name,
             leaf_name,
             shape: shape.clone(),
+            axes: axes.clone(),
         });
-        TensorExpr::input_node(leaf_name, shape.axes(), dtype)
+        TensorExpr::input_node(leaf_name, &axes, dtype)
     }
 
     /// Freeze the reachable expressions as the graph's ordered outputs.
@@ -283,19 +253,25 @@ impl Graph {
                 tensor.shape,
                 tensor.data.len()
             );
-            for (&axis, &actual) in spec.shape.axes().iter().zip(&tensor.shape) {
-                match axis.extent {
+            for (dimension, ((&axis, expected), &actual)) in spec
+                .axes
+                .iter()
+                .zip(spec.shape.extents())
+                .zip(&tensor.shape)
+                .enumerate()
+            {
+                match expected {
                     Extent::Static(expected) => assert_eq!(
                         actual, expected,
-                        "input `{}` axis `{}` has extent {actual}; graph expects {expected}",
-                        spec.binding_name, axis.name
+                        "input `{}` axis {dimension} has extent {actual}; graph expects {expected}",
+                        spec.binding_name
                     ),
                     Extent::Dynamic => {
                         let previous = resolved.entry(axis).or_insert(actual);
                         assert_eq!(
                             *previous, actual,
-                            "dynamic axis `{}` resolved to both {} and {actual}",
-                            axis.name, *previous
+                            "input `{}` dynamic axis {dimension} resolved to both {} and {actual}",
+                            spec.binding_name, *previous
                         );
                     }
                 }
@@ -309,8 +285,7 @@ impl Graph {
                 spec.leaf_name,
                 Tensor {
                     axes: spec
-                        .shape
-                        .axes()
+                        .axes
                         .iter()
                         .map(|&axis| concretize_axis(axis, &resolved))
                         .collect(),
@@ -333,7 +308,15 @@ impl Graph {
     pub fn output_shapes(&self) -> Vec<Shape> {
         self.outputs
             .iter()
-            .map(|output| Shape(output_axes(output)))
+            .map(|output| {
+                Shape::from(
+                    output
+                        .shape()
+                        .into_iter()
+                        .map(|axis| axis.extent)
+                        .collect::<Vec<_>>(),
+                )
+            })
             .collect()
     }
 }
@@ -444,7 +427,7 @@ impl TensorExpr {
 
     fn input_node(name: &'static str, axes: &[Axis], dtype: Dtype) -> TensorExpr {
         TensorExpr {
-            node: ir::input_dt(name, axes, dtype),
+            node: ir::input(name, axes, dtype),
         }
     }
 
@@ -499,14 +482,20 @@ impl TensorExpr {
 
     // ── shape ────────────────────────────────────────────────────────────────
 
-    /// The output axes, in the graph's axis order — each carrying its extent.
-    /// A scalar has none.
+    /// The ordered output shape. Axis indices are positions in this shape; a
+    /// scalar has no axes.
     pub fn shape(&self) -> Shape {
-        Shape(output_axes(&self.node))
+        Shape::from(
+            self.node
+                .shape()
+                .into_iter()
+                .map(|axis| axis.extent)
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn axis(&self, dimension: isize, op: &str) -> Axis {
-        let axes = output_axes(&self.node);
+        let axes = self.node.shape();
         let rank = axes.len() as isize;
         let index = if dimension < 0 {
             rank + dimension
@@ -522,14 +511,17 @@ impl TensorExpr {
     }
 
     fn static_extent(axis: Axis, op: &str) -> usize {
-        axis.extent.static_value().unwrap_or_else(|| {
-            panic!("{op}: dynamic dimensions are resolved only when the graph runs")
-        })
+        match axis.extent {
+            Extent::Static(extent) => extent,
+            Extent::Dynamic => {
+                panic!("{op}: dynamic dimensions are resolved only when the graph runs")
+            }
+        }
     }
 
     /// Rebind `node` positionally to `target`, applying size-one broadcasting.
     fn broadcast_node(node: Node, target: &[Axis], op: &str) -> Node {
-        let source = output_axes(&node);
+        let source = node.shape();
         assert!(
             source.len() <= target.len(),
             "{op}: cannot broadcast rank {} to rank {}",
@@ -557,7 +549,7 @@ impl TensorExpr {
             }
         }
 
-        if output_axes(&node) == target {
+        if node.shape() == target {
             return node;
         }
 
@@ -565,7 +557,7 @@ impl TensorExpr {
     }
 
     fn with_axis_order(node: Node, target: &[Axis]) -> Node {
-        if output_axes(&node) == target {
+        if node.shape() == target {
             return node;
         }
         // Putting a zero expression first establishes the exact Torch output
@@ -620,8 +612,8 @@ impl TensorExpr {
     }
 
     fn binary(&self, op: MapOp, other: &TensorExpr) -> TensorExpr {
-        let left_axes = output_axes(&self.node);
-        let right_axes = output_axes(&other.node);
+        let left_axes = self.node.shape();
+        let right_axes = other.node.shape();
         let axes = Self::broadcast_axes(&left_axes, &right_axes, "elementwise operation");
         TensorExpr {
             node: ir::map(
@@ -690,9 +682,9 @@ impl TensorExpr {
     }
     /// `self != 0 ? if_true : if_false`, elementwise; `self` is the condition.
     pub fn select(&self, if_true: &TensorExpr, if_false: &TensorExpr) -> TensorExpr {
-        let condition_axes = output_axes(&self.node);
-        let true_axes = output_axes(&if_true.node);
-        let false_axes = output_axes(&if_false.node);
+        let condition_axes = self.node.shape();
+        let true_axes = if_true.node.shape();
+        let false_axes = if_false.node.shape();
         let axes = Self::broadcast_axes(
             &Self::broadcast_axes(&condition_axes, &true_axes, "where"),
             &false_axes,
@@ -859,8 +851,8 @@ impl TensorExpr {
     ///
     /// Leading dimensions use trailing-dimension broadcasting.
     pub fn matmul(&self, other: &TensorExpr) -> TensorExpr {
-        let left = output_axes(&self.node);
-        let right = output_axes(&other.node);
+        let left = self.node.shape();
+        let right = other.node.shape();
         assert!(
             left.len() >= 2 && right.len() >= 2,
             "matmul requires tensors with rank >= 2; received ranks {} and {}",
@@ -935,8 +927,8 @@ impl TensorExpr {
     pub fn embedding(&self, ids: &TensorExpr) -> TensorExpr {
         let vocabulary = self.axis(0, "embedding");
         let gathered = ir::gather(self.node.clone(), ids.node.clone(), vocabulary);
-        let mut axes = output_axes(&ids.node);
-        axes.extend(output_axes(&self.node).into_iter().skip(1));
+        let mut axes = ids.node.shape();
+        axes.extend(self.node.shape().into_iter().skip(1));
         TensorExpr {
             node: Self::with_axis_order(gathered, &axes),
         }
@@ -965,7 +957,7 @@ impl TensorExpr {
 
     /// Reorder dimensions. `dimensions` must be a permutation of the rank.
     pub fn permute(&self, dimensions: &[isize]) -> TensorExpr {
-        let axes = output_axes(&self.node);
+        let axes = self.node.shape();
         assert_eq!(
             dimensions.len(),
             axes.len(),
@@ -991,7 +983,7 @@ impl TensorExpr {
     }
 
     pub fn transpose(&self, first: isize, second: isize) -> TensorExpr {
-        let rank = output_axes(&self.node).len();
+        let rank = self.node.shape().len();
         let mut dimensions: Vec<isize> = (0..rank as isize).collect();
         let normalize = |dimension: isize| {
             if dimension < 0 {
@@ -1012,7 +1004,7 @@ impl TensorExpr {
 
     /// Insert a size-one dimension.
     pub fn unsqueeze(&self, dimension: isize) -> TensorExpr {
-        let mut axes = output_axes(&self.node);
+        let mut axes = self.node.shape();
         let rank = axes.len() as isize;
         let index = if dimension < 0 {
             rank + dimension + 1
@@ -1044,7 +1036,7 @@ impl TensorExpr {
 
     /// Flatten the inclusive dimension range in row-major order.
     pub fn flatten(&self, start_dimension: isize, end_dimension: isize) -> TensorExpr {
-        let axes = output_axes(&self.node);
+        let axes = self.node.shape();
         let start = self.axis(start_dimension, "flatten");
         let end = self.axis(end_dimension, "flatten");
         let start = axes.iter().position(|axis| *axis == start).unwrap();

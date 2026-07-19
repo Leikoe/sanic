@@ -79,9 +79,9 @@ fn main() {
     let group_size = 4; // query heads per kv-head (the GQA ratio)
     let head_dim_size = 128;
 
-    let q = input("q", &[batch, q_heads, seq_len, head_dim]);
-    let k = input("k", &[batch, kv_heads, kv_seq_len, head_dim]);
-    let v = input("v", &[batch, kv_heads, kv_seq_len, head_dim]);
+    let q = input("q", &[batch, q_heads, seq_len, head_dim], Dtype::F32);
+    let k = input("k", &[batch, kv_heads, kv_seq_len, head_dim], Dtype::F32);
+    let v = input("v", &[batch, kv_heads, kv_seq_len, head_dim], Dtype::F32);
     // GQA reshape: q_heads → (kv_heads, group). Now each group shares a kv-head.
     let qg = split(q.clone(), q_heads, kv_heads, group, group_size);
     // Scaled dot-product attention, spelled out from the basis:

@@ -82,7 +82,7 @@ fn rms(x: Node, w: &'static str, dm: Axis, n: usize) -> Node {
     );
     map(
         MapOp::Mul,
-        vec![map(MapOp::Mul, vec![x, inv]), input(w, &[dm])],
+        vec![map(MapOp::Mul, vec![x, inv]), input(w, &[dm], Dtype::F32)],
     )
 }
 
@@ -107,7 +107,7 @@ fn rms_head(x: Node, w: &'static str, j2: Axis, rr: Axis, hd: Axis) -> Node {
     );
     map(
         MapOp::Mul,
-        vec![map(MapOp::Mul, vec![x, inv]), input(w, &[j2, rr])],
+        vec![map(MapOp::Mul, vec![x, inv]), input(w, &[j2, rr], Dtype::F32)],
     )
 }
 
@@ -171,8 +171,8 @@ fn w4_matvec(
     let prod = map(
         MapOp::Mul,
         vec![
-            map(MapOp::Mul, vec![input_dt(w, &w_axes, Dtype::I4), xs]),
-            input(s, &s_axes),
+            map(MapOp::Mul, vec![input(w, &w_axes, Dtype::I4), xs]),
+            input(s, &s_axes, Dtype::F32),
         ],
     );
     reduce(flatten(prod, &[gi, ri], flat), flat, BinOp::Monoid(Monoid::Add))
@@ -186,10 +186,10 @@ struct Model {
 fn build() -> Model {
     let (dm, vv) = (axis("dm"), axis("v"));
     let mut ext: Extents = [(dm, DM), (vv, VOCAB)].into_iter().collect();
-    let pos = input("pos", &[]);
+    let pos = input("pos", &[], Dtype::F32);
 
     // μP-scaled token embedding, read from an f16 table
-    let tok = gather(input_dt("embed", &[vv, dm], Dtype::BF16), input("id", &[]), vv);
+    let tok = gather(input("embed", &[vv, dm], Dtype::BF16), input("id", &[], Dtype::F32), vv);
     let x0 = map(MapOp::Mul, vec![tok, konst((DM as f64).sqrt())]);
 
     let mut roots: Vec<(Node, &'static str)> = vec![(x0.clone(), "xd0")];
@@ -225,13 +225,13 @@ fn build() -> Model {
             ext.insert(a, n);
         }
 
-        let x = input(leak(format!("xd{l}")), &prev_axes);
+        let x = input(leak(format!("xd{l}")), &prev_axes, Dtype::F32);
         let xn = rms(x.clone(), nm("ln_in"), dm, DM);
 
         // ── attention: GQA as axis structure, QK-norm, RoPE-or-NoPE ──
-        let q = matmul(xn.clone(), input_dt(nm("wq"), &[hk, qg, j2, rr, dm], Dtype::BF16), dm);
-        let k = matmul(xn.clone(), input_dt(nm("wk"), &[hk, j2, rr, dm], Dtype::BF16), dm);
-        let v = matmul(xn.clone(), input_dt(nm("wv"), &[hk, rv, dm], Dtype::BF16), dm);
+        let q = matmul(xn.clone(), input(nm("wq"), &[hk, qg, j2, rr, dm], Dtype::BF16), dm);
+        let k = matmul(xn.clone(), input(nm("wk"), &[hk, j2, rr, dm], Dtype::BF16), dm);
+        let v = matmul(xn.clone(), input(nm("wv"), &[hk, rv, dm], Dtype::BF16), dm);
         let mut qn = rms_head(q, nm("qn"), j2, rr, hq); // [hk, qg, j2, rr]
         let mut kn = rms_head(k, nm("kn"), j2, rr, hkn); // [hk, j2, rr]
         if is_sliding {
@@ -243,7 +243,7 @@ fn build() -> Model {
             vec![
                 one_hot(t, pos.clone()),
                 kn,
-                input(nm("cache_k"), &[t, hk, j2, rr]),
+                input(nm("cache_k"), &[t, hk, j2, rr], Dtype::F32),
             ],
         );
         let cv = map(
@@ -251,7 +251,7 @@ fn build() -> Model {
             vec![
                 one_hot(t, pos.clone()),
                 v,
-                input(nm("cache_v"), &[t, hk, rv]),
+                input(nm("cache_v"), &[t, hk, rv], Dtype::F32),
             ],
         );
         roots.push((ck.clone(), nm("ckN")));
@@ -272,10 +272,10 @@ fn build() -> Model {
             ],
         );
         let ctx = matmul(softmax(masked, t), cv, t); // [hk, qg, rv]
-        let gate = matmul(xn, input_dt(nm("wg"), &[hk, qg, rv, dm], Dtype::BF16), dm);
+        let gate = matmul(xn, input(nm("wg"), &[hk, qg, rv, dm], Dtype::BF16), dm);
         let gated = map(MapOp::Mul, vec![ctx, sigmoid(gate)]);
         let flat = flatten(gated, &[hk, qg, rv], dmv);
-        let attn_out = matmul(flat, input_dt(nm("wo"), &[dm, dmv], Dtype::BF16), dmv); // [dm]
+        let attn_out = matmul(flat, input(nm("wo"), &[dm, dmv], Dtype::BF16), dmv); // [dm]
         let x1 = map(MapOp::Add, vec![x, rms(attn_out, nm("ln_pa"), dm, DM)]);
 
         // ── MLP: dense SwiGLU (l<2) or 128-expert MoE, all weights int4 ──
@@ -309,12 +309,12 @@ fn build() -> Model {
             // weight sets. Three grouped folds do all experts at once.
             let ne = axis("ne");
             ext.insert(ne, NE + 1); // experts 0..127 + the shared expert
-            let router_in = input(nm("router"), &[axis("nr"), dm]);
+            let router_in = input(nm("router"), &[axis("nr"), dm], Dtype::F32);
             let nr = output_axes(&router_in)[0];
             ext.insert(nr, NE);
             let score = sigmoid(matmul(xn2.clone(), router_in, dm));
             roots.push((score, nm("score")));
-            let score_in = input(nm("score"), &[nr]);
+            let score_in = input(nm("score"), &[nr], Dtype::F32);
             // Selection is on bias-corrected scores; ALL EIGHT ranks are ONE
             // fold (`topk_all`): the k-best slots are shared across the rank
             // queries and the rank one-hot is read at project time, so the
@@ -323,12 +323,12 @@ fn build() -> Model {
             // sigmoid scores below.
             let biased = map(
                 MapOp::Add,
-                vec![score_in.clone(), input(nm("ebias"), &[nr])],
+                vec![score_in.clone(), input(nm("ebias"), &[nr], Dtype::F32)],
             );
             let rk = axis("rk");
             ext.insert(rk, TOPK);
             roots.push((topk_all(biased, nr, TOPK, rk, true), nm("ranks")));
-            let ranks_in = input(nm("ranks"), &[rk]);
+            let ranks_in = input(nm("ranks"), &[rk], Dtype::F32);
 
             let mut idxs = Vec::new();
             let mut ws: Vec<Node> = Vec::new();
@@ -368,8 +368,8 @@ fn build() -> Model {
             }
             roots.push((idx_all, leak(format!("idxall_{l}"))));
             roots.push((coef, leak(format!("coef_{l}"))));
-            let idx_in = input(leak(format!("idxall_{l}")), &[sl]);
-            let coef_in = input(leak(format!("coef_{l}")), &[sl]);
+            let idx_in = input(leak(format!("idxall_{l}")), &[sl], Dtype::F32);
+            let coef_in = input(leak(format!("coef_{l}")), &[sl], Dtype::F32);
 
             // grouped gate/up/down: gather-by-slot over the stacked weights,
             // dequantize in-body, one fold per projection for ALL slots
@@ -394,11 +394,11 @@ fn build() -> Model {
             let xs = split(xn2.clone(), dm, gi, ri, GROUP);
             let grouped = |w: &'static str, s: &'static str, out_ax: Axis, gx: Axis, rx: Axis, x: Node, fl: Axis| {
                 let wsel = gather(
-                    input_dt(w, &[ne, out_ax, gx, rx], Dtype::I4),
+                    input(w, &[ne, out_ax, gx, rx], Dtype::I4),
                     idx_in.clone(),
                     ne,
                 );
-                let ssel = gather(input(s, &[ne, out_ax, gx]), idx_in.clone(), ne);
+                let ssel = gather(input(s, &[ne, out_ax, gx], Dtype::F32), idx_in.clone(), ne);
                 let prod = map(MapOp::Mul, vec![map(MapOp::Mul, vec![wsel, x]), ssel]);
                 reduce(flatten(prod, &[gx, rx], fl), fl, BinOp::Monoid(Monoid::Add))
             };
@@ -428,12 +428,12 @@ fn build() -> Model {
     // to carry the cut by hand.
     let logits = matmul(
         rms(
-            input(leak(format!("xd{N_LAYER}")), &prev_axes),
+            input(leak(format!("xd{N_LAYER}")), &prev_axes, Dtype::F32),
             "fnorm",
             dm,
             DM,
         ),
-        input_dt("lm_head", &[vv, dm], Dtype::BF16),
+        input("lm_head", &[vv, dm], Dtype::BF16),
         dm,
     );
     roots.push((logits, "logits"));

@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::derive::Carrier;
-use crate::ir::{Axis, BinOp, MapOp, Monoid, Node, NodeKind, output_axes};
+use crate::ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 /// Input tensors by leaf name.
 pub type Env = HashMap<&'static str, Value>;
@@ -266,7 +266,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
 
         NodeKind::Map { op, inputs } => {
             let ins: Vec<Rc<Value>> = inputs.iter().map(|n| eval_rc(n, env, cache)).collect();
-            let oaxes = output_axes(node);
+            let oaxes = node.shape();
             Value::from_fn(&oaxes, |c| {
                 let args: Vec<f64> = ins.iter().map(|t| t.at(c)).collect();
                 apply_map(*op, &args)
@@ -340,7 +340,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
         NodeKind::Gather { src, index, axis } => {
             let s = eval_rc(src, env, cache);
             let idx = eval_rc(index, env, cache);
-            let oaxes = output_axes(node);
+            let oaxes = node.shape();
             let bound = axis.extent();
             Value::from_fn(&oaxes, |c| {
                 let i = idx.at(c).round() as usize;
@@ -362,7 +362,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
         // emitters must reproduce.
         NodeKind::Reindex { src, map, padded } => {
             let s = eval_rc(src, env, cache);
-            let oaxes = output_axes(node);
+            let oaxes = node.shape();
             Value::from_fn(&oaxes, |c| {
                 let mut coord = c.clone();
                 for (m, terms, off) in map {
@@ -424,7 +424,7 @@ fn eval_scan(
 /// computation. Each source coordinate maps to exactly one output coordinate,
 /// so this is a pure data reshuffle.
 fn eval_view(s: &Value, groups: &[(Vec<Axis>, Axis)], node: &Node) -> Value {
-    let oaxes = output_axes(node);
+    let oaxes = node.shape();
     // Extent of each output axis: a plain pass-through keeps its extent; a
     // flattened group's extent is the product of its members'.
     let ext_of = |a: Axis| -> usize {
@@ -606,7 +606,7 @@ pub fn run_carrier_split(
         carrier.project.len()
     );
 
-    let grid = output_axes(node); // the free axes — the kernel's parallel grid
+    let grid = node.shape(); // the free axes — the kernel's parallel grid
     let n = axis.extent();
     assert!(
         blocks == 1
@@ -728,7 +728,11 @@ mod tests {
         let b = rand_tensor(&[k, j], &mut rng);
         let env: Env = [("A", a.clone()), ("B", b.clone())].into_iter().collect();
 
-        let mm = matmul(input("A", &[i, k]), input("B", &[k, j]), k);
+        let mm = matmul(
+            input("A", &[i, k], Dtype::F32),
+            input("B", &[k, j], Dtype::F32),
+            k,
+        );
         let got = eval(&mm, &env);
 
         let want = Value::from_fn(&[i, j], |c| {
@@ -746,7 +750,7 @@ mod tests {
         let mut rng = Lcg(9);
         let x = rand_tensor(&[r, k], &mut rng);
         let env: Env = [("X", x)].into_iter().collect();
-        let sm = eval(&softmax(input("X", &[r, k]), k), &env);
+        let sm = eval(&softmax(input("X", &[r, k], Dtype::F32), k), &env);
         for r_i in 0..4 {
             let mut s = 0.0;
             for k_i in 0..7 {
@@ -770,9 +774,9 @@ mod tests {
         let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
 
         let attn = attention(
-            input("Q", &[sq, d]),
-            input("K", &[k, d]),
-            input("V", &[k, e]),
+            input("Q", &[sq, d], Dtype::F32),
+            input("K", &[k, d], Dtype::F32),
+            input("V", &[k, e], Dtype::F32),
             d,
             k,
         );
@@ -795,10 +799,14 @@ mod tests {
         let v = rand_tensor(&[t, dv], &mut rng);
         let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
 
-        let scores = matmul(input("Q", &[s, dk]), input("K", &[t, dk]), dk);
+        let scores = matmul(
+            input("Q", &[s, dk], Dtype::F32),
+            input("K", &[t, dk], Dtype::F32),
+            dk,
+        );
         let scaled = map(MapOp::Mul, vec![scores, konst(0.125)]);
         let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
-        let attn = matmul(softmax(masked, t), input("V", &[t, dv]), t);
+        let attn = matmul(softmax(masked, t), input("V", &[t, dv], Dtype::F32), t);
 
         let reference = eval(&attn, &env);
         let carrier = derive(&attn, t).unwrap();
@@ -815,7 +823,11 @@ mod tests {
         let ids = Value::from_fn(&[s], |c| [2.0, 7.0, 0.0][c[&s]]);
         let env: Env = [("E", table.clone()), ("ids", ids)].into_iter().collect();
 
-        let emb = embedding(input("E", &[v, dm]), input("ids", &[s]), v);
+        let emb = embedding(
+            input("E", &[v, dm], Dtype::F32),
+            input("ids", &[s], Dtype::F32),
+            v,
+        );
         let got = eval(&emb, &env);
         // read by coordinate, not raw offset — gather's output axis order is
         // (kept ∪ index) = [dm, s], and `at` is layout-agnostic.
@@ -835,7 +847,10 @@ mod tests {
         let mut rng = Lcg(3);
         let x = rand_tensor(&[h, dv], &mut rng);
         let env: Env = [("X", x.clone())].into_iter().collect();
-        let flat = eval(&flatten(input("X", &[h, dv]), &[h, dv], dmv), &env);
+        let flat = eval(
+            &flatten(input("X", &[h, dv], Dtype::F32), &[h, dv], dmv),
+            &env,
+        );
         assert_eq!(flat.axes, vec![dmv]);
         for hh in 0..2 {
             for dd in 0..3 {

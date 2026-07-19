@@ -45,7 +45,7 @@ fn topk_matches_a_hand_sort() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n]), n, k);
+    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
 
     // hand reference: sort (value, index) descending by value
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
@@ -70,8 +70,8 @@ fn topk_partitions_and_executes() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n]), n, k);
-    let names: Vec<(Node, &'static str)> = pairs
+    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
+    let names: Vec<(NodeRef, &'static str)> = pairs
         .iter()
         .enumerate()
         .flat_map(|(r, (v, i))| {
@@ -107,12 +107,15 @@ fn topk_all_is_one_fold_with_shared_slots() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let all = topk_all(input("X", &[n]), n, k, rk, true);
+    let all = topk_all(input("X", &[n], Dtype::F32), n, k, rk, true);
 
     // one carrier: k value slots + k index slots, not k separate lists
     let c = sanic::derive::derive(&all, n).expect("topk_all derives over the scored axis");
     assert_eq!(c.slots, 2 * k, "k-best slots shared across rank queries");
-    assert!(c.project_reads_leaves(), "rank one-hot read at project time");
+    assert!(
+        c.project_reads_leaves(),
+        "rank one-hot read at project time"
+    );
     assert!(c.rules.contains(&"project-leaf"), "rules: {:?}", c.rules);
 
     // the carrier equals the naive semantics, per rank
@@ -150,16 +153,12 @@ fn topk_all_ties_match_per_rank_folds() {
     let x = Value::from_fn(&[n], |c| data[c[&n]]);
     let env: Env = [("X", x)].into_iter().collect();
 
-    let all = topk_all(input("X", &[n]), n, k, rk, true);
+    let all = topk_all(input("X", &[n], Dtype::F32), n, k, rk, true);
     let got = eval(&all, &env);
-    let pairs = topk(input("X", &[n]), n, k);
+    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
     for (r, (_, i)) in pairs.iter().enumerate() {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(
-            got.at(&coord),
-            eval(i, &env).data[0],
-            "rank {r} under ties"
-        );
+        assert_eq!(got.at(&coord), eval(i, &env).data[0], "rank {r} under ties");
     }
     let coord0: HashMap<Axis, usize> = [(rk, 0)].into_iter().collect();
     let coord1: HashMap<Axis, usize> = [(rk, 1)].into_iter().collect();
@@ -177,7 +176,7 @@ fn batched_top1_routes_rows() {
     let gates = rand_tensor(&[b, e], &mut rng);
     let env: Env = [("G", gates.clone())].into_iter().collect();
 
-    let pairs = topk(input("G", &[b, e]), e, 1);
+    let pairs = topk(input("G", &[b, e], Dtype::F32), e, 1);
     let idx = eval(&pairs[0].1, &env);
     for bi in 0..5 {
         let mut best = 0usize;
@@ -207,7 +206,12 @@ fn scatter_add_matches_hand_with_collisions() {
     let idx = Value::from_fn(&[i], |c| idx_vals[c[&i]] as f64);
     let env: Env = [("S", src.clone()), ("idx", idx)].into_iter().collect();
 
-    let sc = scatter_add(input("S", &[i, d]), input("idx", &[i]), i, j);
+    let sc = scatter_add(
+        input("S", &[i, d], Dtype::F32),
+        input("idx", &[i], Dtype::F32),
+        i,
+        j,
+    );
     let got = eval(&sc, &env);
 
     let hand = Value::from_fn(&[j, d], |c| {
@@ -229,7 +233,12 @@ fn scatter_add_matches_hand_with_collisions() {
 
     // and through the pipeline: one fused kernel (a one-hot contraction)
     let sched = partition(&sc, &Device::toy());
-    assert_eq!(sched.stages.len(), 1, "scatter-add is one fold:\n{}", sched.render());
+    assert_eq!(
+        sched.stages.len(),
+        1,
+        "scatter-add is one fold:\n{}",
+        sched.render()
+    );
     let executed = sched.execute(&env);
     let exec_p = executed.permuted_to(&got.axes);
     for (a, b) in got.data.iter().zip(&exec_p.data) {
@@ -248,8 +257,12 @@ fn scatter_add_inverts_a_permutation_gather() {
     let ids = Value::from_fn(&[s], |c| perm[c[&s]] as f64);
     let env: Env = [("T", table.clone()), ("ids", ids)].into_iter().collect();
 
-    let gathered = gather(input("T", &[v, d]), input("ids", &[s]), v); // [d, s]
-    let back = scatter_add(gathered, input("ids", &[s]), s, v2); // [d, v2]
+    let gathered = gather(
+        input("T", &[v, d], Dtype::F32),
+        input("ids", &[s], Dtype::F32),
+        v,
+    ); // [d, s]
+    let back = scatter_add(gathered, input("ids", &[s], Dtype::F32), s, v2); // [d, v2]
     let got = eval(&back, &env);
     for vi in 0..5 {
         for di in 0..3 {

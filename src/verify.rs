@@ -7,7 +7,7 @@
 //! interpreter bounds errors or compiler failures.
 //!
 //! Verification is deliberately separate from construction. The public
-//! [`NodeKind`] enum can represent an invalid graph long enough for [`verify`]
+//! [`Node`] can represent an invalid graph long enough for [`verify`]
 //! to return a useful [`VerifyError`]. Public pipeline boundaries call
 //! [`assert_valid`] or [`assert_valid_many`] before doing work.
 
@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ir::{AffineIndex, Axis, AxisName, BinOp, Dtype, Extent, Node, NodeKind};
+use crate::ir::{
+    AffineIndex, Axis, AxisName, BinOp, Dtype, Extent, Node as NodeKind, NodeRef as Node,
+};
 
 /// The first node that violates the current IR well-formedness rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +79,7 @@ pub fn assert_valid_many(roots: &[Node]) {
 struct InputDecl {
     node_index: usize,
     axes: Vec<Axis>,
-    dtype: Option<Dtype>,
+    dtype: Dtype,
 }
 
 #[derive(Default)]
@@ -538,9 +540,7 @@ fn op_name(node: &Node) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{
-        MapOp, Monoid, axis, input, input_dt, konst, map, reduce, reindex, rename, view,
-    };
+    use crate::ir::{MapOp, Monoid, axis, input, konst, map, reduce, reindex, rename, view};
 
     fn add() -> BinOp {
         BinOp::Monoid(Monoid::Add)
@@ -550,9 +550,9 @@ mod tests {
     fn accepts_a_valid_composed_graph() {
         let (q, k, d, e) = (axis("q", 3), axis("k", 5), axis("d", 4), axis("e", 2));
         let graph = crate::ir::attention(
-            input("Q", &[q, d]),
-            input("K", &[k, d]),
-            input("V", &[k, e]),
+            input("Q", &[q, d], Dtype::F32),
+            input("K", &[k, d], Dtype::F32),
+            input("V", &[k, e], Dtype::F32),
             d,
             k,
         );
@@ -577,11 +577,11 @@ mod tests {
         let count = reduce(konst(1.0), missing, add());
         assert_eq!(verify(&count), Ok(()));
 
-        let invalid = crate::ir::scan(input("X", &[n]), missing, add());
+        let invalid = crate::ir::scan(input("X", &[n], Dtype::F32), missing, add());
         assert!(verify(&invalid).unwrap_err().reason.contains("not present"));
 
         let invalid = reduce(
-            input("X", &[n]),
+            input("X", &[n], Dtype::F32),
             n,
             BinOp::TopK {
                 k: 2,
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn checks_input_axes_and_storage_declarations() {
         let n = axis("n", 4);
-        let duplicate_axis = input("X", &[n, n]);
+        let duplicate_axis = input("X", &[n, n], Dtype::F32);
         assert!(
             verify(&duplicate_axis)
                 .unwrap_err()
@@ -604,15 +604,15 @@ mod tests {
         );
 
         let m = axis("m", 4);
-        let compatible_alias = map(MapOp::Add, vec![input("X", &[n]), input("X", &[m])]);
+        let compatible_alias = map(
+            MapOp::Add,
+            vec![input("X", &[n], Dtype::F32), input("X", &[m], Dtype::F32)],
+        );
         assert_eq!(verify(&compatible_alias), Ok(()));
 
         let conflicting_dtype = map(
             MapOp::Add,
-            vec![
-                input_dt("X", &[n], Dtype::F16),
-                input_dt("X", &[m], Dtype::F32),
-            ],
+            vec![input("X", &[n], Dtype::F16), input("X", &[m], Dtype::F32)],
         );
         assert!(
             verify(&conflicting_dtype)
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn checks_view_groups_and_extents() {
         let (a, b, flat) = (axis("a", 2), axis("b", 3), axis("flat", 5));
-        let wrong_extent = view(input("X", &[a, b]), vec![(vec![a, b], flat)]);
+        let wrong_extent = view(input("X", &[a, b], Dtype::F32), vec![(vec![a, b], flat)]);
         assert!(
             verify(&wrong_extent)
                 .unwrap_err()
@@ -633,7 +633,7 @@ mod tests {
                 .contains("grouped source extent is 6")
         );
 
-        let target_collision = rename(input("X", &[a, b]), a, b);
+        let target_collision = rename(input("X", &[a, b], Dtype::F32), a, b);
         assert!(
             verify(&target_collision)
                 .unwrap_err()
@@ -646,7 +646,7 @@ mod tests {
     fn proves_unpadded_affine_indices_are_in_bounds() {
         let (source, output) = (axis("source", 5), axis("output", 4));
         let invalid = reindex(
-            input("X", &[source]),
+            input("X", &[source], Dtype::F32),
             vec![(source, vec![(1, output)], 2)],
             false,
         );
@@ -658,14 +658,14 @@ mod tests {
         );
 
         let padded = reindex(
-            input("X", &[source]),
+            input("X", &[source], Dtype::F32),
             vec![(source, vec![(1, output)], 2)],
             true,
         );
         assert_eq!(verify(&padded), Ok(()));
 
         let reversed = reindex(
-            input("X", &[source]),
+            input("X", &[source], Dtype::F32),
             vec![(source, vec![(-1, source)], 4)],
             false,
         );
@@ -673,7 +673,7 @@ mod tests {
 
         let singleton = axis("singleton", 1);
         let correlated = reindex(
-            input("Y", &[singleton]),
+            input("Y", &[singleton], Dtype::F32),
             vec![(singleton, vec![(1, output), (-1, output)], 0)],
             false,
         );

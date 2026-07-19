@@ -42,7 +42,7 @@ fn rms_norm(x: Node, g: &'static str, dm: Axis) -> Node {
     let inv_n = konst(1.0 / D as f64);
     let ms = map(MapOp::Mul, vec![reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), dm, add_r()), inv_n]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![ms, konst(EPS)])]);
-    map(MapOp::Mul, vec![map(MapOp::Div, vec![x, denom]), input(g, &[dm])])
+    map(MapOp::Mul, vec![map(MapOp::Div, vec![x, denom]), input(g, &[dm], Dtype::F32)])
 }
 
 /// GELU (tanh approximation), the activation nanoGPT uses.
@@ -158,9 +158,9 @@ fn main() {
     // ── forward graph: embed → blocks → final norm → tied logits ──
     // ids is a flat [b·s] index (single-axis, as the gather's scatter-add
     // backward requires); split the gathered rows back to [b, s].
-    let tok_flat = gather(input("wte", &[vv, dm]), input("ids", &[bs]), vv); // [dm, bs]
+    let tok_flat = gather(input("wte", &[vv, dm], Dtype::F32), input("ids", &[bs], Dtype::F32), vv); // [dm, bs]
     let tok = split(tok_flat, bs, bb, s); // [dm, b, s]
-    let pos = gather(input("wpe", &[pp, dm]), iota(s), pp); // [dm, s] — shared across the batch
+    let pos = gather(input("wpe", &[pp, dm], Dtype::F32), iota(s), pp); // [dm, s] — shared across the batch
     let mut x = map(MapOp::Add, vec![tok, pos]);
     for (l, [dk, dv, t, f]) in per_layer.iter().enumerate() {
         let (dk, dv, t, f) = (*dk, *dv, *t, *f);
@@ -168,28 +168,28 @@ fn main() {
         // attention
         let xn = rms_norm(x.clone(), nm("g1"), dm);
         let xnt = rename(xn.clone(), s, t);
-        let q = matmul(xn, input(nm("Wq"), &[dk, dm]), dm); // [dk, s]
-        let k = matmul(xnt.clone(), input(nm("Wk"), &[dk, dm]), dm); // [dk, t]
-        let v = matmul(xnt, input(nm("Wv"), &[dv, dm]), dm); // [dv, t]
+        let q = matmul(xn, input(nm("Wq"), &[dk, dm], Dtype::F32), dm); // [dk, s]
+        let k = matmul(xnt.clone(), input(nm("Wk"), &[dk, dm], Dtype::F32), dm); // [dk, t]
+        let v = matmul(xnt, input(nm("Wv"), &[dv, dm], Dtype::F32), dm); // [dv, t]
         let scores = map(MapOp::Mul, vec![matmul(q, k, dk), konst(1.0 / (D as f64).sqrt())]);
         let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
         let o = matmul(softmax(masked, t), v, t); // [dv, s]
-        let proj = matmul(o, input(nm("Wo"), &[dm, dv]), dv); // [dm, s]
+        let proj = matmul(o, input(nm("Wo"), &[dm, dv], Dtype::F32), dv); // [dm, s]
         let x1 = map(MapOp::Add, vec![x, proj]);
         // mlp
         let xn2 = rms_norm(x1.clone(), nm("g2"), dm);
-        let hpre = matmul(xn2, input(nm("Wf"), &[f, dm]), dm); // [f, s]
-        let m = matmul(gelu(hpre), input(nm("Wp"), &[dm, f]), f); // [dm, s]
+        let hpre = matmul(xn2, input(nm("Wf"), &[f, dm], Dtype::F32), dm); // [f, s]
+        let m = matmul(gelu(hpre), input(nm("Wp"), &[dm, f], Dtype::F32), f); // [dm, s]
         x = map(MapOp::Add, vec![x1, m]);
     }
     let xf = rms_norm(x, "gf", dm);
-    let logits = matmul(xf, input("wte", &[vv, dm]), dm); // [s, v]  (weight-tied)
+    let logits = matmul(xf, input("wte", &[vv, dm], Dtype::F32), dm); // [s, v]  (weight-tied)
 
     // ── next-token cross-entropy, mean over positions (composed logsumexp) ──
     let mmax = reduce(logits.clone(), vv, BinOp::Monoid(Monoid::Max));
     let sh = map(MapOp::Exp, vec![map(MapOp::Sub, vec![logits.clone(), mmax.clone()])]);
     let lse = map(MapOp::Add, vec![mmax, map(MapOp::Log, vec![reduce(sh, vv, add_r())])]); // [s]
-    let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[bb, s]))]), vv, add_r());
+    let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[bb, s], Dtype::F32))]), vv, add_r());
     // mean over every token in the batch: fold positions AND batch, scale by
     // 1/(B·S). Keeping it a mean (not a sum) holds the gradient scale — and thus
     // `lr` — invariant to batch size, and the scalar keeps `grad` happy.
@@ -205,7 +205,7 @@ fn main() {
     for (name, axes) in &params {
         // the update is named after the weight itself — it writes `w` in place
         // (partition orders it after every reader), so no shadow buffer.
-        let upd = map(MapOp::Sub, vec![input(name, axes), map(MapOp::Mul, vec![konst(lr), grads[name].clone()])]);
+        let upd = map(MapOp::Sub, vec![input(name, axes, Dtype::F32), map(MapOp::Mul, vec![konst(lr), grads[name].clone()])]);
         roots.push((upd, name));
     }
     // training-time algebraic simplification: the winner-mask cancels and the

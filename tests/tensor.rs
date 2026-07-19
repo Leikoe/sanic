@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sanic::{Dtype, Extent, GraphBuilder, Shape, Tensor, TensorExpr, axis};
+use sanic::{Dtype, Extent, GraphBuilder, Shape, Tensor, TensorExpr};
 
 fn bindings(inputs: impl IntoIterator<Item = (&'static str, Tensor)>) -> HashMap<String, Tensor> {
     inputs
@@ -19,27 +19,20 @@ fn linear(x: TensorExpr, weight: TensorExpr, bias: Option<TensorExpr>) -> Tensor
 
 #[test]
 fn function_builds_a_reusable_graph() {
-    let (batch, input, output) = (axis("batch", 2), axis("input", 3), axis("output", 2));
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [batch, input], Dtype::F64);
-    let weight = builder.input("weight", [input, output], Dtype::F64);
-    let bias = builder.input("bias", [output], Dtype::F64);
+    let x = builder.input("x", [2, 3], Dtype::F64);
+    let weight = builder.input("weight", [3, 2], Dtype::F64);
+    let bias = builder.input("bias", [2], Dtype::F64);
     let graph = builder.finish([linear(x, weight, Some(bias))]);
 
     assert_eq!(graph.input_count(), 3);
     assert_eq!(graph.output_count(), 1);
 
-    let weights = Tensor::from_fn(&[input, output], |coord| {
-        [[1.0, 0.5], [0.0, 2.0], [-1.0, 0.0]][coord[&input]][coord[&output]]
-    });
-    let bias = Tensor::from_fn(&[output], |coord| [0.25, -0.5][coord[&output]]);
+    let weights = Tensor::from_shape([3, 2], vec![1.0, 0.5, 0.0, 2.0, -1.0, 0.0]);
+    let bias = Tensor::from_shape([2], vec![0.25, -0.5]);
 
-    let first = Tensor::from_fn(&[batch, input], |coord| {
-        [[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]][coord[&batch]][coord[&input]]
-    });
-    let second = Tensor::from_fn(&[batch, input], |coord| {
-        [[1.0, 1.0, 1.0], [4.0, 0.0, -2.0]][coord[&batch]][coord[&input]]
-    });
+    let first = Tensor::from_shape([2, 3], vec![2.0, 3.0, 5.0, 7.0, 11.0, 13.0]);
+    let second = Tensor::from_shape([2, 3], vec![1.0, 1.0, 1.0, 4.0, 0.0, -2.0]);
 
     let first = graph.run(&bindings([
         ("x", first),
@@ -60,19 +53,17 @@ fn function_builds_a_reusable_graph() {
 #[test]
 #[should_panic(expected = "declared more than once")]
 fn input_names_must_be_unique() {
-    let a = axis("a", 2);
     let mut builder = GraphBuilder::new();
-    let _ = builder.input("x", [a], Dtype::F64);
-    let _ = builder.input("x", [a], Dtype::F64);
+    let _ = builder.input("x", [2], Dtype::F64);
+    let _ = builder.input("x", [2], Dtype::F64);
 }
 
 #[test]
 fn graph_keeps_multiple_declared_outputs() {
-    let n = axis("n", 3);
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [n], Dtype::F64);
+    let x = builder.input("x", [3], Dtype::F64);
     let graph = builder.finish([x.sum(0), x.prod(-1)]);
-    let input = Tensor::from_fn(&[n], |coord| [2.0, 3.0, 5.0][coord[&n]]);
+    let input = Tensor::from_shape([3], vec![2.0, 3.0, 5.0]);
 
     let outputs = graph.run(&bindings([("x", input)]));
     assert_eq!(outputs.len(), 2);
@@ -82,21 +73,18 @@ fn graph_keeps_multiple_declared_outputs() {
 
 #[test]
 fn composed_operations_build_from_tensor_expr_receivers() {
-    let (vocab, sequence, feature) = (axis("vocab", 4), axis("sequence", 2), axis("feature", 2));
     let mut builder = GraphBuilder::new();
-    let table = builder.input("table", [vocab, feature], Dtype::F64);
-    let ids = builder.input("ids", [sequence], Dtype::F64);
-    let scores = builder.input("scores", [vocab], Dtype::F64);
+    let table = builder.input("table", [4, 2], Dtype::F64);
+    let ids = builder.input("ids", [2], Dtype::F64);
+    let scores = builder.input("scores", [4], Dtype::F64);
     let embedding = table.embedding(&ids);
-    let one_hot = ids.one_hot(vocab.extent());
+    let one_hot = ids.one_hot(4);
     let (best, best_index) = scores.topk(0, 1).pop().unwrap();
     let graph = builder.finish([embedding, one_hot, best, best_index]);
 
-    let table = Tensor::from_fn(&[vocab, feature], |coord| {
-        [[1.0, 2.0], [3.0, 5.0], [7.0, 11.0], [13.0, 17.0]][coord[&vocab]][coord[&feature]]
-    });
-    let ids = Tensor::from_fn(&[sequence], |coord| [2.0, 0.0][coord[&sequence]]);
-    let scores = Tensor::from_fn(&[vocab], |coord| [1.0, 9.0, 9.0, 2.0][coord[&vocab]]);
+    let table = Tensor::from_shape([4, 2], vec![1.0, 2.0, 3.0, 5.0, 7.0, 11.0, 13.0, 17.0]);
+    let ids = Tensor::from_shape([2], vec![2.0, 0.0]);
+    let scores = Tensor::from_shape([4], vec![1.0, 9.0, 9.0, 2.0]);
     let outputs = graph.run(&bindings([
         ("table", table),
         ("ids", ids),
@@ -115,11 +103,10 @@ fn composed_operations_build_from_tensor_expr_receivers() {
 
 #[test]
 fn sigmoid_is_composed_from_tensor_expr_operations() {
-    let n = axis("n", 3);
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [n], Dtype::F64);
+    let x = builder.input("x", [3], Dtype::F64);
     let graph = builder.finish([x.sigmoid()]);
-    let input = Tensor::from_fn(&[n], |coord| [-1.0, 0.0, 1.0][coord[&n]]);
+    let input = Tensor::from_shape([3], vec![-1.0, 0.0, 1.0]);
 
     let output = graph.run(&bindings([("x", input)]));
     let expected = [0.268_941_421_369_995_1, 0.5, 0.731_058_578_630_004_9];
@@ -130,17 +117,16 @@ fn sigmoid_is_composed_from_tensor_expr_operations() {
 
 #[test]
 fn dynamic_extent_is_resolved_for_each_run() {
-    let sequence = axis("sequence", Extent::Dynamic);
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [sequence], Dtype::F64);
+    let x = builder.input("x", [Extent::Dynamic], Dtype::F64);
     let graph = builder.finish([&x * 2.0, x.sum(0)]);
 
-    assert_eq!(graph.output_shapes()[0].axes()[0].extent, Extent::Dynamic);
+    assert_eq!(graph.output_shapes()[0].extent(0), Extent::Dynamic);
     assert_eq!(graph.output_shapes()[0].rank(), 1);
     assert_eq!(graph.output_shapes()[0].element_count(), None);
 
     let run = |data: Vec<f64>| {
-        let input = Tensor::from_data(&[sequence], vec![data.len()], data);
+        let input = Tensor::from_shape([data.len()], data);
         graph.run(&bindings([("x", input)]))
     };
 
@@ -158,12 +144,11 @@ fn dynamic_extent_is_resolved_for_each_run() {
 #[test]
 #[should_panic(expected = "was not bound")]
 fn run_reports_missing_named_bindings() {
-    let n = axis("n", 2);
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [n], Dtype::F64);
-    let y = builder.input("y", [n], Dtype::F64);
+    let x = builder.input("x", [2], Dtype::F64);
+    let y = builder.input("y", [2], Dtype::F64);
     let graph = builder.finish([x + y]);
-    let x = Tensor::from_fn(&[n], |coord| coord[&n] as f64);
+    let x = Tensor::from_shape([2], vec![0.0, 1.0]);
 
     let _ = graph.run(&bindings([("x", x)]));
 }
@@ -171,11 +156,10 @@ fn run_reports_missing_named_bindings() {
 #[test]
 #[should_panic(expected = "has no input named")]
 fn run_rejects_unknown_named_bindings() {
-    let n = axis("n", 2);
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [n], Dtype::F64);
+    let x = builder.input("x", [2], Dtype::F64);
     let graph = builder.finish([x]);
-    let input = Tensor::from_fn(&[n], |coord| coord[&n] as f64);
+    let input = Tensor::from_shape([2], vec![0.0, 1.0]);
 
     let _ = graph.run(&bindings([("unknown", input)]));
 }
@@ -183,23 +167,21 @@ fn run_rejects_unknown_named_bindings() {
 #[test]
 #[should_panic(expected = "different GraphBuilder")]
 fn finish_rejects_a_foreign_input() {
-    let n = axis("n", 2);
     let mut left = GraphBuilder::new();
-    let x = left.input("x", [n], Dtype::F64);
+    let x = left.input("x", [2], Dtype::F64);
     let mut right = GraphBuilder::new();
-    let y = right.input("x", [n], Dtype::F64);
+    let y = right.input("x", [2], Dtype::F64);
 
     let _ = left.finish([x + y]);
 }
 
 #[test]
 fn flip_is_an_affine_view_over_one_axis() {
-    let n = axis("n", 4);
     let mut builder = GraphBuilder::new();
-    let x = builder.input("x", [n], Dtype::F64);
+    let x = builder.input("x", [4], Dtype::F64);
     let graph = builder.finish([x.flip(0)]);
 
-    let input = Tensor::from_fn(&[n], |coord| [2.0, 3.0, 5.0, 7.0][coord[&n]]);
+    let input = Tensor::from_shape([4], vec![2.0, 3.0, 5.0, 7.0]);
     assert_eq!(
         graph.run(&bindings([("x", input)]))[0].data,
         vec![7.0, 5.0, 3.0, 2.0]
@@ -207,21 +189,15 @@ fn flip_is_an_affine_view_over_one_axis() {
 }
 
 #[test]
-fn dimensions_are_positional_and_labels_do_not_align_tensors() {
-    assert_eq!(
-        Shape::new([axis("rows", 2), axis("columns", 3)]),
-        Shape::new([axis("debug_a", 2), axis("debug_b", 3)])
-    );
+fn axes_are_indices_into_a_shape() {
+    let shape = Shape::new([2, 3]);
+    assert_eq!(shape.extent(0), Extent::Static(2));
+    assert_eq!(shape[1], Extent::Static(3));
 
     let mut builder = GraphBuilder::new();
-    let matrix = builder.input(
-        "matrix",
-        [axis("left_debug_label", 2), axis("shared_label", 3)],
-        Dtype::F64,
-    );
-    // This deliberately matches the matrix's first label. Broadcasting must
-    // still align it with the trailing dimension.
-    let row = builder.input("row", [axis("left_debug_label", 3)], Dtype::F64);
+    let matrix = builder.input("matrix", [2, 3], Dtype::F64);
+    // A rank-one operand aligns with the trailing shape index.
+    let row = builder.input("row", [3], Dtype::F64);
     let graph = builder.finish([matrix + row]);
 
     let output = graph.run(&bindings([

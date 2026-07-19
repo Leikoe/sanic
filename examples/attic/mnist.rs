@@ -48,7 +48,7 @@ fn leak(s: String) -> &'static str {
 fn dense(x: Node, w: &'static str, b: &'static str, out: Axis, cin: Axis) -> Node {
     map(
         MapOp::Add,
-        vec![matmul(x, input(w, &[out, cin]), cin), input(b, &[out])],
+        vec![matmul(x, input(w, &[out, cin], Dtype::F32), cin), input(b, &[out], Dtype::F32)],
     )
 }
 
@@ -57,7 +57,7 @@ fn dense(x: Node, w: &'static str, b: &'static str, out: Axis, cin: Axis) -> Nod
 fn mlp(b: Axis, din: Axis, hid: Axis, cls: Axis) -> Node {
     let h = map(
         MapOp::Max,
-        vec![dense(input("X", &[b, din]), "W1", "b1", hid, din), konst(0.0)],
+        vec![dense(input("X", &[b, din], Dtype::F32), "W1", "b1", hid, din), konst(0.0)],
     );
     dense(h, "W2", "b2", cls, hid)
 }
@@ -81,7 +81,7 @@ fn cross_entropy(logits: Node, b: Axis, c: Axis, batch: usize) -> Node {
         vec![m, map(MapOp::Log, vec![reduce(shifted, c, BinOp::Monoid(Monoid::Add))])],
     ); // [b]
     let picked = reduce(
-        map(MapOp::Mul, vec![logits, one_hot(c, input("y", &[b]))]),
+        map(MapOp::Mul, vec![logits, one_hot(c, input("y", &[b], Dtype::F32))]),
         c,
         BinOp::Monoid(Monoid::Add),
     ); // [b] — the logit of the correct class
@@ -262,7 +262,7 @@ fn main() {
         let update = map(
             MapOp::Sub,
             vec![
-                input(name, axes),
+                input(name, axes, Dtype::F32),
                 map(MapOp::Mul, vec![konst(lr), grads[name].clone()]),
             ],
         );

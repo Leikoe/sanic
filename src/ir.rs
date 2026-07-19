@@ -19,7 +19,8 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub type Node = Rc<NodeKind>;
+/// A shared reference to a graph node.
+pub type NodeRef = Rc<Node>;
 
 /// One affine source-axis index:
 /// `(source axis, (coefficient, output axis) terms, offset)`.
@@ -60,20 +61,6 @@ pub enum Extent {
     Dynamic,
 }
 
-impl Extent {
-    pub const fn static_value(self) -> Option<usize> {
-        match self {
-            Extent::Static(value) => Some(value),
-            Extent::Dynamic => None,
-        }
-    }
-
-    pub fn expect_static(self, axis: AxisName) -> usize {
-        self.static_value()
-            .unwrap_or_else(|| panic!("axis `{axis}` has a dynamic extent"))
-    }
-}
-
 impl From<usize> for Extent {
     fn from(value: usize) -> Self {
         Extent::Static(value)
@@ -105,7 +92,10 @@ pub fn axis(name: &'static str, extent: impl Into<Extent>) -> Axis {
 impl Axis {
     /// The concrete extent required by core interpretation and compilation.
     pub fn extent(self) -> usize {
-        self.extent.expect_static(self.name)
+        match self.extent {
+            Extent::Static(value) => value,
+            Extent::Dynamic => panic!("axis `{}` has a dynamic extent", self.name),
+        }
     }
 
     pub const fn is_dynamic(self) -> bool {
@@ -351,14 +341,14 @@ impl Dtype {
 // ── nodes ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-pub enum NodeKind {
+pub enum Node {
     /// Raw data. Depends on no axis. `dtype` is the buffer's declared storage
     /// width — pricing information for the planner, not a change of
-    /// semantics; `None` prices at the device's compute dtype.
+    /// semantics.
     Input {
         name: &'static str,
         axes: Vec<Axis>,
-        dtype: Option<Dtype>,
+        dtype: Dtype,
     },
     /// A literal scalar. No axes, no storage.
     Const { v: f64 },
@@ -366,20 +356,24 @@ pub enum NodeKind {
     /// this is what makes aranges and causal masks cost no memory traffic.
     Iota { axis: Axis },
     /// Elementwise / broadcast application of a basis op.
-    Map { op: MapOp, inputs: Vec<Node> },
+    Map { op: MapOp, inputs: Vec<NodeRef> },
     /// Folds `axis` with `op`; the result no longer carries `axis`.
-    Reduce { src: Node, axis: Axis, op: BinOp },
+    Reduce { src: NodeRef, axis: Axis, op: BinOp },
     /// Prefix recurrence over `axis`; foldable iff `op` is associative.
-    Scan { src: Node, axis: Axis, op: BinOp },
+    Scan { src: NodeRef, axis: Axis, op: BinOp },
     /// `src[index[...]]` — data-dependent access along `axis`.
-    Gather { src: Node, index: Node, axis: Axis },
+    Gather {
+        src: NodeRef,
+        index: NodeRef,
+        axis: Axis,
+    },
     /// Reindexing — the one structural operator: no computation, no copy,
     /// just new names for the same values. Each group maps source axes to
     /// one fresh output axis: `[s] → t` is a rename, `[h, dv] → dm` is a
     /// flatten. A consumed source axis goes out of scope above the view; a
     /// grouped output inherits the joined structure of its members.
     View {
-        src: Node,
+        src: NodeRef,
         groups: Vec<(Vec<Axis>, Axis)>,
     },
     /// Affine reindexing — the movement vocabulary past rename/flatten. Each
@@ -391,7 +385,7 @@ pub enum NodeKind {
     /// source axis goes out of scope above the node; the term axes are the
     /// (possibly shared) output axes that drive it.
     Reindex {
-        src: Node,
+        src: NodeRef,
         /// (source axis, terms over output axes, constant offset).
         map: Vec<AffineIndex>,
         padded: bool,
@@ -400,31 +394,22 @@ pub enum NodeKind {
 
 // ── constructors ─────────────────────────────────────────────────────────────
 
-pub fn input(name: &'static str, axes: &[Axis]) -> Node {
-    Rc::new(NodeKind::Input {
+/// An input with its storage dtype. The dtype is required because storage
+/// width is part of an input declaration, not a target-dependent default.
+pub fn input(name: &'static str, axes: &[Axis], dtype: Dtype) -> NodeRef {
+    Rc::new(Node::Input {
         name,
         axes: axes.to_vec(),
-        dtype: None,
+        dtype,
     })
 }
 
-/// An input with an explicit storage dtype — how quantized weights tell the
-/// planner they cost 1 (or 0.5) bytes of bandwidth per element.
-pub fn input_dt(name: &'static str, axes: &[Axis], dtype: Dtype) -> Node {
-    Rc::new(NodeKind::Input {
-        name,
-        axes: axes.to_vec(),
-        dtype: Some(dtype),
-    })
-}
-
-/// Every input that DECLARES a storage dtype, by name (first declaration
-/// wins). Inputs without one price at the device's compute dtype.
-pub fn input_dtypes(node: &Node) -> Vec<(&'static str, Dtype)> {
+/// Every input's storage dtype, by name (first declaration wins).
+pub fn input_dtypes(node: &NodeRef) -> Vec<(&'static str, Dtype)> {
     fn go(
-        n: &Node,
+        n: &NodeRef,
         out: &mut Vec<(&'static str, Dtype)>,
-        seen: &mut std::collections::HashSet<*const NodeKind>,
+        seen: &mut std::collections::HashSet<*const Node>,
     ) {
         // Walk each DAG node once — exponential on shared backward graphs
         // otherwise (dtypes dedup by name, so first-reach is equivalent).
@@ -432,22 +417,18 @@ pub fn input_dtypes(node: &Node) -> Vec<(&'static str, Dtype)> {
             return;
         }
         match n.as_ref() {
-            NodeKind::Input {
-                name,
-                dtype: Some(d),
-                ..
-            } => {
+            Node::Input { name, dtype, .. } => {
                 if !out.iter().any(|(m, _)| m == name) {
-                    out.push((name, *d));
+                    out.push((name, *dtype));
                 }
             }
-            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out, seen)),
-            NodeKind::Reduce { src, .. }
-            | NodeKind::Scan { src, .. }
-            | NodeKind::View { src, .. }
-            | NodeKind::Reindex { src, .. } => go(src, out, seen),
-            NodeKind::Gather { src, index, .. } => {
+            Node::Const { .. } | Node::Iota { .. } => {}
+            Node::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out, seen)),
+            Node::Reduce { src, .. }
+            | Node::Scan { src, .. }
+            | Node::View { src, .. }
+            | Node::Reindex { src, .. } => go(src, out, seen),
+            Node::Gather { src, index, .. } => {
                 go(src, out, seen);
                 go(index, out, seen);
             }
@@ -458,65 +439,65 @@ pub fn input_dtypes(node: &Node) -> Vec<(&'static str, Dtype)> {
     out
 }
 
-pub fn konst(v: f64) -> Node {
-    Rc::new(NodeKind::Const { v })
+pub fn konst(v: f64) -> NodeRef {
+    Rc::new(Node::Const { v })
 }
 
-pub fn iota(axis: Axis) -> Node {
-    Rc::new(NodeKind::Iota { axis })
+pub fn iota(axis: Axis) -> NodeRef {
+    Rc::new(Node::Iota { axis })
 }
 
-pub fn map(op: MapOp, inputs: Vec<Node>) -> Node {
+pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
     debug_assert_eq!(op.arity(), inputs.len(), "{op:?} arity");
-    Rc::new(NodeKind::Map { op, inputs })
+    Rc::new(Node::Map { op, inputs })
 }
 
-pub fn reduce(src: Node, axis: Axis, op: BinOp) -> Node {
-    Rc::new(NodeKind::Reduce { src, axis, op })
+pub fn reduce(src: NodeRef, axis: Axis, op: BinOp) -> NodeRef {
+    Rc::new(Node::Reduce { src, axis, op })
 }
 
-pub fn scan(src: Node, axis: Axis, op: BinOp) -> Node {
-    Rc::new(NodeKind::Scan { src, axis, op })
+pub fn scan(src: NodeRef, axis: Axis, op: BinOp) -> NodeRef {
+    Rc::new(Node::Scan { src, axis, op })
 }
 
-pub fn gather(src: Node, index: Node, axis: Axis) -> Node {
-    Rc::new(NodeKind::Gather { src, index, axis })
+pub fn gather(src: NodeRef, index: NodeRef, axis: Axis) -> NodeRef {
+    Rc::new(Node::Gather { src, index, axis })
 }
 
-pub fn view(src: Node, groups: Vec<(Vec<Axis>, Axis)>) -> Node {
-    Rc::new(NodeKind::View { src, groups })
+pub fn view(src: NodeRef, groups: Vec<(Vec<Axis>, Axis)>) -> NodeRef {
+    Rc::new(Node::View { src, groups })
 }
 
 /// The same values under a different axis variable — `X[s,·]` seen as `X[t,·]`.
-pub fn rename(src: Node, from: Axis, to: Axis) -> Node {
+pub fn rename(src: NodeRef, from: Axis, to: Axis) -> NodeRef {
     view(src, vec![(vec![from], to)])
 }
 
 /// Merge a group of axes into one (`[h, dv] → dm`); extent(to) is the
 /// product of the members' extents.
-pub fn flatten(src: Node, group: &[Axis], to: Axis) -> Node {
+pub fn flatten(src: NodeRef, group: &[Axis], to: Axis) -> NodeRef {
     view(src, vec![(group.to_vec(), to)])
 }
 
-pub fn reindex(src: Node, map: Vec<AffineIndex>, padded: bool) -> Node {
-    Rc::new(NodeKind::Reindex { src, map, padded })
+pub fn reindex(src: NodeRef, map: Vec<AffineIndex>, padded: bool) -> NodeRef {
+    Rc::new(Node::Reindex { src, map, padded })
 }
 
 /// A contiguous slice along one axis: `out[i] = src[i + start]`. `to` is a
 /// fresh, shorter axis (its declared extent is the slice length).
-pub fn slice(src: Node, from: Axis, to: Axis, start: usize) -> Node {
+pub fn slice(src: NodeRef, from: Axis, to: Axis, start: usize) -> NodeRef {
     reindex(src, vec![(from, vec![(1, to)], start as i64)], false)
 }
 
 /// Zero-pad along one axis: `out[i] = src[i − lo]`, 0.0 outside. `to` is a
 /// fresh axis whose declared extent is `lo + extent(from) + hi`.
-pub fn pad(src: Node, from: Axis, to: Axis, lo: usize) -> Node {
+pub fn pad(src: NodeRef, from: Axis, to: Axis, lo: usize) -> NodeRef {
     reindex(src, vec![(from, vec![(1, to)], -(lo as i64))], true)
 }
 
 /// Split one axis into `(outer, inner)` — the inverse of [`flatten`]:
 /// `out[o, i] = src[o·extent(inner) + i]`.
-pub fn split(src: Node, from: Axis, outer: Axis, inner: Axis) -> Node {
+pub fn split(src: NodeRef, from: Axis, outer: Axis, inner: Axis) -> NodeRef {
     reindex(
         src,
         vec![(from, vec![(inner.extent() as i64, outer), (1, inner)], 0)],
@@ -529,7 +510,14 @@ pub fn split(src: Node, from: Axis, outer: Axis, inner: Axis) -> Node {
 /// followed by a [`reduce`] over `k`. `out` may be an *existing* axis to
 /// share an index space (sliding-window attention rides the query axis).
 /// Compose with [`pad`] for SAME-style windows that hang off the ends.
-pub fn window(src: Node, from: Axis, out: Axis, k: Axis, stride: usize, dilation: usize) -> Node {
+pub fn window(
+    src: NodeRef,
+    from: Axis,
+    out: Axis,
+    k: Axis,
+    stride: usize,
+    dilation: usize,
+) -> NodeRef {
     reindex(
         src,
         vec![(from, vec![(stride as i64, out), (dilation as i64, k)], 0)],
@@ -539,43 +527,40 @@ pub fn window(src: Node, from: Axis, out: Axis, k: Axis, stride: usize, dilation
 
 // ── shape and axis queries ───────────────────────────────────────────────────
 
-/// The axes of a node's output — its shape, inferred. A reduce drops its
-/// axis; a gather swaps the indexed axis for the index's axes; a view
-/// remaps. This is what tells the deriver which free axes an accumulator
-/// slot spans.
-pub fn output_axes(node: &Node) -> Vec<Axis> {
-    // Memoized by pointer WITHIN one call: the IR is a DAG, and this is
-    // called at every node by the roofline (`count_flops`, grid/volume) —
-    // an unmemoized walk re-derives shared subtrees once per path to them,
-    // which profiling showed to be the dominant cost of partitioning.
-    // A fresh cache per call keeps it pure and stale-pointer-free.
-    output_axes_memo(node, &mut std::collections::HashMap::new())
+impl Node {
+    /// The axes of this node's output, in shape order.
+    ///
+    /// A reduce drops its axis, a gather replaces the indexed axis with the
+    /// index shape, and movement nodes remap the source shape.
+    pub fn shape(&self) -> Vec<Axis> {
+        shape_memo(self, &mut std::collections::HashMap::new())
+    }
 }
 
 /// The number of elements a node's output holds — the product of its shape's
 /// extents (`1` for a scalar). This is the size a materialized buffer for the
 /// node needs; a stage's dispatch grid may be smaller (a packed fold writes
 /// several elements per thread), so allocation keys off THIS, never the grid.
-pub fn volume(node: &Node) -> usize {
-    output_axes(node)
+pub fn volume(node: &NodeRef) -> usize {
+    node.shape()
         .iter()
         .map(|a| a.extent())
         .product::<usize>()
         .max(1)
 }
 
-fn output_axes_memo(
+fn shape_memo(
     node: &Node,
-    cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>,
+    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
 ) -> Vec<Axis> {
-    (*output_axes_rc(node, cache)).clone()
+    (*shape_rc(node, cache)).clone()
 }
 
-fn output_axes_rc(
+fn shape_rc(
     node: &Node,
-    cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>,
+    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
 ) -> Rc<Vec<Axis>> {
-    let key = Rc::as_ptr(node);
+    let key = std::ptr::from_ref(node);
     if let Some(v) = cache.get(&key) {
         return v.clone();
     }
@@ -587,32 +572,32 @@ fn output_axes_rc(
         }
         acc
     };
-    let out: Vec<Axis> = match node.as_ref() {
-        NodeKind::Input { axes, .. } => axes.clone(),
-        NodeKind::Const { .. } => Vec::new(),
-        NodeKind::Iota { axis } => vec![*axis],
-        NodeKind::Map { inputs, .. } => inputs.iter().fold(Vec::new(), |acc, i| {
-            let ia = output_axes_rc(i, cache);
+    let out: Vec<Axis> = match node {
+        Node::Input { axes, .. } => axes.clone(),
+        Node::Const { .. } => Vec::new(),
+        Node::Iota { axis } => vec![*axis],
+        Node::Map { inputs, .. } => inputs.iter().fold(Vec::new(), |acc, i| {
+            let ia = shape_rc(i, cache);
             union(acc, &ia)
         }),
-        NodeKind::Reduce { src, axis, .. } => output_axes_rc(src, cache)
+        Node::Reduce { src, axis, .. } => shape_rc(src, cache)
             .iter()
             .copied()
             .filter(|a| a != axis)
             .collect(),
-        NodeKind::Scan { src, .. } => (*output_axes_rc(src, cache)).clone(),
-        NodeKind::Gather { src, index, axis } => {
-            let kept: Vec<Axis> = output_axes_rc(src, cache)
+        Node::Scan { src, .. } => (*shape_rc(src, cache)).clone(),
+        Node::Gather { src, index, axis } => {
+            let kept: Vec<Axis> = shape_rc(src, cache)
                 .iter()
                 .copied()
                 .filter(|a| a != axis)
                 .collect();
-            let ia = output_axes_rc(index, cache);
+            let ia = shape_rc(index, cache);
             union(kept, &ia)
         }
-        NodeKind::View { src, groups } => {
+        Node::View { src, groups } => {
             let mut out: Vec<Axis> = Vec::new();
-            for a in output_axes_rc(src, cache).iter().copied() {
+            for a in shape_rc(src, cache).iter().copied() {
                 if let Some((_, to)) = groups.iter().find(|(members, _)| members.contains(&a)) {
                     if !out.contains(to) {
                         out.push(*to);
@@ -625,9 +610,9 @@ fn output_axes_rc(
         }
         // A mapped source axis is replaced, in place, by the axes its index
         // is computed from; unmapped axes pass through.
-        NodeKind::Reindex { src, map, .. } => {
+        Node::Reindex { src, map, .. } => {
             let mut out: Vec<Axis> = Vec::new();
-            for a in output_axes_rc(src, cache).iter().copied() {
+            for a in shape_rc(src, cache).iter().copied() {
                 if let Some((_, terms, _)) = map.iter().find(|(m, _, _)| *m == a) {
                     for (_, t) in terms {
                         if !out.contains(t) {
@@ -649,7 +634,7 @@ fn output_axes_rc(
 /// Every `Input` leaf and its axes, in first-seen order. May repeat a name if
 /// the same tensor is reached along several paths — callers dedup as needed.
 /// `Const` and `Iota` carry no storage and are not reported.
-pub fn input_axes(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
+pub fn input_axes(node: &NodeRef) -> Vec<(&'static str, Vec<Axis>)> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     collect_input_axes(node, &mut out, &mut seen);
@@ -657,9 +642,9 @@ pub fn input_axes(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
 }
 
 fn collect_input_axes(
-    node: &Node,
+    node: &NodeRef,
     out: &mut Vec<(&'static str, Vec<Axis>)>,
-    seen: &mut std::collections::HashSet<*const NodeKind>,
+    seen: &mut std::collections::HashSet<*const Node>,
 ) {
     // Walk each DAG node once. Without this the per-PATH result is exponential
     // in a backward graph's sharing (both time AND output size — a diamond
@@ -670,23 +655,23 @@ fn collect_input_axes(
         return;
     }
     match node.as_ref() {
-        NodeKind::Input { name, axes, .. } => out.push((name, axes.clone())),
-        NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-        NodeKind::Map { inputs, .. } => {
+        Node::Input { name, axes, .. } => out.push((name, axes.clone())),
+        Node::Const { .. } | Node::Iota { .. } => {}
+        Node::Map { inputs, .. } => {
             for i in inputs {
                 collect_input_axes(i, out, seen);
             }
         }
-        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
+        Node::Reduce { src, .. } | Node::Scan { src, .. } => {
             collect_input_axes(src, out, seen);
         }
-        NodeKind::Gather { src, index, .. } => {
+        Node::Gather { src, index, .. } => {
             collect_input_axes(src, out, seen);
             collect_input_axes(index, out, seen);
         }
         // A view relabels: report the inputs below under the viewed names, so
         // shape-based modeling (SRAM, traffic) sees what the consumer reads.
-        NodeKind::View { src, groups } => {
+        Node::View { src, groups } => {
             let before = out.len();
             collect_input_axes(src, out, seen);
             for (_, axes) in out[before..].iter_mut() {
@@ -711,7 +696,7 @@ fn collect_input_axes(
         // Same for an affine reindex: a mapped axis is reported as the axes
         // driving it (a windowed input reads as out×k — the naive traffic,
         // which is what the consumer-side model should price).
-        NodeKind::Reindex { src, map, .. } => {
+        Node::Reindex { src, map, .. } => {
             let before = out.len();
             collect_input_axes(src, out, seen);
             for (_, axes) in out[before..].iter_mut() {
@@ -739,7 +724,7 @@ fn collect_input_axes(
 }
 
 /// Every `Input` leaf's name, deduped, in first-seen order.
-pub fn leaf_names(node: &Node) -> Vec<&'static str> {
+pub fn leaf_names(node: &NodeRef) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for (name, _) in input_axes(node) {
         if !out.contains(&name) {
@@ -751,7 +736,7 @@ pub fn leaf_names(node: &Node) -> Vec<&'static str> {
 
 /// Every axis the graph touches, in first-seen order — the set the structure
 /// map classifies.
-pub fn all_axes(node: &Node) -> Vec<Axis> {
+pub fn all_axes(node: &NodeRef) -> Vec<Axis> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     collect_axes(node, &mut out, &mut seen);
@@ -759,9 +744,9 @@ pub fn all_axes(node: &Node) -> Vec<Axis> {
 }
 
 fn collect_axes(
-    node: &Node,
+    node: &NodeRef,
     out: &mut Vec<Axis>,
-    seen: &mut std::collections::HashSet<*const NodeKind>,
+    seen: &mut std::collections::HashSet<*const Node>,
 ) {
     // A DAG-shared node reached along several paths is walked ONCE: its axes are
     // already in `out`. Without this, a backward graph's heavy sharing makes the
@@ -776,34 +761,34 @@ fn collect_axes(
         }
     };
     match node.as_ref() {
-        NodeKind::Input { axes, .. } => {
+        Node::Input { axes, .. } => {
             for &a in axes {
                 push(a, out);
             }
         }
-        NodeKind::Const { .. } => {}
-        NodeKind::Iota { axis } => push(*axis, out),
-        NodeKind::Map { inputs, .. } => {
+        Node::Const { .. } => {}
+        Node::Iota { axis } => push(*axis, out),
+        Node::Map { inputs, .. } => {
             for i in inputs {
                 collect_axes(i, out, seen);
             }
         }
-        NodeKind::Reduce { src, axis, .. } | NodeKind::Scan { src, axis, .. } => {
+        Node::Reduce { src, axis, .. } | Node::Scan { src, axis, .. } => {
             push(*axis, out);
             collect_axes(src, out, seen);
         }
-        NodeKind::Gather { src, index, axis } => {
+        Node::Gather { src, index, axis } => {
             push(*axis, out);
             collect_axes(src, out, seen);
             collect_axes(index, out, seen);
         }
-        NodeKind::View { src, groups } => {
+        Node::View { src, groups } => {
             for (_, to) in groups {
                 push(*to, out);
             }
             collect_axes(src, out, seen);
         }
-        NodeKind::Reindex { src, map, .. } => {
+        Node::Reindex { src, map, .. } => {
             for (_, terms, _) in map {
                 for (_, t) in terms {
                     push(*t, out);
@@ -817,7 +802,7 @@ fn collect_axes(
 // ── derived operators — compositions, not primitives ─────────────────────────
 
 /// `matmul(A, B; contract=k) = Reduce(Map(×, A, B), k, Add)`.
-pub fn matmul(a: Node, b: Node, contract: Axis) -> Node {
+pub fn matmul(a: NodeRef, b: NodeRef, contract: Axis) -> NodeRef {
     reduce(
         map(MapOp::Mul, vec![a, b]),
         contract,
@@ -830,7 +815,7 @@ pub fn matmul(a: Node, b: Node, contract: Axis) -> Node {
 /// ```text
 /// m = Reduce(x, k, Max); e = Exp(x − m); s = Reduce(e, k, Add); e / s
 /// ```
-pub fn softmax(x: Node, k: Axis) -> Node {
+pub fn softmax(x: NodeRef, k: Axis) -> NodeRef {
     let m = reduce(x.clone(), k, BinOp::Monoid(Monoid::Max));
     let e = map(MapOp::Exp, vec![map(MapOp::Sub, vec![x, m])]);
     let s = reduce(e.clone(), k, BinOp::Monoid(Monoid::Add));
@@ -838,7 +823,7 @@ pub fn softmax(x: Node, k: Axis) -> Node {
 }
 
 /// `attention(Q,K,V) = matmul(softmax(matmul(Q,K; d), k), V; k)`.
-pub fn attention(q: Node, k_in: Node, v: Node, d: Axis, k: Axis) -> Node {
+pub fn attention(q: NodeRef, k_in: NodeRef, v: NodeRef, d: Axis, k: Axis) -> NodeRef {
     let scores = matmul(q, k_in, d);
     let weights = softmax(scores, k);
     matmul(weights, v, k)
@@ -846,7 +831,7 @@ pub fn attention(q: Node, k_in: Node, v: Node, d: Axis, k: Axis) -> Node {
 
 /// `silu(x) = x · sigmoid(x) = x / (1 + exp(−x))` — a composition, so it
 /// fuses into the lift of a downstream reduction with no special case.
-pub fn silu(x: Node) -> Node {
+pub fn silu(x: NodeRef) -> NodeRef {
     let sig = map(
         MapOp::Recip,
         vec![map(
@@ -865,7 +850,7 @@ pub fn silu(x: Node) -> Node {
 /// whatever lift consumes it. The mask is a large *finite* negative, not −∞:
 /// an all-masked block would otherwise feed `exp(−∞ − −∞) = NaN` into the
 /// online-softmax rescale — the same edge real flash kernels guard against.
-pub fn causal_mask(query: Axis, key: Axis) -> Node {
+pub fn causal_mask(query: Axis, key: Axis) -> NodeRef {
     map(
         MapOp::Where,
         vec![
@@ -878,25 +863,25 @@ pub fn causal_mask(query: Axis, key: Axis) -> Node {
 
 /// A linear / SSM recurrence `h_t = A_t·h_{t−1} + b_t`: a `Scan` whose step is
 /// affine-map composition — associative, so it streams.
-pub fn ssm_scan(params: Node, t: Axis) -> Node {
+pub fn ssm_scan(params: NodeRef, t: Axis) -> NodeRef {
     scan(params, t, BinOp::AffineCompose)
 }
 
 /// A `tanh`-RNN `h_t = tanh(W·h_{t−1} + x_t)`: a non-associative step, so its
 /// time axis is serial. The engine must refuse to fold it.
-pub fn tanh_rnn(x: Node, t: Axis) -> Node {
+pub fn tanh_rnn(x: NodeRef, t: Axis) -> NodeRef {
     scan(map(MapOp::Tanh, vec![x]), t, BinOp::NonAssoc("tanh_recur"))
 }
 
 /// Embedding lookup: a gather along the vocabulary axis.
-pub fn embedding(table: Node, ids: Node, axis: Axis) -> Node {
+pub fn embedding(table: NodeRef, ids: NodeRef, axis: Axis) -> NodeRef {
     gather(table, ids, axis)
 }
 
 /// `1.0` where `iota(axis) == v` (an integer-valued node), else `0.0` — a
 /// computed one-hot: equality from two `Lt`s, no Eq op needed. The KV-cache
 /// row write, scatter's collision test and topk's mask are all this.
-pub fn one_hot(axis: Axis, v: Node) -> Node {
+pub fn one_hot(axis: Axis, v: NodeRef) -> NodeRef {
     let it = iota(axis);
     map(
         MapOp::Sub,
@@ -913,7 +898,7 @@ pub fn one_hot(axis: Axis, v: Node) -> Node {
 /// The index of the FIRST maximum along `axis`, as a value — one
 /// index-carrying fold ([`BinOp::ArgMax`]): the `(max, idx)` tuple monoid
 /// with first-max-wins ties, matching every framework's argmax convention.
-pub fn argmax(x: Node, axis: Axis) -> Node {
+pub fn argmax(x: NodeRef, axis: Axis) -> NodeRef {
     reduce(x, axis, BinOp::ArgMax)
 }
 
@@ -925,7 +910,7 @@ pub fn argmax(x: Node, axis: Axis) -> Node {
 /// merge-take-k operation over two full lists. A full sort stays out of the
 /// supported fragment on purpose: it is a data-movement network, not a fold,
 /// and nothing in an inference pipeline needs one.
-pub fn topk(x: Node, axis: Axis, k: usize) -> Vec<(Node, Node)> {
+pub fn topk(x: NodeRef, axis: Axis, k: usize) -> Vec<(NodeRef, NodeRef)> {
     let q = |rank: usize, idx: bool| {
         reduce(
             x.clone(),
@@ -947,8 +932,8 @@ pub fn topk(x: Node, axis: Axis, k: usize) -> Vec<(Node, Node)> {
 /// never touch the streamed axis, so they evaluate at PROJECT time — each
 /// grid point of `rk` selects its slot from the shared list. Eight rank
 /// kernels per MoE layer become one.
-pub fn topk_all(x: Node, axis: Axis, k: usize, rk: Axis, idx: bool) -> Node {
-    let mut sum: Option<Node> = None;
+pub fn topk_all(x: NodeRef, axis: Axis, k: usize, rk: Axis, idx: bool) -> NodeRef {
+    let mut sum: Option<NodeRef> = None;
     for r in 0..k {
         let q = reduce(
             x.clone(),
@@ -974,7 +959,7 @@ pub fn topk_all(x: Node, axis: Axis, k: usize, rk: Axis, idx: bool) -> Node {
 /// but the *semantics* need no new node. Add-combine is chosen because it is
 /// order-free (deterministic under any parallel schedule) and is exactly
 /// gather's backward, so embedding gradients fall out of this constructor.
-pub fn scatter_add(src: Node, index: Node, from: Axis, to: Axis) -> Node {
+pub fn scatter_add(src: NodeRef, index: NodeRef, from: Axis, to: Axis) -> NodeRef {
     reduce(
         map(MapOp::Mul, vec![one_hot(to, index), src]),
         from,

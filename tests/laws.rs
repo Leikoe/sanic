@@ -61,8 +61,8 @@ fn check(car: &Carrier, items: &[Vec<f64>], reference: &[f64]) {
 #[test]
 fn matmul_axis_tags() {
     let (i, j, k) = (axis("i", 5), axis("j", 6), axis("k", 8));
-    let a = input("A", &[i, k]);
-    let b = input("B", &[k, j]);
+    let a = input("A", &[i, k], Dtype::F32);
+    let b = input("B", &[k, j], Dtype::F32);
     let mm = matmul(a, b, k);
 
     assert_eq!(structure(&mm, i).level, Parallelism::Free);
@@ -78,8 +78,8 @@ fn matmul_axis_tags() {
 #[test]
 fn dot_product_carrier() {
     let k = axis("k", 17);
-    let a = input("A", &[k]);
-    let b = input("B", &[k]);
+    let a = input("A", &[k], Dtype::F32);
+    let b = input("B", &[k], Dtype::F32);
     let mm = matmul(a, b, k);
 
     let car = derive(&mm, k).expect("matmul k is derivable");
@@ -100,9 +100,9 @@ fn dot_product_carrier() {
 #[test]
 fn renders_derived_flash_attention() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
     let car = derive(&attention(q, kk, v, d, k), k).unwrap();
     let r = car.render();
     assert!(r.contains("into:    s0 = x0;  s1 = 1;  s2 = x1"));
@@ -116,9 +116,9 @@ fn renders_derived_flash_attention() {
 #[test]
 fn structure_map_for_attention() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
     let report = analyze(&attention(q, kk, v, d, k), &[sq, k]);
 
     let rs = &report.axes[0];
@@ -140,9 +140,9 @@ fn structure_map_for_attention() {
 #[test]
 fn structure_map_auto_discovers_axes() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
     let attn = attention(q, kk, v, d, k);
 
     let discovered: std::collections::BTreeSet<_> = all_axes(&attn).into_iter().collect();
@@ -173,13 +173,13 @@ fn carrier_knows_its_accumulator_size() {
     use std::collections::BTreeSet;
 
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
     let attn = attention(q, kk, v, d, k);
 
     // output-shape inference: attention is indexed by query and value-feature.
-    let out: BTreeSet<Axis> = output_axes(&attn).into_iter().collect();
+    let out: BTreeSet<Axis> = attn.shape().into_iter().collect();
     assert_eq!(out, [sq, e].into_iter().collect());
 
     let car = derive(&attn, k).unwrap();
@@ -212,16 +212,16 @@ fn multi_head_attention_derives_identically_to_single_head() {
         axis("e", 64),
     );
     let mha = attention(
-        input("Q", &[b, h, sq, d]),
-        input("K", &[b, h, k, d]),
-        input("V", &[b, h, k, e]),
+        input("Q", &[b, h, sq, d], Dtype::F32),
+        input("K", &[b, h, k, d], Dtype::F32),
+        input("V", &[b, h, k, e], Dtype::F32),
         d,
         k,
     );
     let sha = attention(
-        input("Q", &[sq, d]),
-        input("K", &[k, d]),
-        input("V", &[k, e]),
+        input("Q", &[sq, d], Dtype::F32),
+        input("K", &[k, d], Dtype::F32),
+        input("V", &[k, e], Dtype::F32),
         d,
         k,
     );
@@ -243,9 +243,9 @@ fn multi_head_attention_derives_identically_to_single_head() {
 #[test]
 fn attention_axis_tags_and_carrier() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 23), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
     let attn = attention(q, kk, v, d, k);
 
     assert_eq!(structure(&attn, sq).level, Parallelism::Free);
@@ -277,7 +277,7 @@ fn attention_axis_tags_and_carrier() {
 fn mean_carrier() {
     // mean = (Σ x) / (Σ 1) — the count is a fold over a literal 1.
     let a = axis("a", 31);
-    let x = input("X", &[a]);
+    let x = input("X", &[a], Dtype::F32);
     let sum = reduce(x.clone(), a, add_r());
     let count = reduce(konst(1.0), a, add_r());
     let mean = map(MapOp::Div, vec![sum, count]);
@@ -298,7 +298,7 @@ fn mean_carrier() {
 fn variance_carrier() {
     // var = E[x²] − E[x]²  =  Σx²/n − (Σx/n)²
     let a = axis("a", 40);
-    let x = input("X", &[a]);
+    let x = input("X", &[a], Dtype::F32);
     let sumx2 = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), a, add_r());
     let sumx = reduce(x.clone(), a, add_r());
     let count = reduce(konst(1.0), a, add_r());
@@ -323,7 +323,7 @@ fn variance_carrier() {
 fn logsumexp_carrier() {
     // lse(x) = log(Σ exp(x − m)) + m,   m = max x
     let a = axis("a", 29);
-    let x = input("X", &[a]);
+    let x = input("X", &[a], Dtype::F32);
     let m = reduce(x.clone(), a, max_r());
     let e = map(
         MapOp::Exp,
@@ -350,10 +350,10 @@ fn logsumexp_carrier() {
 #[test]
 fn masked_scaled_attention_derives() {
     let (s, k, e) = (axis("s", 8), axis("k", 21), axis("e", 64));
-    let scores = input("S", &[s, k]);
-    let scale = input("scale", &[]);
-    let mask = input("M", &[s, k]);
-    let v = input("V", &[k, e]);
+    let scores = input("S", &[s, k], Dtype::F32);
+    let scale = input("scale", &[], Dtype::F32);
+    let mask = input("M", &[s, k], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
 
     let sc = map(MapOp::Add, vec![map(MapOp::Mul, vec![scores, scale]), mask]);
     let out = matmul(softmax(sc, k), v, k);
@@ -386,8 +386,8 @@ fn masked_scaled_attention_derives() {
 #[test]
 fn computed_causal_mask_derives() {
     let (s, t, e) = (axis("s", 8), axis("t", 12), axis("e", 64));
-    let scores = input("S", &[s, t]);
-    let v = input("V", &[t, e]);
+    let scores = input("S", &[s, t], Dtype::F32);
+    let v = input("V", &[t, e], Dtype::F32);
     let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
     let out = matmul(softmax(masked, t), v, t);
 
@@ -415,9 +415,9 @@ fn computed_causal_mask_derives() {
 #[test]
 fn silu_fuses_into_a_contraction() {
     let f = axis("f", 27);
-    let gate = input("G", &[f]);
-    let up = input("U", &[f]);
-    let w = input("Wd", &[f]);
+    let gate = input("G", &[f], Dtype::F32);
+    let up = input("U", &[f], Dtype::F32);
+    let w = input("Wd", &[f], Dtype::F32);
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let down = reduce(map(MapOp::Mul, vec![act, w]), f, add_r());
 
@@ -442,9 +442,9 @@ fn silu_fuses_into_a_contraction() {
 #[test]
 fn rmsnorm_fused_projection_carrier() {
     let d = axis("d", 16);
-    let x = input("X", &[d]);
-    let g = input("G", &[d]);
-    let w = input("W", &[d]);
+    let x = input("X", &[d], Dtype::F32);
+    let g = input("G", &[d], Dtype::F32);
+    let w = input("W", &[d], Dtype::F32);
     let n = 16.0;
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), d, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
@@ -477,9 +477,9 @@ fn view_scoping_rules() {
         axis("f", 6),
         axis("sf", 24),
     );
-    let x = input("X", &[s, dm]);
+    let x = input("X", &[s, dm], Dtype::F32);
     let xt = rename(x.clone(), s, t);
-    assert_eq!(output_axes(&xt), vec![t, dm]);
+    assert_eq!(xt.shape(), vec![t, dm]);
     assert_eq!(structure(&xt, t).level, Parallelism::Free);
     assert_eq!(
         structure(&xt, s).level,
@@ -490,9 +490,9 @@ fn view_scoping_rules() {
     // a grouped output joins its members' structures; the members go out of
     // scope — asking about them above the view is asking about variables
     // that no longer exist.
-    let mm = matmul(x, input("W", &[f, dm]), dm); // [s, f]
+    let mm = matmul(x, input("W", &[f, dm], Dtype::F32), dm); // [s, f]
     let grouped = flatten(mm, &[s, f], sf);
-    assert_eq!(output_axes(&grouped), vec![sf]);
+    assert_eq!(grouped.shape(), vec![sf]);
     assert_eq!(structure(&grouped, sf).level, Parallelism::Free);
     assert_eq!(structure(&grouped, s).level, Parallelism::Free);
     assert_eq!(structure(&grouped, f).level, Parallelism::Free);
@@ -503,11 +503,11 @@ fn view_scoping_rules() {
 fn fold_through_a_flattened_view() {
     // out = Σ_dmv flat[dmv]·w[dmv], where flat reindexes a *computed* [h, dv]
     let (h, dv, dmv) = (axis("h", 4), axis("dv", 6), axis("dmv", 24));
-    let a = input("A", &[h, dv]);
-    let b = input("B", &[h, dv]);
+    let a = input("A", &[h, dv], Dtype::F32);
+    let b = input("B", &[h, dv], Dtype::F32);
     let prod = map(MapOp::Mul, vec![a, b]); // computed, not a raw input
     let flat = flatten(prod, &[h, dv], dmv);
-    let w = input("W", &[dmv]);
+    let w = input("W", &[dmv], Dtype::F32);
     let out = reduce(map(MapOp::Mul, vec![flat, w]), dmv, add_r());
 
     let car = derive(&out, dmv).expect("folds over the flattened axis");
@@ -526,7 +526,7 @@ fn fold_through_a_flattened_view() {
 #[test]
 fn tanh_rnn_is_sequential() {
     let (t, h) = (axis("t", 8), axis("h", 16));
-    let x = input("X", &[t, h]);
+    let x = input("X", &[t, h], Dtype::F32);
     let rnn = tanh_rnn(x, t);
     assert_eq!(structure(&rnn, t).level, Parallelism::Sequential);
     assert!(!streamable(&rnn, t));
@@ -540,7 +540,7 @@ fn tanh_rnn_is_sequential() {
 #[test]
 fn ssm_scan_is_monoidal() {
     let t = axis("t", 19);
-    let params = input("AB", &[t]); // each step carries its (A_t, b_t)
+    let params = input("AB", &[t], Dtype::F32); // each step carries its (A_t, b_t)
     let ssm = ssm_scan(params, t);
     assert_eq!(structure(&ssm, t).level, Parallelism::Monoidal);
     assert!(streamable(&ssm, t));
@@ -565,8 +565,8 @@ fn ssm_scan_is_monoidal() {
 #[test]
 fn embedding_is_opaque() {
     let (vocab, d, seq) = (axis("vocab", 32), axis("d", 16), axis("seq", 8));
-    let table = input("E", &[vocab, d]);
-    let ids = input("ids", &[seq]);
+    let table = input("E", &[vocab, d], Dtype::F32);
+    let ids = input("ids", &[seq], Dtype::F32);
     let emb = embedding(table, ids, vocab);
     assert_eq!(structure(&emb, vocab).level, Parallelism::Opaque);
     assert!(!streamable(&emb, vocab));
@@ -582,10 +582,10 @@ fn per_node_axis_double_gemm() {
     // only because the analysis is per (node, axis) rather than collapsed
     // onto the output.
     let (i, a, m, j) = (axis("i", 4), axis("a", 5), axis("m", 6), axis("j", 7));
-    let x = input("X", &[i, a]);
-    let y = input("Y", &[a, m]);
+    let x = input("X", &[i, a], Dtype::F32);
+    let y = input("Y", &[a, m], Dtype::F32);
     let g1 = matmul(x, y, a); // contracts a → output [i, m]
-    let z = input("Z", &[m, j]);
+    let z = input("Z", &[m, j], Dtype::F32);
     let g2 = matmul(g1.clone(), z, m); // contracts m → output [i, j]
 
     // `m` is a free output index of GEMM-1 ...
@@ -599,9 +599,9 @@ fn per_node_axis_double_gemm() {
 #[test]
 fn flash_attention_associative_all_splits() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 12), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
     let attn = attention(q, kk, v, d, k);
     let car = derive(&attn, k).unwrap();
     let mut rng = Lcg::new(2024);
@@ -626,9 +626,9 @@ fn multi_value_attention_generalizes() {
     // Σ softmax(scores)·V1 and Σ softmax(scores)·V2, summed — the coupling
     // with two deferred linear reductions sharing one (m, s).
     let k = axis("k", 15);
-    let scores = input("S", &[k]);
-    let v1 = input("V1", &[k]);
-    let v2 = input("V2", &[k]);
+    let scores = input("S", &[k], Dtype::F32);
+    let v1 = input("V1", &[k], Dtype::F32);
+    let v2 = input("V2", &[k], Dtype::F32);
     let w = softmax(scores, k);
     let o1 = reduce(map(MapOp::Mul, vec![w.clone(), v1]), k, add_r());
     let o2 = reduce(map(MapOp::Mul, vec![w, v2]), k, add_r());
@@ -695,16 +695,16 @@ fn ctc_forward_battle_test() {
         axis("pred", 6),
         axis("v", 32),
     );
-    let logp = input("logp", &[b, t, v]);
-    let labels = input("labels", &[s]);
+    let logp = input("logp", &[b, t, v], Dtype::F32);
+    let labels = input("labels", &[s], Dtype::F32);
     let emit = gather(logp, labels, v); // logp_t[ℓ(s)] — index vocab by label
 
-    let prev = input("alpha_prev", &[b, pred, s]); // α_{t-1} at predecessors
+    let prev = input("alpha_prev", &[b, pred, s], Dtype::F32); // α_{t-1} at predecessors
     let trans = reduce(prev, pred, lse_r()); // logsumexp over predecessors
     let step = map(MapOp::Add, vec![trans.clone(), emit.clone()]); // + emission
     let alpha = scan(step.clone(), t, BinOp::NonAssoc("ctc_forward")); // recurrence
 
-    let alpha_t = input("alpha_T", &[b, s]);
+    let alpha_t = input("alpha_T", &[b, s], Dtype::F32);
     let loss = reduce(alpha_t, s, lse_r()); // final logsumexp over states
 
     // ── b (batch) → FREE → grid ──────────────────────────────────────────────
@@ -774,16 +774,16 @@ fn soft_attention_over_logspace_dp() {
         axis("h", 14),
         axis("t", 6),
     );
-    let q = input("Q", &[b, d]);
-    let ktable = input("Ktable", &[idx, k, d]);
-    let labels = input("labels", &[b]);
+    let q = input("Q", &[b, d], Dtype::F32);
+    let ktable = input("Ktable", &[idx, k, d], Dtype::F32);
+    let labels = input("labels", &[b], Dtype::F32);
     let kgath = gather(ktable, labels, idx); // K[b,k,d] via runtime index → OPAQUE on idx
     let score = reduce(map(MapOp::Mul, vec![q, kgath.clone()]), d, add_r()); // linear contraction on d
     let weight = softmax(score.clone(), k); // (m, s) coupling
 
     // VALUES are themselves a streamed reduction: a logsumexp-matmul over h.
-    let wv = input("Wv", &[d, h]);
-    let hmat = input("H", &[b, t, k, h]);
+    let wv = input("Wv", &[d, h], Dtype::F32);
+    let hmat = input("H", &[b, t, k, h], Dtype::F32);
     let value = reduce(map(MapOp::Add, vec![wv, hmat]), h, lse_r()); // LogMatMul contract=h
 
     let out = reduce(map(MapOp::Mul, vec![weight, value.clone()]), k, add_r()); // linear consumer on k
@@ -869,31 +869,31 @@ fn soft_attention_over_logspace_dp() {
 fn probe_discovered_laws_are_sound() {
     use sanic::interp::{Env, Value, eval, run_carrier};
 
-    fn x(n: Axis) -> Node {
-        input("X", &[n])
+    fn x(n: Axis) -> NodeRef {
+        input("X", &[n], Dtype::F32)
     }
-    fn coll(n: Axis, op: BinOp) -> Node {
+    fn coll(n: Axis, op: BinOp) -> NodeRef {
         reduce(x(n), n, op)
     }
-    fn mul(a: Node, b: Node) -> Node {
+    fn mul(a: NodeRef, b: NodeRef) -> NodeRef {
         map(MapOp::Mul, vec![a, b])
     }
-    fn add(a: Node, b: Node) -> Node {
+    fn add(a: NodeRef, b: NodeRef) -> NodeRef {
         map(MapOp::Add, vec![a, b])
     }
-    fn subn(a: Node, b: Node) -> Node {
+    fn subn(a: NodeRef, b: NodeRef) -> NodeRef {
         map(MapOp::Sub, vec![a, b])
     }
-    fn mx(a: Node, b: Node) -> Node {
+    fn mx(a: NodeRef, b: NodeRef) -> NodeRef {
         map(MapOp::Max, vec![a, b])
     }
-    fn mn(a: Node, b: Node) -> Node {
+    fn mn(a: NodeRef, b: NodeRef) -> NodeRef {
         map(MapOp::Min, vec![a, b])
     }
 
     // Each program is a builder: the axis carries its extent, so every trial
     // length below mints its own `n` and rebuilds the graph around it.
-    let programs: Vec<(&str, fn(Axis) -> Node)> = vec![
+    let programs: Vec<(&str, fn(Axis) -> NodeRef)> = vec![
         // invariant reductions: Σ/max/min/lse over a same-axis collapsed value
         ("sum_of_sum", |n| reduce(coll(n, add_r()), n, add_r())),
         ("max_of_sum", |n| reduce(coll(n, add_r()), n, max_r())),
@@ -937,12 +937,46 @@ fn probe_discovered_laws_are_sound() {
             )
         }),
         ("max_of_scaled_iota", |n| {
-            reduce(mul(mul(iota(n), coll(n, max_r())), coll(n, add_r())), n, max_r())
+            reduce(
+                mul(mul(iota(n), coll(n, max_r())), coll(n, add_r())),
+                n,
+                max_r(),
+            )
         }),
         // k-best values and indices at every rank
-        ("top3_v0", |n| reduce(x(n), n, BinOp::TopK { k: 3, rank: 0, idx: false })),
-        ("top3_v2", |n| reduce(x(n), n, BinOp::TopK { k: 3, rank: 2, idx: false })),
-        ("top3_i1", |n| reduce(x(n), n, BinOp::TopK { k: 3, rank: 1, idx: true })),
+        ("top3_v0", |n| {
+            reduce(
+                x(n),
+                n,
+                BinOp::TopK {
+                    k: 3,
+                    rank: 0,
+                    idx: false,
+                },
+            )
+        }),
+        ("top3_v2", |n| {
+            reduce(
+                x(n),
+                n,
+                BinOp::TopK {
+                    k: 3,
+                    rank: 2,
+                    idx: false,
+                },
+            )
+        }),
+        ("top3_i1", |n| {
+            reduce(
+                x(n),
+                n,
+                BinOp::TopK {
+                    k: 3,
+                    rank: 1,
+                    idx: true,
+                },
+            )
+        }),
     ];
 
     let mut rng = Lcg::new(0xD15C0);

@@ -241,9 +241,9 @@ mod tests {
     fn emitted_flash_kernel_is_real_and_correct() {
         let (sq, k, d, e) = (axis("sq", 8), axis("k", 64), axis("d", 64), axis("e", 64));
         let attn = attention(
-            input("Q", &[sq, d]),
-            input("K", &[k, d]),
-            input("V", &[k, e]),
+            input("Q", &[sq, d], Dtype::F32),
+            input("K", &[k, d], Dtype::F32),
+            input("V", &[k, e], Dtype::F32),
             d,
             k,
         );
@@ -306,9 +306,9 @@ mod tests {
     fn emitted_tiled_kernel_is_real_and_correct() {
         let (sq, k, d, e) = (axis("sq", 8), axis("k", 64), axis("d", 64), axis("e", 64));
         let attn = attention(
-            input("Q", &[sq, d]),
-            input("K", &[k, d]),
-            input("V", &[k, e]),
+            input("Q", &[sq, d], Dtype::F32),
+            input("K", &[k, d], Dtype::F32),
+            input("V", &[k, e], Dtype::F32),
             d,
             k,
         );

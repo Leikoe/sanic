@@ -16,9 +16,9 @@ const KT: f64 = 64.0; // K/V block streamed per step
 fn acc_per_lane(d: f64) -> f64 {
     let (sq, k, dd, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
     let attn = attention(
-        input("Q", &[sq, dd]),
-        input("K", &[k, dd]),
-        input("V", &[k, e]),
+        input("Q", &[sq, dd], Dtype::F32),
+        input("K", &[k, dd], Dtype::F32),
+        input("V", &[k, e], Dtype::F32),
         dd,
         k,
     );

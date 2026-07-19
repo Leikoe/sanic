@@ -46,7 +46,7 @@ fn add_r() -> BinOp {
     BinOp::Monoid(Monoid::Add)
 }
 
-fn rmsnorm(x: Node, g: Node, n: f64, ax: Axis) -> Node {
+fn rmsnorm(x: NodeRef, g: NodeRef, n: f64, ax: Axis) -> NodeRef {
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), ax, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
@@ -74,13 +74,13 @@ fn attention_block_schedule_executes_to_reference() {
     .into_iter()
     .collect();
 
-    let x = input("X", &[s, dm]);
+    let x = input("X", &[s, dm], Dtype::F32);
     let xk = rename(x.clone(), s, t);
-    let q = matmul(x.clone(), input("Wq", &[dk, dm]), dm); // [s, dk]
-    let k = matmul(xk.clone(), input("Wk", &[dk, dm]), dm); // [t, dk]
-    let v = matmul(xk, input("Wv", &[dv, dm]), dm); // [t, dv]
+    let q = matmul(x.clone(), input("Wq", &[dk, dm], Dtype::F32), dm); // [s, dk]
+    let k = matmul(xk.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [t, dk]
+    let v = matmul(xk, input("Wv", &[dv, dm], Dtype::F32), dm); // [t, dv]
     let attn = attention(q, k, v, dk, t); // [s, dv]
-    let o = matmul(attn, input("Wo", &[dm, dv]), dv); // [s, dm]
+    let o = matmul(attn, input("Wo", &[dm, dv], Dtype::F32), dv); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
     let sched = partition(&y, &Device::toy());
@@ -125,13 +125,13 @@ fn full_transformer_block_schedule_executes_to_reference() {
     .into_iter()
     .collect();
 
-    let x = input("X", &[s, dm]);
-    let xn = rmsnorm(x.clone(), input("g1", &[dm]), n, dm);
+    let x = input("X", &[s, dm], Dtype::F32);
+    let xn = rmsnorm(x.clone(), input("g1", &[dm], Dtype::F32), n, dm);
     let xn_kv = rename(xn.clone(), s, t);
 
-    let q = matmul(xn, input("Wq", &[h, dk, dm]), dm); // [s, h, dk]
-    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm]), dm); // [t, h, dk]
-    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm]), dm); // [t, h, dv]
+    let q = matmul(xn, input("Wq", &[h, dk, dm], Dtype::F32), dm); // [s, h, dk]
+    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32), dm); // [t, h, dk]
+    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32), dm); // [t, h, dv]
 
     let scores = matmul(q, k, dk); // [s, h, t]
     let scaled = map(
@@ -142,21 +142,21 @@ fn full_transformer_block_schedule_executes_to_reference() {
     let attn = matmul(softmax(masked, t), vv, t); // [s, h, dv]
 
     let flat = flatten(attn, &[h, dv], dmv); // [s, dmv]
-    let o = matmul(flat, input("Wo", &[dmv, dm]), dmv); // [s, dm]
+    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32), dmv); // [s, dm]
     let res1 = map(MapOp::Add, vec![o, x]);
 
-    let hn = rmsnorm(res1.clone(), input("g2", &[dm]), n, dm);
-    let gate = matmul(hn.clone(), input("Wg", &[f, dm]), dm); // [s, f]
-    let up = matmul(hn, input("Wu", &[f, dm]), dm); // [s, f]
+    let hn = rmsnorm(res1.clone(), input("g2", &[dm], Dtype::F32), n, dm);
+    let gate = matmul(hn.clone(), input("Wg", &[f, dm], Dtype::F32), dm); // [s, f]
+    let up = matmul(hn, input("Wu", &[f, dm], Dtype::F32), dm); // [s, f]
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = reduce(
-        map(MapOp::Mul, vec![act, input("Wd", &[f, dm])]),
+        map(MapOp::Mul, vec![act, input("Wd", &[f, dm], Dtype::F32)]),
         f,
         add_r(),
     );
     let yb = map(MapOp::Add, vec![mlp, res1]);
 
-    let logits = matmul(yb, input("W_lm", &[v, dm]), dm); // [s, v]
+    let logits = matmul(yb, input("W_lm", &[v, dm], Dtype::F32), dm); // [s, v]
 
     let sched = partition(&logits, &Device::toy());
     assert!(

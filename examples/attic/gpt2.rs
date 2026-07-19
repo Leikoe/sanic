@@ -205,9 +205,9 @@ fn layer_norm(x: Node, g: &'static str, b: &'static str, dm: Axis) -> Node {
         vec![
             map(
                 MapOp::Mul,
-                vec![map(MapOp::Div, vec![xc, denom]), input(g, &[dm])],
+                vec![map(MapOp::Div, vec![xc, denom]), input(g, &[dm], Dtype::F32)],
             ),
-            input(b, &[dm]),
+            input(b, &[dm], Dtype::F32),
         ],
     )
 }
@@ -258,8 +258,8 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
 
     // embedding: token row + learned position row (positions are data-free —
     // the index IS iota over the sequence axis)
-    let tok = gather(input("wte", &[vv, dm]), input("ids", &[s]), vv); // [dm, s]
-    let pos = gather(input("wpe", &[pp, dm]), iota(s), pp); // [dm, s]
+    let tok = gather(input("wte", &[vv, dm], Dtype::F32), input("ids", &[s], Dtype::F32), vv); // [dm, s]
+    let pos = gather(input("wpe", &[pp, dm], Dtype::F32), iota(s), pp); // [dm, s]
     let x0 = map(MapOp::Add, vec![tok, pos]);
 
     let mut roots: Vec<(Node, &'static str)> = vec![(x0.clone(), "xb0")];
@@ -301,7 +301,7 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
         bind_axes(&mut env, nm("wp"), &[dm, f], &ext_us);
         bind_axes(&mut env, nm("bp"), &[dm], &ext_us);
 
-        let x = input(leak(format!("xb{l}")), &prev_axes);
+        let x = input(leak(format!("xb{l}")), &prev_axes, Dtype::F32);
 
         // ── attention ──
         let xn = layer_norm(x.clone(), nm("g1"), nm("c1"), dm);
@@ -309,22 +309,22 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
         let q = map(
             MapOp::Add,
             vec![
-                matmul(xn.clone(), input(nm("wq"), &[h, dk, dm]), dm),
-                input(nm("bq"), &[h, dk]),
+                matmul(xn.clone(), input(nm("wq"), &[h, dk, dm], Dtype::F32), dm),
+                input(nm("bq"), &[h, dk], Dtype::F32),
             ],
         );
         let k = map(
             MapOp::Add,
             vec![
-                matmul(xnt.clone(), input(nm("wk"), &[h, dk, dm]), dm),
-                input(nm("bk"), &[h, dk]),
+                matmul(xnt.clone(), input(nm("wk"), &[h, dk, dm], Dtype::F32), dm),
+                input(nm("bk"), &[h, dk], Dtype::F32),
             ],
         );
         let v = map(
             MapOp::Add,
             vec![
-                matmul(xnt, input(nm("wv"), &[h, dv, dm]), dm),
-                input(nm("bv"), &[h, dv]),
+                matmul(xnt, input(nm("wv"), &[h, dv, dm], Dtype::F32), dm),
+                input(nm("bv"), &[h, dv], Dtype::F32),
             ],
         );
         let scores = map(
@@ -337,8 +337,8 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
         let proj = map(
             MapOp::Add,
             vec![
-                matmul(flat, input(nm("wo"), &[dm, dmv]), dmv),
-                input(nm("bo"), &[dm]),
+                matmul(flat, input(nm("wo"), &[dm, dmv], Dtype::F32), dmv),
+                input(nm("bo"), &[dm], Dtype::F32),
             ],
         );
         let x1 = map(MapOp::Add, vec![x, proj]);
@@ -348,16 +348,16 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
         let hpre = map(
             MapOp::Add,
             vec![
-                matmul(xn2, input(nm("wf"), &[f, dm]), dm),
-                input(nm("bf"), &[f]),
+                matmul(xn2, input(nm("wf"), &[f, dm], Dtype::F32), dm),
+                input(nm("bf"), &[f], Dtype::F32),
             ],
         );
         let act = gelu_new(hpre);
         let m = map(
             MapOp::Add,
             vec![
-                matmul(act, input(nm("wp"), &[dm, f]), f),
-                input(nm("bp"), &[dm]),
+                matmul(act, input(nm("wp"), &[dm, f], Dtype::F32), f),
+                input(nm("bp"), &[dm], Dtype::F32),
             ],
         );
         let x2 = map(MapOp::Add, vec![x1, m]);
@@ -368,12 +368,12 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
 
     // final norm + weight-tied logits
     let xf = layer_norm(
-        input(leak(format!("xb{N_LAYER}")), &prev_axes),
+        input(leak(format!("xb{N_LAYER}")), &prev_axes, Dtype::F32),
         "gf",
         "cf",
         dm,
     );
-    let logits = matmul(xf, input("wte", &[vv, dm]), dm); // [.., v]
+    let logits = matmul(xf, input("wte", &[vv, dm], Dtype::F32), dm); // [.., v]
     roots.push((logits, "logits"));
 
     let ext_f: HashMap<Axis, f64> = ext_us.iter().map(|(&a, &n)| (a, n as f64)).collect();
@@ -414,9 +414,9 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
     bind_axes(&mut env, "gf", &[dm], &ext_us);
     bind_axes(&mut env, "cf", &[dm], &ext_us);
 
-    let pos = input("pos", &[]);
-    let tok = gather(input("wte", &[vv, dm]), input("id", &[]), vv); // [dm]
-    let prow = gather(input("wpe", &[pp, dm]), pos.clone(), pp); // [dm]
+    let pos = input("pos", &[], Dtype::F32);
+    let tok = gather(input("wte", &[vv, dm], Dtype::F32), input("id", &[], Dtype::F32), vv); // [dm]
+    let prow = gather(input("wpe", &[pp, dm], Dtype::F32), pos.clone(), pp); // [dm]
     let x0 = map(MapOp::Add, vec![tok, prow]);
 
     let mut roots: Vec<(Node, &'static str)> = vec![(x0.clone(), "xd0")];
@@ -455,29 +455,29 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
         bind_axes(&mut env, nm("bf"), &[f], &ext_us);
         bind_axes(&mut env, nm("wp"), &[dm, f], &ext_us);
 
-        let x = input(leak(format!("xd{l}")), &prev_axes);
+        let x = input(leak(format!("xd{l}")), &prev_axes, Dtype::F32);
 
         // ── attention over the updated cache ──
         let xn = layer_norm(x.clone(), nm("g1"), nm("c1"), dm);
         let q = map(
             MapOp::Add,
             vec![
-                matmul(xn.clone(), input(nm("wq"), &[h, dk, dm]), dm),
-                input(nm("bq"), &[h, dk]),
+                matmul(xn.clone(), input(nm("wq"), &[h, dk, dm], Dtype::F32), dm),
+                input(nm("bq"), &[h, dk], Dtype::F32),
             ],
         ); // [h, dk]
         let nk = map(
             MapOp::Add,
             vec![
-                matmul(xn.clone(), input(nm("wk"), &[h, dk, dm]), dm),
-                input(nm("bk"), &[h, dk]),
+                matmul(xn.clone(), input(nm("wk"), &[h, dk, dm], Dtype::F32), dm),
+                input(nm("bk"), &[h, dk], Dtype::F32),
             ],
         );
         let nv = map(
             MapOp::Add,
             vec![
-                matmul(xn, input(nm("wv"), &[h, dv, dm]), dm),
-                input(nm("bv"), &[h, dv]),
+                matmul(xn, input(nm("wv"), &[h, dv, dm], Dtype::F32), dm),
+                input(nm("bv"), &[h, dv], Dtype::F32),
             ],
         );
         let ck = map(
@@ -485,7 +485,7 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
             vec![
                 one_hot(t, pos.clone()),
                 nk,
-                input(nm("cache_k"), &[t, h, dk]),
+                input(nm("cache_k"), &[t, h, dk], Dtype::F32),
             ],
         ); // [t, h, dk]
         let cv = map(
@@ -493,7 +493,7 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
             vec![
                 one_hot(t, pos.clone()),
                 nv,
-                input(nm("cache_v"), &[t, h, dv]),
+                input(nm("cache_v"), &[t, h, dv], Dtype::F32),
             ],
         );
         roots.push((ck.clone(), leak(format!("ckN_{l}"))));
@@ -516,8 +516,8 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
         let proj = map(
             MapOp::Add,
             vec![
-                matmul(flat, input(nm("wo"), &[dm, dmv]), dmv),
-                input(nm("bo"), &[dm]),
+                matmul(flat, input(nm("wo"), &[dm, dmv], Dtype::F32), dmv),
+                input(nm("bo"), &[dm], Dtype::F32),
             ],
         );
         let x1 = map(MapOp::Add, vec![x, proj]);
@@ -527,16 +527,16 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
         let hpre = map(
             MapOp::Add,
             vec![
-                matmul(xn2, input(nm("wf"), &[f, dm]), dm),
-                input(nm("bf"), &[f]),
+                matmul(xn2, input(nm("wf"), &[f, dm], Dtype::F32), dm),
+                input(nm("bf"), &[f], Dtype::F32),
             ],
         );
         let act = gelu_new(hpre);
         let m = map(
             MapOp::Add,
             vec![
-                matmul(act, input(nm("wp"), &[dm, f]), f),
-                input(nm("bp"), &[dm]),
+                matmul(act, input(nm("wp"), &[dm, f], Dtype::F32), f),
+                input(nm("bp"), &[dm], Dtype::F32),
             ],
         );
         let x2 = map(MapOp::Add, vec![x1, m]);
@@ -546,12 +546,12 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
     }
 
     let xf = layer_norm(
-        input(leak(format!("xd{N_LAYER}")), &prev_axes),
+        input(leak(format!("xd{N_LAYER}")), &prev_axes, Dtype::F32),
         "gf",
         "cf",
         dm,
     );
-    let logits = matmul(xf, input("wte", &[vv, dm]), dm); // [v]
+    let logits = matmul(xf, input("wte", &[vv, dm], Dtype::F32), dm); // [v]
     roots.push((logits, "logits"));
 
     let ext_f: HashMap<Axis, f64> = ext_us.iter().map(|(&a, &n)| (a, n as f64)).collect();

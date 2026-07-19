@@ -20,7 +20,9 @@ use crate::codegen::{
     thread_grid_decode, thread_grid_decode_from, value,
 };
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{Axis, Dtype, MapOp, Monoid, Node, NodeKind, input_dtypes, output_axes, volume};
+use crate::ir::{
+    Axis, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, input_dtypes, volume,
+};
 use crate::partition::{Schedule, Stage};
 use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
 
@@ -113,17 +115,17 @@ impl Lang for MetalLang {
     /// buffer widens on load; packed int4 unpacks two's-complementless
     /// (compressed-tensors stores UNSIGNED q+8 nibbles, low nibble = even
     /// element); int8 is plain signed bytes.
-    fn buffer_load(&self, name: &str, off: &str, dtype: Option<Dtype>) -> String {
+    fn buffer_load(&self, name: &str, off: &str, dtype: Dtype) -> String {
         let b = san(name);
         match dtype {
-            None | Some(Dtype::F32) => format!("{b}[{off}]"),
-            Some(Dtype::F16) => format!("((float){b}[{off}])"),
+            Dtype::F32 => format!("{b}[{off}]"),
+            Dtype::F16 => format!("((float){b}[{off}])"),
             // bf16 = the high 16 bits of an f32: widen by shifting back up,
             // exact over the whole f32 range (no rounding, no range limit).
-            Some(Dtype::BF16) => format!("as_type<float>((uint){b}[{off}] << 16u)"),
-            Some(Dtype::I8) => format!("((float){b}[{off}])"),
-            Some(Dtype::I4) => format!("w4({b}, {off})"),
-            Some(Dtype::F64) => panic!("Apple GPUs have no f64 buffers"),
+            Dtype::BF16 => format!("as_type<float>((uint){b}[{off}] << 16u)"),
+            Dtype::I8 => format!("((float){b}[{off}])"),
+            Dtype::I4 => format!("w4({b}, {off})"),
+            Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
         }
     }
     /// Present only in scheduled (cooperative) kernels, which is the only
@@ -146,14 +148,14 @@ impl Lang for MetalLang {
 }
 
 /// The `[[buffer(i)]]` pointer type for a storage dtype.
-fn buf_ty(dtype: Option<Dtype>) -> &'static str {
+fn buf_ty(dtype: Dtype) -> &'static str {
     match dtype {
-        None | Some(Dtype::F32) => "device const float*",
-        Some(Dtype::F16) => "device const half*",
-        Some(Dtype::BF16) => "device const ushort*",
-        Some(Dtype::I8) => "device const char*",
-        Some(Dtype::I4) => "device const uchar*",
-        Some(Dtype::F64) => panic!("Apple GPUs have no f64 buffers"),
+        Dtype::F32 => "device const float*",
+        Dtype::F16 => "device const half*",
+        Dtype::BF16 => "device const ushort*",
+        Dtype::I8 => "device const char*",
+        Dtype::I4 => "device const uchar*",
+        Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
     }
 }
 
@@ -166,8 +168,8 @@ inline float w4(device const uchar* p, uint i) {\n\
 // ── kernels ──────────────────────────────────────────────────────────────────
 
 /// An emitted Metal kernel: MSL source, entry name, the input buffers it binds
-/// (in `[[buffer(0..)]]` order), their declared storage dtypes (absent =
-/// float), and the output grid.
+/// (in `[[buffer(0..)]]` order), their declared storage dtypes, and the output
+/// grid.
 pub struct MetalKernel {
     pub msl: String,
     pub name: String,
@@ -184,7 +186,11 @@ fn signature(bufs: &[(&'static str, Vec<Axis>)], dtypes: &HashMap<&'static str, 
         .map(|(i, (n, _))| {
             format!(
                 "{} {} [[buffer({i})]]",
-                buf_ty(dtypes.get(n).copied()),
+                buf_ty(
+                    *dtypes
+                        .get(n)
+                        .expect("every input buffer must declare a storage dtype"),
+                ),
                 san(n)
             )
         })
@@ -234,7 +240,13 @@ pub(crate) const METAL_MAX_BUFFERS: usize = 31;
 /// host fills the address table in the same order).
 fn make_bindless(k: &MetalKernel) -> String {
     let strct = format!("Args_{}", k.name);
-    let field = |n: &str| -> &'static str { buf_ty(k.dtypes.get(n).copied()) };
+    let field = |n: &str| -> &'static str {
+        buf_ty(
+            *k.dtypes
+                .get(n)
+                .expect("every input buffer must declare a storage dtype"),
+        )
+    };
 
     // struct of the inputs, in bind order (one `device const T*` per input)
     let mut def = format!("struct {strct} {{\n");
@@ -416,7 +428,7 @@ fn prefix_mask_edge(carrier: &Carrier, stream: Axis) -> Option<usize> {
             && let Expr::Lt(x, y) = &**c
             && let (Expr::Item(p), Expr::Item(i)) = (&**x, &**y)
             && matches!(leaves[*i].as_ref(), NodeKind::Iota { axis } if *axis == stream)
-            && !output_axes(&leaves[*p]).contains(&stream)
+            && !leaves[*p].shape().contains(&stream)
             && matches!(&**a, Expr::Const(k) if *k <= -1e29)
             && matches!(&**b, Expr::Const(z) if *z == 0.0)
         {
@@ -454,10 +466,10 @@ pub fn emit_fused_metal(
 }
 
 /// [`emit_fused_metal`] with an optional fused EPILOGUE: an elementwise node
-/// of the fold's own shape that reads the fold's result (as `input(out)`)
-/// plus other buffers, rendered IN the kernel after the projection — the
-/// projection lands in a register, `Gen::local_inputs` resolves the read,
-/// one dispatch instead of a fold plus an in-place map.
+/// of the fold's own shape that reads the fold's result as an input leaf plus
+/// other buffers, rendered IN the kernel after the projection — the projection
+/// lands in a register, `Gen::local_inputs` resolves the read, one dispatch
+/// instead of a fold plus an in-place map.
 pub fn emit_fused_metal_with(
     name: &str,
     carrier: &Carrier,
@@ -670,7 +682,7 @@ pub fn emit_fused_metal_sched_with(
     let sliced_leaf: Vec<bool> = carrier
         .leaves
         .iter()
-        .map(|l| sched.lane_axis.is_some_and(|a| output_axes(l).contains(&a)))
+        .map(|l| sched.lane_axis.is_some_and(|a| l.shape().contains(&a)))
         .collect();
     // A slot the schedule holds once per simdgroup must not read a
     // lane-sliced item or slot; spans should guarantee it — verify anyway.
@@ -1320,7 +1332,7 @@ pub struct MetalProgram {
     pub msl: String,
     pub stages: Vec<MetalStageInfo>,
     pub inputs: Vec<(&'static str, Vec<Axis>)>,
-    /// Storage dtype per input that declared one (absent = float32).
+    /// Declared storage dtype for every input.
     pub dtypes: HashMap<String, Dtype>,
     /// Intermediate/output buffers to allocate: name → element count.
     pub buffers: Vec<(String, usize)>,
@@ -1452,7 +1464,7 @@ pub fn emit_schedule_metal_over(
                     note_inputs(epi, &ex, &mut inputs);
                 }
                 last_out = out;
-                last_axes = output_axes(epilogue_node.as_ref().unwrap_or(fold_node));
+                last_axes = epilogue_node.as_ref().unwrap_or(fold_node).shape();
             }
             Stage::Elementwise { output, exec, .. }
             | Stage::Gather { output, exec, .. }
@@ -1475,7 +1487,7 @@ pub fn emit_schedule_metal_over(
                 });
                 produced.push(output.clone());
                 last_out = output.clone();
-                last_axes = output_axes(exec);
+                last_axes = exec.shape();
             }
             Stage::Infeasible { output, .. } => {
                 panic!("metal: cannot emit an infeasible stage producing `{output}`")

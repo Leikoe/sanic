@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ir::{
-    Axis, BinOp, MapOp, Monoid, Node, NodeKind, iota, konst, map, output_axes, reduce, reindex,
-    scatter_add, view,
+    Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node, iota, konst, map, reduce,
+    reindex, scatter_add, view,
 };
 
 /// d(loss)/d(each named input), as graphs. `loss` must be a scalar (no free
@@ -43,9 +43,9 @@ use crate::ir::{
 pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
     crate::verify::assert_valid(loss);
     assert!(
-        output_axes(loss).is_empty(),
+        loss.shape().is_empty(),
         "grad: the loss must be a scalar (reduce it first); got free axes {:?}",
-        output_axes(loss)
+        loss.shape()
     );
 
     // reverse topological order (postorder of the DAG, reversed)
@@ -104,7 +104,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
 
             NodeKind::Map { op, inputs } => {
                 for (contrib, child) in map_backward(*op, inputs, &g) {
-                    let target = output_axes(child);
+                    let target = child.shape();
                     add_adj(&mut adj, child, reduce_to(contrib, &target));
                 }
             }
@@ -135,7 +135,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
                 // of the same value: forward = n·src for Add (and shifts LSE
                 // by ln n), so the additive contributions scale by n. Max/Min
                 // of identical copies stay the identity.
-                if !output_axes(src).contains(axis)
+                if !src.shape().contains(axis)
                     && matches!(
                         op,
                         BinOp::Monoid(Monoid::Add) | BinOp::Monoid(Monoid::LogSumExp)
@@ -148,7 +148,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
 
             NodeKind::Gather { src, index, axis } => {
                 // adjoint of an indexed read: an add-combined indexed write
-                let idx_axes = output_axes(index);
+                let idx_axes = index.shape();
                 assert_eq!(
                     idx_axes.len(),
                     1,
@@ -451,7 +451,7 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
 /// contribution carries that the operand does not are reduced away with Add.
 fn reduce_to(n: Node, target: &[Axis]) -> Node {
     let mut out = n;
-    for a in output_axes(&out) {
+    for a in out.shape() {
         if !target.contains(&a) {
             out = reduce(out, a, BinOp::Monoid(Monoid::Add));
         }

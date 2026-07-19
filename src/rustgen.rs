@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::codegen::{Gen, Lang, buffers, carrier_expr, carrier_expr_map, offset, san, value};
 use crate::derive::Carrier;
-use crate::ir::{Axis, MapOp, Monoid, Node, output_axes};
+use crate::ir::{Axis, MapOp, Monoid, NodeRef as Node};
 use crate::partition::{Schedule, Stage};
 
 // ── the Rust target ──────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ fn emit_fused(
         1,
         "rustgen fused kernel needs a scalar projection"
     );
-    let grid = output_axes(fold_node);
+    let grid = fold_node.shape();
     let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(fold_node);
 
@@ -238,7 +238,7 @@ fn emit_fused(
 /// A straight-line kernel (elementwise cone, gather, monoidal scan-as-reduce):
 /// grid over the output axes, write [`value`] of the spliced graph.
 fn emit_pointwise(fname: &str, exec: &Node) -> (String, Vec<&'static str>) {
-    let grid = output_axes(exec);
+    let grid = exec.shape();
     let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(exec);
 
@@ -337,7 +337,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
                 }
                 produced_axes.insert(
                     out.clone(),
-                    output_axes(epilogue_node.as_ref().unwrap_or(fold_node)),
+                    epilogue_node.as_ref().unwrap_or(fold_node).shape(),
                 );
             }
             Stage::Elementwise { output, exec, .. }
@@ -353,7 +353,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
                     arglist(&args)
                 ));
                 produced.push(leak(output));
-                produced_axes.insert(output.clone(), output_axes(exec));
+                produced_axes.insert(output.clone(), exec.shape());
             }
             Stage::Infeasible { output, .. } => {
                 panic!("rustgen: cannot emit an infeasible stage producing `{output}`")

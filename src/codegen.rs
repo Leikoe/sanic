@@ -14,15 +14,15 @@
 use std::collections::HashMap;
 
 use crate::derive::Expr;
-use crate::ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node, NodeKind, output_axes};
+use crate::ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── fresh names ──────────────────────────────────────────────────────────────
 
 pub struct Gen {
     pub n: usize,
-    /// Storage dtypes of the inputs in scope (from [`crate::ir::input_dtypes`]):
-    /// a name found here loads through [`Lang::buffer_load`] with its declared
-    /// width — packed int4 nibbles, halfs — instead of the default float read.
+    /// Storage dtypes of the inputs in scope (from [`crate::ir::input_dtypes`]).
+    /// Each load uses its declared representation: packed int4 nibbles,
+    /// halfs, or a native float.
     pub dtypes: HashMap<&'static str, Dtype>,
     /// When set (by a cooperative GPU emitter), an in-body `Reduce` whose
     /// subtree avoids `avoid_axis` and whose extent is a multiple of the
@@ -36,9 +36,9 @@ pub struct Gen {
     pub lane_body: Option<LaneBody>,
     /// Input names whose value is already IN A REGISTER at the current
     /// render site — read the variable instead of the buffer. This is how a
-    /// fused epilogue reads the fold's own result: the projection lands in
-    /// a local, the epilogue's `input(out)` resolves to it, and the kernel
-    /// writes the final value in one pass.
+    /// fused epilogue reads the fold's own result: the projection lands in a
+    /// local, the epilogue's input leaf resolves to it, and the kernel writes
+    /// the final value in one pass.
     pub local_inputs: HashMap<String, String>,
 }
 
@@ -168,14 +168,14 @@ pub trait Lang {
     fn map_op(&self, op: MapOp, a: &[String]) -> String;
     /// The scalar monoid combine `acc ⊕ ev`.
     fn monoid(&self, m: Monoid, acc: &str, ev: &str) -> String;
-    /// Read element `off` of input buffer `name` stored at `dtype` width,
-    /// as a float expression. `None` is the target's native float buffer.
-    /// The Metal target reads halfs and unpacks int4 nibbles here; a target
-    /// without typed storage must decline loudly rather than mis-read.
-    fn buffer_load(&self, name: &str, off: &str, dtype: Option<Dtype>) -> String {
+    /// Read element `off` of input buffer `name` stored at `dtype` width as a
+    /// float expression. The Metal target reads halfs and unpacks int4
+    /// nibbles here; a target without typed storage must decline loudly
+    /// rather than mis-read.
+    fn buffer_load(&self, name: &str, off: &str, dtype: Dtype) -> String {
         match dtype {
-            None => format!("{}[{off}]", san(name)),
-            Some(d) => panic!("this backend has no {d:?} storage support"),
+            Dtype::F64 | Dtype::F32 => format!("{}[{off}]", san(name)),
+            d => panic!("this backend has no {d:?} storage support"),
         }
     }
     /// The current lane index expression, for targets with a simd width
@@ -212,12 +212,11 @@ pub fn value<L: Lang>(
     match node.as_ref() {
         NodeKind::Const { v } => lang.lit(*v),
         NodeKind::Iota { axis } => lang.iota_val(&coord[axis]),
-        NodeKind::Input { name, axes, .. } => {
+        NodeKind::Input { name, axes, dtype } => {
             if let Some(v) = g.local_inputs.get(*name) {
                 return v.clone();
             }
-            let dt = g.dtypes.get(name).copied();
-            lang.buffer_load(name, &offset(axes, coord), dt)
+            lang.buffer_load(name, &offset(axes, coord), *dtype)
         }
         NodeKind::Map { op, inputs } => {
             let a: Vec<String> = inputs
@@ -245,7 +244,7 @@ pub fn value<L: Lang>(
             // the lane-distributed axis).
             let lane_split = g.lane_body.and_then(|lb| {
                 let lane = lang.lane_var()?;
-                let uniform = lb.avoid_axis.is_none_or(|a| !output_axes(src).contains(&a));
+                let uniform = lb.avoid_axis.is_none_or(|a| !src.shape().contains(&a));
                 let merge = lang.simd_lane_merge(&acc, m, lb.simd_width)?;
                 (axis.extent() % lb.simd_width == 0 && uniform).then_some((
                     lane,
@@ -467,5 +466,5 @@ pub fn thread_grid_decode_from<L: Lang>(
 
 /// The output grid (free axes) and its flattened size for a kernel node.
 pub fn grid_of(node: &Node) -> (Vec<Axis>, usize) {
-    (output_axes(node), crate::ir::volume(node))
+    (node.shape(), crate::ir::volume(node))
 }

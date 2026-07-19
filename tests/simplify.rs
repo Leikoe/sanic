@@ -28,23 +28,36 @@ fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
 
 /// Softmax cross-entropy over `[b, c]`, `logsumexp − logit[y]`. `primitive`
 /// uses the `LogSumExp` monoid; otherwise the composition `m + log(Σ exp(x−m))`.
-fn cross_entropy(logits: &Node, b: Axis, c: Axis, primitive: bool) -> Node {
+fn cross_entropy(logits: &NodeRef, b: Axis, c: Axis, primitive: bool) -> NodeRef {
     let lse = if primitive {
         reduce(logits.clone(), c, BinOp::Monoid(Monoid::LogSumExp))
     } else {
         let m = reduce(logits.clone(), c, BinOp::Monoid(Monoid::Max));
-        let sh = map(MapOp::Exp, vec![map(MapOp::Sub, vec![logits.clone(), m.clone()])]);
+        let sh = map(
+            MapOp::Exp,
+            vec![map(MapOp::Sub, vec![logits.clone(), m.clone()])],
+        );
         map(
             MapOp::Add,
-            vec![m, map(MapOp::Log, vec![reduce(sh, c, BinOp::Monoid(Monoid::Add))])],
+            vec![
+                m,
+                map(MapOp::Log, vec![reduce(sh, c, BinOp::Monoid(Monoid::Add))]),
+            ],
         )
     };
     let picked = reduce(
-        map(MapOp::Mul, vec![logits.clone(), one_hot(c, input("y", &[b]))]),
+        map(
+            MapOp::Mul,
+            vec![logits.clone(), one_hot(c, input("y", &[b], Dtype::F32))],
+        ),
         c,
         BinOp::Monoid(Monoid::Add),
     );
-    reduce(map(MapOp::Sub, vec![lse, picked]), b, BinOp::Monoid(Monoid::Add))
+    reduce(
+        map(MapOp::Sub, vec![lse, picked]),
+        b,
+        BinOp::Monoid(Monoid::Add),
+    )
 }
 
 /// The simplifier is a value-preserving identity: the simplified gradient
@@ -61,7 +74,7 @@ fn simplify_preserves_the_gradient() {
     .into_iter()
     .collect();
 
-    let loss = cross_entropy(&input("Z", &[b, c]), b, c, false);
+    let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), b, c, false);
     let dz = grad(&loss, &["Z"])["Z"].clone();
     let simplified = simplify_many(&[loss, dz.clone()]).pop().unwrap();
 
@@ -84,7 +97,7 @@ fn simplify_preserves_the_gradient() {
 fn composed_logsumexp_backward_matches_the_primitive() {
     let (b, c) = (axis("b", 100), axis("c", 10));
     let kernels = |primitive: bool| {
-        let loss = cross_entropy(&input("Z", &[b, c]), b, c, primitive);
+        let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), b, c, primitive);
         let dz = grad(&loss, &["Z"])["Z"].clone();
         let roots = simplify_many(&[loss, dz]);
         partition_many(

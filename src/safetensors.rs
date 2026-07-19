@@ -7,7 +7,7 @@
 //! every tensor to `f64` host-side — `BF16` and `F16` widen exactly (bf16 is
 //! a truncated f32), so a bf16 checkpoint loses nothing on the way in. The
 //! *storage* dtype is still visible to the planner through
-//! [`crate::ir::input_dt`]; in-kernel byte storage is the part that remains
+//! [`crate::ir::input`]; in-kernel byte storage is the part that remains
 //! open (see todo.md).
 //!
 //! The tiny JSON parser is public because a tokenizer's `vocab.json` needs
@@ -225,7 +225,7 @@ fn parse_string(b: &[u8], i: &mut usize) -> Result<String, String> {
 pub struct RawTensor {
     pub shape: Vec<usize>,
     pub data: Vec<f64>,
-    /// The dtype the file stored — what `input_dt` should declare so the
+    /// The dtype the file stored — what `input` should declare so the
     /// planner prices the true bandwidth.
     pub dtype: &'static str,
 }
@@ -405,9 +405,7 @@ impl StFile {
                 .collect(),
             "BF16" => raw
                 .chunks_exact(2)
-                .map(|c| {
-                    f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16)
-                })
+                .map(|c| f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16))
                 .collect(),
             "F16" => raw
                 .chunks_exact(2)
@@ -525,8 +523,9 @@ mod tests {
 
     #[test]
     fn json_parses_headers_and_escapes() {
-        let j = parse_json(r#"{"a":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"s":"Ġx\n"}"#)
-            .unwrap();
+        let j =
+            parse_json(r#"{"a":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"s":"Ġx\n"}"#)
+                .unwrap();
         assert_eq!(
             j.get("a").unwrap().get("dtype").unwrap().as_str(),
             Some("F32")

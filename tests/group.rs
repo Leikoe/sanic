@@ -56,9 +56,9 @@ fn split_flash_equals_eval_for_any_block_count() {
     .collect();
 
     let attn = attention(
-        input("Q", &[s, d]),
-        input("K", &[k, d]),
-        input("V", &[k, e]),
+        input("Q", &[s, d], Dtype::F32),
+        input("K", &[k, d], Dtype::F32),
+        input("V", &[k, e], Dtype::F32),
         d,
         k,
     );
@@ -87,9 +87,13 @@ fn split_causal_flash_handles_identity_partials() {
     .into_iter()
     .collect();
 
-    let scores = matmul(input("Q", &[s, dk]), input("K", &[t, dk]), dk);
+    let scores = matmul(
+        input("Q", &[s, dk], Dtype::F32),
+        input("K", &[t, dk], Dtype::F32),
+        dk,
+    );
     let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
-    let attn = matmul(softmax(masked, t), input("V", &[t, dv]), t);
+    let attn = matmul(softmax(masked, t), input("V", &[t, dv], Dtype::F32), t);
 
     let reference = eval(&attn, &env);
     let carrier = derive(&attn, t).unwrap();
@@ -105,8 +109,8 @@ fn occupancy_starved_matvec_wants_a_split() {
     let (m, k) = (axis("m", 4), axis("k", 1_048_576));
     // grid of 4, a million-element contraction: one pass = 4 resident blocks
     // on a device that wants 8 — latency-bound. The roofline must split.
-    let w = input("W", &[m, k]);
-    let x = input("x", &[k]);
+    let w = input("W", &[m, k], Dtype::F32);
+    let x = input("x", &[k], Dtype::F32);
     let y = matmul(w, x, k);
     let carrier = derive(&y, k).unwrap();
 
@@ -119,11 +123,16 @@ fn occupancy_starved_matvec_wants_a_split() {
 
 #[test]
 fn well_parallelized_attention_keeps_one_pass() {
-    let (s, k, d, e) = (axis("s", 1024), axis("k", 1024), axis("d", 64), axis("e", 64));
+    let (s, k, d, e) = (
+        axis("s", 1024),
+        axis("k", 1024),
+        axis("d", 64),
+        axis("e", 64),
+    );
     let attn = attention(
-        input("Q", &[s, d]),
-        input("K", &[k, d]),
-        input("V", &[k, e]),
+        input("Q", &[s, d], Dtype::F32),
+        input("K", &[k, d], Dtype::F32),
+        input("V", &[k, e], Dtype::F32),
         d,
         k,
     );

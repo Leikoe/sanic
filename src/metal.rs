@@ -681,7 +681,8 @@ pub fn tune_schedules(
         // the --proto discipline (same math, same buffers, checked), in the
         // loop. A mismatch is an emitter bug surfacing, not a schedule
         // preference; it is reported and never chosen.
-        let out_elems: usize = crate::ir::output_axes(fold_node)
+        let out_elems: usize = fold_node
+            .shape()
             .iter()
             .map(|a| a.extent())
             .product::<usize>()
