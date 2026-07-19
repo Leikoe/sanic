@@ -115,10 +115,21 @@ pub fn partition(node: &Node, dev: &DeviceProfile) -> Schedule {
 /// root reachable from a *later* root is reused through its materialization
 /// (so put producers before consumers). Each root lands under its given name.
 pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Schedule {
-    let graph_roots: Vec<Node> = roots.iter().map(|(root, _)| root.clone()).collect();
+    // Canonicalize FIRST: everything below reads sharing through
+    // pointer-keyed maps (`parents`, `done`), so two separately built but
+    // structurally identical subgraphs must already be one node when the
+    // counting starts — otherwise the same value is derived, and possibly
+    // computed, once per copy.
+    let graph_roots = crate::kernel_ir::canonicalize_many(
+        &roots.iter().map(|(root, _)| root.clone()).collect::<Vec<_>>(),
+    );
     crate::verify::assert_valid_many(&graph_roots);
+    let roots: Vec<(Node, &'static str)> = graph_roots
+        .into_iter()
+        .zip(roots.iter().map(|(_, name)| *name))
+        .collect();
     let mut parents = HashMap::new();
-    for (r, _) in roots {
+    for (r, _) in &roots {
         count_parents(r, &mut parents);
     }
     let mut p = Partitioner {
@@ -130,7 +141,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         parents,
     };
     let mut outputs = Vec::new();
-    for (r, name) in roots {
+    for (r, name) in &roots {
         let landed = p.emit(r, name);
         // a later root (or leaf) reaching this one reuses the buffer
         p.done.insert(Rc::as_ptr(r), landed);

@@ -188,26 +188,12 @@ fn pass(
 /// Return the canonical node for this shallow structure — two structurally
 /// identical nodes (identical op and identical, already-canonical children)
 /// collapse to one, which is what turns structural equality into a pointer
-/// test for the rewrites below.
+/// test for the rewrites below. The key is [`crate::kernel_ir::shallow_key`],
+/// shared with the pipeline-entry [`crate::kernel_ir::canonicalize_many`].
 fn hashcons(node: Node, cse: &mut HashMap<String, Node>) -> Node {
-    cse.entry(key(&node)).or_insert(node).clone()
-}
-
-fn key(n: &Node) -> String {
-    let p = |c: &Node| Rc::as_ptr(c) as usize;
-    match n.as_ref() {
-        NodeKind::Const { v } => format!("C{}", v.to_bits()),
-        NodeKind::Input { name, axes, dtype } => format!("I{name}{axes:?}{dtype:?}"),
-        NodeKind::Iota { axis } => format!("O{axis:?}"),
-        NodeKind::Map { op, inputs } => {
-            format!("M{op:?}{:?}", inputs.iter().map(p).collect::<Vec<_>>())
-        }
-        NodeKind::Reduce { src, axis, op } => format!("R{op:?}{axis:?}.{}", p(src)),
-        NodeKind::Scan { src, axis, op } => format!("S{op:?}{axis:?}.{}", p(src)),
-        NodeKind::Gather { src, index, axis } => format!("G{axis:?}.{}.{}", p(src), p(index)),
-        NodeKind::View { src, groups } => format!("V{groups:?}.{}", p(src)),
-        NodeKind::Reindex { src, map, padded } => format!("X{map:?}{padded}.{}", p(src)),
-    }
+    cse.entry(crate::kernel_ir::shallow_key(&node))
+        .or_insert(node)
+        .clone()
 }
 
 // ── local rewrites (children already canonical, so `≡` is `Rc::ptr_eq`) ───────

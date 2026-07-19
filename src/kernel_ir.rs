@@ -643,6 +643,106 @@ fn shape_rc(
     out
 }
 
+/// One node's structure with children identified by POINTER. When the
+/// children are already canonical, two nodes get the same key exactly when
+/// they are structurally identical — so keying is O(children), never
+/// O(subtree). This is what [`canonicalize_many`] and the simplifier's CSE
+/// both dedup by.
+pub(crate) fn shallow_key(n: &NodeRef) -> String {
+    let p = |c: &NodeRef| Rc::as_ptr(c) as usize;
+    match n.as_ref() {
+        Node::Const { v } => format!("C{}", v.to_bits()),
+        Node::Input { name, axes, dtype } => format!("I{name}{axes:?}{dtype:?}"),
+        Node::Iota { axis } => format!("O{axis:?}"),
+        Node::Map { op, inputs } => {
+            format!("M{op:?}{:?}", inputs.iter().map(p).collect::<Vec<_>>())
+        }
+        Node::Reduce { src, axis, op } => format!("R{op:?}{axis:?}.{}", p(src)),
+        Node::Scan { src, axis, op } => format!("S{op:?}{axis:?}.{}", p(src)),
+        Node::Gather { src, index, axis } => format!("G{axis:?}.{}.{}", p(src), p(index)),
+        Node::View { src, groups } => format!("V{groups:?}.{}", p(src)),
+        Node::Reindex { src, map, padded } => format!("X{map:?}{padded}.{}", p(src)),
+    }
+}
+
+/// Rebuild `roots` with maximal sharing: separately constructed but
+/// structurally identical subgraphs collapse into ONE node with several
+/// consumers. One canonical table spans all roots, so equal subtrees shared
+/// *between* roots (a forward value recomputed in the backward) merge too.
+/// After this pass structural equality IS pointer equality — the invariant
+/// the pointer-keyed caches in [`crate::derive`] and [`crate::partition`]
+/// read sharing through. A subtree that is already canonical keeps its
+/// original `Rc`, so identities held elsewhere stay valid.
+pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
+    let mut canonical: std::collections::HashMap<String, NodeRef> = std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<*const Node, NodeRef> = std::collections::HashMap::new();
+    roots
+        .iter()
+        .map(|root| canonicalize_node(root, &mut canonical, &mut memo))
+        .collect()
+}
+
+fn canonicalize_node(
+    node: &NodeRef,
+    canonical: &mut std::collections::HashMap<String, NodeRef>,
+    memo: &mut std::collections::HashMap<*const Node, NodeRef>,
+) -> NodeRef {
+    if let Some(n) = memo.get(&Rc::as_ptr(node)) {
+        return n.clone();
+    }
+    // Canonicalize children first; keep the ORIGINAL `Rc` when nothing
+    // beneath changed, so an already-canonical subtree keeps its identity.
+    let rebuilt = match node.as_ref() {
+        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
+        Node::Map { op, inputs } => {
+            let ins: Vec<NodeRef> = inputs
+                .iter()
+                .map(|i| canonicalize_node(i, canonical, memo))
+                .collect();
+            if ins.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+                node.clone()
+            } else {
+                map(*op, ins)
+            }
+        }
+        Node::Reduce { src, axis, op } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) { node.clone() } else { reduce(s, *axis, *op) }
+        }
+        Node::Scan { src, axis, op } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) { node.clone() } else { scan(s, *axis, *op) }
+        }
+        Node::Gather { src, index, axis } => {
+            let s = canonicalize_node(src, canonical, memo);
+            let i = canonicalize_node(index, canonical, memo);
+            if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+                node.clone()
+            } else {
+                gather(s, i, *axis)
+            }
+        }
+        Node::View { src, groups } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) { node.clone() } else { view(s, groups.clone()) }
+        }
+        Node::Reindex { src, map, padded } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                reindex(s, map.clone(), *padded)
+            }
+        }
+    };
+    let out = canonical
+        .entry(shallow_key(&rebuilt))
+        .or_insert(rebuilt)
+        .clone();
+    memo.insert(Rc::as_ptr(node), out.clone());
+    out
+}
+
 /// Every `Input` leaf and its axes, in first-seen order. May repeat a name if
 /// the same tensor is reached along several paths — callers dedup as needed.
 /// `Const` and `Iota` carry no storage and are not reported.

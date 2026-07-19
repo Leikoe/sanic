@@ -113,3 +113,85 @@ fn composed_logsumexp_backward_matches_the_primitive() {
         "composed backward must derive to the primitive's kernel count"
     );
 }
+
+/// Two separately constructed, structurally identical subgraphs become ONE
+/// shared node: after canonicalization, structural equality is pointer
+/// equality — and the merge preserves the computed value.
+#[test]
+fn canonicalize_merges_structural_duplicates() {
+    let (b, c) = (axis("b", 4), axis("c", 6));
+    let x = input("x", &[b, c], Dtype::F32);
+    let row_energy = |x: &NodeRef| {
+        reduce(
+            map(MapOp::Mul, vec![x.clone(), x.clone()]),
+            c,
+            BinOp::Monoid(Monoid::Add),
+        )
+    };
+    // Built twice on purpose: equal structure, distinct nodes.
+    let once = row_energy(&x);
+    let again = row_energy(&x);
+    assert!(!std::rc::Rc::ptr_eq(&once, &again));
+
+    let y = map(MapOp::Add, vec![once, again]); // 2·Σx² per row
+    let canonical = canonicalize_many(&[y.clone()]).pop().unwrap();
+    let Node::Map { inputs, .. } = canonical.as_ref() else {
+        panic!("expected the root Add to survive canonicalization");
+    };
+    assert!(
+        std::rc::Rc::ptr_eq(&inputs[0], &inputs[1]),
+        "the duplicated reduction must canonicalize to one shared node"
+    );
+
+    let mut rng = Lcg(0xCA11);
+    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))].into_iter().collect();
+    assert_eq!(eval(&canonical, &env).data, eval(&y, &env).data);
+}
+
+/// Partition computes a structurally duplicated subgraph ONCE: building the
+/// same graph with the subtree shared vs rebuilt yields the same number of
+/// kernels, and the schedule still executes to the naive reference.
+#[test]
+fn partition_computes_a_structural_duplicate_once() {
+    let (b, c) = (axis("b", 4), axis("c", 6));
+    let x = || input("x", &[b, c], Dtype::F32);
+    let row_energy = |x: NodeRef| {
+        reduce(
+            map(MapOp::Mul, vec![x.clone(), x]),
+            c,
+            BinOp::Monoid(Monoid::Add),
+        )
+    };
+    // One fold consumed by two different parents — written once with the
+    // node shared, once with the fold rebuilt from scratch.
+    let combine = |e1: NodeRef, e2: NodeRef| {
+        map(
+            MapOp::Add,
+            vec![map(MapOp::Exp, vec![e1]), map(MapOp::Sqrt, vec![e2])],
+        )
+    };
+    let shared_fold = row_energy(x());
+    let shared = combine(shared_fold.clone(), shared_fold);
+    let duplicated = combine(row_energy(x()), row_energy(x()));
+
+    let toy = DeviceProfile::toy();
+    let shared_schedule = partition_many(&[(shared.clone(), "Out")], &toy);
+    let duplicated_schedule = partition_many(&[(duplicated.clone(), "Out")], &toy);
+    assert_eq!(
+        duplicated_schedule.stages.len(),
+        shared_schedule.stages.len(),
+        "a structural duplicate must partition like an explicitly shared node"
+    );
+
+    let mut rng = Lcg(0xD00D);
+    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))].into_iter().collect();
+    let executed = duplicated_schedule.execute(&env);
+    let reference = eval(&duplicated, &env).permuted_to(&executed.axes);
+    assert_eq!(executed.shape, reference.shape);
+    for (got, want) in executed.data.iter().zip(&reference.data) {
+        assert!(
+            (got - want).abs() <= 1e-9 * (1.0 + want.abs()),
+            "schedule diverged from the reference: {got} vs {want}"
+        );
+    }
+}
