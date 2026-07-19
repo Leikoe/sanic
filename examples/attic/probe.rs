@@ -1,4 +1,4 @@
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::ir::*;
 use sanic::partition::partition;
 use std::collections::HashMap;
@@ -13,6 +13,6 @@ fn main() {
     let sg = gather(input("S", &[ne, fe, gi], Dtype::F32), input("idx2", &[], Dtype::F32), ne);
     let prod = map(MapOp::Mul, vec![map(MapOp::Mul, vec![wg, xs]), sg]);
     let y = reduce(flatten(prod, &[gi, ri], c), c, BinOp::Monoid(Monoid::Add));
-    let sched = partition(&y, &Device::toy(), &ext);
+    let sched = partition(&y, &DeviceProfile::toy(), &ext);
     println!("{}", sched.render());
 }

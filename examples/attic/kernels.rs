@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::derive;
 use sanic::emit_rust::{rust_kernel, tiled_kernel};
 use sanic::ir::*;
@@ -56,7 +56,7 @@ fn main() {
 
     // ── 3. the planner-tiled variant ─────────────────────────────────────────
     banner("3. the same fold, blocked by the tile the planner priced");
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let extents: HashMap<Axis, f64> = [(sq, 2048.0), (k, 4096.0), (d, 64.0), (e, 64.0)]
         .into_iter()
         .collect();

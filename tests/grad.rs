@@ -12,10 +12,10 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::grad::grad;
 use sanic::interp::{Env, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::partition::partition;
 
 struct Lcg(u64);
@@ -292,7 +292,7 @@ fn gradient_schedules_like_any_graph() {
     for name in ["V", "Q"] {
         let g = &grads[name];
         let reference = eval(g, &env);
-        let sched = partition(g, &Device::toy());
+        let sched = partition(g, &DeviceProfile::toy());
         assert!(
             sched.stages.len() >= 1,
             "gradient of {name} must partition:\n{}",
@@ -351,7 +351,7 @@ fn sgd_training_loop_converges() {
     // one schedule computes the loss AND the updated weights
     let sched = sanic::partition::partition_many(
         &[(loss_node.clone(), "loss"), (step, "w_next")],
-        &Device::toy(),
+        &DeviceProfile::toy(),
     );
 
     let mut sess = sanic::runtime::Session::new();

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 use sanic::partition::partition;
@@ -110,7 +110,7 @@ fn main() {
     let logits = matmul(yb, input("W_lm", &[v, dm], Dtype::F32), dm);
 
     // lower → schedule
-    let sched = partition(&logits, &Device::toy(), &f64ext);
+    let sched = partition(&logits, &DeviceProfile::toy(), &f64ext);
     println!("{}", sched.render());
 
     // execute the schedule, and compute the naive reference

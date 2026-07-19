@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::derive::Carrier;
-use crate::ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
+use crate::kernel_ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 /// Input tensors by leaf name.
 pub type Env = HashMap<&'static str, Value>;
@@ -44,7 +44,7 @@ pub type Env = HashMap<&'static str, Value>;
 
 /// A dense, row-major tensor tagged with the axis each dimension ranges over —
 /// the interpreter's value domain: what a graph *means* on concrete data.
-/// (The graph-building handle is [`crate::tensor::TensorExpr`]; this is data.)
+/// (The public graph is made of [`crate::ir::NodeRef`] values; this is data.)
 /// Lowered axes are opaque semantic identities; their labels are diagnostic.
 /// The position in `axes` is the storage order. Two values with the same
 /// internal axes in different orders denote the same lowered object (see
@@ -71,7 +71,7 @@ impl Value {
         let shape = shape.as_ref().to_vec();
         let axes: Vec<Axis> = shape
             .iter()
-            .map(|&extent| crate::ir::axis("", extent))
+            .map(|&extent| crate::kernel_ir::axis("", extent))
             .collect();
         Value::from_data(&axes, shape, data)
     }
@@ -87,7 +87,7 @@ impl Value {
             axes.len()
         );
         for (&axis, &actual) in axes.iter().zip(&shape) {
-            if let crate::ir::Extent::Static(expected) = axis.extent {
+            if let crate::kernel_ir::Extent::Static(expected) = axis.extent {
                 assert_eq!(
                     actual, expected,
                     "axis `{}` has extent {actual}; expected {expected}",
@@ -589,7 +589,7 @@ pub fn run_carrier(node: &Node, axis: Axis, carrier: &Carrier, env: &Env) -> Val
 /// `blocks` may not exceed the axis extent: an empty chunk's partial is the
 /// carrier identity, and merging an identity-valued *accumulator* puts the
 /// online-softmax rescale at `exp(−∞ − −∞)` — the same −∞ edge
-/// [`crate::ir::causal_mask`] documents. Keeping every chunk non-empty keeps
+/// [`crate::kernel_ir::causal_mask`] documents. Keeping every chunk non-empty keeps
 /// the whole computation in the finite domain, exactly as real split-K flash
 /// kernels do.
 pub fn run_carrier_split(
@@ -688,7 +688,7 @@ pub fn run_carrier_split(
 mod tests {
     use super::*;
     use crate::derive::derive;
-    use crate::ir::*;
+    use crate::kernel_ir::*;
 
     struct Lcg(u64);
     impl Lcg {

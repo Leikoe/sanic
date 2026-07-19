@@ -10,7 +10,7 @@
 //!
 //!     cargo run --example mha
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::emit_rust::{rust_kernel, tiled_kernel};
 use sanic::plan::plan;
 use sanic::{Parallelism, Tensor, analyze_all, axis};
@@ -90,7 +90,7 @@ fn main() {
     // Now size it for a device: the planner reads |Acc| off the carrier and
     // every extent off the tensor, enumerates block structures, and keeps the
     // cheapest one that fits SRAM.
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let spec = &plan(&out.node, &dev).expect("a tile fits").kernels[0];
     println!(
         "\nplanner: stream `{}`, grid {:?}, row tile {} ({} × {} = {} scalars resident)\n",

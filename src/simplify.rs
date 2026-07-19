@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ir::{
+use crate::kernel_ir::{
     Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node, gather, konst, map, reduce,
     reindex, scan, view,
 };

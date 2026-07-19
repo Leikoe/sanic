@@ -263,6 +263,26 @@ impl StFile {
         StFile::parse_owned(bytes)
     }
 
+    /// Read only the safetensors header.
+    ///
+    /// This supports cheap checkpoint discovery and shape validation without
+    /// reading a multi-gigabyte payload. [`StFile::raw`] and the decoding
+    /// methods require [`StFile::open`] or [`StFile::open_zero_copy`].
+    pub fn open_metadata(path: &Path) -> Result<StFile, String> {
+        use std::io::Read;
+
+        let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut length = [0u8; 8];
+        file.read_exact(&mut length)
+            .map_err(|e| format!("read {} header length: {e}", path.display()))?;
+        let header_len = u64::from_le_bytes(length) as usize;
+        let mut bytes = vec![0u8; 8 + header_len];
+        bytes[..8].copy_from_slice(&length);
+        file.read_exact(&mut bytes[8..])
+            .map_err(|e| format!("read {} header: {e}", path.display()))?;
+        StFile::parse_owned(bytes)
+    }
+
     fn parse(bytes: &[u8]) -> Result<StFile, String> {
         StFile::parse_owned(bytes.to_vec()).map(|mut st| {
             // callers replace the payload; keep only header-derived state

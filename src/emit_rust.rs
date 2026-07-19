@@ -217,7 +217,7 @@ fn render(e: &Expr, parent: u8, n: &Names) -> String {
 mod tests {
     use super::*;
     use crate::derive::derive;
-    use crate::ir::*;
+    use crate::kernel_ir::*;
 
     // The verbatim output of `rust_kernel` for FlashAttention. That it lives
     // here and compiles is the point: the emitted kernel is real Rust. The

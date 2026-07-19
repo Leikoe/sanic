@@ -1,3 +1,7 @@
+//! Legacy low-level Metal coverage, preserved while it migrates from the
+//! removed external-extent API. Active public Metal coverage lives in
+//! `tests/compile.rs`.
+//!
 //! The GPU backend, verified on real hardware: emit the derived kernel as
 //! Metal, compile the MSL **in-process** (no external toolchain), dispatch it
 //! on the GPU through `objc2-metal`, and compare the result to the
@@ -17,11 +21,11 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::derive::derive;
 use sanic::emit_metal::{MetalKernel, MetalProgram, emit_fused_metal, emit_schedule_metal};
 use sanic::interp::{Env, Extents, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::metal::{Dispatch, MetalBuf, MetalDevice, program_dispatches};
 use sanic::partition::partition;
 
@@ -337,7 +341,7 @@ fn greedy_sampling_runs_on_gpu() {
     ); // [s, v]
     let token = argmax(logits, v); // [s]
 
-    let sched = partition(&token, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&token, &DeviceProfile::toy(), &as_f64(&ext));
     let program = emit_schedule_metal(&sched, &ext);
     let reference = eval(&token, &env, &ext);
     let Some(out) = run_schedule_on_gpu("greedy", &program, &env, &reference) else {
@@ -447,7 +451,7 @@ fn greedy_decode_step_runs_on_gpu() {
     let logits = matmul(yb, input("W_lm", &[vv, dm], Dtype::F32), dm); // [s, v]
     let token = argmax(logits, vv); // [s] — next-token per position
 
-    let sched = partition(&token, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&token, &DeviceProfile::toy(), &as_f64(&ext));
     let program = emit_schedule_metal(&sched, &ext);
     let reference = eval(&token, &env, &ext);
     let Some(out) = run_schedule_on_gpu("decode", &program, &env, &reference) else {
@@ -543,7 +547,7 @@ fn full_transformer_block_runs_on_gpu() {
     let yb = map(MapOp::Add, vec![mlp, res1]);
     let logits = matmul(yb, input("W_lm", &[v, dm], Dtype::F32), dm);
 
-    let sched = partition(&logits, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&logits, &DeviceProfile::toy(), &as_f64(&ext));
     let program = emit_schedule_metal(&sched, &ext);
     let reference = eval(&logits, &env, &ext);
     let Some(out) = run_schedule_on_gpu("block", &program, &env, &reference) else {
@@ -756,7 +760,7 @@ fn decode_loop_runs_on_gpu() {
     let logits = matmul(out, input("Wl", &[v, dv], Dtype::F32), dv);
     let sched = sanic::partition::partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
-        &Device::toy(),
+        &DeviceProfile::toy(),
         &as_f64(&ext),
     );
     let program = emit_schedule_metal(&sched, &ext);
@@ -872,7 +876,7 @@ fn attention_backward_runs_on_gpu() {
 
     let grads = sanic::grad::grad(&loss, &["Q"], &ext);
     let g = &grads["Q"];
-    let sched = partition(g, &Device::toy(), &as_f64(&ext));
+    let sched = partition(g, &DeviceProfile::toy(), &as_f64(&ext));
     let program = emit_schedule_metal(&sched, &ext);
     let reference = eval(g, &env, &ext);
 
@@ -1284,7 +1288,7 @@ fn graph_replay_matches_oracle() {
     let logits = matmul(xn, input("W", &[v, dm], Dtype::F32), dm); // [s, v]
     let out = reduce(logits, v, BinOp::Monoid(Monoid::LogSumExp)); // [s]
 
-    let sched = partition(&out, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&out, &DeviceProfile::toy(), &as_f64(&ext));
     let program = emit_schedule_metal(&sched, &ext);
     let reference = eval(&out, &env, &ext).permuted_to(&program.output_axes);
 

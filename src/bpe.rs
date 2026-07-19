@@ -115,9 +115,7 @@ impl Bpe {
             // the lowest-ranked adjacent pair, if any
             let mut best: Option<(usize, usize)> = None; // (rank, index)
             for i in 0..syms.len() - 1 {
-                if let Some(&r) = self
-                    .ranks
-                    .get(&(syms[i].clone(), syms[i + 1].clone()))
+                if let Some(&r) = self.ranks.get(&(syms[i].clone(), syms[i + 1].clone()))
                     && best.is_none_or(|(br, _)| r < br)
                 {
                     best = Some((r, i));

@@ -73,16 +73,15 @@ SGD loop that converges, and split reductions.
 ## Run it
 
 ```
-cargo run --example llama3   # current Llama 3 graph-builder fixture
-cargo test                   # the full suite (incl. rustc-compiled and GPU-dispatched)
+cargo run --example direct_attention
+cargo test
 ```
 
-The frontend API is churning, so ONE example is kept current — `llama3` — and
-the rest (GPT-2 on the GPU, the 5.5B MoE, GPU training, and the guided tours)
-are parked in `examples/attic/` until the surface settles. `llama3` is the
-modeling fixture for iterating on graph-builder ergonomics; it builds a compact
-Llama 3 decoder graph with grouped-query attention, RMSNorm, SwiGLU, and logits.
-The engine still derives the streaming attention carrier from its naive graph:
+The current frontend constructs immutable nodes directly and compiles one or
+more output roots; no explicit graph builder is required. Larger historical
+model fixtures are parked in `examples/attic/` while they migrate to this
+surface. The engine still derives the streaming attention carrier from the
+naive graph:
 
 ```
 structure map

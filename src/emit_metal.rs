@@ -20,7 +20,7 @@ use crate::codegen::{
     thread_grid_decode, thread_grid_decode_from, value,
 };
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{
+use crate::kernel_ir::{
     Axis, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, input_dtypes, volume,
 };
 use crate::partition::{Schedule, Stage};
@@ -578,7 +578,7 @@ pub fn emit_fused_metal_with(
     for &i in &pitems {
         let leaf = &carrier.leaves[i];
         assert!(
-            !crate::ir::all_axes(leaf).contains(&stream),
+            !crate::kernel_ir::all_axes(leaf).contains(&stream),
             "a projection may only read stream-invariant leaves"
         );
         let e = value(&METAL, leaf, &coord, &mut g, &mut body);
@@ -1343,13 +1343,13 @@ pub struct MetalProgram {
 /// Lower a whole schedule to a Metal program (the GPU analog of
 /// [`crate::rustgen::emit_schedule`]).
 pub fn emit_schedule_metal(sched: &Schedule) -> MetalProgram {
-    emit_schedule_metal_on(&crate::cost::Device::toy(), sched)
+    emit_schedule_metal_on(&crate::cost::DeviceProfile::toy(), sched)
 }
 
 /// [`emit_schedule_metal`] with fold schedules priced against a specific
-/// device — the Metal examples pass [`crate::cost::Device::m1_pro`], the
+/// device — the Metal examples pass [`crate::cost::DeviceProfile::m1_pro`], the
 /// machine the kernels actually run on.
-pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule) -> MetalProgram {
+pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule) -> MetalProgram {
     emit_schedule_metal_over(dev, sched, &HashMap::new())
 }
 
@@ -1357,7 +1357,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::Device, sched: &Schedule) -> Me
 /// output name): a measured tuner times the legal candidates on the real
 /// device and overrules the analytical chooser where the silicon disagrees.
 pub fn emit_schedule_metal_over(
-    dev: &crate::cost::Device,
+    dev: &crate::cost::DeviceProfile,
     sched: &Schedule,
     overrides: &HashMap<String, FoldSched>,
 ) -> MetalProgram {

@@ -15,9 +15,9 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::interp::{Env, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::partition::{partition, partition_many};
 
 struct Lcg(u64);
@@ -80,7 +80,7 @@ fn topk_partitions_and_executes() {
             [(v.clone(), vn), (i.clone(), in_)]
         })
         .collect();
-    let sched = partition_many(&names, &Device::toy());
+    let sched = partition_many(&names, &DeviceProfile::toy());
 
     let mut run_env = env.clone();
     sched.execute_env(&mut run_env);
@@ -130,7 +130,7 @@ fn topk_all_is_one_fold_with_shared_slots() {
     }
 
     // and the whole thing schedules as ONE kernel
-    let sched = partition(&all, &Device::toy());
+    let sched = partition(&all, &DeviceProfile::toy());
     assert_eq!(sched.stages.len(), 1, "one fold for all ranks");
     let mut run_env = env.clone();
     sched.execute_env(&mut run_env);
@@ -232,7 +232,7 @@ fn scatter_add_matches_hand_with_collisions() {
     }
 
     // and through the pipeline: one fused kernel (a one-hot contraction)
-    let sched = partition(&sc, &Device::toy());
+    let sched = partition(&sc, &DeviceProfile::toy());
     assert_eq!(
         sched.stages.len(),
         1,

@@ -7,14 +7,14 @@
 //! a wrong one.
 
 use sanic::cost::*;
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 
 const KT: f64 = 64.0; // K/V block streamed per step
 
 /// The engine-supplied accumulator size: derive the attention carrier and
 /// read off its per-query scalar count (m, ℓ, plus o over the value dim).
 fn acc_per_lane(d: f64) -> f64 {
-    let (sq, k, dd, e) = (axis("sq"), axis("k"), axis("d"), axis("e"));
+    let (sq, k, dd, e) = (axis("sq", 1), axis("k", 1), axis("d", 1), axis("e", 1));
     let attn = attention(
         input("Q", &[sq, dd], Dtype::F32),
         input("K", &[k, dd], Dtype::F32),
@@ -30,7 +30,7 @@ fn acc_per_lane(d: f64) -> f64 {
 /// The fused flash kernel and its query tile: the inner search over
 /// power-of-two tiles. Larger tiles amortize the per-block K/V re-reads
 /// against SRAM / occupancy pressure.
-fn fused(dev: &Device, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)> {
+fn fused(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)> {
     let b = dev.dtype_bytes;
     let constant = 2.0 * KT * d * b; // K/V tiles
     let per_tile = (d + acc_per_lane(d) + KT) * b; // Q tile + |Acc| + scores block
@@ -57,7 +57,7 @@ fn fused(dev: &Device, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)> {
 }
 
 /// The cut: materialize the sq×k scores, then softmax·V. Two dense matmuls.
-fn cut(dev: &Device, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
+fn cut(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
     let b = dev.dtype_bytes;
     let mm_sram = (64.0 * 32.0 + 32.0 * 64.0 + 64.0 * 64.0) * b;
     vec![
@@ -83,7 +83,7 @@ fn cut(dev: &Device, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
 }
 
 /// Does the scheduler fuse? The outer search over the two candidate plans.
-fn fuses(dev: &Device, sq: f64, k: f64, d: f64) -> bool {
+fn fuses(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> bool {
     let cut_plan = cut(dev, sq, k, d);
     match fused(dev, sq, k, d) {
         Some((_, fk)) => {
@@ -97,14 +97,14 @@ fn fuses(dev: &Device, sq: f64, k: f64, d: f64) -> bool {
 // reproduce flash attention: at a typical head dim, fusing wins.
 #[test]
 fn reproduces_flash_at_typical_shape() {
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     assert!(fuses(&dev, 2048.0, 4096.0, 64.0));
 }
 
 // the real test: cut when fusion doesn't pay (large d collapses occupancy).
 #[test]
 fn cuts_when_fusion_does_not_pay() {
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     assert!(fuses(&dev, 2048.0, 2048.0, 32.0));
     assert!(!fuses(&dev, 2048.0, 2048.0, 512.0));
 }
@@ -112,7 +112,7 @@ fn cuts_when_fusion_does_not_pay() {
 // the crossover is monotone in d: fuse below it, cut above, no flip-flopping.
 #[test]
 fn fuse_cut_crossover_is_monotone() {
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let ds = [16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0];
     let decisions: Vec<bool> = ds.iter().map(|&d| fuses(&dev, 2048.0, 2048.0, d)).collect();
     let first_cut = decisions.iter().position(|f| !f).unwrap();
@@ -126,7 +126,7 @@ fn fuse_cut_crossover_is_monotone() {
 // feasibility forces a correct fallback: huge d can't fuse at any tile → cut.
 #[test]
 fn infeasible_fusion_forces_cut() {
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     assert!(fused(&dev, 2048.0, 2048.0, 2048.0).is_none());
     assert!(!fuses(&dev, 2048.0, 2048.0, 2048.0));
 }
@@ -134,7 +134,7 @@ fn infeasible_fusion_forces_cut() {
 // query-tiling amortizes K/V reads, so the inner search picks a real tile.
 #[test]
 fn fusion_chooses_a_real_query_tile() {
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let (tile, _) = fused(&dev, 2048.0, 4096.0, 64.0).unwrap();
     assert!(tile > 1, "tiling amortizes K/V reads → tile > 1");
 }
@@ -143,7 +143,7 @@ fn fusion_chooses_a_real_query_tile() {
 // exactly the traffic fusion avoids by never materializing them.
 #[test]
 fn cut_pays_for_materializing_the_scores() {
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let (sq, k, d) = (2048.0, 4096.0, 64.0);
     let cut_total: f64 = cut(&dev, sq, k, d).iter().map(|c| c.hbm_bytes).sum();
     let essential = (2.0 * sq * d + 2.0 * k * d) * dev.dtype_bytes;

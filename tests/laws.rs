@@ -9,7 +9,7 @@
 //! against the reference oracle separately and is forbidden from tree/split
 //! execution.
 
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::{Carrier, Expr, Parallelism, analyze, analyze_all, derive, streamable, structure};
 
 fn add_r() -> BinOp {

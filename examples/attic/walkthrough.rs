@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::{Device, feasible, kernel_time};
+use sanic::cost::{DeviceProfile, feasible, kernel_time};
 use sanic::derive;
 use sanic::emit_metal::emit_schedule_metal;
 use sanic::interp::{Env, Extents, Value, eval};
@@ -109,7 +109,7 @@ fn main() {
     .into_iter()
     .collect();
     let real_price: HashMap<Axis, f64> = real.iter().map(|(&a, &n)| (a, n as f64)).collect();
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
 
     step(
         0,
@@ -167,7 +167,7 @@ fn main() {
     step(
         3,
         "plan + cost — choose streamed axis, tile, and block structure",
-        "graph + axis + carrier + Device + extents",
+        "graph + axis + carrier + DeviceProfile + extents",
         "a KernelSpec (block dims, resident state, priced cost)",
     );
     let spec =
@@ -216,7 +216,7 @@ fn main() {
     step(
         4,
         "partition — whole graph → kernels, cutting only where the algebra stops",
-        "the graph + Device + extents",
+        "the graph + DeviceProfile + extents",
         "a Schedule: Stages in execution order",
     );
     let sched = partition_many(&[(attn.clone(), "attn")], &dev, &real_price);

@@ -18,9 +18,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::interp::{Env, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::partition::{Schedule, partition_many};
 use sanic::runtime::Session;
 use sanic::rustgen::emit_schedule;
@@ -85,7 +85,7 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
 
     partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
-        &Device::toy(),
+        &DeviceProfile::toy(),
     )
 }
 

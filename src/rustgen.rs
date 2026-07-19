@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::codegen::{Gen, Lang, buffers, carrier_expr, carrier_expr_map, offset, san, value};
 use crate::derive::Carrier;
-use crate::ir::{Axis, MapOp, Monoid, NodeRef as Node};
+use crate::kernel_ir::{Axis, MapOp, Monoid, NodeRef as Node};
 use crate::partition::{Schedule, Stage};
 
 // ── the Rust target ──────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ fn emit_fused(
     for &i in &pitems {
         let leaf = &carrier.leaves[i];
         assert!(
-            !crate::ir::all_axes(leaf).contains(&stream),
+            !crate::kernel_ir::all_axes(leaf).contains(&stream),
             "a projection may only read stream-invariant leaves"
         );
         let e = value(&RUST, leaf, &coord, &mut g, &mut src);

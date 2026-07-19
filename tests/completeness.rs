@@ -43,7 +43,7 @@ use std::collections::HashMap;
 
 use sanic::derive::derive;
 use sanic::interp::{Env, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 
 // ── streams over a quantized alphabet ────────────────────────────────────────
 

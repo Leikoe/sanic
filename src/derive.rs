@@ -60,7 +60,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
-use crate::ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
+use crate::kernel_ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── symbolic expressions over carrier slots ──────────────────────────────────
 
@@ -876,7 +876,7 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             return None;
         }
         let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
-        let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+        let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
         let idx_slot = ctx.push_slot(SlotKind::ArgIdx { max_slot }, Expr::Item(iota_leaf));
         // The index ranges over whatever grid rows the max does — its `into`
         // (an iota) says nothing about that, so inherit the span.
@@ -927,7 +927,7 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             );
             found.unwrap_or_else(|| {
                 let ibase = ctx.slots.len();
-                let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+                let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
                 for r in 0..k {
                     let into = if r == 0 {
                         Expr::Item(iota_leaf)

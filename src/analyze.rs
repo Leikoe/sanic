@@ -7,7 +7,8 @@
 //! classified, with the derived accumulator attached wherever one exists.
 
 use crate::derive::{self, Carrier};
-use crate::ir::{self, Axis, Node as NodeKind, NodeRef as Node};
+use crate::kernel_ir as ir;
+use crate::kernel_ir::{Axis, Node as NodeKind, NodeRef as Node};
 
 /// How parallel an axis is, best to worst. `Ord` follows that order, so the
 /// join of two structures is `max` — the least parallel input wins.

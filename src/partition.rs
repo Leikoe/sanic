@@ -31,10 +31,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
-use crate::cost::Device;
+use crate::cost::DeviceProfile;
 use crate::derive::{Carrier, SlotKind, derive, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
-use crate::ir::{
+use crate::kernel_ir::{
     Axis, BinOp, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, all_axes, input,
     leaf_names,
 };
@@ -105,7 +105,7 @@ pub struct Schedule {
 }
 
 /// Split `node` into a schedule of kernels for `dev`.
-pub fn partition(node: &Node, dev: &Device) -> Schedule {
+pub fn partition(node: &Node, dev: &DeviceProfile) -> Schedule {
     partition_many(&[(node.clone(), "Out")], dev)
 }
 
@@ -114,7 +114,7 @@ pub fn partition(node: &Node, dev: &Device) -> Schedule {
 /// instead of recomputing them per output. Roots are emitted in order, and a
 /// root reachable from a *later* root is reused through its materialization
 /// (so put producers before consumers). Each root lands under its given name.
-pub fn partition_many(roots: &[(Node, &'static str)], dev: &Device) -> Schedule {
+pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Schedule {
     let graph_roots: Vec<Node> = roots.iter().map(|(root, _)| root.clone()).collect();
     crate::verify::assert_valid_many(&graph_roots);
     let mut parents = HashMap::new();
@@ -321,7 +321,7 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
 }
 
 struct Partitioner<'a> {
-    dev: &'a Device,
+    dev: &'a DeviceProfile,
     stages: Vec<Stage>,
     fresh: usize,
     /// Nodes already materialized, by pointer → the name they live under.
@@ -469,8 +469,11 @@ impl Partitioner<'_> {
                         (c.clone(), self.splice(c, false))
                     })
                     .collect();
-                let rebuilt =
-                    crate::ir::reduce(replace_many(src, &subs, &mut HashMap::new()), *axis, *op);
+                let rebuilt = crate::kernel_ir::reduce(
+                    replace_many(src, &subs, &mut HashMap::new()),
+                    *axis,
+                    *op,
+                );
                 self.emit(&rebuilt, out)
             }
 
@@ -541,7 +544,7 @@ impl Partitioner<'_> {
                 let out = if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::view(s, groups.clone())
+                    crate::kernel_ir::view(s, groups.clone())
                 };
                 memo.insert(Rc::as_ptr(node), out.clone());
                 return out;
@@ -551,7 +554,7 @@ impl Partitioner<'_> {
                 let out = if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::reindex(s, map.clone(), *padded)
+                    crate::kernel_ir::reindex(s, map.clone(), *padded)
                 };
                 memo.insert(Rc::as_ptr(node), out.clone());
                 return out;
@@ -572,7 +575,7 @@ impl Partitioner<'_> {
                 if new.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
                     node.clone()
                 } else {
-                    crate::ir::map(*op, new)
+                    crate::kernel_ir::map(*op, new)
                 }
             }
             NodeKind::Reduce { src, axis, op } => {
@@ -580,7 +583,7 @@ impl Partitioner<'_> {
                 if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::reduce(s, *axis, *op)
+                    crate::kernel_ir::reduce(s, *axis, *op)
                 }
             }
             NodeKind::Scan { src, axis, op } => {
@@ -588,7 +591,7 @@ impl Partitioner<'_> {
                 if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::scan(s, *axis, *op)
+                    crate::kernel_ir::scan(s, *axis, *op)
                 }
             }
             NodeKind::Gather { src, index, axis } => {
@@ -597,7 +600,7 @@ impl Partitioner<'_> {
                 if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
                     node.clone()
                 } else {
-                    crate::ir::gather(s, i, *axis)
+                    crate::kernel_ir::gather(s, i, *axis)
                 }
             }
             NodeKind::View { src, groups } => {
@@ -605,7 +608,7 @@ impl Partitioner<'_> {
                 if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::view(s, groups.clone())
+                    crate::kernel_ir::view(s, groups.clone())
                 }
             }
             NodeKind::Reindex { src, map, padded } => {
@@ -613,7 +616,7 @@ impl Partitioner<'_> {
                 if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::reindex(s, map.clone(), *padded)
+                    crate::kernel_ir::reindex(s, map.clone(), *padded)
                 }
             }
         };
@@ -1179,7 +1182,7 @@ fn stream_below_view(axes: &[Axis], groups: &[(Vec<Axis>, Axis)]) -> Vec<Axis> {
     below
 }
 
-fn stream_below_reindex(axes: &[Axis], map: &[crate::ir::AffineIndex]) -> Vec<Axis> {
+fn stream_below_reindex(axes: &[Axis], map: &[crate::kernel_ir::AffineIndex]) -> Vec<Axis> {
     let mut below = Vec::new();
     for &a in axes {
         let mut driving = map
@@ -1295,26 +1298,26 @@ fn replace_many(
     }
     let rebuilt = match node.as_ref() {
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => node.clone(),
-        NodeKind::Map { op, inputs } => crate::ir::map(
+        NodeKind::Map { op, inputs } => crate::kernel_ir::map(
             *op,
             inputs.iter().map(|i| replace_many(i, subs, memo)).collect(),
         ),
         NodeKind::Reduce { src, axis, op } => {
-            crate::ir::reduce(replace_many(src, subs, memo), *axis, *op)
+            crate::kernel_ir::reduce(replace_many(src, subs, memo), *axis, *op)
         }
         NodeKind::Scan { src, axis, op } => {
-            crate::ir::scan(replace_many(src, subs, memo), *axis, *op)
+            crate::kernel_ir::scan(replace_many(src, subs, memo), *axis, *op)
         }
-        NodeKind::Gather { src, index, axis } => crate::ir::gather(
+        NodeKind::Gather { src, index, axis } => crate::kernel_ir::gather(
             replace_many(src, subs, memo),
             replace_many(index, subs, memo),
             *axis,
         ),
         NodeKind::View { src, groups } => {
-            crate::ir::view(replace_many(src, subs, memo), groups.clone())
+            crate::kernel_ir::view(replace_many(src, subs, memo), groups.clone())
         }
         NodeKind::Reindex { src, map, padded } => {
-            crate::ir::reindex(replace_many(src, subs, memo), map.clone(), *padded)
+            crate::kernel_ir::reindex(replace_many(src, subs, memo), map.clone(), *padded)
         }
     };
     memo.insert(key, rebuilt.clone());
@@ -1698,7 +1701,7 @@ fn op_bag(ops: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::*;
+    use crate::kernel_ir::*;
 
     fn add_r() -> BinOp {
         BinOp::Monoid(Monoid::Add)
@@ -1720,7 +1723,7 @@ mod tests {
             d,
             k,
         );
-        let sched = partition(&attn, &Device::toy());
+        let sched = partition(&attn, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1);
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!("expected a fused stage")
@@ -1750,7 +1753,7 @@ mod tests {
         let scores = matmul(q, kk, dq);
         let out = matmul(softmax(scores, k), v, k);
 
-        let sched = partition(&out, &Device::toy());
+        let sched = partition(&out, &DeviceProfile::toy());
 
         // 3 GEMM producers + 1 flash kernel, producers first.
         assert_eq!(sched.stages.len(), 4);
@@ -1792,7 +1795,7 @@ mod tests {
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom]);
 
-        let sched = partition(&norm, &Device::toy());
+        let sched = partition(&norm, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 2);
         assert!(matches!(&sched.stages[0], Stage::Fused { spec, .. }
             if spec.streaming_axis == d && spec.carrier.slots == 1));
@@ -1814,7 +1817,7 @@ mod tests {
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom]);
         let proj = matmul(norm, input("W", &[f, d], Dtype::F32), d);
 
-        let sched = partition(&proj, &Device::toy());
+        let sched = partition(&proj, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "norm + GEMM = one kernel");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!()
@@ -1839,7 +1842,7 @@ mod tests {
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom]);
         let head = matmul(norm, input("W", &[v, d], Dtype::F32), d);
 
-        let sched = partition(&head, &Device::toy());
+        let sched = partition(&head, &DeviceProfile::toy());
         assert!(
             !sched
                 .stages
@@ -1872,7 +1875,7 @@ mod tests {
         let proj = matmul(h, w, f); // [s, dm]
         let y = map(MapOp::Add, vec![proj, x]); // residual
 
-        let sched = partition(&y, &Device::toy());
+        let sched = partition(&y, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "the add must not be its own kernel");
         let Stage::Fused {
             spec,
@@ -1904,7 +1907,7 @@ mod tests {
             add_r(),
         );
 
-        let sched = partition(&down, &Device::toy());
+        let sched = partition(&down, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 3, "gate GEMM, up GEMM, fused down GEMM");
         let Stage::Fused { spec, .. } = &sched.stages[2] else {
             panic!()
@@ -1939,7 +1942,7 @@ mod tests {
         let lse = map(MapOp::Add, vec![m, map(MapOp::Log, vec![sumexp])]); // [b]
         let loss = reduce(lse, b, add_r()); // scalar
 
-        let sched = partition(&loss, &Device::toy());
+        let sched = partition(&loss, &DeviceProfile::toy());
         assert_eq!(
             sched.stages.len(),
             2,
@@ -1984,7 +1987,7 @@ mod tests {
         );
         let down = reduce(flatten(prod, &[gi, ri], fl), fl, add_r());
 
-        let sched = partition(&down, &Device::toy());
+        let sched = partition(&down, &DeviceProfile::toy());
         // The whole silu·up cone is one elementwise stage; the fold reads it.
         assert_eq!(sched.stages.len(), 2, "activation cone + down fold");
         let Stage::Elementwise { ops, .. } = &sched.stages[0] else {
@@ -2042,7 +2045,7 @@ mod tests {
         );
         let down = reduce(flatten(prod, &[gi, ri], fl), fl, add_r());
 
-        let sched = partition(&down, &Device::toy());
+        let sched = partition(&down, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 2, "gate+up+silu fold, then down fold");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!("the activation derives as one fold")
@@ -2060,7 +2063,7 @@ mod tests {
             input("ids", &[s], Dtype::F32),
             v,
         );
-        let sched = partition(&emb, &Device::toy());
+        let sched = partition(&emb, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1);
         assert!(matches!(&sched.stages[0], Stage::Gather { axis, .. } if *axis == v));
     }
@@ -2092,7 +2095,7 @@ mod tests {
         let v = matmul(xn_t, input("Wv", &[dv, dm], Dtype::F32), dm); // [t, dv]
         let attn = matmul(softmax(matmul(q, k, dq), t), v, t);
 
-        let sched = partition(&attn, &Device::toy());
+        let sched = partition(&attn, &DeviceProfile::toy());
 
         // Σx² fold + norm map + Q/K/V GEMMs + flash — the norm appears ONCE.
         assert_eq!(sched.stages.len(), 6);
@@ -2128,7 +2131,7 @@ mod tests {
         let flat = flatten(attn, &[h, dv], dmv); // [s, dmv]
         let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32), dmv); // [s, dm]
 
-        let sched = partition(&o, &Device::toy());
+        let sched = partition(&o, &DeviceProfile::toy());
 
         assert_eq!(sched.stages.len(), 2, "flash kernel + projection GEMM");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
@@ -2161,7 +2164,7 @@ mod tests {
         let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
         let out = matmul(softmax(masked, t), input("V", &[t, dv], Dtype::F32), t);
 
-        let sched = partition(&out, &Device::toy());
+        let sched = partition(&out, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "mask and scale ride the lift");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!()

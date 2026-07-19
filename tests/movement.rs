@@ -11,9 +11,9 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::interp::{Env, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::partition::{Stage, partition};
 
 struct Lcg(u64);
@@ -154,7 +154,7 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
 
     // it partitions to ONE fused kernel (implicit GEMM over the flattened
     // reduction axis), and the schedule reproduces the reference
-    let sched = partition(&conv, &Device::toy());
+    let sched = partition(&conv, &DeviceProfile::toy());
     assert_eq!(
         sched.stages.len(),
         1,
@@ -224,7 +224,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &Device::toy());
+    let sched = partition(&conv, &DeviceProfile::toy());
     assert_eq!(
         sched.stages.len(),
         1,
@@ -280,7 +280,7 @@ fn padded_conv1d_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &Device::toy());
+    let sched = partition(&conv, &DeviceProfile::toy());
     assert_eq!(sched.stages.len(), 1, "padded conv is still one kernel");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -307,7 +307,7 @@ fn maxpool_is_one_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&pool, &Device::toy());
+    let sched = partition(&pool, &DeviceProfile::toy());
     assert_eq!(sched.stages.len(), 1, "pooling is one kernel");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -403,7 +403,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
     assert_close(&got, &hand);
 
     // one fused flash kernel streaming the WINDOW axis
-    let sched = partition(&attn, &Device::toy());
+    let sched = partition(&attn, &DeviceProfile::toy());
     assert_eq!(
         sched.stages.len(),
         1,

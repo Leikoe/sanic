@@ -28,7 +28,7 @@
 //! done
 //! ```
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::grad::grad;
 use sanic::interp::Value;
 use sanic::ir::*;
@@ -280,8 +280,8 @@ fn main() {
         nodes.into_iter().zip(&roots).map(|(n, (_, name))| (n, *name)).collect();
 
     let t0 = std::time::Instant::now();
-    let sched = partition_many(&roots, &Device::toy());
-    let program = sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &sched);
+    let sched = partition_many(&roots, &DeviceProfile::toy());
+    let program = sanic::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &sched);
     println!(
         "training step: {} kernels, partitioned + lowered to MSL in {:.2}s",
         program.stages.len(),

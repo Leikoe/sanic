@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ir::{
+use crate::kernel_ir::{
     Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node, iota, konst, map, reduce,
     reindex, scatter_add, view,
 };
@@ -168,7 +168,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
                         2 => {
                             // flatten ⟵ split (row-major: first member most
                             // significant, inner extent = the second member's)
-                            crate::ir::split(inv, *to, members[0], members[1])
+                            crate::kernel_ir::split(inv, *to, members[0], members[1])
                         }
                         n => panic!("grad: view backward for {n}-member groups not implemented"),
                     };
@@ -197,9 +197,9 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
             } => {
                 let rev = |x: Node| {
                     let flip = (axis.extent() - 1) as i64;
-                    crate::ir::reindex(x, vec![(*axis, vec![(-1, *axis)], flip)], false)
+                    crate::kernel_ir::reindex(x, vec![(*axis, vec![(-1, *axis)], flip)], false)
                 };
-                let contrib = rev(crate::ir::scan(
+                let contrib = rev(crate::kernel_ir::scan(
                     rev(g.clone()),
                     *axis,
                     BinOp::Monoid(Monoid::Add),
@@ -224,7 +224,7 @@ fn transpose_axis_map(g: Node, m: Axis, terms: &[(i64, Axis)], off: i64) -> Node
         // constant index: the whole cotangent lands on position `off`
         [] => map(
             MapOp::Mul,
-            vec![g, crate::ir::one_hot(m, konst(off as f64))],
+            vec![g, crate::kernel_ir::one_hot(m, konst(off as f64))],
         ),
         // slice / pad: a = m − off, out-of-range contributes nothing
         [(1, a)] => reindex(g, vec![(*a, vec![(1, m)], -off)], true),
@@ -267,7 +267,7 @@ fn transpose_axis_map(g: Node, m: Axis, terms: &[(i64, Axis)], off: i64) -> Node
                     konst(off as f64),
                 ],
             );
-            let sel = crate::ir::one_hot(m, target);
+            let sel = crate::kernel_ir::one_hot(m, target);
             reduce(
                 reduce(
                     map(MapOp::Mul, vec![g, sel]),

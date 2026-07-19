@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::ir::*;
 use sanic::partition::partition;
 
@@ -52,7 +52,7 @@ fn main() {
         axis("dmv"), // flattened h·dv
         axis("f"),   // FFN hidden dim
     );
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let extents: HashMap<Axis, f64> = [
         (v, 32000.0),
         (s, 2048.0),

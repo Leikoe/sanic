@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 #[cfg(target_os = "macos")]
 use sanic::metal::{MetalBuf, MetalDevice, MetalGraph, program_dispatches};
 use sanic::interp::Extents;
@@ -440,7 +440,7 @@ fn build() -> Model {
 
     let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let t0 = std::time::Instant::now();
-    let sched = partition_many(&roots, &Device::toy(), &ext_f);
+    let sched = partition_many(&roots, &DeviceProfile::toy(), &ext_f);
     println!(
         "partitioned: {} kernels in {:.1}s",
         sched.stages.len(),
@@ -779,7 +779,7 @@ fn main() {
     }
     let t0 = std::time::Instant::now();
     let program =
-        sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &model.sched, &model.ext);
+        sanic::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &model.sched, &model.ext);
     println!(
         "emitted {} kernels, {:.1} MB MSL in {:.1}s",
         program.stages.len(),
@@ -856,7 +856,7 @@ inline float w4(device const uchar* p, uint i) {\n\
         g.run(&program_dispatches(&program, &bufs, &pipes));
         let t0 = std::time::Instant::now();
         let overrides =
-            sanic::metal::tune_schedules(&g, &model.sched, &Device::m1_pro(), &model.ext, &bufs);
+            sanic::metal::tune_schedules(&g, &model.sched, &DeviceProfile::m1_pro(), &model.ext, &bufs);
         println!(
             "tuned: {} stages overruled in {:.1}s",
             overrides.len(),
@@ -871,7 +871,7 @@ inline float w4(device const uchar* p, uint i) {\n\
             g.run(&ds0);
             let l0 = g.read_f32(&bufs["logits"], VOCAB);
             let tuned = sanic::emit_metal::emit_schedule_metal_over(
-                &Device::m1_pro(),
+                &DeviceProfile::m1_pro(),
                 &model.sched,
                 &model.ext,
                 &overrides,

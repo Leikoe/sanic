@@ -8,9 +8,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::analyze::{Parallelism, analyze_all};
-use crate::cost::{Device, Kernel, feasible, kernel_time, schedule_time};
+use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time, schedule_time};
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{
+use crate::kernel_ir::{
     Axis, Dtype, Node as NodeKind, NodeRef as Node, all_axes, input_axes, input_dtypes, leaf_names,
 };
 
@@ -59,7 +59,7 @@ pub struct Plan {
 }
 
 /// Plan the whole graph: try every axis that folds, keep the cheapest kernel.
-pub fn plan(node: &Node, dev: &Device) -> Option<Plan> {
+pub fn plan(node: &Node, dev: &DeviceProfile) -> Option<Plan> {
     let report = analyze_all(node);
 
     let mut best: Option<KernelSpec> = None;
@@ -92,7 +92,7 @@ pub fn plan_axis(
     node: &Node,
     streaming_axis: Axis,
     carrier: &Carrier,
-    dev: &Device,
+    dev: &DeviceProfile,
 ) -> Option<KernelSpec> {
     let b_bytes = dev.dtype_bytes;
     let tn = TILE_N as f64;
@@ -133,8 +133,19 @@ pub fn plan_axis(
         v.sort();
         v
     };
-    let span_shared: Vec<Axis> = {
-        let mut v: Vec<Axis> = span_intersection.iter().copied().collect();
+    let span_schedulable: Vec<Axis> = {
+        // A deferred divisor is intentionally kept whole: tiling an axis
+        // absent from its normalizer slot would recompute that normalization
+        // once per tile (the giant-vocabulary RMSNorm head). Let partitioning
+        // cut the divisor instead. Other partial-span slots, including the
+        // structural slot introduced by a flattened attention projection,
+        // are cheap and legal to duplicate across tiles.
+        let source = if carrier.rules.contains(&"defer-div") {
+            &span_intersection
+        } else {
+            &span_union
+        };
+        let mut v: Vec<Axis> = source.iter().copied().collect();
         v.sort();
         v
     };
@@ -195,7 +206,14 @@ pub fn plan_axis(
         }
         v
     };
-    let mut by_extent: Vec<Axis> = span_shared.clone();
+    // An axis need not span every accumulator slot to be tiled. Flash
+    // attention's value dimension, and a positional reorder's zero-valued
+    // ordering slot, both span only a subset. Tiling such an axis merely
+    // recomputes the invariant slots in each tile; the issue and traffic
+    // models already price that duplication. Requiring the intersection here
+    // made otherwise ordinary projections impossible when one invariant slot
+    // accompanied their accumulator.
+    let mut by_extent: Vec<Axis> = span_schedulable.clone();
     by_extent.sort_by(|&a, &b| ext(b).total_cmp(&ext(a)));
 
     struct Best {
@@ -221,7 +239,7 @@ pub fn plan_axis(
             )
             .collect();
         for &col in &col_options {
-            let rest: Vec<Axis> = span_shared
+            let rest: Vec<Axis> = span_schedulable
                 .iter()
                 .copied()
                 .filter(|&a| Some(a) != row && Some(a) != col)
@@ -315,7 +333,9 @@ pub fn plan_axis(
                         // area times the col span held resident in it
                         let resident_cols: f64 = col_axes
                             .iter()
-                            .filter(|&&ax| Some(ax) != col)
+                            .filter(|&&ax| {
+                                Some(ax) != row && Some(ax) != col && !batch.contains(&ax)
+                            })
                             .map(|&ax| ext(ax))
                             .product();
                         let k = Kernel {
@@ -391,7 +411,7 @@ pub fn split_factor(
     node: &Node,
     streaming_axis: Axis,
     carrier: &Carrier,
-    dev: &Device,
+    dev: &DeviceProfile,
 ) -> Option<usize> {
     let spec = plan_axis(node, streaming_axis, carrier, dev)?;
     let single = spec.cost;
@@ -587,7 +607,7 @@ pub fn fold_sched(
     fold_node: &Node,
     streaming_axis: Axis,
     carrier: &Carrier,
-    dev: &Device,
+    dev: &DeviceProfile,
 ) -> FoldSched {
     if !mergeable_out_of_order(carrier)
         || carrier.project.len() != 1
@@ -872,9 +892,9 @@ fn count_flops_memo(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cost::Device;
-    use crate::derive::derive;
-    use crate::ir::*;
+    use crate::cost::DeviceProfile;
+    use crate::derive::{Expr, SlotKind, derive};
+    use crate::kernel_ir::*;
 
     #[test]
     fn attention_selects_row_axis_sq() {
@@ -894,7 +914,7 @@ mod tests {
             k,
         );
         let c = derive(&attn, k).unwrap();
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
         let spec = plan_axis(&attn, k, &c, &dev).unwrap();
 
         assert_eq!(
@@ -916,12 +936,38 @@ mod tests {
         let x = input("X", &[n], Dtype::F32);
         let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
         let c = derive(&s, n).unwrap();
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
         let spec = plan_axis(&s, n, &c, &dev).unwrap();
 
         assert_eq!(spec.tile_m, 1, "scalar output → row tile must be 1");
         assert_eq!(spec.row_axis, None);
         assert!(spec.cost > 0.0);
+    }
+
+    #[test]
+    fn a_partial_span_axis_can_still_be_tiled() {
+        let (stream, singleton, output) = (
+            axis("stream", 2048),
+            axis("singleton", 1),
+            axis("output", 2048),
+        );
+        let dot = matmul(
+            input("X", &[stream, singleton], Dtype::F32),
+            input("W", &[output, stream], Dtype::BF16),
+            stream,
+        );
+        let mut carrier = derive(&dot, stream).unwrap();
+        let invariant = carrier.slots;
+        carrier.slots += 1;
+        carrier.into.push(Expr::Const(0.0));
+        carrier.combine.push(Expr::A(invariant));
+        carrier.identity.push(0.0);
+        carrier.spans.push(Vec::new());
+        carrier.kinds.push(SlotKind::Plain(Monoid::Add));
+
+        let spec = plan_axis(&dot, stream, &carrier, &DeviceProfile::m1_pro())
+            .expect("the output axis is a legal tile even if one slot is invariant");
+        assert_eq!(spec.row_axis, Some(output));
     }
 
     #[test]
@@ -939,7 +985,7 @@ mod tests {
             d,
             k,
         );
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
 
         let plan = plan(&attn, &dev).expect("must find a feasible kernel");
         assert_eq!(plan.kernels.len(), 1);
@@ -952,7 +998,7 @@ mod tests {
         let n = axis("n", 65536);
         let x = input("X", &[n], Dtype::F32);
         let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
 
         // Sum has a carrier, so planning succeeds even for a fold with no
         // row tile and no inner contraction.
@@ -967,7 +1013,7 @@ mod tests {
     #[test]
     fn quantized_weights_price_less_bandwidth() {
         let (s, d, f) = (axis("s", 4), axis("d", 4096), axis("f", 4096));
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
 
         let cost_of = |w: NodeRef| {
             let g = matmul(input("X", &[s, d], Dtype::F32), w, d);

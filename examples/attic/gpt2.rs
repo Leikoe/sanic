@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 #[cfg(target_os = "macos")]
 use sanic::metal::{MetalBuf, MetalDevice, MetalGraph, program_dispatches};
 use sanic::interp::{Env, Value};
@@ -378,7 +378,7 @@ fn build_prefill(weights: Weights, label: &str, t_len: usize) -> Gpt2 {
 
     let ext_f: HashMap<Axis, f64> = ext_us.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let t0 = std::time::Instant::now();
-    let sched = partition_many(&roots, &Device::toy(), &ext_f);
+    let sched = partition_many(&roots, &DeviceProfile::toy(), &ext_f);
     println!(
         "[{label}] partitioned: {} kernels in {:.2}s",
         sched.stages.len(),
@@ -556,7 +556,7 @@ fn build_decode(weights: Weights, label: &str) -> DecodeModel {
 
     let ext_f: HashMap<Axis, f64> = ext_us.iter().map(|(&a, &n)| (a, n as f64)).collect();
     let t0 = std::time::Instant::now();
-    let sched = partition_many(&roots, &Device::toy(), &ext_f);
+    let sched = partition_many(&roots, &DeviceProfile::toy(), &ext_f);
     println!(
         "[{label}] decode step partitioned: {} kernels in {:.2}s (cache window {T_GEN})",
         sched.stages.len(),
@@ -713,7 +713,7 @@ fn main() {
 
         let t0 = std::time::Instant::now();
         let program =
-            sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &model.sched, &model.ext);
+            sanic::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &model.sched, &model.ext);
         let Some(g) = MetalDevice::open() else {
             eprintln!("no Metal device — skipping");
             return;

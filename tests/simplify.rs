@@ -4,10 +4,10 @@
 //! no stop-gradient. The winner-mask of the stabilizing max-shift cancels, and
 //! cross-root CSE lets the backward reuse the forward's logsumexp carrier.
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::grad::grad;
 use sanic::interp::{Env, Value, eval};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::partition::partition_many;
 use sanic::simplify::simplify_many;
 
@@ -102,7 +102,7 @@ fn composed_logsumexp_backward_matches_the_primitive() {
         let roots = simplify_many(&[loss, dz]);
         partition_many(
             &[(roots[0].clone(), "loss"), (roots[1].clone(), "dZ")],
-            &Device::toy(),
+            &DeviceProfile::toy(),
         )
         .stages
         .len()

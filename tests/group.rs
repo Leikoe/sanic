@@ -12,10 +12,10 @@
 //! The same re-association is the data-parallel story: each device folds its
 //! shard, the allreduce is stage 2's merge. One mechanism, three uses.
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::derive::derive;
 use sanic::interp::{Env, Value, eval, run_carrier_split};
-use sanic::ir::*;
+use sanic::kernel_ir::*;
 use sanic::plan::split_factor;
 
 struct Lcg(u64);
@@ -114,7 +114,7 @@ fn occupancy_starved_matvec_wants_a_split() {
     let y = matmul(w, x, k);
     let carrier = derive(&y, k).unwrap();
 
-    let factor = split_factor(&y, k, &carrier, &Device::toy());
+    let factor = split_factor(&y, k, &carrier, &DeviceProfile::toy());
     assert!(
         factor.is_some_and(|b| b >= 2),
         "a 4-row matvec over 2^20 must split; got {factor:?}"
@@ -138,7 +138,7 @@ fn well_parallelized_attention_keeps_one_pass() {
     );
     let carrier = derive(&attn, k).unwrap();
 
-    let factor = split_factor(&attn, k, &carrier, &Device::toy());
+    let factor = split_factor(&attn, k, &carrier, &DeviceProfile::toy());
     assert_eq!(
         factor, None,
         "a 1024-row flash kernel already fills the device; splitting only \

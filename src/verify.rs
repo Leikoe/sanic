@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ir::{
+use crate::kernel_ir::{
     AffineIndex, Axis, AxisName, BinOp, Dtype, Extent, Node as NodeKind, NodeRef as Node,
 };
 
@@ -540,7 +540,7 @@ fn op_name(node: &Node) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{MapOp, Monoid, axis, input, konst, map, reduce, reindex, rename, view};
+    use crate::kernel_ir::{MapOp, Monoid, axis, input, konst, map, reduce, reindex, rename, view};
 
     fn add() -> BinOp {
         BinOp::Monoid(Monoid::Add)
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn accepts_a_valid_composed_graph() {
         let (q, k, d, e) = (axis("q", 3), axis("k", 5), axis("d", 4), axis("e", 2));
-        let graph = crate::ir::attention(
+        let graph = crate::kernel_ir::attention(
             input("Q", &[q, d], Dtype::F32),
             input("K", &[k, d], Dtype::F32),
             input("V", &[k, e], Dtype::F32),
@@ -577,7 +577,7 @@ mod tests {
         let count = reduce(konst(1.0), missing, add());
         assert_eq!(verify(&count), Ok(()));
 
-        let invalid = crate::ir::scan(input("X", &[n], Dtype::F32), missing, add());
+        let invalid = crate::kernel_ir::scan(input("X", &[n], Dtype::F32), missing, add());
         assert!(verify(&invalid).unwrap_err().reason.contains("not present"));
 
         let invalid = reduce(

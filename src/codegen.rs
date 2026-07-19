@@ -14,13 +14,13 @@
 use std::collections::HashMap;
 
 use crate::derive::Expr;
-use crate::ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
+use crate::kernel_ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── fresh names ──────────────────────────────────────────────────────────────
 
 pub struct Gen {
     pub n: usize,
-    /// Storage dtypes of the inputs in scope (from [`crate::ir::input_dtypes`]).
+    /// Storage dtypes of the inputs in scope (from [`crate::kernel_ir::input_dtypes`]).
     /// Each load uses its declared representation: packed int4 nibbles,
     /// halfs, or a native float.
     pub dtypes: HashMap<&'static str, Dtype>,
@@ -466,5 +466,5 @@ pub fn thread_grid_decode_from<L: Lang>(
 
 /// The output grid (free axes) and its flattened size for a kernel node.
 pub fn grid_of(node: &Node) -> (Vec<Axis>, usize) {
-    (node.shape(), crate::ir::volume(node))
+    (node.shape(), crate::kernel_ir::volume(node))
 }

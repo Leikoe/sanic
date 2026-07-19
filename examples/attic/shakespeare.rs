@@ -19,7 +19,7 @@
 //!   https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 //! ```
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::grad::grad;
 use sanic::interp::Value;
 use sanic::ir::*;
@@ -214,8 +214,8 @@ fn main() {
     let roots: Vec<(Node, &'static str)> =
         sanic::simplify::simplify_many(&raw).into_iter().zip(&roots).map(|(n, (_, nm))| (n, *nm)).collect();
 
-    let sched = partition_many(&roots, &Device::toy());
-    let program = sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &sched);
+    let sched = partition_many(&roots, &DeviceProfile::toy());
+    let program = sanic::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &sched);
     let bindless = program.stages.iter().filter(|s| s.argbuf.is_some()).count();
     println!("training step: {} kernels ({bindless} bindless)", program.stages.len());
 
@@ -302,7 +302,7 @@ fn main() {
     // is B seqs of S tokens, so B·S tokens.
     let n_params: usize = params.iter().map(|(_, ax)| ax.iter().map(|a| a.extent).product::<usize>()).sum();
     let flops_per_step = ((6 * n_params + 12 * n_layer * D * S) * S * batch) as f64;
-    let peak_flops = Device::m1_pro().peak_flops;
+    let peak_flops = DeviceProfile::m1_pro().peak_flops;
 
     // ── training loop: SGD on next-token prediction ──
     println!("training {steps} steps (lr {lr}) — {n_params} params, {:.0} MFLOP/step…", flops_per_step / 1e6);

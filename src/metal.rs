@@ -117,6 +117,7 @@ pub struct Dispatch {
     pub argbuf: Option<MetalBuf>,
 }
 
+#[derive(Clone)]
 pub struct MetalDevice {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -576,7 +577,7 @@ impl MetalDevice {
 pub fn tune_schedules(
     g: &MetalDevice,
     sched: &Schedule,
-    dev: &crate::cost::Device,
+    dev: &crate::cost::DeviceProfile,
     bufs: &HashMap<String, MetalBuf>,
 ) -> HashMap<String, FoldSched> {
     use crate::emit_metal::{canonical_source, emit_fused_metal_sched_with};
