@@ -144,7 +144,9 @@ fn canonicalize_merges_structural_duplicates() {
     );
 
     let mut rng = Lcg(0xCA11);
-    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))].into_iter().collect();
+    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))]
+        .into_iter()
+        .collect();
     assert_eq!(eval(&canonical, &env).data, eval(&y, &env).data);
 }
 
@@ -184,7 +186,9 @@ fn partition_computes_a_structural_duplicate_once() {
     );
 
     let mut rng = Lcg(0xD00D);
-    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))].into_iter().collect();
+    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))]
+        .into_iter()
+        .collect();
     let executed = duplicated_schedule.execute(&env);
     let reference = eval(&duplicated, &env).permuted_to(&executed.axes);
     assert_eq!(executed.shape, reference.shape);

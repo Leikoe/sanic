@@ -357,7 +357,13 @@ impl MetalDevice {
         desc.setInheritBuffers(false);
         let max_bufs = dispatches
             .iter()
-            .map(|d| if d.argbuf.is_some() { 2 } else { d.inputs.len() + 1 })
+            .map(|d| {
+                if d.argbuf.is_some() {
+                    2
+                } else {
+                    d.inputs.len() + 1
+                }
+            })
             .max()
             .unwrap_or(1);
         desc.setMaxKernelBufferBindCount(max_bufs);

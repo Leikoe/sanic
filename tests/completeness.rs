@@ -793,7 +793,11 @@ fn rank_oracle_measures_small_carriers() {
         )
     };
     let spec = relative_spectrum(futures_matrix(&[sumsq], 6, 40, 12, false, 0xB0B));
-    assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σx² spectrum: {spec:?}");
+    assert_eq!(
+        rank_with_gap(&spec, 1e-8),
+        Some(1),
+        "Σx² spectrum: {spec:?}"
+    );
 }
 
 #[test]
@@ -867,8 +871,14 @@ fn rank_oracle_corroborates_the_median_wall() {
     // separating witness and the fooling family settle the claim; this
     // corroborates it from a second, independent instrument.
     let effective_rank = |n_sufs: usize| {
-        let spec =
-            relative_spectrum(futures_matrix(&[median_graph], 8, n_sufs + 8, n_sufs, false, 0x3D1A));
+        let spec = relative_spectrum(futures_matrix(
+            &[median_graph],
+            8,
+            n_sufs + 8,
+            n_sufs,
+            false,
+            0x3D1A,
+        ));
         spec.iter().take_while(|&&v| v > 1e-8).count()
     };
     for n_sufs in [8usize, 16, 24] {

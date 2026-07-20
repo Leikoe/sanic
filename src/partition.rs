@@ -563,7 +563,8 @@ impl Partitioner<'_> {
                 let out = if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::kernel_ir::view(s, groups.clone()))
+                    self.canon
+                        .shallow(crate::kernel_ir::view(s, groups.clone()))
                 };
                 memo.insert(Rc::as_ptr(node), out.clone());
                 return out;
@@ -629,7 +630,8 @@ impl Partitioner<'_> {
                 if Rc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::kernel_ir::view(s, groups.clone()))
+                    self.canon
+                        .shallow(crate::kernel_ir::view(s, groups.clone()))
                 }
             }
             NodeKind::Reindex { src, map, padded } => {
@@ -1489,7 +1491,12 @@ impl Schedule {
                     Stage::Sequential { .. } => "seq",
                     Stage::Infeasible { .. } => unreachable!(),
                 };
-                timings.push((name, kind, tensor.data.len(), started.elapsed().as_secs_f64()));
+                timings.push((
+                    name,
+                    kind,
+                    tensor.data.len(),
+                    started.elapsed().as_secs_f64(),
+                ));
             }
             env.insert(name, tensor);
         }
@@ -1581,10 +1588,9 @@ impl Schedule {
                     axis.name,
                     inputs.join(", ")
                 ),
-                Stage::Infeasible { axis, output, why } => format!(
-                    "{output:<4} = fold `{}` — INFEASIBLE: {why}",
-                    axis.name
-                ),
+                Stage::Infeasible { axis, output, why } => {
+                    format!("{output:<4} = fold `{}` — INFEASIBLE: {why}", axis.name)
+                }
             };
             out += &format!("  [{i:>2}] {line}\n");
         }

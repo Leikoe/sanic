@@ -801,7 +801,9 @@ impl Backend for CpuDevice {
 mod metal_backend {
     use super::*;
     use crate::emit_metal::{MetalProgram, emit_schedule_metal_on};
-    use crate::metal::{Dispatch, MetalBuf, MetalDevice, MetalGraph, Pipelines, program_dispatches};
+    use crate::metal::{
+        Dispatch, MetalBuf, MetalDevice, MetalGraph, Pipelines, program_dispatches,
+    };
 
     pub struct MetalExecutable {
         program: MetalProgram,

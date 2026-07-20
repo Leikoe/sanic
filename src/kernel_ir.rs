@@ -705,11 +705,19 @@ impl Canonicalizer {
             }
             Node::Reduce { src, axis, op } => {
                 let s = self.tree(src);
-                if Rc::ptr_eq(&s, src) { node.clone() } else { reduce(s, *axis, *op) }
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    reduce(s, *axis, *op)
+                }
             }
             Node::Scan { src, axis, op } => {
                 let s = self.tree(src);
-                if Rc::ptr_eq(&s, src) { node.clone() } else { scan(s, *axis, *op) }
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    scan(s, *axis, *op)
+                }
             }
             Node::Gather { src, index, axis } => {
                 let s = self.tree(src);
@@ -722,7 +730,11 @@ impl Canonicalizer {
             }
             Node::View { src, groups } => {
                 let s = self.tree(src);
-                if Rc::ptr_eq(&s, src) { node.clone() } else { view(s, groups.clone()) }
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    view(s, groups.clone())
+                }
             }
             Node::Reindex { src, map, padded } => {
                 let s = self.tree(src);

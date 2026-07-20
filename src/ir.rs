@@ -442,8 +442,10 @@ pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> No
 /// can never merge again. One table spans all roots. A subtree that is
 /// already canonical keeps its original `Rc`.
 pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
-    let mut canonical: std::collections::HashMap<String, NodeRef> = std::collections::HashMap::new();
-    let mut memo: std::collections::HashMap<*const Node, NodeRef> = std::collections::HashMap::new();
+    let mut canonical: std::collections::HashMap<String, NodeRef> =
+        std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<*const Node, NodeRef> =
+        std::collections::HashMap::new();
     roots
         .iter()
         .map(|root| canonicalize_node(root, &mut canonical, &mut memo))

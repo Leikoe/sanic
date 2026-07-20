@@ -9,9 +9,9 @@
 //! against the reference oracle separately and is forbidden from tree/split
 //! execution.
 
-use sanic::kernel_ir::*;
 use sanic::analyze::{Parallelism, analyze, analyze_all, streamable, structure};
 use sanic::derive::{Carrier, Expr, derive};
+use sanic::kernel_ir::*;
 
 fn add_r() -> BinOp {
     BinOp::Monoid(Monoid::Add)

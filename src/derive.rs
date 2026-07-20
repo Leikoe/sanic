@@ -1267,7 +1267,13 @@ fn reduce_op(node: &Node, src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> R
 /// basis (an op the fold genuinely can't stream through declines, and the
 /// caller falls back to a whole-map leaf when legal). `node` is the map
 /// itself — the site a decline reports.
-fn map_op(node: &Node, op: MapOp, inputs: &[Node], axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
+fn map_op(
+    node: &Node,
+    op: MapOp,
+    inputs: &[Node],
+    axis: Axis,
+    ctx: &mut Ctx,
+) -> Result<S, Decline> {
     match op {
         MapOp::Add => binop(node, Bin::Add, &inputs[0], &inputs[1], axis, ctx),
         MapOp::Sub => binop(node, Bin::Sub, &inputs[0], &inputs[1], axis, ctx),
@@ -1383,7 +1389,14 @@ enum Bin {
     Lt,
 }
 
-fn binop(node: &Node, op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
+fn binop(
+    node: &Node,
+    op: Bin,
+    x: &Node,
+    y: &Node,
+    axis: Axis,
+    ctx: &mut Ctx,
+) -> Result<S, Decline> {
     let a = go(x, axis, ctx)?;
     let b = go(y, axis, ctx)?;
 

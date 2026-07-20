@@ -547,7 +547,9 @@ fn open_checkpoint_zero_copy(path: &Path) -> Result<(SafeTensors<'static>, &'sta
     let pad = data_start.next_multiple_of(4) - data_start;
 
     const PAGE: usize = 16384;
-    let file_length = std::fs::metadata(path).map_err(|error| error.to_string())?.len() as usize;
+    let file_length = std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .len() as usize;
     let capacity = (pad + file_length).div_ceil(PAGE).max(1) * PAGE;
     let layout =
         std::alloc::Layout::from_size_align(capacity, PAGE).map_err(|error| error.to_string())?;
@@ -740,7 +742,11 @@ fn run_metal() -> Result<(), String> {
         .iter()
         .enumerate()
         .map(|(cache, name)| {
-            let output = if cache < graph.logits_index { cache } else { cache + 1 };
+            let output = if cache < graph.logits_index {
+                cache
+            } else {
+                cache + 1
+            };
             (output, name.as_str())
         })
         .collect::<Vec<_>>();

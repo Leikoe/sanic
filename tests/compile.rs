@@ -252,10 +252,19 @@ fn captured_replay_without_feedback_reruns_one_graph_over_live_bindings() {
         .unwrap();
     let mut replay = program.capture([("x", &x)], &[]).unwrap();
 
-    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [3.0, 7.0]);
-    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [3.0, 7.0]);
+    assert_eq!(
+        metal.read_tensor_f32(&replay.step().unwrap()[0]),
+        [3.0, 7.0]
+    );
+    assert_eq!(
+        metal.read_tensor_f32(&replay.step().unwrap()[0]),
+        [3.0, 7.0]
+    );
     metal.write_f64(x.raw(), &[10.0, 20.0, 30.0, 40.0]);
-    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [30.0, 70.0]);
+    assert_eq!(
+        metal.read_tensor_f32(&replay.step().unwrap()[0]),
+        [30.0, 70.0]
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -275,7 +284,6 @@ fn capture_rejects_bad_feedback_wiring() {
 
     let out_of_range = program.capture([("state", &state), ("delta", &delta)], &[(1, "state")]);
     assert!(matches!(out_of_range, Err(RunError::Feedback(_))));
-    let unknown_input =
-        program.capture([("state", &state), ("delta", &delta)], &[(0, "missing")]);
+    let unknown_input = program.capture([("state", &state), ("delta", &delta)], &[(0, "missing")]);
     assert!(matches!(unknown_input, Err(RunError::Feedback(_))));
 }
