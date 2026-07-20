@@ -557,6 +557,154 @@ pub fn volume(node: &NodeRef) -> usize {
         .max(1)
 }
 
+/// Rebuild `roots` with maximal sharing: separately constructed but
+/// structurally identical subtrees collapse into ONE node. This runs BEFORE
+/// lowering (see [`crate::compile`]), which mints fresh scoped axes per node
+/// — after that, two copies of the same public subtree are axis-distinct and
+/// can never merge again. One table spans all roots. A subtree that is
+/// already canonical keeps its original `Rc`.
+pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
+    let mut canonical: std::collections::HashMap<String, NodeRef> = std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<*const Node, NodeRef> = std::collections::HashMap::new();
+    roots
+        .iter()
+        .map(|root| canonicalize_node(root, &mut canonical, &mut memo))
+        .collect()
+}
+
+fn canonicalize_node(
+    node: &NodeRef,
+    canonical: &mut std::collections::HashMap<String, NodeRef>,
+    memo: &mut std::collections::HashMap<*const Node, NodeRef>,
+) -> NodeRef {
+    if let Some(n) = memo.get(&Rc::as_ptr(node)) {
+        return n.clone();
+    }
+    // Children first; keep the ORIGINAL `Rc` when nothing beneath changed.
+    let rebuilt = match node.as_ref() {
+        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
+        Node::Map { op, inputs } => {
+            let ins: Vec<NodeRef> = inputs
+                .iter()
+                .map(|i| canonicalize_node(i, canonical, memo))
+                .collect();
+            if ins.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+                node.clone()
+            } else {
+                Rc::new(Node::Map {
+                    op: *op,
+                    inputs: ins,
+                })
+            }
+        }
+        Node::Coordinate { src, dim } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Coordinate { src: s, dim: *dim })
+            }
+        }
+        Node::Reduce { src, dim, op } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Reduce {
+                    src: s,
+                    dim: *dim,
+                    op: *op,
+                })
+            }
+        }
+        Node::Scan { src, dim, op } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Scan {
+                    src: s,
+                    dim: *dim,
+                    op: *op,
+                })
+            }
+        }
+        Node::Gather { src, index, dim } => {
+            let s = canonicalize_node(src, canonical, memo);
+            let i = canonicalize_node(index, canonical, memo);
+            if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+                node.clone()
+            } else {
+                Rc::new(Node::Gather {
+                    src: s,
+                    index: i,
+                    dim: *dim,
+                })
+            }
+        }
+        Node::View { src, dims } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::View {
+                    src: s,
+                    dims: dims.clone(),
+                })
+            }
+        }
+        Node::Reindex {
+            src,
+            shape,
+            map,
+            padded,
+        } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Reindex {
+                    src: s,
+                    shape: shape.clone(),
+                    map: map.clone(),
+                    padded: *padded,
+                })
+            }
+        }
+    };
+    let out = canonical
+        .entry(shallow_key(&rebuilt))
+        .or_insert(rebuilt)
+        .clone();
+    memo.insert(Rc::as_ptr(node), out.clone());
+    out
+}
+
+/// One node's structure with children identified by POINTER — valid as an
+/// identity key exactly when the children are already canonical.
+fn shallow_key(n: &NodeRef) -> String {
+    let p = |c: &NodeRef| Rc::as_ptr(c) as usize;
+    match n.as_ref() {
+        Node::Input { name, shape, dtype } => format!("I{name}{shape:?}{dtype:?}"),
+        Node::Const { v } => format!("C{}", v.to_bits()),
+        Node::Iota { axis } => format!("O{axis:?}"),
+        Node::Coordinate { src, dim } => format!("D{dim}.{}", p(src)),
+        Node::Map { op, inputs } => {
+            format!("M{op:?}{:?}", inputs.iter().map(p).collect::<Vec<_>>())
+        }
+        Node::Reduce { src, dim, op } => format!("R{op:?}{dim}.{}", p(src)),
+        Node::Scan { src, dim, op } => format!("S{op:?}{dim}.{}", p(src)),
+        Node::Gather { src, index, dim } => format!("G{dim}.{}.{}", p(src), p(index)),
+        Node::View { src, dims } => format!("V{dims:?}.{}", p(src)),
+        Node::Reindex {
+            src,
+            shape,
+            map,
+            padded,
+        } => format!("X{shape:?}{map:?}{padded}.{}", p(src)),
+    }
+}
+
 // ── derived compositions ────────────────────────────────────────────────────
 
 /// Batched matrix multiplication, contracting the left last dimension with

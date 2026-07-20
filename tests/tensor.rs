@@ -88,3 +88,24 @@ fn only_inputs_reachable_from_the_selected_roots_are_compiled() {
     let program = x.compile(&CpuDevice::new()).unwrap();
     assert_eq!(program.input_names().collect::<Vec<_>>(), ["x"]);
 }
+
+/// Two separately built, structurally identical public subtrees become ONE
+/// node. This must happen BEFORE lowering (which mints fresh scoped axes per
+/// node, making copies unmergeable) — it is what lets a RoPE frequency table
+/// built once per layer compile once for the whole model.
+#[test]
+fn structural_duplicates_canonicalize_to_one_node() {
+    let d = axis("d", 8);
+    let energy = || {
+        let x = input("x", [d], Dtype::F32);
+        reduce(map(MapOp::Mul, vec![x.clone(), x]), 0usize, add())
+    };
+    let (first, second) = (energy(), energy());
+    assert!(!std::rc::Rc::ptr_eq(&first, &second));
+
+    let canonical = sanic::canonicalize_many(&[first, second]);
+    assert!(
+        std::rc::Rc::ptr_eq(&canonical[0], &canonical[1]),
+        "identical subtrees must share one node after canonicalization"
+    );
+}

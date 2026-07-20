@@ -315,6 +315,13 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         return Err(CompileError::DynamicShapesNotYetSupported);
     }
 
+    // Canonicalize BEFORE lowering: lowering mints fresh scoped axes per
+    // node, so two structurally identical public subtrees (a RoPE frequency
+    // table built once for the query path and once for the key path) become
+    // axis-distinct — and unmergeable — the moment they lower. Merged here,
+    // they lower ONCE through the pointer-keyed memo.
+    let roots = crate::ir::canonicalize_many(&roots);
+
     let mut lowerer = Lowerer::default();
     let lowered = roots
         .iter()

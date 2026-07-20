@@ -674,73 +674,83 @@ pub(crate) fn shallow_key(n: &NodeRef) -> String {
 /// read sharing through. A subtree that is already canonical keeps its
 /// original `Rc`, so identities held elsewhere stay valid.
 pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
-    let mut canonical: std::collections::HashMap<String, NodeRef> = std::collections::HashMap::new();
-    let mut memo: std::collections::HashMap<*const Node, NodeRef> = std::collections::HashMap::new();
-    roots
-        .iter()
-        .map(|root| canonicalize_node(root, &mut canonical, &mut memo))
-        .collect()
+    let mut canon = Canonicalizer::default();
+    roots.iter().map(|root| canon.tree(root)).collect()
 }
 
-fn canonicalize_node(
-    node: &NodeRef,
-    canonical: &mut std::collections::HashMap<String, NodeRef>,
-    memo: &mut std::collections::HashMap<*const Node, NodeRef>,
-) -> NodeRef {
-    if let Some(n) = memo.get(&Rc::as_ptr(node)) {
-        return n.clone();
+/// The canonical table behind [`canonicalize_many`], usable past the entry
+/// pass: the partitioner keeps the table it canonicalized its roots with and
+/// routes every node it constructs afterwards through [`Canonicalizer::shallow`],
+/// so a rebuilt structural twin resolves to the FIRST-SEEN node (the
+/// original) and pointer-keyed maps keep deduplicating.
+#[derive(Default)]
+pub struct Canonicalizer {
+    canonical: std::collections::HashMap<String, NodeRef>,
+    memo: std::collections::HashMap<*const Node, NodeRef>,
+}
+
+impl Canonicalizer {
+    /// Canonicalize a whole subtree, bottom-up. Keeps the ORIGINAL `Rc` for
+    /// any part that was already canonical, so identities held elsewhere
+    /// stay valid.
+    pub fn tree(&mut self, node: &NodeRef) -> NodeRef {
+        if let Some(n) = self.memo.get(&Rc::as_ptr(node)) {
+            return n.clone();
+        }
+        let rebuilt = match node.as_ref() {
+            Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
+            Node::Map { op, inputs } => {
+                let ins: Vec<NodeRef> = inputs.iter().map(|i| self.tree(i)).collect();
+                if ins.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+                    node.clone()
+                } else {
+                    map(*op, ins)
+                }
+            }
+            Node::Reduce { src, axis, op } => {
+                let s = self.tree(src);
+                if Rc::ptr_eq(&s, src) { node.clone() } else { reduce(s, *axis, *op) }
+            }
+            Node::Scan { src, axis, op } => {
+                let s = self.tree(src);
+                if Rc::ptr_eq(&s, src) { node.clone() } else { scan(s, *axis, *op) }
+            }
+            Node::Gather { src, index, axis } => {
+                let s = self.tree(src);
+                let i = self.tree(index);
+                if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+                    node.clone()
+                } else {
+                    gather(s, i, *axis)
+                }
+            }
+            Node::View { src, groups } => {
+                let s = self.tree(src);
+                if Rc::ptr_eq(&s, src) { node.clone() } else { view(s, groups.clone()) }
+            }
+            Node::Reindex { src, map, padded } => {
+                let s = self.tree(src);
+                if Rc::ptr_eq(&s, src) {
+                    node.clone()
+                } else {
+                    reindex(s, map.clone(), *padded)
+                }
+            }
+        };
+        let out = self.shallow(rebuilt);
+        self.memo.insert(Rc::as_ptr(node), out.clone());
+        out
     }
-    // Canonicalize children first; keep the ORIGINAL `Rc` when nothing
-    // beneath changed, so an already-canonical subtree keeps its identity.
-    let rebuilt = match node.as_ref() {
-        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
-        Node::Map { op, inputs } => {
-            let ins: Vec<NodeRef> = inputs
-                .iter()
-                .map(|i| canonicalize_node(i, canonical, memo))
-                .collect();
-            if ins.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
-                node.clone()
-            } else {
-                map(*op, ins)
-            }
-        }
-        Node::Reduce { src, axis, op } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) { node.clone() } else { reduce(s, *axis, *op) }
-        }
-        Node::Scan { src, axis, op } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) { node.clone() } else { scan(s, *axis, *op) }
-        }
-        Node::Gather { src, index, axis } => {
-            let s = canonicalize_node(src, canonical, memo);
-            let i = canonicalize_node(index, canonical, memo);
-            if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
-                node.clone()
-            } else {
-                gather(s, i, *axis)
-            }
-        }
-        Node::View { src, groups } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) { node.clone() } else { view(s, groups.clone()) }
-        }
-        Node::Reindex { src, map, padded } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) {
-                node.clone()
-            } else {
-                reindex(s, map.clone(), *padded)
-            }
-        }
-    };
-    let out = canonical
-        .entry(shallow_key(&rebuilt))
-        .or_insert(rebuilt)
-        .clone();
-    memo.insert(Rc::as_ptr(node), out.clone());
-    out
+
+    /// Canonical node for `node`, whose children must already be canonical:
+    /// the first node seen with this structure wins, later twins collapse
+    /// onto it.
+    pub fn shallow(&mut self, node: NodeRef) -> NodeRef {
+        self.canonical
+            .entry(shallow_key(&node))
+            .or_insert(node)
+            .clone()
+    }
 }
 
 /// Every `Input` leaf and its axes, in first-seen order. May repeat a name if
