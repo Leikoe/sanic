@@ -22,6 +22,34 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+/// `SANIC_DEBUG` level, parsed once — the shape of tinygrad's `DEBUG`.
+/// `1` dumps the compiled schedule (see [`partition`]); `2` additionally
+/// times every kernel at runtime and prints one line per launch.
+pub(crate) fn debug_level() -> u32 {
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("SANIC_DEBUG")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// A `width`-character bar filled to `fraction` of its length,
+/// eighth-block resolution — the hotspot column of the `SANIC_DEBUG=2`
+/// runtime dumps.
+pub(crate) fn debug_bar(fraction: f64, width: usize) -> String {
+    const PARTIAL: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
+    let mut bar = "█".repeat(eighths / 8);
+    if eighths % 8 > 0 {
+        bar.push_str(PARTIAL[eighths % 8 - 1]);
+    }
+    let filled = eighths.div_ceil(8);
+    bar.push_str(&" ".repeat(width - filled));
+    bar
+}
+
 #[doc(hidden)]
 pub mod analyze;
 pub mod bpe;

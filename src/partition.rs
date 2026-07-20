@@ -161,19 +161,15 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         .collect();
     let stages = order_in_place(p.stages, &graph_inputs);
     let sched = Schedule { stages, outputs };
-    // SANIC_DEBUG (any non-zero value): dump the schedule and each kernel's
-    // fusion, like tinygrad's DEBUG — the compilation made inspectable.
-    if std::env::var("SANIC_DEBUG")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .is_some_and(|l| l >= 1)
-    {
+    // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like
+    // tinygrad's DEBUG — the compilation made inspectable.
+    if crate::debug_level() >= 1 {
         sched.debug_dump();
     }
     sched
 }
 
-fn stage_output(s: &Stage) -> &str {
+pub(crate) fn stage_output(s: &Stage) -> &str {
     match s {
         Stage::Fused { spec, .. } => &spec.output_name,
         Stage::Elementwise { output, .. }
@@ -1453,7 +1449,12 @@ impl Schedule {
     /// session ([`crate::runtime::Session`]) executes into its persistent
     /// environment and then commits outputs over existing buffers.
     pub fn execute_env(&self, env: &mut Env) {
+        // SANIC_DEBUG >= 2: collect per-stage wall times and print them after
+        // the run, so each line can carry its share of the whole step (the
+        // Metal backend prints GPU times the same way in `crate::compile`).
+        let mut timings: Vec<(&'static str, &'static str, usize, f64)> = Vec::new();
         for stage in &self.stages {
+            let started = (crate::debug_level() >= 2).then(std::time::Instant::now);
             let (name, tensor): (&'static str, Value) = match stage {
                 Stage::Fused {
                     spec,
@@ -1483,7 +1484,38 @@ impl Schedule {
                     panic!("cannot execute an infeasible stage producing `{output}`")
                 }
             };
+            if let Some(started) = started {
+                let kind = match stage {
+                    Stage::Fused { .. } => "fold",
+                    Stage::Elementwise { .. } => "map",
+                    Stage::Gather { .. } => "gather",
+                    Stage::Sequential { .. } => "seq",
+                    Stage::Infeasible { .. } => unreachable!(),
+                };
+                timings.push((name, kind, tensor.data.len(), started.elapsed().as_secs_f64()));
+            }
             env.insert(name, tensor);
+        }
+        if !timings.is_empty() {
+            let total = timings.iter().map(|(_, _, _, s)| s).sum::<f64>().max(1e-12);
+            let slowest = timings
+                .iter()
+                .map(|(_, _, _, s)| *s)
+                .fold(0.0, f64::max)
+                .max(1e-12);
+            for (index, (name, kind, elements, seconds)) in timings.iter().enumerate() {
+                eprintln!(
+                    "*** interp {index:4} {name:<12} {kind:<6} {:7.0}us {} {:4.1}%  {elements:>8} elems",
+                    seconds * 1e6,
+                    crate::debug_bar(seconds / slowest, 10),
+                    100.0 * seconds / total,
+                );
+            }
+            eprintln!(
+                "*** interp step: {} stages {:.2}ms",
+                timings.len(),
+                total * 1e3,
+            );
         }
     }
 

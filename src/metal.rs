@@ -319,38 +319,7 @@ impl MetalDevice {
     pub fn run(&self, dispatches: &[Dispatch]) {
         let cb = self.queue.commandBuffer().expect("command buffer");
         for d in dispatches {
-            let enc = cb.computeCommandEncoder().expect("compute encoder");
-            enc.setComputePipelineState(&d.pipe);
-            if let Some(ab) = &d.argbuf {
-                // bindless: one address table at 0, output at 1, inputs resident
-                unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
-                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
-                for b in &d.inputs {
-                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
-                    enc.useResource_usage(res, MTLResourceUsage::Read);
-                }
-            } else {
-                for (i, b) in d.inputs.iter().enumerate() {
-                    unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
-                }
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len())
-                };
-            }
-            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
-            enc.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: d.grid,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: tg,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            enc.endEncoding();
+            encode(&cb, d);
         }
         cb.commit();
         cb.waitUntilCompleted();
@@ -363,46 +332,74 @@ impl MetalDevice {
     pub fn run_timed(&self, dispatches: &[Dispatch]) -> f64 {
         let cb = self.queue.commandBuffer().expect("command buffer");
         for d in dispatches {
-            let enc = cb.computeCommandEncoder().expect("compute encoder");
-            enc.setComputePipelineState(&d.pipe);
-            if let Some(ab) = &d.argbuf {
-                // bindless: one address table at 0, output at 1, inputs resident
-                unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
-                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
-                for b in &d.inputs {
-                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
-                    enc.useResource_usage(res, MTLResourceUsage::Read);
-                }
-            } else {
-                for (i, b) in d.inputs.iter().enumerate() {
-                    unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
-                }
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len())
-                };
-            }
-            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
-            enc.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: d.grid,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: tg,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            enc.endEncoding();
+            encode(&cb, d);
         }
         cb.commit();
         cb.waitUntilCompleted();
-        // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
-        let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
-        let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
-        t1 - t0
+        gpu_seconds(&cb)
     }
+
+    /// One command buffer PER dispatch: each kernel's own GPU residency, in
+    /// order. This is the `SANIC_DEBUG=2` path (tinygrad's `DEBUG=2` also
+    /// synchronizes per kernel to time it) — the per-dispatch submit adds a
+    /// sync floor, so the SUM is not a decode-speed number; [`Self::run_timed`]
+    /// is. Individual kernel times are accurate: GPU start→end, no CPU cost.
+    pub fn run_each_timed(&self, dispatches: &[Dispatch]) -> Vec<f64> {
+        dispatches
+            .iter()
+            .map(|d| {
+                let cb = self.queue.commandBuffer().expect("command buffer");
+                encode(&cb, d);
+                cb.commit();
+                cb.waitUntilCompleted();
+                gpu_seconds(&cb)
+            })
+            .collect()
+    }
+}
+
+/// Encode one kernel launch onto a command buffer — the one encode path
+/// behind [`MetalDevice::run`], [`MetalDevice::run_timed`] and
+/// [`MetalDevice::run_each_timed`].
+fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch) {
+    let enc = cb.computeCommandEncoder().expect("compute encoder");
+    enc.setComputePipelineState(&d.pipe);
+    if let Some(ab) = &d.argbuf {
+        // bindless: one address table at 0, output at 1, inputs resident
+        unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
+        for b in &d.inputs {
+            let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
+            enc.useResource_usage(res, MTLResourceUsage::Read);
+        }
+    } else {
+        for (i, b) in d.inputs.iter().enumerate() {
+            unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+        }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
+    }
+    let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
+    enc.dispatchThreads_threadsPerThreadgroup(
+        MTLSize {
+            width: d.grid,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+}
+
+/// A committed command buffer's GPU residency in seconds.
+fn gpu_seconds(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
+    // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
+    let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
+    let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
+    t1 - t0
 }
 
 /// A captured dispatch sequence in an `MTLIndirectCommandBuffer`: encode

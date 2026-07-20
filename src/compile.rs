@@ -796,7 +796,7 @@ struct BackendMarker<B: Backend>(PhantomData<B>);
 mod metal_backend {
     use super::*;
     use crate::emit_metal::{MetalProgram, emit_schedule_metal_on};
-    use crate::metal::{MetalBuf, MetalDevice, Pipelines, program_dispatches};
+    use crate::metal::{Dispatch, MetalBuf, MetalDevice, Pipelines, program_dispatches};
 
     pub struct MetalExecutable {
         program: MetalProgram,
@@ -871,11 +871,13 @@ mod metal_backend {
             for (name, size) in &executable.program.buffers {
                 buffers.insert(name.clone(), self.alloc_f32(*size));
             }
-            self.run(&program_dispatches(
-                &executable.program,
-                &buffers,
-                &executable.pipelines,
-            ));
+            let dispatches =
+                program_dispatches(&executable.program, &buffers, &executable.pipelines);
+            if crate::debug_level() >= 2 {
+                run_debug(self, &executable.program, schedule, &dispatches);
+            } else {
+                self.run(&dispatches);
+            }
             schedule
                 .outputs
                 .iter()
@@ -892,6 +894,135 @@ mod metal_backend {
                 })
                 .collect()
         }
+    }
+
+    /// The `SANIC_DEBUG=2` runtime dump. One line per launch, printed after
+    /// the step so shares are exact:
+    ///
+    /// ```text
+    /// *** metal  407 Out32        fold   grid   128256   7934us █████████▏ 16.6%  plan ×1.28  ~ 525.9MB bw  33%
+    /// ```
+    ///
+    /// The index and OUTPUT name match the `SANIC_DEBUG=1` schedule dump, so
+    /// the two dumps cross-reference. The bar is scaled to the slowest
+    /// launch; `plan ×r` is measured over the cost the planner CHOSE this
+    /// schedule by (fused stages), so the dump audits the cost model — the
+    /// footer's `plan Σ` is its aggregate calibration on this machine. `bw`
+    /// is the fraction of the device's memory bandwidth actually achieved;
+    /// bytes are logical buffer sizes (an upper bound — a gather reading one
+    /// row of a huge table overcounts, so implausible ratios print `--`).
+    ///
+    /// Times come from one command buffer per dispatch — accurate per
+    /// kernel, but the submits add overhead: the SUM is a debug number, and
+    /// `MetalDevice::run_timed` measures the production step.
+    fn run_debug(
+        device: &MetalDevice,
+        program: &MetalProgram,
+        schedule: &Schedule,
+        dispatches: &[Dispatch],
+    ) {
+        use crate::partition::Stage;
+        // Logical bytes per buffer name. An allocation's `byte_len` would
+        // overcount: a zero-copy checkpoint tensor is a SLICE of the whole
+        // weights file.
+        let mut logical_bytes = HashMap::<&str, f64>::new();
+        for (name, elements) in &program.buffers {
+            logical_bytes.insert(name, *elements as f64 * 4.0);
+        }
+        for (name, axes) in &program.inputs {
+            let elements: usize = axes.iter().map(|a| a.extent()).product();
+            let width = program.dtypes.get(*name).map_or(4.0, |dtype| dtype.bytes());
+            logical_bytes.insert(name, elements as f64 * width);
+        }
+        // Kind and planned cost, by the output name each dispatch writes.
+        let mut stage_info = HashMap::<&str, (&'static str, Option<f64>)>::new();
+        for stage in &schedule.stages {
+            let (kind, planned) = match stage {
+                Stage::Fused { spec, .. } => ("fold", Some(spec.cost)),
+                Stage::Elementwise { .. } => ("map", None),
+                Stage::Gather { .. } => ("gather", None),
+                Stage::Sequential { .. } => ("seq", None),
+                Stage::Infeasible { .. } => ("infeasible", None),
+            };
+            stage_info.insert(crate::partition::stage_output(stage), (kind, planned));
+        }
+
+        let times = device.run_each_timed(dispatches);
+        let total = times.iter().sum::<f64>().max(1e-12);
+        let slowest = times.iter().copied().fold(0.0, f64::max).max(1e-12);
+        let (mut fused_measured, mut fused_planned) = (0.0f64, 0.0f64);
+        for (index, ((stage, dispatch), &seconds)) in program
+            .stages
+            .iter()
+            .zip(dispatches)
+            .zip(&times)
+            .enumerate()
+        {
+            let bytes = stage
+                .inputs
+                .iter()
+                .chain(std::iter::once(&stage.output))
+                .map(|name| logical_bytes.get(name.as_str()).copied().unwrap_or(0.0))
+                .sum::<f64>();
+            let (kind, planned) = stage_info
+                .get(stage.output.as_str())
+                .copied()
+                .unwrap_or(("?", None));
+            let micros = seconds * 1e6;
+            let time = if micros >= 1000.0 {
+                format!("\x1b[33m{micros:7.0}us\x1b[0m") // slow launch: yellow
+            } else {
+                format!("{micros:7.0}us")
+            };
+            let plan = match planned {
+                Some(p) if p > 0.0 => {
+                    fused_measured += seconds;
+                    fused_planned += p;
+                    format!("plan ×{:<5.2}", seconds / p)
+                }
+                _ => " ".repeat(11),
+            };
+            let peak_fraction = bytes / seconds.max(1e-9) / device.profile().hbm_bandwidth;
+            let bandwidth = if peak_fraction > 5.0 {
+                "bw  --".to_string()
+            } else {
+                format!("bw {:3.0}%", peak_fraction * 100.0)
+            };
+            eprintln!(
+                "*** metal {index:4} {:<12} {kind:<6} grid {:>8} {time} {} {:4.1}%  {plan} ~{:>6.1}MB {bandwidth}",
+                stage.output,
+                dispatch.grid,
+                crate::debug_bar(seconds / slowest, 10),
+                100.0 * seconds / total,
+                bytes / 1e6,
+            );
+        }
+
+        let mut ranked: Vec<(&str, f64)> = program
+            .stages
+            .iter()
+            .map(|s| s.output.as_str())
+            .zip(times.iter().copied())
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let top = ranked
+            .iter()
+            .take(4)
+            .map(|(name, t)| format!("{name} {:.1}%", 100.0 * t / total))
+            .collect::<Vec<_>>()
+            .join("  ");
+        let rest = 100.0 * (total - ranked.iter().take(4).map(|(_, t)| t).sum::<f64>()) / total;
+        let calibration = if fused_planned > 0.0 {
+            format!("plan Σ ×{:.2}", fused_measured / fused_planned)
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "*** metal step: {} launches {:.2}ms GPU (per-launch sync; production time = run_timed)",
+            times.len(),
+            total * 1e3,
+        );
+        eprintln!("*** metal top:  {top}  rest {rest:.0}%  |  {calibration}");
     }
 
     impl MetalDevice {
