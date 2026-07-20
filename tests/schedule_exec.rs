@@ -170,4 +170,26 @@ fn full_transformer_block_schedule_executes_to_reference() {
     let executed = sched.execute(&env);
     let reference = eval(&logits, &env);
     assert_close(&executed, &reference);
+
+    // The decline census (CRITIQUE.md §2.2): the declines THIS workload hit,
+    // not the syllabus's. Printed for inspection; the assertions pin that
+    // every bucket is in the deriver's stable rule vocabulary, so a new kind
+    // of decline showing up on a transformer is a visible event, not noise.
+    let census = sched.decline_census();
+    println!("{census}");
+    let mut buckets = std::collections::BTreeMap::new();
+    for decline in &sched.declines {
+        *buckets.entry(decline.rule).or_insert(0) += 1;
+    }
+    assert_eq!(
+        buckets,
+        [
+            ("binop-of-coupled", 1),
+            ("not-streamed", 32),
+            ("still-per-element", 2),
+        ]
+        .into_iter()
+        .collect(),
+        "a transformer decline bucket changed; inspect the census above"
+    );
 }

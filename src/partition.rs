@@ -32,7 +32,7 @@ use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
 use crate::cost::DeviceProfile;
-use crate::derive::{Carrier, SlotKind, derive, items_of};
+use crate::derive::{Carrier, Decline, SlotKind, derive, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::kernel_ir::{
     Axis, BinOp, Canonicalizer, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, all_axes,
@@ -107,6 +107,10 @@ pub struct Schedule {
     /// [`Schedule::execute`] returns the last; a stateful runtime
     /// ([`crate::runtime`]) reads them all.
     pub outputs: Vec<String>,
+    /// The decline census: every MONOIDAL-classified axis the deriver could
+    /// not compose at the node the partitioner stood on, in emission order.
+    /// [`Schedule::decline_census`] buckets it.
+    pub declines: Vec<Decline>,
 }
 
 /// Split `node` into a schedule of kernels for `dev`.
@@ -142,6 +146,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
     let mut p = Partitioner {
         dev,
         stages: Vec::new(),
+        declines: Vec::new(),
         fresh: 0,
         done: HashMap::new(),
         keepalive: Vec::new(),
@@ -167,7 +172,11 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
     let stages = order_in_place(p.stages, &graph_inputs);
     #[cfg(debug_assertions)]
     assert_stage_order(&stages, &graph_inputs);
-    let sched = Schedule { stages, outputs };
+    let sched = Schedule {
+        stages,
+        outputs,
+        declines: p.declines,
+    };
     // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like
     // tinygrad's DEBUG — the compilation made inspectable.
     if crate::debug_level() >= 1 {
@@ -301,8 +310,8 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
     // producers of genuine intermediates only (an in-place writer's readers
     // read the external weight, so it must NOT create a producer→reader edge)
     let mut producer: HashMap<String, usize> = HashMap::new();
-    for i in 0..n {
-        if !inplace[i] {
+    for (i, &is_inplace) in inplace.iter().enumerate() {
+        if !is_inplace {
             producer.insert(out[i].clone(), i);
         }
     }
@@ -314,20 +323,20 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
             indeg[b] += 1;
         }
     };
-    for i in 0..n {
-        for r in &reads[i] {
+    for (i, stage_reads) in reads.iter().enumerate() {
+        for r in stage_reads {
             if let Some(&j) = producer.get(*r) {
                 edge(j, i, &mut adj, &mut indeg);
             }
         }
     }
-    for i in 0..n {
-        if !inplace[i] {
+    for (i, &is_inplace) in inplace.iter().enumerate() {
+        if !is_inplace {
             continue;
         }
         let o = out[i].as_str();
-        for k in 0..n {
-            if reads[k].iter().any(|r| *r == o) {
+        for (k, stage_reads) in reads.iter().enumerate() {
+            if stage_reads.contains(&o) {
                 edge(k, i, &mut adj, &mut indeg);
             }
         }
@@ -364,6 +373,11 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
 struct Partitioner<'a> {
     dev: &'a DeviceProfile,
     stages: Vec<Stage>,
+    /// Every fold the deriver declined while the partitioner stood at a
+    /// node: an axis the classifier called MONOIDAL whose carrier did not
+    /// compose there. The census (CRITIQUE.md §2.2) — the declines this
+    /// WORKLOAD actually hit, not the syllabus's.
+    declines: Vec<Decline>,
     fresh: usize,
     /// Nodes already materialized, by pointer → the name they live under.
     /// A DAG-shared producer (a residual, say) is cut once, not per consumer.
@@ -899,8 +913,12 @@ impl Partitioner<'_> {
             if structure(node, axis).level != Parallelism::Monoidal {
                 continue;
             }
-            let Ok(c) = derive(node, axis) else {
-                continue;
+            let c = match derive(node, axis) {
+                Ok(c) => c,
+                Err(d) => {
+                    self.declines.push(d);
+                    continue;
+                }
             };
             // Rank by planned cost on the uncut graph; an unplannable axis
             // ranks last but is still a legal fold.
@@ -989,10 +1007,12 @@ impl Partitioner<'_> {
         let c2 = match derive(&cut_graph, axis) {
             Ok(c) => c,
             Err(why) => {
+                let reason = why.to_string();
+                self.declines.push(why);
                 self.stages.push(Stage::Infeasible {
                     axis,
                     output: out.to_string(),
-                    why: why.to_string(),
+                    why: reason,
                 });
                 return leak(out);
             }
@@ -1113,7 +1133,7 @@ impl Partitioner<'_> {
                 // read under a distinct name (its temp `landed`) — otherwise the
                 // weight read and the fold-output read alias and `w` becomes `∇w`.
                 let leaked_out = leak(out);
-                let sentinel = if leaf_names(node).iter().any(|n| *n == leaked_out) {
+                let sentinel = if leaf_names(node).contains(&leaked_out) {
                     landed
                 } else {
                     leaked_out
@@ -1397,6 +1417,34 @@ fn replace_many(
 // ── rendering ────────────────────────────────────────────────────────────────
 
 impl Schedule {
+    /// The per-model decline ledger (CRITIQUE.md §2.2): what this WORKLOAD's
+    /// declines were, bucketed by the missing rule, one witness line per
+    /// bucket. This is the version of the completeness claim a user cares
+    /// about — "our declines on this graph are these, for these reasons" —
+    /// and each entry carries its node and axis, so the probe can be pointed
+    /// at any bucket next.
+    pub fn decline_census(&self) -> String {
+        let mut buckets: std::collections::BTreeMap<&'static str, Vec<&Decline>> =
+            std::collections::BTreeMap::new();
+        for d in &self.declines {
+            buckets.entry(d.rule).or_default().push(d);
+        }
+        let mut out = format!(
+            "decline census — {} decline(s) across {} rule(s)\n",
+            self.declines.len(),
+            buckets.len()
+        );
+        for (rule, entries) in &buckets {
+            out += &format!("  {:<24} ×{:<3} e.g. {}\n", rule, entries.len(), entries[0]);
+        }
+        for stage in &self.stages {
+            if let Stage::Infeasible { axis, output, why } = stage {
+                out += &format!("  INFEASIBLE stage `{output}` over {}: {why}\n", axis.name);
+            }
+        }
+        out
+    }
+
     pub fn kernel_count(&self) -> usize {
         self.stages.len()
     }
