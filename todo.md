@@ -159,7 +159,22 @@ page is substrate we need so the moat is usable on real workloads.
   keep one graph per step parity: after two captured steps, a Trinity
   token is two Metal calls instead of 1,856 encoder round-trips. Trinity
   236 → 200 ms/tok, GPT-2 numerics/latency unchanged, replay-stability
-  GPU test (`graph_replay_matches_oracle`).
+  GPU test (`graph_replay_matches_oracle`). Wired into the Program path
+  (2026-07-19): `Program::capture` freezes a binding set into a
+  `MetalReplay` — declared feedback pairs (a cache output becomes the
+  next step's input) ping-pong between two eagerly captured parities;
+  `SANIC_DEBUG=2` steps fall back to the per-dispatch timed dump.
+  Bindless stages now capture correctly (address table at 0, per-parity
+  tables) and binding offsets are guarded to u32 — an ICB wire limit
+  tinygrad also rejects; a >4 GB zero-copy checkpoint slice must stay on
+  direct dispatch. Every replay is error-checked and fails fast: any
+  command buffer error — our own fault or an "innocent victim" discard
+  from a system-wide GPU recovery (observed live) — surfaces as an `Err`
+  through `run_graph`/`MetalReplay::step`; the step's writes are
+  untrustworthy and a decode loop must not continue on them.
+  Llama 3.2 1B decode 20.5 → 25.8 tok/s wall at 38 ms/tok GPU
+  replay residency (now printed by the example), prefill 2.6×, greedy
+  tokens unchanged (`captured_replay_*` GPU tests).
 - **Cooperative fold schedules (M10)** *(new)* — any derived fold can
   split its streamed axis across lanes/simdgroups and lane-distribute one
   output axis, with every merge rendered from the carrier's own `combine`

@@ -429,14 +429,33 @@ pub struct MetalGraph {
 
 impl MetalDevice {
     /// Freeze a dispatch list into a replayable graph.
+    ///
+    /// Panics if any binding offset exceeds `u32::MAX`: indirect command
+    /// buffers encode offsets as u32 on the wire (tinygrad's Metal graph
+    /// rejects these too), so a zero-copy checkpoint slice past 4 GB would
+    /// silently corrupt — such a schedule must stay on direct dispatch.
     pub fn capture(&self, dispatches: &[Dispatch]) -> MetalGraph {
+        for d in dispatches {
+            for b in d
+                .inputs
+                .iter()
+                .chain(std::iter::once(&d.output))
+                .chain(d.argbuf.as_ref())
+            {
+                assert!(
+                    b.1 <= u32::MAX as usize,
+                    "buffer offset {} exceeds u32 — indirect command buffers cannot bind it",
+                    b.1
+                );
+            }
+        }
         let desc = MTLIndirectCommandBufferDescriptor::new();
         desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatchThreads);
         desc.setInheritPipelineState(false);
         desc.setInheritBuffers(false);
         let max_bufs = dispatches
             .iter()
-            .map(|d| d.inputs.len() + 1)
+            .map(|d| if d.argbuf.is_some() { 2 } else { d.inputs.len() + 1 })
             .max()
             .unwrap_or(1);
         desc.setMaxKernelBufferBindCount(max_bufs);
@@ -464,15 +483,27 @@ impl MetalDevice {
             if seen_pipe.insert(Retained::as_ptr(&d.pipe) as usize) {
                 pipelines.push(d.pipe.clone());
             }
-            for (bi, b) in d.inputs.iter().enumerate() {
-                unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, b.1, bi) };
+            // a bindless dispatch binds its address table at 0 and the output
+            // at 1; the inputs are reached through the table, so they need
+            // residency, not binding slots (mirrors `encode`)
+            if let Some(ab) = &d.argbuf {
+                unsafe { cmd.setKernelBuffer_offset_atIndex(&ab.0, ab.1, 0) };
+                unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, 1) };
+                if seen.insert(Retained::as_ptr(&ab.0) as usize) {
+                    resources.push(ab.clone());
+                }
+            } else {
+                for (bi, b) in d.inputs.iter().enumerate() {
+                    unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, b.1, bi) };
+                }
+                unsafe {
+                    cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, d.inputs.len())
+                };
+            }
+            for b in d.inputs.iter().chain(std::iter::once(&d.output)) {
                 if seen.insert(Retained::as_ptr(&b.0) as usize) {
                     resources.push(b.clone());
                 }
-            }
-            unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, d.inputs.len()) };
-            if seen.insert(Retained::as_ptr(&d.output.0) as usize) {
-                resources.push(d.output.clone());
             }
             let hazard = d
                 .inputs
@@ -521,7 +552,24 @@ impl MetalDevice {
 
     /// Replay a captured graph and wait: one command buffer, one encoder,
     /// one execute call.
-    pub fn run_graph(&self, g: &MetalGraph) {
+    pub fn run_graph(&self, g: &MetalGraph) -> Result<(), String> {
+        self.replay_checked(g).map(|_| ())
+    }
+
+    /// [`Self::run_graph`], returning GPU residency in seconds (see
+    /// [`Self::run_timed`]).
+    pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
+        self.replay_checked(g).map(|cb| gpu_seconds(&cb))
+    }
+
+    /// One replay, error-checked. Any command buffer error — a GPU fault of
+    /// our own, or "Discarded (victim of GPU error/recovery)" when something
+    /// ELSE faults the GPU mid-flight — is an `Err`: the step's writes are
+    /// untrustworthy and a decode loop must not continue on them.
+    fn replay_checked(
+        &self,
+        g: &MetalGraph,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let cb = self.queue.commandBuffer().expect("command buffer");
         cb.useResidencySet(&g.residency); // buffers + pipelines resident for this replay
         let enc = cb.computeCommandEncoder().expect("compute encoder");
@@ -535,28 +583,10 @@ impl MetalDevice {
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
-    }
-
-    /// [`Self::run_graph`], returning GPU residency in seconds (see
-    /// [`Self::run_timed`]).
-    pub fn run_graph_timed(&self, g: &MetalGraph) -> f64 {
-        let cb = self.queue.commandBuffer().expect("command buffer");
-        cb.useResidencySet(&g.residency);
-        let enc = cb.computeCommandEncoder().expect("compute encoder");
-        let range = NSRange {
-            location: 0,
-            length: g.len,
-        };
-        let _: () = unsafe { msg_send![&*enc, executeCommandsInBuffer: &*g.icb, withRange: range] };
-        enc.endEncoding();
-        cb.commit();
-        cb.waitUntilCompleted();
-        if let Some(err) = cb.error() {
-            eprintln!("graph replay FAILED: {err}");
+        match cb.error() {
+            Some(error) => Err(format!("graph replay failed: {error}")),
+            None => Ok(cb),
         }
-        let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
-        let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
-        t1 - t0
     }
 }
 

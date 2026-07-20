@@ -57,6 +57,7 @@ pub enum RunError {
         expected: Dtype,
         actual: Dtype,
     },
+    Feedback(String),
     Backend(String),
 }
 
@@ -82,6 +83,7 @@ impl fmt::Display for RunError {
                 f,
                 "input `{name}` has dtype {actual:?}; expected {expected:?}"
             ),
+            RunError::Feedback(reason) => write!(f, "feedback wiring: {reason}"),
             RunError::Backend(reason) => write!(f, "backend execution failed: {reason}"),
         }
     }
@@ -180,6 +182,22 @@ impl<B: Backend> Program<B> {
         &self,
         bindings: impl IntoIterator<Item = (&'a str, &'a B::Buffer)>,
     ) -> Result<Vec<B::Buffer>, RunError> {
+        let ordered = self.ordered_bindings(bindings)?;
+        self.backend.execute(
+            &self.executable,
+            &self.schedule,
+            &self.inputs,
+            &ordered,
+            &self.output_shapes,
+        )
+    }
+
+    /// Validate a named binding set and order it by the program's inputs —
+    /// the checks behind [`Program::try_run`] and the Metal capture path.
+    fn ordered_bindings<'a>(
+        &self,
+        bindings: impl IntoIterator<Item = (&'a str, &'a B::Buffer)>,
+    ) -> Result<Vec<&'a B::Buffer>, RunError> {
         let mut by_name = HashMap::<&str, &B::Buffer>::new();
         for (name, buffer) in bindings {
             if !self.inputs.iter().any(|input| input.name == name) {
@@ -212,14 +230,7 @@ impl<B: Backend> Program<B> {
             }
             ordered.push(buffer);
         }
-
-        self.backend.execute(
-            &self.executable,
-            &self.schedule,
-            &self.inputs,
-            &ordered,
-            &self.output_shapes,
-        )
+        Ok(ordered)
     }
 }
 
@@ -796,7 +807,7 @@ struct BackendMarker<B: Backend>(PhantomData<B>);
 mod metal_backend {
     use super::*;
     use crate::emit_metal::{MetalProgram, emit_schedule_metal_on};
-    use crate::metal::{Dispatch, MetalBuf, MetalDevice, Pipelines, program_dispatches};
+    use crate::metal::{Dispatch, MetalBuf, MetalDevice, MetalGraph, Pipelines, program_dispatches};
 
     pub struct MetalExecutable {
         program: MetalProgram,
@@ -896,6 +907,205 @@ mod metal_backend {
         }
     }
 
+    /// A program frozen over one binding set and captured as replayable
+    /// Metal graphs — the production decode path. [`Program::capture`]
+    /// encodes every dispatch ONCE into an indirect command buffer
+    /// ([`crate::metal::MetalGraph`]); [`MetalReplay::step`] then replays
+    /// the whole schedule as one encoder and one `executeCommandsInBuffer`
+    /// instead of re-allocating buffers and re-encoding N kernels per step.
+    ///
+    /// `feedback` wires an output to an input of the NEXT step (a KV cache
+    /// flowing through a decode loop). Bindings are frozen at capture, so a
+    /// fed-back pair ping-pongs between two buffers: two graphs are captured
+    /// with the pair's roles swapped and steps alternate between them.
+    /// Everything else — weights, intermediates, CPU-written inputs like a
+    /// token id — is the same buffer in both parities.
+    pub struct MetalReplay<'p> {
+        program: &'p Program<MetalDevice>,
+        /// One captured graph, or two when feedback swaps bindings.
+        graphs: Vec<MetalGraph>,
+        /// Per-parity dispatch lists — the `SANIC_DEBUG=2` fallback.
+        dispatches: Vec<Vec<Dispatch>>,
+        /// Per-parity outputs in compilation-root order.
+        outputs: Vec<Vec<MetalBuffer>>,
+        parity: usize,
+    }
+
+    impl Program<MetalDevice> {
+        /// Freeze this program over `bindings` and capture it for replay —
+        /// see [`MetalReplay`]. Binding validation matches
+        /// [`Program::try_run`]; every `feedback` pair `(output index,
+        /// input name)` must name a real output and a real input of equal
+        /// shape (outputs are f32, so the input must be too).
+        pub fn capture<'a>(
+            &self,
+            bindings: impl IntoIterator<Item = (&'a str, &'a MetalBuffer)>,
+            feedback: &[(usize, &str)],
+        ) -> Result<MetalReplay<'_>, RunError> {
+            use std::collections::HashSet;
+
+            let ordered = self.ordered_bindings(bindings)?;
+            // (output buffer name, the fed input's lowered name)
+            let mut swaps = Vec::new();
+            let mut fed_outputs = HashSet::new();
+            let mut fed_inputs = HashSet::new();
+            for &(output, input_name) in feedback {
+                let output_name = self.schedule.outputs.get(output).ok_or_else(|| {
+                    RunError::Feedback(format!(
+                        "output index {output} is out of range ({} outputs)",
+                        self.schedule.outputs.len()
+                    ))
+                })?;
+                let input = self
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == input_name)
+                    .ok_or_else(|| {
+                        RunError::Feedback(format!("program has no input named `{input_name}`"))
+                    })?;
+                if self.output_shapes[output] != input.concrete_shape() {
+                    return Err(RunError::Feedback(format!(
+                        "output {output} has shape {:?}; input `{input_name}` expects {:?}",
+                        self.output_shapes[output],
+                        input.concrete_shape()
+                    )));
+                }
+                if input.dtype != Dtype::F32 {
+                    return Err(RunError::Feedback(format!(
+                        "input `{input_name}` is {:?}; outputs are F32",
+                        input.dtype
+                    )));
+                }
+                if !fed_outputs.insert(output) {
+                    return Err(RunError::Feedback(format!(
+                        "output {output} is fed back more than once"
+                    )));
+                }
+                if !fed_inputs.insert(input_name) {
+                    return Err(RunError::Feedback(format!(
+                        "input `{input_name}` is fed more than once"
+                    )));
+                }
+                swaps.push((output_name.clone(), input.lowered_name));
+            }
+
+            let device = &self.backend;
+            let executable = &self.executable;
+            let mut base = HashMap::<String, MetalBuf>::new();
+            for (input, buffer) in self.inputs.iter().zip(&ordered) {
+                base.insert(input.lowered_name.to_string(), buffer.raw.clone());
+            }
+            for (name, size) in &executable.program.buffers {
+                base.insert(name.clone(), device.alloc_f32(*size));
+            }
+
+            let parities = if feedback.is_empty() { 1 } else { 2 };
+            let mut graphs = Vec::with_capacity(parities);
+            let mut dispatches = Vec::with_capacity(parities);
+            let mut outputs = Vec::with_capacity(parities);
+            for parity in 0..parities {
+                let mut buffers = base.clone();
+                if parity == 1 {
+                    for (output_name, lowered_name) in &swaps {
+                        let fed_input = base[*lowered_name].clone();
+                        let first_output = base[output_name.as_str()].clone();
+                        buffers.insert(output_name.clone(), fed_input);
+                        buffers.insert(lowered_name.to_string(), first_output);
+                    }
+                    // a bindless stage's address table is filled at dispatch
+                    // build; this parity binds different buffers, so it needs
+                    // its own table
+                    for stage in &executable.program.stages {
+                        if let Some(argbuf) = &stage.argbuf {
+                            let size = executable
+                                .program
+                                .buffers
+                                .iter()
+                                .find(|(name, _)| name == argbuf)
+                                .map(|(_, size)| *size)
+                                .unwrap_or(stage.inputs.len() * 2);
+                            buffers.insert(argbuf.clone(), device.alloc_f32(size));
+                        }
+                    }
+                }
+                let dispatch_list =
+                    program_dispatches(&executable.program, &buffers, &executable.pipelines);
+                graphs.push(device.capture(&dispatch_list));
+                dispatches.push(dispatch_list);
+                outputs.push(
+                    self.schedule
+                        .outputs
+                        .iter()
+                        .zip(&self.output_shapes)
+                        .map(|(name, shape)| {
+                            let raw = buffers.get(name).cloned().ok_or_else(|| {
+                                RunError::Backend(format!(
+                                    "Metal schedule did not produce `{name}`"
+                                ))
+                            })?;
+                            Ok(MetalBuffer {
+                                raw,
+                                shape: shape.clone(),
+                                dtype: Dtype::F32,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, RunError>>()?,
+                );
+            }
+
+            Ok(MetalReplay {
+                program: self,
+                graphs,
+                dispatches,
+                outputs,
+                parity: 0,
+            })
+        }
+    }
+
+    impl MetalReplay<'_> {
+        /// Replay one step and return its outputs in compilation-root order.
+        /// Fed-back outputs are already wired as the NEXT step's inputs;
+        /// write CPU-driven inputs (a token id) into their bound buffers
+        /// before calling. Under `SANIC_DEBUG=2` the step runs through the
+        /// per-dispatch timed path and prints the launch dump instead of
+        /// replaying the captured graph.
+        ///
+        /// Errs on any command buffer error — the step's writes are
+        /// untrustworthy and a decode loop must not continue on them.
+        pub fn step(&mut self) -> Result<&[MetalBuffer], RunError> {
+            self.step_timed().map(|(outputs, _)| outputs)
+        }
+
+        /// [`Self::step`], returning the replayed command buffer's GPU
+        /// residency in seconds (see [`crate::metal::MetalDevice::run_timed`]).
+        /// Under `SANIC_DEBUG=2` the returned time is the per-dispatch sum —
+        /// a debug number with a sync floor, as the dump's footer says.
+        pub fn step_timed(&mut self) -> Result<(&[MetalBuffer], f64), RunError> {
+            let parity = self.advance();
+            let seconds = if crate::debug_level() >= 2 {
+                run_debug(
+                    &self.program.backend,
+                    &self.program.executable.program,
+                    &self.program.schedule,
+                    &self.dispatches[parity],
+                )
+            } else {
+                self.program
+                    .backend
+                    .run_graph_timed(&self.graphs[parity])
+                    .map_err(RunError::Backend)?
+            };
+            Ok((&self.outputs[parity], seconds))
+        }
+
+        fn advance(&mut self) -> usize {
+            let parity = self.parity;
+            self.parity = (parity + 1) % self.graphs.len();
+            parity
+        }
+    }
+
     /// The `SANIC_DEBUG=2` runtime dump. One line per launch, printed after
     /// the step so shares are exact:
     ///
@@ -920,7 +1130,7 @@ mod metal_backend {
         program: &MetalProgram,
         schedule: &Schedule,
         dispatches: &[Dispatch],
-    ) {
+    ) -> f64 {
         use crate::partition::Stage;
         // Logical bytes per buffer name. An allocation's `byte_len` would
         // overcount: a zero-copy checkpoint tensor is a SLICE of the whole
@@ -1023,6 +1233,7 @@ mod metal_backend {
             total * 1e3,
         );
         eprintln!("*** metal top:  {top}  rest {rest:.0}%  |  {calibration}");
+        times.iter().sum()
     }
 
     impl MetalDevice {
@@ -1091,7 +1302,7 @@ mod metal_backend {
 }
 
 #[cfg(target_os = "macos")]
-pub use metal_backend::PublicMetalBuffer as MetalBuffer;
+pub use metal_backend::{MetalReplay, PublicMetalBuffer as MetalBuffer};
 
 #[cfg(test)]
 mod positional_lowering_tests {

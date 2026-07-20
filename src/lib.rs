@@ -86,7 +86,7 @@ pub mod simplify;
 pub mod verify;
 
 #[cfg(target_os = "macos")]
-pub use compile::MetalBuffer;
+pub use compile::{MetalBuffer, MetalReplay};
 pub use compile::{
     Backend, Buffer, Compile, CompileError, CpuBuffer, CpuDevice, Program, RootItem, Roots,
     RunError,
