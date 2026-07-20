@@ -24,6 +24,14 @@
 //! updated caches for the next step. `tests/decode.rs` proves N incremental
 //! steps equal one full-attention prefill — on the interpreter and on
 //! compiled Rust with buffers persisting across a real host loop.
+//!
+//! A caveat for long-lived processes: COMPILATION (not execution) interns
+//! temporary buffer names with `Box::leak` (the `leak` helpers in
+//! `partition`/`compile`/`rustgen`), so a process that keeps compiling new
+//! schedules leaks a few strings per compilation, without bound. A session
+//! that compiles its schedules once and then steps forever — the decode
+//! loop — does not grow. Interning into a session-owned arena is the fix if
+//! recompile-per-request ever becomes a real shape here.
 
 use crate::interp::{Env, Value};
 use crate::partition::Schedule;

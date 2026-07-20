@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Format and every CPU test on Linux — the fast, always-on leg.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test --all-targets
+      # Not gating yet: the mechanical lint backlog is tracked in CRITIQUE.md
+      # §4.5. Drop `continue-on-error` once it is cleared.
+      - run: cargo clippy --all-targets
+        continue-on-error: true
+
+  # The macOS leg is the only thing standing between "tests pass" and "the
+  # GPU path still works": Apple-silicon runners have a real Metal device.
+  macos-metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
