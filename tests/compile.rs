@@ -198,3 +198,84 @@ fn direct_attention_is_one_metal_kernel() {
             .all(|(actual, expected)| (actual - expected).abs() < 1e-5)
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn captured_replay_feeds_outputs_back_as_inputs() {
+    let Some(metal) = sanic::MetalDevice::open() else {
+        return;
+    };
+    let d = axis("d", 4);
+    let state = input("state", [d], Dtype::F32);
+    let delta = input("delta", [d], Dtype::F32);
+    let program = map(MapOp::Add, vec![state, delta]).compile(&metal).unwrap();
+
+    let state = metal
+        .tensor_from_f64([4], Dtype::F32, &[1.0, 2.0, 3.0, 4.0])
+        .unwrap();
+    let delta = metal
+        .tensor_from_f64([4], Dtype::F32, &[10.0, 10.0, 10.0, 10.0])
+        .unwrap();
+    let mut replay = program
+        .capture([("state", &state), ("delta", &delta)], &[(0, "state")])
+        .unwrap();
+
+    // the fed-back state accumulates delta on every replayed step
+    assert_eq!(
+        metal.read_tensor_f32(&replay.step().unwrap()[0]),
+        [11.0, 12.0, 13.0, 14.0]
+    );
+    assert_eq!(
+        metal.read_tensor_f32(&replay.step().unwrap()[0]),
+        [21.0, 22.0, 23.0, 24.0]
+    );
+    // bindings are frozen but their contents are live: a CPU write into
+    // `delta` is visible to the next replay (the token-id pattern)
+    metal.write_f64(delta.raw(), &[100.0, 100.0, 100.0, 100.0]);
+    assert_eq!(
+        metal.read_tensor_f32(&replay.step().unwrap()[0]),
+        [121.0, 122.0, 123.0, 124.0]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn captured_replay_without_feedback_reruns_one_graph_over_live_bindings() {
+    let Some(metal) = sanic::MetalDevice::open() else {
+        return;
+    };
+    let d = axis("d", 2);
+    let output = reduce(input("x", [d, d], Dtype::F32), 1usize, add());
+    let program = output.compile(&metal).unwrap();
+    let x = metal
+        .tensor_from_f64([2, 2], Dtype::F32, &[1.0, 2.0, 3.0, 4.0])
+        .unwrap();
+    let mut replay = program.capture([("x", &x)], &[]).unwrap();
+
+    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [3.0, 7.0]);
+    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [3.0, 7.0]);
+    metal.write_f64(x.raw(), &[10.0, 20.0, 30.0, 40.0]);
+    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [30.0, 70.0]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn capture_rejects_bad_feedback_wiring() {
+    use sanic::RunError;
+
+    let Some(metal) = sanic::MetalDevice::open() else {
+        return;
+    };
+    let d = axis("d", 4);
+    let state = input("state", [d], Dtype::F32);
+    let delta = input("delta", [d], Dtype::F32);
+    let program = map(MapOp::Add, vec![state, delta]).compile(&metal).unwrap();
+    let state = metal.tensor_from_f64([4], Dtype::F32, &[0.0; 4]).unwrap();
+    let delta = metal.tensor_from_f64([4], Dtype::F32, &[0.0; 4]).unwrap();
+
+    let out_of_range = program.capture([("state", &state), ("delta", &delta)], &[(1, "state")]);
+    assert!(matches!(out_of_range, Err(RunError::Feedback(_))));
+    let unknown_input =
+        program.capture([("state", &state), ("delta", &delta)], &[(0, "missing")]);
+    assert!(matches!(unknown_input, Err(RunError::Feedback(_))));
+}

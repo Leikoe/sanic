@@ -732,35 +732,53 @@ fn run_metal() -> Result<(), String> {
         started.elapsed().as_secs_f32()
     );
 
-    let step = |token: u32,
-                position: usize,
-                buffers: &mut HashMap<String, sanic::MetalBuffer>|
-     -> Result<sanic::MetalBuffer, String> {
-        device.write_f64(buffers["tokens"].raw(), &[token as f64]);
-        device.write_f64(buffers["position"].raw(), &[position as f64]);
-        let bindings = program
-            .input_names()
-            .map(|name| (name, &buffers[name]))
-            .collect::<Vec<_>>();
-        let mut outputs = program
-            .try_run(bindings)
-            .map_err(|error| error.to_string())?;
-        let logits = outputs.remove(graph.logits_index);
-        for (name, cache) in graph.cache_names.iter().zip(outputs) {
-            buffers.insert(name.clone(), cache);
-        }
-        Ok(logits)
+    // Freeze the bindings and capture the whole schedule as replayable
+    // graphs: each cache output is the NEXT step's cache input, so a step is
+    // one `executeCommandsInBuffer` instead of re-encoding every kernel.
+    let feedback = graph
+        .cache_names
+        .iter()
+        .enumerate()
+        .map(|(cache, name)| {
+            let output = if cache < graph.logits_index { cache } else { cache + 1 };
+            (output, name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let mut replay = program
+        .capture(
+            buffers.iter().map(|(name, buffer)| (name.as_str(), buffer)),
+            &feedback,
+        )
+        .map_err(|error| error.to_string())?;
+    eprintln!(
+        "captured {} dispatches into two replay graphs in {:.2}s",
+        program.kernel_count(),
+        started.elapsed().as_secs_f32()
+    );
+
+    let tokens_buffer = buffers["tokens"].clone();
+    let position_buffer = buffers["position"].clone();
+    let mut step = |token: u32, position: usize| -> Result<(sanic::MetalBuffer, f64), String> {
+        device.write_f64(tokens_buffer.raw(), &[token as f64]);
+        device.write_f64(position_buffer.raw(), &[position as f64]);
+        let (outputs, seconds) = replay.step_timed().map_err(|error| error.to_string())?;
+        Ok((outputs[graph.logits_index].clone(), seconds))
     };
 
     eprintln!("prefilling {} tokens...", prompt_tokens.len());
     let started = std::time::Instant::now();
     let mut logits = None;
+    let mut prefill_gpu_seconds = 0.0f64;
     for (position, &token) in prompt_tokens.iter().enumerate() {
-        logits = Some(step(token, position, &mut buffers)?);
+        let (output, seconds) = step(token, position)?;
+        logits = Some(output);
+        prefill_gpu_seconds += seconds;
     }
     eprintln!(
-        "prefill finished in {:.2}s",
-        started.elapsed().as_secs_f32()
+        "prefill finished in {:.2}s ({:.1} ms/tok GPU replay)",
+        started.elapsed().as_secs_f32(),
+        1e3 * prefill_gpu_seconds / prompt_tokens.len() as f64
     );
 
     let mut stream = tokenizer.decode_stream(true);
@@ -777,6 +795,7 @@ fn run_metal() -> Result<(), String> {
     let started = std::time::Instant::now();
     let mut generated = 0usize;
     let mut decode_steps = 0usize;
+    let mut decode_gpu_seconds = 0.0f64;
     while generated < arguments.new_tokens {
         let scores = device.read_tensor_f32(logits.as_ref().unwrap());
         let next = scores
@@ -798,11 +817,9 @@ fn run_metal() -> Result<(), String> {
         if next == 128_001 || generated == arguments.new_tokens {
             break;
         }
-        logits = Some(step(
-            next,
-            prompt_tokens.len() + generated - 1,
-            &mut buffers,
-        )?);
+        let (output, seconds) = step(next, prompt_tokens.len() + generated - 1)?;
+        logits = Some(output);
+        decode_gpu_seconds += seconds;
         decode_steps += 1;
     }
     println!();
@@ -811,8 +828,9 @@ fn run_metal() -> Result<(), String> {
         eprintln!("generated {generated} token from the prefill logits");
     } else {
         eprintln!(
-            "generated {generated} tokens in {elapsed:.2}s ({:.2} decode tok/s)",
-            decode_steps as f32 / elapsed
+            "generated {generated} tokens in {elapsed:.2}s ({:.2} decode tok/s, {:.1} ms/tok GPU replay)",
+            decode_steps as f32 / elapsed,
+            1e3 * decode_gpu_seconds / decode_steps as f64
         );
     }
     Ok(())
