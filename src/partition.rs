@@ -1363,19 +1363,6 @@ impl Schedule {
         self.stages.len()
     }
 
-    /// Sum of the planned costs of the fused stages. Elementwise / gather /
-    /// sequential stages are not costed (they are bandwidth-bound copies at
-    /// worst; a real model would price them too).
-    pub fn fused_cost(&self) -> f64 {
-        self.stages
-            .iter()
-            .map(|s| match s {
-                Stage::Fused { spec, .. } => spec.cost,
-                _ => 0.0,
-            })
-            .sum()
-    }
-
     /// Execute the whole schedule on real input tensors; return the final
     /// output — the compiler's end-to-end result.
     ///
@@ -1539,29 +1526,13 @@ impl Schedule {
                             epilogue_inputs.join(", ")
                         )
                     };
-                    let mut block = String::new();
-                    if let Some(r) = spec.row_axis {
-                        block += &format!("row {}\u{d7}{}", r.name, spec.tile_m);
-                    }
-                    if let Some(c) = spec.col_tile_axis {
-                        block += &format!(" col {}\u{d7}{}", c.name, spec.tile_c);
-                    }
-                    if !spec.batch_axes.is_empty() {
-                        let labels: Vec<&str> =
-                            spec.batch_axes.iter().map(|a| a.name.as_str()).collect();
-                        block += &format!(" grid {{{}}}", labels.join(","));
-                    }
-                    if block.is_empty() {
-                        block = "scalar".to_string();
-                    }
                     format!(
-                        "{:<4} = fold `{}`({})  [{} slots: {}]  {}{}",
+                        "{:<4} = fold `{}`({})  [{} slots: {}]{}",
                         spec.output_name,
                         spec.streaming_axis.name,
                         spec.input_names.join(", "),
                         spec.carrier.slots,
                         spec.carrier.rules.join(", "),
-                        block.trim_start(),
                         epi,
                     )
                 }

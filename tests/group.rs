@@ -5,18 +5,15 @@
 //! numeric: `run_carrier_split(blocks) == eval` for awkward block counts
 //! (remainders, more blocks than elements), for the coupled online-softmax
 //! carrier where the merge does real work (rescaling by `exp(m − M)`), not
-//! just for plain sums. Then the scheduling half: the roofline picks a split
-//! exactly for occupancy-starved folds (matvec, giant softmax) and leaves
-//! well-parallelized kernels alone.
+//! just for plain sums.
 //!
 //! The same re-association is the data-parallel story: each device folds its
-//! shard, the allreduce is stage 2's merge. One mechanism, three uses.
+//! shard, the allreduce is stage 2's merge — and it is the law behind the
+//! intra-kernel simdgroup merges `plan::fold_sched` schedules.
 
-use sanic::cost::DeviceProfile;
 use sanic::derive::derive;
 use sanic::interp::{Env, Value, eval, run_carrier_split};
 use sanic::kernel_ir::*;
-use sanic::plan::split_factor;
 
 struct Lcg(u64);
 impl Lcg {
@@ -101,47 +98,4 @@ fn split_causal_flash_handles_identity_partials() {
         let got = run_carrier_split(&attn, t, &carrier, blocks, &env);
         assert_close(&got, &reference);
     }
-}
-
-// ── the scheduler: split exactly when the one-pass kernel starves ────────────
-#[test]
-fn occupancy_starved_matvec_wants_a_split() {
-    let (m, k) = (axis("m", 4), axis("k", 1_048_576));
-    // grid of 4, a million-element contraction: one pass = 4 resident blocks
-    // on a device that wants 8 — latency-bound. The roofline must split.
-    let w = input("W", &[m, k], Dtype::F32);
-    let x = input("x", &[k], Dtype::F32);
-    let y = matmul(w, x, k);
-    let carrier = derive(&y, k).unwrap();
-
-    let factor = split_factor(&y, k, &carrier, &DeviceProfile::toy());
-    assert!(
-        factor.is_some_and(|b| b >= 2),
-        "a 4-row matvec over 2^20 must split; got {factor:?}"
-    );
-}
-
-#[test]
-fn well_parallelized_attention_keeps_one_pass() {
-    let (s, k, d, e) = (
-        axis("s", 1024),
-        axis("k", 1024),
-        axis("d", 64),
-        axis("e", 64),
-    );
-    let attn = attention(
-        input("Q", &[s, d], Dtype::F32),
-        input("K", &[k, d], Dtype::F32),
-        input("V", &[k, e], Dtype::F32),
-        d,
-        k,
-    );
-    let carrier = derive(&attn, k).unwrap();
-
-    let factor = split_factor(&attn, k, &carrier, &DeviceProfile::toy());
-    assert_eq!(
-        factor, None,
-        "a 1024-row flash kernel already fills the device; splitting only \
-         adds a round trip"
-    );
 }

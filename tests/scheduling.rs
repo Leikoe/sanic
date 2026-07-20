@@ -22,7 +22,7 @@ fn acc_per_lane(d: f64) -> f64 {
         dd,
         k,
     );
-    sanic::derive(&attn, k)
+    sanic::derive::derive(&attn, k)
         .unwrap()
         .acc_scalars(|ax| if ax == e { d } else { 1.0 })
 }
@@ -42,7 +42,6 @@ fn fused(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)
         cands.push((
             t as usize,
             Kernel {
-                name: format!("flash(sq_tile={})", t as u64),
                 flops: 4.0 * sq * k * d,
                 hbm_bytes: (2.0 * sq * d + blocks * 2.0 * k * d) * b, // Q,O once; K,V per block
                 sram_per_block: constant + per_tile * t,
@@ -62,7 +61,6 @@ fn cut(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
     let mm_sram = (64.0 * 32.0 + 32.0 * 64.0 + 64.0 * 64.0) * b;
     vec![
         Kernel {
-            name: "scores = QKᵀ".into(),
             flops: 2.0 * sq * k * d,
             hbm_bytes: (sq * d + k * d + sq * k) * b,
             sram_per_block: mm_sram,
@@ -71,7 +69,6 @@ fn cut(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
             lanes_per_block: 64.0 * 64.0, // one lane per output point of the tile
         },
         Kernel {
-            name: "out = softmax(S)·V".into(),
             flops: 2.0 * sq * k * d + sq * k,
             hbm_bytes: (sq * k + k * d + sq * d) * b,
             sram_per_block: mm_sram,

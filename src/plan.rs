@@ -7,83 +7,27 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::analyze::{Parallelism, analyze_all};
-use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time, schedule_time};
+use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
 use crate::kernel_ir::{
-    Axis, Dtype, Node as NodeKind, NodeRef as Node, all_axes, input_axes, input_dtypes, leaf_names,
+    Axis, Dtype, Node as NodeKind, NodeRef as Node, input_axes, input_dtypes, leaf_names,
 };
 
 /// Elements streamed per step along the folded axis.
-pub const TILE_N: usize = 64;
+const TILE_N: usize = 64;
 
-/// A fully-resolved kernel: everything an emitter needs.
+/// A planned fused fold: the streamed axis, its carrier, and the cost that
+/// ranked it against other fold axes and against cutting. The physical GPU
+/// schedule is chosen downstream by [`fold_sched`]; this spec carries what
+/// the partitioner and the emitters actually consume.
 #[derive(Debug, Clone)]
 pub struct KernelSpec {
-    pub name: String,
     /// The axis this kernel folds over.
     pub streaming_axis: Axis,
-    /// Axes contracted internally (in the inputs, but neither streamed nor in
-    /// the output).
-    pub contract_axes: Vec<Axis>,
-    /// The axis tiled across SRAM rows per block. `None` means the output is
-    /// scalar-ish — the row tile is always 1.
-    pub row_axis: Option<Axis>,
-    /// Axes spanned only by some accumulator slots (e.g. the value head dim).
-    pub col_axes: Vec<Axis>,
-    /// Axes handled as grid-level parallelism, not tiled in SRAM.
-    pub batch_axes: Vec<Axis>,
     pub carrier: Carrier,
-    pub tile_m: usize,
-    pub tile_n: usize,
-    /// A second tiled block dimension, when the planner chose one (the 2D
-    /// GEMM block). `None` / 1 when the block is one-dimensional.
-    pub col_tile_axis: Option<Axis>,
-    pub tile_c: usize,
     pub input_names: Vec<&'static str>,
     pub output_name: String,
     pub cost: f64,
-    /// The winning roofline instance behind `cost` — what the block structure
-    /// actually costs in flops/traffic/SRAM/parallelism. Downstream searches
-    /// (the split-reduction factor) reprice variations of THIS kernel instead
-    /// of inventing a second, incomparable model.
-    pub roofline: Kernel,
-}
-
-/// A schedule: kernels in execution order, with a total cost. Currently the
-/// planner always produces a single fused kernel; splitting into pipelines is
-/// a natural extension, not a done one.
-pub struct Plan {
-    pub kernels: Vec<KernelSpec>,
-    pub total_cost: f64,
-}
-
-/// Plan the whole graph: try every axis that folds, keep the cheapest kernel.
-pub fn plan(node: &Node, dev: &DeviceProfile) -> Option<Plan> {
-    let report = analyze_all(node);
-
-    let mut best: Option<KernelSpec> = None;
-    for axis_report in &report.axes {
-        if axis_report.structure.level != Parallelism::Monoidal {
-            continue;
-        }
-        let Some(ref carrier) = axis_report.carrier else {
-            continue;
-        };
-        let Some(spec) = plan_axis(node, axis_report.axis, carrier, dev) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|b| spec.cost < b.cost) {
-            best = Some(spec);
-        }
-    }
-
-    let spec = best?;
-    let cost = spec.cost;
-    Some(Plan {
-        kernels: vec![spec],
-        total_cost: cost,
-    })
 }
 
 /// Choose the cheapest feasible block structure for streaming `node` over one
@@ -100,12 +44,6 @@ pub fn plan_axis(
     // ── axis roles, read off the carrier and the IR ──────────────────────────
     let out_axes = node.shape();
     let out_set: HashSet<Axis> = out_axes.iter().copied().collect();
-
-    // Contract axes: in the graph, but neither streamed nor in the output.
-    let contract_axes: Vec<Axis> = all_axes(node)
-        .into_iter()
-        .filter(|&ax| ax != streaming_axis && !out_set.contains(&ax))
-        .collect();
 
     // Each slot spans some free axes per output point. Axes shared by every
     // slot are row/batch/col-tile candidates; axes on only some slots are
@@ -216,16 +154,7 @@ pub fn plan_axis(
     let mut by_extent: Vec<Axis> = span_schedulable.clone();
     by_extent.sort_by(|&a, &b| ext(b).total_cmp(&ext(a)));
 
-    struct Best {
-        row: Option<Axis>,
-        col: Option<Axis>,
-        batch: Vec<Axis>,
-        tile_m: usize,
-        tile_c: usize,
-        cost: f64,
-        kernel: Kernel,
-    }
-    let mut best: Option<Best> = None;
+    let mut best_cost: Option<f64> = None;
 
     let row_options: Vec<Option<Axis>> = by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
     for &row in &row_options {
@@ -339,7 +268,6 @@ pub fn plan_axis(
                             .map(|&ax| ext(ax))
                             .product();
                         let k = Kernel {
-                            name: format!("fused(tile={tm}x{tc})"),
                             flops: total_flops,
                             hbm_bytes: hbm,
                             sram_per_block: sram,
@@ -352,16 +280,8 @@ pub fn plan_axis(
                             continue;
                         }
                         let cost = kernel_time(dev, &k);
-                        if best.as_ref().is_none_or(|b| cost < b.cost) {
-                            best = Some(Best {
-                                row,
-                                col,
-                                batch: batch.clone(),
-                                tile_m: tm as usize,
-                                tile_c: tc as usize,
-                                cost,
-                                kernel: k,
-                            });
+                        if best_cost.is_none_or(|b| cost < b) {
+                            best_cost = Some(cost);
                         }
                     }
                 }
@@ -369,88 +289,13 @@ pub fn plan_axis(
         }
     }
 
-    let Best {
-        row: row_axis,
-        col: col_tile_axis,
-        batch: batch_axes,
-        tile_m,
-        tile_c,
-        cost,
-        kernel,
-    } = best?;
-
     Some(KernelSpec {
-        name: "fused".to_string(),
         streaming_axis,
-        contract_axes,
-        row_axis,
-        col_axes,
-        batch_axes,
         carrier: carrier.clone(),
-        tile_m,
-        tile_n: TILE_N,
-        col_tile_axis,
-        tile_c,
         input_names: leaf_names(node),
         output_name: "Out".to_string(),
-        cost,
-        roofline: kernel,
+        cost: best_cost?,
     })
-}
-
-/// Should this fold run as a TWO-STAGE split reduction (GROUP), and in how
-/// many blocks? Price every factor with the same roofline that ranks tiles:
-/// stage 1 folds `blocks` chunks in parallel and writes `grid·blocks·slots`
-/// raw partials; stage 2 reads them back, merges, projects. Splitting wins
-/// exactly when the one-pass kernel cannot occupy the device — a matvec's
-/// grid of 1 or a giant softmax denominator leaves it latency-bound, and
-/// re-associating the fold (legal by the monoid law) buys `blocks`-way
-/// parallelism for the price of one small round trip. Returns the winning
-/// factor, or `None` when one pass is already cheapest.
-pub fn split_factor(
-    node: &Node,
-    streaming_axis: Axis,
-    carrier: &Carrier,
-    dev: &DeviceProfile,
-) -> Option<usize> {
-    let spec = plan_axis(node, streaming_axis, carrier, dev)?;
-    let single = spec.cost;
-    let bytes = dev.dtype_bytes;
-    let grid_vol: f64 = node.shape().iter().map(|ax| ax.extent() as f64).product();
-    let slots = carrier.slots as f64;
-    let n = streaming_axis.extent() as f64;
-
-    let mut best: Option<(usize, f64)> = None;
-    let mut b = 2usize;
-    while (b as f64) <= n && b <= 4096 {
-        let bf = b as f64;
-        let partials = grid_vol * bf * slots;
-        // Stage 1 is THE SAME kernel the single-pass plan chose — same tiles,
-        // same traffic, same working set — with two differences the split
-        // buys/pays for: `b`-way more block parallelism, and the partials
-        // written out instead of projected in registers.
-        let mut stage1 = spec.roofline.clone();
-        stage1.name = format!("partial(×{b})");
-        stage1.parallel_blocks *= bf;
-        stage1.hbm_bytes += partials * bytes;
-        // Stage 2 reads the partials back and merges them per output point.
-        let stage2 = Kernel {
-            name: "combine".to_string(),
-            flops: partials,
-            hbm_bytes: (partials + grid_vol) * bytes,
-            sram_per_block: slots * bytes,
-            regs_per_block: slots * bytes,
-            parallel_blocks: grid_vol,
-            lanes_per_block: 1.0,
-        };
-        if let Some(t) = schedule_time(dev, &[stage1, stage2])
-            && best.as_ref().is_none_or(|(_, bt)| t < *bt)
-        {
-            best = Some((b, t));
-        }
-        b *= 2;
-    }
-    best.filter(|(_, t)| *t < single).map(|(b, _)| b)
 }
 
 // ── intra-kernel fold schedules ──────────────────────────────────────────────
@@ -512,7 +357,7 @@ impl FoldSched {
 /// so both split freely. ArgIdx ties break by FIRST position and the k-best
 /// combine is a singleton insert, not a two-list merge — an interleaved
 /// lane/simdgroup partition would change their meaning, so they decline
-/// (the same rule `emit_split_metal` enforces); AffineStep is sequential.
+/// (the same rule `run_carrier_split` guards); AffineStep is sequential.
 pub fn mergeable_out_of_order(carrier: &Carrier) -> bool {
     carrier
         .kinds
@@ -719,7 +564,6 @@ pub fn fold_sched(
             carrier.slots as f64 * b_bytes
         };
         let k = Kernel {
-            name: "sched".into(),
             flops,
             hbm_bytes: hbm,
             sram_per_block: sram,
@@ -766,7 +610,7 @@ pub fn fold_sched(
 /// analytical chooser prices, exposed so a measured tuner can time the same
 /// set on the real device and overrule the model (`--tune`). Order-sensitive
 /// carriers get only the scalar entry, exactly as the chooser treats them.
-pub fn fold_sched_candidates(
+fn fold_sched_candidates(
     fold_node: &Node,
     streaming_axis: Axis,
     carrier: &Carrier,
@@ -897,7 +741,7 @@ mod tests {
     use crate::kernel_ir::*;
 
     #[test]
-    fn attention_selects_row_axis_sq() {
+    fn attention_plans_a_feasible_batched_kernel() {
         let (b, h, sq, k, d, e) = (
             axis("b", 1),
             axis("h", 8),
@@ -917,20 +761,12 @@ mod tests {
         let dev = DeviceProfile::toy();
         let spec = plan_axis(&attn, k, &c, &dev).unwrap();
 
-        assert_eq!(
-            spec.row_axis,
-            Some(sq),
-            "row axis must be sq, not a batch dim"
-        );
-        assert_eq!(spec.col_axes, vec![e], "col axis is the value head dim");
-        assert!(spec.batch_axes.contains(&b));
-        assert!(spec.batch_axes.contains(&h));
-        assert!(spec.tile_m > 1, "a non-trivial tile should be chosen");
+        assert_eq!(spec.streaming_axis, k);
         assert!(spec.cost > 0.0);
     }
 
     #[test]
-    fn sum_schedules_with_tile_1() {
+    fn a_scalar_output_fold_still_plans() {
         // Reduce(X[n], n, Add) → scalar output; no row axis.
         let n = axis("n", 4096);
         let x = input("X", &[n], Dtype::F32);
@@ -939,9 +775,7 @@ mod tests {
         let dev = DeviceProfile::toy();
         let spec = plan_axis(&s, n, &c, &dev).unwrap();
 
-        assert_eq!(spec.tile_m, 1, "scalar output → row tile must be 1");
-        assert_eq!(spec.row_axis, None);
-        assert!(spec.cost > 0.0);
+        assert!(spec.cost > 0.0, "a scalar-output fold still plans");
     }
 
     #[test]
@@ -965,46 +799,8 @@ mod tests {
         carrier.spans.push(Vec::new());
         carrier.kinds.push(SlotKind::Plain(Monoid::Add));
 
-        let spec = plan_axis(&dot, stream, &carrier, &DeviceProfile::m1_pro())
+        plan_axis(&dot, stream, &carrier, &DeviceProfile::m1_pro())
             .expect("the output axis is a legal tile even if one slot is invariant");
-        assert_eq!(spec.row_axis, Some(output));
-    }
-
-    #[test]
-    fn attention_plans_to_single_kernel() {
-        let (sq, k, d, e) = (
-            axis("sq", 1024),
-            axis("k", 1024),
-            axis("d", 64),
-            axis("e", 64),
-        );
-        let attn = attention(
-            input("Q", &[sq, d], Dtype::F32),
-            input("K", &[k, d], Dtype::F32),
-            input("V", &[k, e], Dtype::F32),
-            d,
-            k,
-        );
-        let dev = DeviceProfile::toy();
-
-        let plan = plan(&attn, &dev).expect("must find a feasible kernel");
-        assert_eq!(plan.kernels.len(), 1);
-        assert_eq!(plan.kernels[0].streaming_axis, k);
-        assert!(plan.total_cost > 0.0);
-    }
-
-    #[test]
-    fn sum_plans_to_single_kernel() {
-        let n = axis("n", 65536);
-        let x = input("X", &[n], Dtype::F32);
-        let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
-        let dev = DeviceProfile::toy();
-
-        // Sum has a carrier, so planning succeeds even for a fold with no
-        // row tile and no inner contraction.
-        let plan = plan(&s, &dev);
-        assert!(plan.is_some(), "sum should have a feasible kernel");
-        assert_eq!(plan.unwrap().kernels.len(), 1);
     }
 
     // Declared storage dtypes change the bandwidth bill: the same

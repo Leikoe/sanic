@@ -10,7 +10,8 @@
 //! execution.
 
 use sanic::kernel_ir::*;
-use sanic::{Carrier, Expr, Parallelism, analyze, analyze_all, derive, streamable, structure};
+use sanic::analyze::{Parallelism, analyze, analyze_all, streamable, structure};
+use sanic::derive::{Carrier, Expr, derive};
 
 fn add_r() -> BinOp {
     BinOp::Monoid(Monoid::Add)

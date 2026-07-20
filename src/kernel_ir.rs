@@ -113,10 +113,6 @@ impl Axis {
             Extent::Dynamic => panic!("axis `{}` has a dynamic extent", self.name),
         }
     }
-
-    pub const fn is_dynamic(self) -> bool {
-        matches!(self.extent, Extent::Dynamic)
-    }
 }
 
 impl PartialEq for Axis {

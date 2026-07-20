@@ -50,7 +50,10 @@ use crate::kernel_ir::{
     reindex, scan, view,
 };
 
-/// Simplify `node` in two phases, each to a fixpoint.
+/// Simplify several roots TOGETHER, in two phases, each to a fixpoint. One
+/// CSE table is shared per pass, so a subtree computed in one root and
+/// recomputed in another (a forward value and its reappearance in the
+/// backward) becomes a single node.
 ///
 /// Phase 1 is cancellation only — the ring identities, the defer-scale factor
 /// and CSE — which collapses a stabilizing max-shift's winner-mask cotangent to
@@ -61,15 +64,6 @@ use crate::kernel_ir::{
 /// mask's cotangent path, so reconstructing it *before* that path has cancelled
 /// would rewrite a live reduction into a spurious `Σ softmax`. Cancelling
 /// first leaves only the true softmax for phase 2 to reshape.
-pub fn simplify(node: &Node) -> Node {
-    simplify_many(std::slice::from_ref(node)).pop().unwrap()
-}
-
-/// Simplify several roots TOGETHER, sharing one CSE table per pass, so a
-/// subtree computed in one root and recomputed in another (a forward value and
-/// its reappearance in the backward) becomes a single node — which is what lets
-/// a reconstructed `exp(x − lse)` reuse the forward's materialized logsumexp
-/// instead of recomputing the `(max, Σexp)` fold. Two phases (see [`simplify`]).
 pub fn simplify_many(roots: &[Node]) -> Vec<Node> {
     let mut cur: Vec<Node> = roots.to_vec();
     for reconstruct in [false, true] {

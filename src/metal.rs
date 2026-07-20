@@ -6,10 +6,7 @@
 //! * [`MetalDevice`] — the device and its command queue; opens `None` on a
 //!   machine without a GPU so callers can skip cleanly.
 //! * **Compiler** — [`MetalDevice::compile`] turns generated MSL into named
-//!   pipelines; [`MetalDevice::compile_chunked`] splits multi-thousand-kernel
-//!   programs into chunks first (Metal's front-end time grows superlinearly
-//!   with source size — a 9k-kernel model compiles in seconds chunked,
-//!   minutes whole).
+//!   pipelines.
 //! * **Allocator** — [`MetalBuf`]s in shared (unified) memory, with typed
 //!   upload paths: f32/f64 widening writes, raw bytes for packed int4 and
 //!   f16 storage.
@@ -23,9 +20,9 @@
 //! KV-cache commit), since dispatches bind by name at build time.
 //!
 //! * **Graphs** — [`MetalDevice::capture`] freezes a dispatch list into an
-//!   `MTLIndirectCommandBuffer`; [`MetalDevice::run_graph`] replays it with
-//!   one encoder and one execute call per step. Swap commits flip bindings
-//!   with period two, so decode loops keep one graph per step parity.
+//!   `MTLIndirectCommandBuffer`; [`MetalDevice::run_graph_timed`] replays it
+//!   with one encoder and one execute call per step. Swap commits flip
+//!   bindings with period two, so decode loops keep one graph per step parity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,8 +40,6 @@ use objc2_metal::{
 };
 
 use crate::emit_metal::MetalProgram;
-use crate::partition::Schedule;
-use crate::plan::FoldSched;
 
 /// A pipeline for one compiled kernel.
 pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -164,77 +159,6 @@ impl MetalDevice {
             .unwrap_or_else(|e| panic!("pipeline `{name}`: {e}"))
     }
 
-    /// Compile a large program in chunks of `chunk` kernels, each prefixed
-    /// with `header` (the shared prelude every kernel needs). Progress goes
-    /// to stderr when `progress` is set.
-    pub fn compile_chunked(
-        &self,
-        msl: &str,
-        header: &str,
-        chunk: usize,
-        progress: bool,
-    ) -> Pipelines {
-        let body = msl.strip_prefix(header).unwrap_or(msl);
-        // A kernel-level attribute (`[[max_total_threads_per_threadgroup(n)]]`
-        // on its own line) precedes `kernel void`, so the split leaves it at
-        // the TAIL of the previous kernel's segment — reattach it to the
-        // kernel it belongs to or a chunk boundary would orphan it.
-        let raw: Vec<&str> = body.split("kernel void ").skip(1).collect();
-        let mut kernels: Vec<(String, &str)> = Vec::new(); // (attr prefix, body)
-        let mut pending = String::new();
-        for k in raw {
-            let attr = std::mem::take(&mut pending);
-            let (piece, tail) = match k.rfind("\n[[") {
-                Some(p) if k[p + 1..].trim_end().ends_with("]]") => {
-                    (&k[..p + 1], k[p + 1..].trim_end().to_string())
-                }
-                _ => (k, String::new()),
-            };
-            pending = tail;
-            kernels.push((attr, piece));
-        }
-        let mut map = HashMap::new();
-        let t0 = std::time::Instant::now();
-        for (ci, group) in kernels.chunks(chunk).enumerate() {
-            let mut src = String::from(header);
-            for (attr, k) in group {
-                if !attr.is_empty() {
-                    src.push_str(attr);
-                    src.push('\n');
-                }
-                src.push_str("kernel void ");
-                src.push_str(k);
-            }
-            let lib = self
-                .dev
-                .newLibraryWithSource_options_error(&NSString::from_str(&src), None)
-                .unwrap_or_else(|e| panic!("MSL chunk {ci} failed to compile: {e}"));
-            for (_, k) in group {
-                let name = k.split('(').next().unwrap().trim().to_string();
-                let f = lib
-                    .newFunctionWithName(&NSString::from_str(&name))
-                    .unwrap_or_else(|| panic!("kernel `{name}` missing"));
-                map.insert(name.clone(), self.pipeline(&f, &name));
-            }
-            if progress && ci % 8 == 0 {
-                eprint!(
-                    "\r  compiling MSL: {}/{} kernels ({:.0}s)",
-                    (ci * chunk + group.len()).min(kernels.len()),
-                    kernels.len(),
-                    t0.elapsed().as_secs_f32()
-                );
-            }
-        }
-        if progress {
-            eprintln!(
-                "\r  compiled {} kernels in {:.1}s        ",
-                kernels.len(),
-                t0.elapsed().as_secs_f32()
-            );
-        }
-        Pipelines { map }
-    }
-
     // ── allocator ────────────────────────────────────────────────────────────
 
     /// A zeroed buffer of `count` f32 elements.
@@ -250,14 +174,6 @@ impl MetalDevice {
             .expect("buffer allocation");
         unsafe { std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes.max(4)) };
         MetalBuf(buf, 0)
-    }
-
-    pub fn from_f32(&self, data: &[f32]) -> MetalBuf {
-        let buf = self.alloc_bytes(data.len() * 4);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len())
-        };
-        buf
     }
 
     /// Host f64 → device f32 (the compute width of this backend).
@@ -325,25 +241,12 @@ impl MetalDevice {
         cb.waitUntilCompleted();
     }
 
-    /// [`Self::run`], returning the command buffer's GPU residency in
-    /// seconds (`GPUEndTime − GPUStartTime`) — kernel time plus any
-    /// inter-dispatch bubbles, free of CPU encode/submit cost. This is the
-    /// number per-dispatch wall clocks can't give: no sync floor.
-    pub fn run_timed(&self, dispatches: &[Dispatch]) -> f64 {
-        let cb = self.queue.commandBuffer().expect("command buffer");
-        for d in dispatches {
-            encode(&cb, d);
-        }
-        cb.commit();
-        cb.waitUntilCompleted();
-        gpu_seconds(&cb)
-    }
-
     /// One command buffer PER dispatch: each kernel's own GPU residency, in
     /// order. This is the `SANIC_DEBUG=2` path (tinygrad's `DEBUG=2` also
     /// synchronizes per kernel to time it) — the per-dispatch submit adds a
-    /// sync floor, so the SUM is not a decode-speed number; [`Self::run_timed`]
-    /// is. Individual kernel times are accurate: GPU start→end, no CPU cost.
+    /// sync floor, so the SUM is not a decode-speed number;
+    /// [`Self::run_graph_timed`] is. Individual kernel times are accurate:
+    /// GPU start→end, no CPU cost.
     pub fn run_each_timed(&self, dispatches: &[Dispatch]) -> Vec<f64> {
         dispatches
             .iter()
@@ -359,8 +262,7 @@ impl MetalDevice {
 }
 
 /// Encode one kernel launch onto a command buffer — the one encode path
-/// behind [`MetalDevice::run`], [`MetalDevice::run_timed`] and
-/// [`MetalDevice::run_each_timed`].
+/// behind [`MetalDevice::run`] and [`MetalDevice::run_each_timed`].
 fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch) {
     let enc = cb.computeCommandEncoder().expect("compute encoder");
     enc.setComputePipelineState(&d.pipe);
@@ -550,14 +452,10 @@ impl MetalDevice {
         }
     }
 
-    /// Replay a captured graph and wait: one command buffer, one encoder,
-    /// one execute call.
-    pub fn run_graph(&self, g: &MetalGraph) -> Result<(), String> {
-        self.replay_checked(g).map(|_| ())
-    }
-
-    /// [`Self::run_graph`], returning GPU residency in seconds (see
-    /// [`Self::run_timed`]).
+    /// Replay a captured graph and wait — one command buffer, one encoder,
+    /// one execute call — returning GPU residency in seconds
+    /// (`GPUEndTime − GPUStartTime`: kernel time plus inter-dispatch
+    /// bubbles, free of CPU encode/submit cost).
     pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
         self.replay_checked(g).map(|cb| gpu_seconds(&cb))
     }
@@ -588,209 +486,6 @@ impl MetalDevice {
             None => Ok(cb),
         }
     }
-}
-
-/// Measure the legal cooperative schedules of a partitioned schedule's fold
-/// stages ON THE REAL DEVICE and return the per-stage winners where the
-/// silicon disagrees with the analytical chooser — the measurement feedback
-/// the `--bench`/`--proto` harnesses collected by hand, closed into a loop.
-///
-/// Runs over the model's ACTUAL buffers (pass the uploaded buffer map), so
-/// data-dependent bounds — the honest window reads `pos` — time truthfully;
-/// outputs go to scratch, never the real intermediates (a tuned kernel must
-/// not scribble over a persistent cache). One measurement per CANONICAL
-/// kernel class: isomorphic layers share it. Feed the result to
-/// [`crate::emit_metal::emit_schedule_metal_over`].
-pub fn tune_schedules(
-    g: &MetalDevice,
-    sched: &Schedule,
-    dev: &crate::cost::DeviceProfile,
-    bufs: &HashMap<String, MetalBuf>,
-) -> HashMap<String, FoldSched> {
-    use crate::emit_metal::{canonical_source, emit_fused_metal_sched_with};
-    use crate::partition::Stage;
-    use crate::plan::{fold_sched, fold_sched_candidates};
-
-    // group fold stages by canonical class under the ANALYTIC choice
-    let mut classes: HashMap<String, (usize, Vec<String>)> = HashMap::new();
-    for (i, st) in sched.stages.iter().enumerate() {
-        let Stage::Fused {
-            spec,
-            fold_node,
-            epilogue_node,
-            ..
-        } = st
-        else {
-            continue;
-        };
-        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev);
-        let k = emit_fused_metal_sched_with(
-            "probe",
-            &spec.carrier,
-            spec.streaming_axis,
-            fold_node,
-            analytic,
-            epilogue_node
-                .as_ref()
-                .map(|e| (e, spec.output_name.as_str())),
-        );
-        classes
-            .entry(canonical_source(&k))
-            .or_insert_with(|| (i, Vec::new()))
-            .1
-            .push(spec.output_name.clone());
-    }
-
-    let mut overrides = HashMap::new();
-    for (class_key, (rep, outs)) in classes {
-        let Stage::Fused {
-            spec,
-            fold_node,
-            epilogue_node,
-            ..
-        } = &sched.stages[rep]
-        else {
-            unreachable!()
-        };
-        let epi = epilogue_node
-            .as_ref()
-            .map(|e| (e, spec.output_name.as_str()));
-        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev);
-        let cands = fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier);
-
-        // emit each candidate; guards fall back to scalar, so dedup by body.
-        // Pre-filter by the threadgroup-memory budget the emitter would
-        // allocate — an over-budget pipeline fails to CREATE, not to rank.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut entries: Vec<(FoldSched, crate::emit_metal::MetalKernel, String)> = Vec::new();
-        for (ci, c) in cands.into_iter().enumerate() {
-            if c.sgs > 1 {
-                let e_a = c.lane_axis.map(|a| a.extent()).unwrap_or(1);
-                let sliced: usize = (0..spec.carrier.slots)
-                    .filter(|&j| {
-                        c.lane_axis
-                            .is_some_and(|a| spec.carrier.spans[j].contains(&a))
-                    })
-                    .map(|_| c.sgs * e_a)
-                    .sum();
-                if (spec.carrier.slots * c.sgs + sliced) * 4 > 32 * 1024 {
-                    continue;
-                }
-            }
-            let k = emit_fused_metal_sched_with(
-                &format!("tune{ci}"),
-                &spec.carrier,
-                spec.streaming_axis,
-                fold_node,
-                c,
-                epi,
-            );
-            let canon = canonical_source(&k);
-            if seen.insert(canon.clone()) {
-                entries.push((c, k, canon));
-            }
-        }
-        if entries.len() < 2 {
-            continue; // nothing to choose between
-        }
-        let full_msl = format!(
-            "{}{}",
-            crate::emit_metal::MSL_HEADER,
-            entries
-                .iter()
-                .map(|(_, k, _)| k.msl.replace(crate::emit_metal::MSL_HEADER, ""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        let pipes = g.compile(&full_msl);
-
-        // The FIRST entry is the scalar base kernel — the reference every
-        // other candidate must MATCH on the same buffers before it may win:
-        // the --proto discipline (same math, same buffers, checked), in the
-        // loop. A mismatch is an emitter bug surfacing, not a schedule
-        // preference; it is reported and never chosen.
-        let out_elems: usize = fold_node
-            .shape()
-            .iter()
-            .map(|a| a.extent())
-            .product::<usize>()
-            .max(1);
-        let mut reference: Option<Vec<f32>> = None;
-        let mut best: Option<(f64, FoldSched)> = None;
-        let mut analytic_t = f64::INFINITY;
-        for (c, k, canon) in &entries {
-            let Some(inputs) = k
-                .inputs
-                .iter()
-                .map(|(n, _)| bufs.get(*n).cloned())
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue; // a buffer the caller didn't upload — skip the class
-            };
-            // scratch must fit the OUTPUT, not the thread grid: a
-            // lane-distributed kernel writes out_elems from far fewer
-            // threads, and an undersized buffer is an out-of-bounds WRITE
-            // over whatever the allocator placed next (measured: silent
-            // weight corruption, then SIGBUS)
-            let out_buf = g.alloc_f32(k.grid_size.max(out_elems).max(1));
-            let d = Dispatch {
-                pipe: pipes.get(&k.name),
-                inputs,
-                argbuf: None,
-                output: out_buf.clone(),
-                grid: k.grid_size,
-            };
-            g.run(&[d.clone()]); // warm + the correctness sample
-            let got = g.read_f32(&out_buf, out_elems);
-            match &reference {
-                None => reference = Some(got), // the scalar base
-                Some(r) => {
-                    // NaN-poisoned garbage in unwritten intermediates must
-                    // FAIL the equivalence, not slip through a vacuous
-                    // comparison
-                    let bad = r
-                        .iter()
-                        .zip(&got)
-                        .any(|(a, b)| !((a - b).abs() <= 2e-3 * (1.0 + a.abs().max(b.abs()))));
-                    if bad {
-                        eprintln!(
-                            "tune: candidate {c:?} MISMATCHES the scalar base on \
-                             `{}` — skipped (emitter bug: report it)",
-                            spec.output_name
-                        );
-                        continue;
-                    }
-                }
-            }
-            let reps: Vec<Dispatch> = (0..16).map(|_| d.clone()).collect();
-            let t = (0..3).map(|_| g.run_timed(&reps)).fold(f64::MAX, f64::min) / 16.0;
-            if *canon == class_key {
-                analytic_t = t;
-            }
-            if best.as_ref().is_none_or(|(bt, _)| t < *bt) {
-                best = Some((t, *c));
-            }
-        }
-        if let Some((bt, bc)) = best
-            && bc != analytic
-            && bt < analytic_t * 0.95
-        {
-            // the measurement overrules the model only when it CLEARLY wins
-            for out in &outs {
-                overrides.insert(out.clone(), bc);
-            }
-            eprintln!(
-                "tune: `{}` ×{}: {:?} → {:?} ({:.1} → {:.1} µs)",
-                spec.output_name,
-                outs.len(),
-                analytic,
-                bc,
-                analytic_t * 1e6,
-                bt * 1e6
-            );
-        }
-    }
-    overrides
 }
 
 /// Entry-point names defined in an MSL source.

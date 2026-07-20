@@ -458,8 +458,8 @@ pub enum SlotKind {
     /// `base` is the rank-0 slot and ranks are contiguous from it. The
     /// combine is the SINGLETON insert `merge(A, [b])` — exact for
     /// element-at-a-time streaming, NOT a two-list merge, so split
-    /// reductions must decline (guarded in `run_carrier_split` /
-    /// `emit_split_metal`).
+    /// reductions must decline (guarded in `run_carrier_split` and
+    /// `plan::mergeable_out_of_order`).
     KBestVal { base: usize, rank: usize },
     /// Index slot `rank` of a k-best selection; `vbase`/`ibase` are the
     /// rank-0 value/index slots. Same singleton-insert caveat as

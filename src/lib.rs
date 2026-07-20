@@ -61,8 +61,6 @@ pub mod derive;
 #[doc(hidden)]
 pub mod emit_metal;
 #[doc(hidden)]
-pub mod emit_rust;
-#[doc(hidden)]
 pub mod grad;
 #[doc(hidden)]
 pub mod interp;
@@ -95,13 +93,3 @@ pub use ir::*;
 #[cfg(target_os = "macos")]
 pub use metal::MetalDevice;
 
-// Transitional compiler-engine exports used by the low-level law suite. New
-// graph construction goes through `ir` and `Compile`.
-#[doc(hidden)]
-pub use analyze::{
-    AxisReport, Parallelism, Report, Structure, analyze, analyze_all, streamable, structure,
-};
-#[doc(hidden)]
-pub use derive::{Carrier, Expr, SlotKind, derive};
-#[doc(hidden)]
-pub use interp::{Env, Value, eval, run_carrier};

@@ -66,16 +66,6 @@ impl Value {
         }
     }
 
-    /// A row-major tensor described only by its positional shape.
-    pub fn from_shape(shape: impl AsRef<[usize]>, data: Vec<f64>) -> Value {
-        let shape = shape.as_ref().to_vec();
-        let axes: Vec<Axis> = shape
-            .iter()
-            .map(|&extent| crate::kernel_ir::axis("", extent))
-            .collect();
-        Value::from_data(&axes, shape, data)
-    }
-
     /// A concrete tensor from runtime shape and row-major data. Dynamic axis
     /// extents are supplied by `shape`; static extents are validated.
     pub fn from_data(axes: &[Axis], shape: Vec<usize>, data: Vec<f64>) -> Value {
@@ -405,7 +395,6 @@ fn eval_scan(
         );
     };
     let s = eval_rc(src, env, cache);
-    let n = axis.extent();
     Value::from_fn(&s.axes.clone(), |c| {
         // prefix fold up to and including this coordinate's position on `axis`
         let upto = c[&axis];
@@ -415,7 +404,6 @@ fn eval_scan(
             coord.insert(axis, i);
             acc = monoid_combine(m, acc, s.at(&coord));
         }
-        let _ = n;
         acc
     })
 }

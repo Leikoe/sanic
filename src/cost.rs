@@ -68,7 +68,6 @@ impl DeviceProfile {
 /// baked in, so costing is a pure readout.
 #[derive(Debug, Clone)]
 pub struct Kernel {
-    pub name: String,
     pub flops: f64,
     /// Total global-memory traffic, reads + writes. Materializing an
     /// intermediate (a fusion cut) shows up here as an extra write + read.
@@ -164,7 +163,6 @@ mod tests {
 
     fn kernel(flops: f64, hbm: f64, sram: f64, blocks: f64) -> Kernel {
         Kernel {
-            name: "k".into(),
             flops,
             hbm_bytes: hbm,
             sram_per_block: sram,

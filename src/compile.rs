@@ -8,7 +8,6 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::cost;
@@ -795,11 +794,6 @@ impl Backend for CpuDevice {
             .collect()
     }
 }
-
-// Keep the generic type parameter visible in rustdoc even on platforms where
-// Metal is not compiled.
-#[allow(dead_code)]
-struct BackendMarker<B: Backend>(PhantomData<B>);
 
 // ── Metal backend ───────────────────────────────────────────────────────────
 

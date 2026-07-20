@@ -32,10 +32,6 @@ impl Axis {
             Extent::Dynamic => panic!("axis `{}` has a dynamic extent", self.name),
         }
     }
-
-    pub const fn is_dynamic(self) -> bool {
-        matches!(self.extent, Extent::Dynamic)
-    }
 }
 
 impl fmt::Display for Axis {
@@ -283,11 +279,6 @@ pub fn reduce(src: NodeRef, dim: impl Dimension, op: BinOp) -> NodeRef {
     Rc::new(Node::Reduce { src, dim, op })
 }
 
-pub fn scan(src: NodeRef, dim: impl Dimension, op: BinOp) -> NodeRef {
-    let dim = dim.resolve(&src.shape(), "scan");
-    Rc::new(Node::Scan { src, dim, op })
-}
-
 pub fn gather(src: NodeRef, index: NodeRef, dim: impl Dimension) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "gather");
     Rc::new(Node::Gather { src, index, dim })
@@ -328,38 +319,6 @@ pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
         "view: every source dimension must be consumed exactly once"
     );
     Rc::new(Node::View { src, dims })
-}
-
-pub trait IntoViewDims {
-    fn into_view_dims(self, source: &[Axis]) -> Vec<ViewDim>;
-}
-
-impl IntoViewDims for Vec<(Vec<usize>, Axis)> {
-    fn into_view_dims(self, _source: &[Axis]) -> Vec<ViewDim> {
-        self.into_iter()
-            .map(|(sources, axis)| ViewDim { sources, axis })
-            .collect()
-    }
-}
-
-/// Build a positional view. Groups are listed in output order.
-pub fn view(src: NodeRef, dims: impl IntoViewDims) -> NodeRef {
-    let shape = src.shape();
-    positional_view(src, dims.into_view_dims(&shape))
-}
-
-pub fn rename(src: NodeRef, from: impl Dimension, to: Axis) -> NodeRef {
-    let source = src.shape();
-    let from = from.resolve(&source, "rename");
-    let dims = source
-        .iter()
-        .enumerate()
-        .map(|(index, &axis)| ViewDim {
-            sources: vec![index],
-            axis: if index == from { to } else { axis },
-        })
-        .collect();
-    positional_view(src, dims)
 }
 
 /// Swap two dimensions without copying storage.
@@ -448,44 +407,6 @@ pub fn positional_reindex(
     })
 }
 
-pub fn slice(src: NodeRef, from: impl Dimension, to: Axis, start: usize) -> NodeRef {
-    let source = src.shape();
-    let from = from.resolve(&source, "slice");
-    let mut shape = source.clone();
-    shape[from] = to;
-    let map = source
-        .iter()
-        .enumerate()
-        .map(|(dim, _)| {
-            (
-                dim,
-                vec![(1, dim)],
-                if dim == from { start as i64 } else { 0 },
-            )
-        })
-        .collect();
-    positional_reindex(src, shape, map, false)
-}
-
-pub fn pad(src: NodeRef, from: impl Dimension, to: Axis, lo: usize) -> NodeRef {
-    let source = src.shape();
-    let from = from.resolve(&source, "pad");
-    let mut shape = source.clone();
-    shape[from] = to;
-    let map = source
-        .iter()
-        .enumerate()
-        .map(|(dim, _)| {
-            (
-                dim,
-                vec![(1, dim)],
-                if dim == from { -(lo as i64) } else { 0 },
-            )
-        })
-        .collect();
-    positional_reindex(src, shape, map, true)
-}
-
 pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> NodeRef {
     let source = src.shape();
     let from = from.resolve(&source, "split");
@@ -512,49 +433,6 @@ pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> No
         })
         .collect();
     positional_reindex(src, shape, map, false)
-}
-
-pub fn window(
-    src: NodeRef,
-    from: impl Dimension,
-    out: Axis,
-    kernel: Axis,
-    stride: usize,
-    dilation: usize,
-) -> NodeRef {
-    let source = src.shape();
-    let from = from.resolve(&source, "window");
-    let mut shape = source.clone();
-    shape.splice(from..=from, [out, kernel]);
-    let map = source
-        .iter()
-        .enumerate()
-        .map(|(source_dim, _)| {
-            if source_dim == from {
-                (
-                    source_dim,
-                    vec![(stride as i64, from), (dilation as i64, from + 1)],
-                    0,
-                )
-            } else {
-                let output_dim = if source_dim < from {
-                    source_dim
-                } else {
-                    source_dim + 1
-                };
-                (source_dim, vec![(1, output_dim)], 0)
-            }
-        })
-        .collect();
-    positional_reindex(src, shape, map, false)
-}
-
-pub fn volume(node: &NodeRef) -> usize {
-    node.shape()
-        .into_iter()
-        .map(Axis::extent)
-        .product::<usize>()
-        .max(1)
 }
 
 /// Rebuild `roots` with maximal sharing: separately constructed but
@@ -810,19 +688,6 @@ pub fn silu(x: NodeRef) -> NodeRef {
         )],
     );
     map(MapOp::Mul, vec![x, sigmoid])
-}
-
-pub fn causal_mask(query: Axis, key: Axis) -> NodeRef {
-    let query_position = unsqueeze_at(iota(query), 1);
-    let key_position = unsqueeze_at(iota(key), 0);
-    map(
-        MapOp::Where,
-        vec![
-            map(MapOp::Lt, vec![query_position, key_position]),
-            konst(-1e30),
-            konst(0.0),
-        ],
-    )
 }
 
 pub(crate) fn causal_mask_like(
