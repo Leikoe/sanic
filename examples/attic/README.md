@@ -15,6 +15,13 @@ the extents maps, drop the extents argument from `eval` / `partition` /
 `plan` / `grad` / `execute` / `Session::new` / `Value::from_fn`, and read
 `.name` / `.extent` off the axis.
 
+Since parked, the hand-rolled loaders also left (2026-07-19):
+`src/safetensors.rs` (`StFile`, `load`, `RawTensor`, `bf16_roundtrip`),
+its tiny JSON parser, and the `src/bpe.rs` GPT-2 encoder are all gone in
+favor of the `safetensors` and `tokenizers` crates (dev-dependencies),
+and the page-aligned zero-copy open is example-local now —
+`examples/llama3_2.rs` shows the pattern.
+
 What lives here and why it's worth reviving:
 
 * `gpt2.rs` — the capstone: real OpenAI weights on the GPU matching

@@ -394,8 +394,8 @@ plus the honest-window early exit. `vs_mlx.md` has the full ledger.
 
 **GPT-2 (124M), real OpenAI weights, matches HuggingFace.**
 `cargo run --release --example gpt2`: the official `model.safetensors` loads
-through a dependency-free reader (`src/safetensors.rs`, BF16/F16/F32 all
-decode), the 12-layer network is built as plain IR — LayerNorm from basis
+through a dependency-free reader (BF16/F16/F32 all decoded; since replaced
+by the `safetensors` crate), the 12-layer network is built as plain IR — LayerNorm from basis
 ops, learned positions as `gather(wpe, iota(s))`, the fused qkv weight split
 host-side, GELU as a tanh composition, weight-tied logits — `partition_many`
 splits it into **223 kernels in 0.18 s**, and the whole schedule dispatches
@@ -647,7 +647,8 @@ provably bit-identical (masked tail = exact f32 no-op; coop bound
 clamped to the split width so no lane merges identity — the −∞ edge);
 prefill causal flash gets per-row windows from the same detector; flash
 class 2.01 → 0.51 ms, GPU-tested at four positions vs the full oracle.
-CLOSED: tokenizer encoder (2026-07-13) — `src/bpe.rs`, GPT-2 byte-level
+CLOSED: tokenizer encoder (2026-07-13) — `src/bpe.rs` (since deleted in
+favor of the `tokenizers` crate), GPT-2 byte-level
 BPE in the dependency-free house style (the pre-tokenizer regex
 hand-rolled as its ordered-alternative matcher), held to HuggingFace
 tokenizations generated on this repo's own vocab files (`tests/bpe.rs`,

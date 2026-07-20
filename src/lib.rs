@@ -52,7 +52,6 @@ pub(crate) fn debug_bar(fraction: f64, width: usize) -> String {
 
 #[doc(hidden)]
 pub mod analyze;
-pub mod bpe;
 #[doc(hidden)]
 pub mod codegen;
 pub mod compile;
@@ -81,7 +80,6 @@ pub mod plan;
 pub mod runtime;
 #[doc(hidden)]
 pub mod rustgen;
-pub mod safetensors;
 #[doc(hidden)]
 pub mod simplify;
 #[doc(hidden)]

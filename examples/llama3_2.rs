@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use safetensors::SafeTensors;
 use sanic::nn::functional::scaled_dot_product_attention;
-use sanic::safetensors::StFile;
 use sanic::{
     Axis, BinOp, Compile, Dtype, MapOp, Monoid, Node, NodeRef, ViewDim, axis, coordinate, flatten,
     gather, input, iota, konst, map, matmul, positional_reindex, positional_view, reduce, silu,
@@ -492,39 +492,77 @@ fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
 
 fn validate_checkpoint(
     roots: &[NodeRef],
-    checkpoint: &Path,
-) -> Result<(StFile, HashMap<String, (Vec<usize>, Dtype)>), String> {
-    let file = StFile::open_metadata(checkpoint)?;
+    checkpoint: &SafeTensors,
+) -> Result<HashMap<String, (Vec<usize>, Dtype)>, String> {
     let specs = input_specs(roots);
     for (name, (expected_shape, expected_dtype)) in &specs {
         if name == "tokens" || name == "position" || name.starts_with("cache.") {
             continue;
         }
-        if !file.has(name) {
-            return Err(format!("checkpoint is missing `{name}`"));
-        }
-        let (dtype, shape) = file.meta(name);
-        if shape != expected_shape {
+        let tensor = checkpoint
+            .tensor(name)
+            .map_err(|_| format!("checkpoint is missing `{name}`"))?;
+        if tensor.shape() != expected_shape {
             return Err(format!(
-                "`{name}` has checkpoint shape {shape:?}; graph expects {expected_shape:?}"
+                "`{name}` has checkpoint shape {:?}; graph expects {expected_shape:?}",
+                tensor.shape()
             ));
         }
         let expected_dtype = match expected_dtype {
-            Dtype::BF16 => "BF16",
-            Dtype::F32 => "F32",
+            Dtype::BF16 => safetensors::Dtype::BF16,
+            Dtype::F32 => safetensors::Dtype::F32,
             other => {
                 return Err(format!(
                     "unsupported checkpoint dtype {other:?} for `{name}`"
                 ));
             }
         };
-        if dtype != expected_dtype {
+        if tensor.dtype() != expected_dtype {
             return Err(format!(
-                "`{name}` has checkpoint dtype {dtype}; graph expects {expected_dtype}"
+                "`{name}` has checkpoint dtype {:?}; graph expects {expected_dtype:?}",
+                tensor.dtype()
             ));
         }
     }
-    Ok((file, specs))
+    Ok(specs)
+}
+
+/// Read the checkpoint into a page-aligned, LEAKED allocation and parse it in
+/// place: `MetalDevice::from_bytes_nocopy` wraps the region without copying,
+/// and every tensor binds at its in-file offset. The bytes live for the
+/// process — a model's weights do anyway.
+///
+/// A file whose header length is not a multiple of 4 puts every tensor at a
+/// misaligned byte offset, and device buffers cannot bind there. All tensors
+/// share the parity, so ONE lead pad realigns the whole data section.
+fn open_checkpoint_zero_copy(path: &Path) -> Result<(SafeTensors<'static>, &'static [u8]), String> {
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut header_length = [0u8; 8];
+    file.read_exact(&mut header_length)
+        .map_err(|error| format!("read {} header: {error}", path.display()))?;
+    let data_start = 8 + u64::from_le_bytes(header_length) as usize;
+    let pad = data_start.next_multiple_of(4) - data_start;
+
+    const PAGE: usize = 16384;
+    let file_length = std::fs::metadata(path).map_err(|error| error.to_string())?.len() as usize;
+    let capacity = (pad + file_length).div_ceil(PAGE).max(1) * PAGE;
+    let layout =
+        std::alloc::Layout::from_size_align(capacity, PAGE).map_err(|error| error.to_string())?;
+    let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err("page-aligned checkpoint allocation failed".into());
+    }
+    let region: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(pointer, capacity) };
+    region[pad..pad + 8].copy_from_slice(&header_length);
+    file.read_exact(&mut region[pad + 8..pad + file_length])
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let region: &'static [u8] = region;
+    let tensors = SafeTensors::deserialize(&region[pad..pad + file_length])
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    Ok((tensors, region))
 }
 
 struct Arguments {
@@ -612,10 +650,15 @@ fn run_metal() -> Result<(), String> {
         arguments.new_tokens
     );
     let graph = build_decode(Config::LLAMA_3_2_1B, context_length);
-    let (_, specs) = validate_checkpoint(&graph.roots, &checkpoint)
+    eprintln!("built graph in {:.2}s", started.elapsed().as_secs_f32());
+
+    let started = std::time::Instant::now();
+    eprintln!("reading cached BF16 checkpoint...");
+    let (checkpoint_tensors, region) = open_checkpoint_zero_copy(&checkpoint)?;
+    let specs = validate_checkpoint(&graph.roots, &checkpoint_tensors)
         .map_err(|error| format!("invalid cached checkpoint: {error}"))?;
     eprintln!(
-        "built and validated graph in {:.2}s",
+        "read and validated checkpoint in {:.2}s",
         started.elapsed().as_secs_f32()
     );
 
@@ -633,8 +676,7 @@ fn run_metal() -> Result<(), String> {
     );
 
     let started = std::time::Instant::now();
-    eprintln!("binding cached BF16 weights zero-copy...");
-    let (file, region) = StFile::open_zero_copy(&checkpoint)?;
+    eprintln!("binding BF16 weights zero-copy...");
     let checkpoint_buffer = device
         .from_bytes_nocopy(region)
         .ok_or("checkpoint allocation is not suitable for zero-copy Metal binding")?;
@@ -661,12 +703,16 @@ fn run_metal() -> Result<(), String> {
                 )
                 .map_err(|error| error.to_string())?
         } else {
-            let (start, end) = file.file_range(name);
-            let raw = if start % 4 == 0 {
-                zero_copy_bytes += end - start;
-                checkpoint_buffer.slice(start)
+            let data = checkpoint_tensors
+                .tensor(name)
+                .map_err(|error| format!("read `{name}` from checkpoint: {error}"))?
+                .data();
+            let offset = data.as_ptr() as usize - region.as_ptr() as usize;
+            let raw = if offset % 4 == 0 {
+                zero_copy_bytes += data.len();
+                checkpoint_buffer.slice(offset)
             } else {
-                device.from_bytes(file.raw(name))
+                device.from_bytes(data)
             };
             device
                 .tensor_from_raw(raw, shape.clone(), *dtype)
