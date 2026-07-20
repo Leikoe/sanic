@@ -134,7 +134,7 @@ fn canonicalize_merges_structural_duplicates() {
     assert!(!std::rc::Rc::ptr_eq(&once, &again));
 
     let y = map(MapOp::Add, vec![once, again]); // 2·Σx² per row
-    let canonical = canonicalize_many(&[y.clone()]).pop().unwrap();
+    let canonical = canonicalize_many(std::slice::from_ref(&y)).pop().unwrap();
     let Node::Map { inputs, .. } = canonical.as_ref() else {
         panic!("expected the root Add to survive canonicalization");
     };

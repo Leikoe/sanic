@@ -270,7 +270,7 @@ fn padded_conv1d_matches_hand() {
         for c_i in 0..2 {
             for k_i in 0..3 {
                 let pos = c[&o] as i64 + k_i as i64 - 1;
-                if pos < 0 || pos >= 6 {
+                if !(0..6).contains(&pos) {
                     continue; // zero-padded
                 }
                 let xc: HashMap<Axis, usize> =

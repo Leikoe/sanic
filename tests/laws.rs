@@ -987,7 +987,8 @@ fn probe_discovered_laws_are_sound() {
 
     // Each program is a builder: the axis carries its extent, so every trial
     // length below mints its own `n` and rebuilds the graph around it.
-    let programs: Vec<(&str, fn(Axis) -> NodeRef)> = vec![
+    type Program = fn(Axis) -> NodeRef;
+    let programs: Vec<(&str, Program)> = vec![
         // invariant reductions: Σ/max/min/lse over a same-axis collapsed value
         ("sum_of_sum", |n| reduce(coll(n, add_r()), n, add_r())),
         ("max_of_sum", |n| reduce(coll(n, add_r()), n, max_r())),

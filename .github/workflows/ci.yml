@@ -18,10 +18,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo test --all-targets
-      # Not gating yet: the mechanical lint backlog is tracked in CRITIQUE.md
-      # §4.5. Drop `continue-on-error` once it is cleared.
-      - run: cargo clippy --all-targets
-        continue-on-error: true
+      - run: cargo clippy --all-targets -- -D warnings
 
   # The macOS leg is the only thing standing between "tests pass" and "the
   # GPU path still works": Apple-silicon runners have a real Metal device.

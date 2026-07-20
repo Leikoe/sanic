@@ -4,14 +4,10 @@ use sanic::{Buffer, Compile, CpuDevice, Dtype, axis, input};
 fn assert_close(actual: &[f64], expected: &[f64]) {
     assert_eq!(actual.len(), expected.len());
     assert!(
-        actual
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| {
-                let tol = sanic::verify::rel_tolerance(Dtype::F64, 64)
-                    * (1.0 + expected.abs());
-                (actual - expected).abs() < tol
-            }),
+        actual.iter().zip(expected).all(|(actual, expected)| {
+            let tol = sanic::verify::rel_tolerance(Dtype::F64, 64) * (1.0 + expected.abs());
+            (actual - expected).abs() < tol
+        }),
         "actual={actual:?}, expected={expected:?}"
     );
 }

@@ -294,15 +294,14 @@ fn gradient_schedules_like_any_graph() {
         let reference = eval(g, &env);
         let sched = partition(g, &DeviceProfile::toy());
         assert!(
-            sched.stages.len() >= 1,
+            !sched.stages.is_empty(),
             "gradient of {name} must partition:\n{}",
             sched.render()
         );
         let executed = sched.execute(&env).permuted_to(&reference.axes);
         assert_eq!(executed.shape, reference.shape);
         for (a, b) in executed.data.iter().zip(&reference.data) {
-            let tol = sanic::verify::rel_tolerance(Dtype::F64, 64)
-                * (1.0 + a.abs().max(b.abs()));
+            let tol = sanic::verify::rel_tolerance(Dtype::F64, 64) * (1.0 + a.abs().max(b.abs()));
             assert!((a - b).abs() <= tol, "d/d{name}: scheduled {a} vs eval {b}");
         }
     }

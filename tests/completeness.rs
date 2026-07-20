@@ -118,6 +118,7 @@ fn suffixes(rng: &mut Lcg, count: usize) -> Vec<Vec<f64>> {
 /// A syllabus program: a scalar function of one streamed input, given as an
 /// IR graph builder so `derive` can be asked about the exact same object.
 type Build = fn(NodeRef, Axis) -> NodeRef;
+type Sketch = fn(&[f64]) -> f64;
 
 fn run_h(build: Build, xs: &[f64]) -> f64 {
     let n = axis("n", xs.len());
@@ -133,7 +134,7 @@ fn run_h(build: Build, xs: &[f64]) -> f64 {
 
 /// Everything here is itself computable by a small fold — that is what makes
 /// a passing σ constructive: its components name the slots a carrier needs.
-const POOL: &[(&str, fn(&[f64]) -> f64)] = &[
+const POOL: &[(&str, Sketch)] = &[
     ("len", |xs| xs.len() as f64),
     ("sum", |xs| xs.iter().sum()),
     ("sumsq", |xs| xs.iter().map(|v| v * v).sum()),
@@ -266,8 +267,7 @@ fn probe_with(build: Build, seed: u64, n_pres: usize, n_sufs: usize) -> Verdict 
                     continue; // identical streams prove nothing
                 }
                 pairs += 1;
-                for s in 0..sufs.len() {
-                    let (fa, fb) = (futures[a][s], futures[b][s]);
+                for (s, (&fa, &fb)) in futures[a].iter().zip(&futures[b]).enumerate() {
                     // Separation at the semantics-quotient tolerance (theory
                     // §5.4): the one policy, at the probe's stream length.
                     let tol = sanic::verify::rel_tolerance(Dtype::F64, 12)
@@ -334,7 +334,8 @@ fn shrink_witness(
             v
         };
         let (fa, fb) = (run_h(build, &cat(p)), run_h(build, &cat(q)));
-        (fa - fb).abs() > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
+        (fa - fb).abs()
+            > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
     };
     loop {
         let mut shrunk = false;
@@ -542,7 +543,13 @@ fn median_graph(x: NodeRef, n: Axis) -> NodeRef {
 /// is a concrete evaluated counterexample and certifies itself.)
 fn confirm_carrier_across_seeds(name: &str, build: Build, failures: &mut Vec<String>) {
     for seed in [0xACE1u64, 0xBEEF] {
-        if let Verdict::Separated { p, q, suffix, sigma } = probe_with(build, seed, 2000, 23) {
+        if let Verdict::Separated {
+            p,
+            q,
+            suffix,
+            sigma,
+        } = probe_with(build, seed, 2000, 23)
+        {
             failures.push(format!(
                 "{name}: probe found a carrier under the primary seed, but seed {seed:#x} \
                  separated every sketch — e.g. σ = ({}) on {p:?} / {q:?} via {suffix:?}",
@@ -606,7 +613,10 @@ fn every_decline_is_justified_or_pinned() {
             (d, v, e) => {
                 let got = match (d.is_some(), v) {
                     (true, Verdict::Carrier(comps, s)) => {
-                        format!("derives; probe agrees via ({}), ≤ {comps} slots", s.join(", "))
+                        format!(
+                            "derives; probe agrees via ({}), ≤ {comps} slots",
+                            s.join(", ")
+                        )
                     }
                     (true, Verdict::Separated { .. }) => {
                         "derives, but the probe separated every sketch (pool too weak)".into()
@@ -804,15 +814,15 @@ fn fooling_family(build: Build, plen: usize, seed: u64) -> Vec<Vec<f64>> {
         })
         .collect();
     let separated = |a: usize, b: usize| {
-        (0..sufs.len()).any(|s| {
-            let (fa, fb) = (futures[a][s], futures[b][s]);
-            (fa - fb).abs() > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
+        futures[a].iter().zip(&futures[b]).any(|(&fa, &fb)| {
+            (fa - fb).abs()
+                > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
         })
     };
     // bucket by the answer, grow the family greedily inside each h-class
     let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-    for i in 0..pres.len() {
-        buckets.entry(futures[i][0].to_bits()).or_default().push(i);
+    for (i, answers) in futures.iter().enumerate() {
+        buckets.entry(answers[0].to_bits()).or_default().push(i);
     }
     let mut best: Vec<usize> = Vec::new();
     for members in buckets.values() {
@@ -877,7 +887,10 @@ fn fooling_families_grow_only_at_true_walls() {
     for (name, build) in [("sum", sum), ("max", mx), ("lse", lse)] {
         for plen in [5usize, 9] {
             let k = same_answer_family(build, plen);
-            assert_eq!(k, 1, "{name} at length {plen}: family of {k} — the answer IS the state");
+            assert_eq!(
+                k, 1,
+                "{name} at length {plen}: family of {k} — the answer IS the state"
+            );
         }
     }
 }

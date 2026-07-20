@@ -204,7 +204,7 @@ fn cst(n: &Node) -> Option<f64> {
     }
 }
 
-fn as_map<'a>(n: &'a Node, want: MapOp) -> Option<&'a [Node]> {
+fn as_map(n: &Node, want: MapOp) -> Option<&[Node]> {
     match n.as_ref() {
         NodeKind::Map { op, inputs } if *op == want => Some(inputs),
         _ => None,

@@ -395,9 +395,7 @@ fn count_issue_ops(node: &Node) -> f64 {
         NodeKind::Const { .. } => 0.0,
         NodeKind::Iota { .. } => vol(node),
         NodeKind::Input { axes, .. } => (1.0 + axes.len() as f64) * vol(node),
-        NodeKind::Map { inputs, .. } => {
-            inputs.iter().map(|i| count_issue_ops(i)).sum::<f64>() + vol(node)
-        }
+        NodeKind::Map { inputs, .. } => inputs.iter().map(count_issue_ops).sum::<f64>() + vol(node),
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
             count_issue_ops(src) + vol(src)
         }
@@ -430,7 +428,7 @@ fn count_issue_ops(node: &Node) -> f64 {
 fn has_simd_reduce(node: &Node) -> bool {
     match node.as_ref() {
         NodeKind::Reduce { src, axis, .. } => axis.extent() % SIMD == 0 || has_simd_reduce(src),
-        NodeKind::Map { inputs, .. } => inputs.iter().any(|i| has_simd_reduce(i)),
+        NodeKind::Map { inputs, .. } => inputs.iter().any(has_simd_reduce),
         NodeKind::Gather { src, index, .. } => has_simd_reduce(src) || has_simd_reduce(index),
         NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } | NodeKind::Scan { src, .. } => {
             has_simd_reduce(src)

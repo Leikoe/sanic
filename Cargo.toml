@@ -8,6 +8,8 @@ rust-version = "1.85"
 description = "Derives streaming ML kernels — FlashAttention, RoPE, convolution, quantized matmul, KV-cache decode, backward passes — from naive dataflow graphs by algebra, not templates, then lowers whole schedules to compilable Rust and to Metal for the GPU."
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/Leikoe/sanic"
+keywords = ["machine-learning", "compiler", "kernel-fusion", "metal", "gpu"]
 
 [dependencies]
 

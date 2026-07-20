@@ -197,7 +197,8 @@ fn direct_attention_is_one_metal_kernel() {
             .iter()
             .zip(expected)
             .all(|(actual, expected): (&f32, f32)| {
-                let tol = sanic::verify::rel_tolerance(Dtype::F32, 2) * (1.0 + expected.abs() as f64);
+                let tol =
+                    sanic::verify::rel_tolerance(Dtype::F32, 2) * (1.0 + expected.abs() as f64);
                 ((actual - expected).abs() as f64) < tol
             })
     );

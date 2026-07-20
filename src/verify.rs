@@ -60,7 +60,7 @@ pub fn rel_tolerance(dtype: Dtype, terms: usize) -> f64 {
     let eps = match dtype {
         Dtype::F64 => f64::EPSILON,
         Dtype::F32 => f32::EPSILON as f64,
-        Dtype::F16 => 9.77e-4, // 2⁻¹⁰
+        Dtype::F16 => 9.77e-4,  // 2⁻¹⁰
         Dtype::BF16 => 7.82e-3, // 2⁻⁷
         // Integer accumulation is exact; a dequantized comparison happens in
         // float and should pass that dtype instead.

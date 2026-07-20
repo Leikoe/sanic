@@ -299,8 +299,8 @@ fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch) {
 /// A committed command buffer's GPU residency in seconds.
 fn gpu_seconds(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
     // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
-    let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
-    let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
+    let t0: f64 = unsafe { msg_send![cb, GPUStartTime] };
+    let t1: f64 = unsafe { msg_send![cb, GPUEndTime] };
     t1 - t0
 }
 

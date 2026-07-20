@@ -87,11 +87,11 @@ fn topk_partitions_and_executes() {
 
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for r in 0..k {
+    for (r, &(expected_value, expected_index)) in order.iter().take(k).enumerate() {
         let v = run_env.get(format!("v{r}").as_str()).unwrap().data[0];
         let i = run_env.get(format!("i{r}").as_str()).unwrap().data[0];
-        assert_eq!(v, order[r].0, "scheduled value of round {r}");
-        assert_eq!(i, order[r].1 as f64, "scheduled index of round {r}");
+        assert_eq!(v, expected_value, "scheduled value of round {r}");
+        assert_eq!(i, expected_index as f64, "scheduled index of round {r}");
     }
 }
 
@@ -123,10 +123,14 @@ fn topk_all_is_one_fold_with_shared_slots() {
     let want = eval(&all, &env);
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for r in 0..k {
+    for (r, &(_, expected_index)) in order.iter().take(k).enumerate() {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
         assert_eq!(got.at(&coord), want.at(&coord), "rank {r}: carrier == eval");
-        assert_eq!(got.at(&coord), order[r].1 as f64, "rank {r}: == hand sort");
+        assert_eq!(
+            got.at(&coord),
+            expected_index as f64,
+            "rank {r}: == hand sort"
+        );
     }
 
     // and the whole thing schedules as ONE kernel
@@ -135,9 +139,9 @@ fn topk_all_is_one_fold_with_shared_slots() {
     let mut run_env = env.clone();
     sched.execute_env(&mut run_env);
     let out = run_env.get(sched.outputs[0].as_str()).unwrap();
-    for r in 0..k {
+    for (r, &(_, expected_index)) in order.iter().take(k).enumerate() {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(out.at(&coord), order[r].1 as f64, "scheduled rank {r}");
+        assert_eq!(out.at(&coord), expected_index as f64, "scheduled rank {r}");
     }
 }
 

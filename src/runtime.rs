@@ -38,6 +38,7 @@ use crate::partition::Schedule;
 
 /// A stateful execution session: named persistent buffers plus step
 /// execution with commit-after-execute updates.
+#[derive(Default)]
 pub struct Session {
     /// The persistent buffers, by name — plus, after a step, that step's
     /// intermediates (`t0`, `t1`, …), which are scratch: a later schedule may
@@ -47,7 +48,7 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Session {
-        Session { env: Env::new() }
+        Session::default()
     }
 
     /// Create or replace a buffer (weights at load time, caches at init).
