@@ -75,14 +75,33 @@ impl Lcg {
 }
 
 fn prefixes(rng: &mut Lcg, count: usize) -> Vec<Vec<f64>> {
-    (0..count)
+    let mut out: Vec<Vec<f64>> = (0..count)
         .map(|_| {
             // long enough that a handful of moments cannot pin the whole
             // multiset — the false-carrier artifact of tiny streams
             let len = 5 + (rng.next() >> 40) as usize % 5; // 5..=9
             (0..len).map(|_| rng.q()).collect()
         })
-        .collect()
+        .collect();
+    // Adversarial generators random draws under-produce (§3.4): planted
+    // ties, permutations of the same multiset (identical to every symmetric
+    // sketch — only order-sensitive functions tell them apart), and extreme
+    // magnitudes planted early and late. These concentrate collisions where
+    // wrong carriers are most likely to hide.
+    for i in 0..count / 4 {
+        let mut p = out[(rng.next() as usize) % out.len()].clone();
+        let len = p.len();
+        let a = (rng.next() as usize) % len;
+        let b = (rng.next() as usize) % len;
+        match i % 4 {
+            0 => p[a] = p[b],                               // planted tie
+            1 => p.rotate_left(1 + a % (len - 1)),          // same multiset, other order
+            2 => p[0] = if i % 8 < 4 { 2.0 } else { -2.0 }, // early extreme
+            _ => *p.last_mut().unwrap() = 2.0,              // late extreme
+        }
+        out.push(p);
+    }
+    out
 }
 
 fn suffixes(rng: &mut Lcg, count: usize) -> Vec<Vec<f64>> {
@@ -157,9 +176,14 @@ const MIN_PAIRS: usize = 30;
 // ── the probe ────────────────────────────────────────────────────────────────
 
 enum Verdict {
-    /// A determining sketch was found: dimension bound and component names.
+    /// A determining sketch was found. The count is the sketch's COMPONENT
+    /// COUNT — an upper bound on carrier dimension, not the dimension
+    /// itself (argmax's passing σ has three components; its carrier has two
+    /// slots). The rank oracle at the bottom of this file measures the real
+    /// number.
     Carrier(usize, Vec<&'static str>),
-    /// Every conclusive candidate was separated; one witness kept.
+    /// Every conclusive candidate was separated; one witness kept, shrunk
+    /// to the shortest (p, q, suffix) that still collides and splits.
     Separated {
         p: Vec<f64>,
         q: Vec<f64>,
@@ -198,9 +222,17 @@ fn subsets_upto(n: usize, k: usize) -> Vec<Vec<usize>> {
 /// Search for a sketch σ = (h, pool components…) such that σ-colliding
 /// prefixes have identical h-futures on every sampled suffix.
 fn probe(build: Build) -> Verdict {
-    let mut rng = Lcg(0x5EED5);
-    let pres = prefixes(&mut rng, 2000);
-    let sufs = suffixes(&mut rng, 23);
+    probe_with(build, 0x5EED5, 2000, 23)
+}
+
+/// The probe under an explicit seed and budget: one seed is a single sample
+/// of a probabilistic argument (§3.4), so justified declines are re-checked
+/// under independent seeds at the same budget — a weaker budget
+/// under-separates and manufactures false carrier candidates.
+fn probe_with(build: Build, seed: u64, n_pres: usize, n_sufs: usize) -> Verdict {
+    let mut rng = Lcg(seed);
+    let pres = prefixes(&mut rng, n_pres);
+    let sufs = suffixes(&mut rng, n_sufs);
 
     // h-futures per prefix, computed once: futures[p][s] = h(pres[p] ++ sufs[s])
     let futures: Vec<Vec<f64>> = pres
@@ -256,11 +288,71 @@ fn probe(build: Build) -> Verdict {
     }
     let (a, b, s, sigma) = last_witness
         .expect("no candidate sketch ever produced a conclusive collision — alphabet too fine?");
+    let (p, q, suffix) = shrink_witness(
+        build,
+        &sigma,
+        pres[a].clone(),
+        pres[b].clone(),
+        sufs[s].clone(),
+    );
     Verdict::Separated {
-        p: pres[a].clone(),
-        q: pres[b].clone(),
-        suffix: sufs[s].clone(),
+        p,
+        q,
+        suffix,
         sigma,
+    }
+}
+
+/// §3.3: QuickCheck-style shrinking — the shortest (p, q, suffix) that still
+/// σ-collides (h and every component, bit-exact) and still splits. What
+/// `last_witness` keeps is an arbitrary artifact of search order; the
+/// minimal witness is a readable proof sketch.
+fn shrink_witness(
+    build: Build,
+    comp_names: &[&'static str],
+    mut p: Vec<f64>,
+    mut q: Vec<f64>,
+    mut suffix: Vec<f64>,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let comps: Vec<fn(&[f64]) -> f64> = comp_names
+        .iter()
+        .map(|n| POOL.iter().find(|(pn, _)| pn == n).unwrap().1)
+        .collect();
+    let witnesses = |p: &[f64], q: &[f64], s: &[f64]| -> bool {
+        if p.is_empty() || q.is_empty() || p == q {
+            return false;
+        }
+        if run_h(build, p).to_bits() != run_h(build, q).to_bits() {
+            return false;
+        }
+        if comps.iter().any(|c| c(p).to_bits() != c(q).to_bits()) {
+            return false;
+        }
+        let cat = |xs: &[f64]| {
+            let mut v = xs.to_vec();
+            v.extend_from_slice(s);
+            v
+        };
+        let (fa, fb) = (run_h(build, &cat(p)), run_h(build, &cat(q)));
+        (fa - fb).abs() > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
+    };
+    loop {
+        let mut shrunk = false;
+        for target in 0..3usize {
+            let len = [p.len(), q.len(), suffix.len()][target];
+            for i in 0..len {
+                let (mut tp, mut tq, mut ts) = (p.clone(), q.clone(), suffix.clone());
+                [&mut tp, &mut tq, &mut ts][target].remove(i);
+                if witnesses(&tp, &tq, &ts) {
+                    (p, q, suffix) = (tp, tq, ts);
+                    shrunk = true;
+                    break;
+                }
+            }
+        }
+        if !shrunk {
+            return (p, q, suffix);
+        }
     }
 }
 
@@ -443,13 +535,32 @@ fn median_graph(x: NodeRef, n: Axis) -> NodeRef {
 
 // ── the ledger ───────────────────────────────────────────────────────────────
 
+/// §3.4: a Carrier verdict is survival under one sample of streams — seed
+/// luck can starve the collisions that would have killed a wrong sketch. A
+/// carrier claim therefore has to survive independent draws at the same
+/// budget. (The dual is NOT checked across seeds on purpose: a separation
+/// is a concrete evaluated counterexample and certifies itself.)
+fn confirm_carrier_across_seeds(name: &str, build: Build, failures: &mut Vec<String>) {
+    for seed in [0xACE1u64, 0xBEEF] {
+        if let Verdict::Separated { p, q, suffix, sigma } = probe_with(build, seed, 2000, 23) {
+            failures.push(format!(
+                "{name}: probe found a carrier under the primary seed, but seed {seed:#x} \
+                 separated every sketch — e.g. σ = ({}) on {p:?} / {q:?} via {suffix:?}",
+                sigma.join(", ")
+            ));
+        }
+    }
+}
+
 #[test]
 fn every_decline_is_justified_or_pinned() {
     let n = axis("n", 8);
     let mut report = String::from(
         "\nLEDGER — semantic carrier probe vs the deriver\n\
          (pool: 9 bounded-state folds; sketches h + ≤4 slots; alphabet 9 × [-2,2];\n\
-          2000 prefixes × 24 suffixes; a σ passes only on ≥30 distinct collisions)\n\n",
+          2000 random + 500 adversarial prefixes × 24 suffixes; a σ passes only on\n\
+          ≥30 distinct collisions; carrier verdicts must SURVIVE two more seeds —\n\
+          a separation is a self-certifying witness, a survival is only evidence)\n\n",
     );
     let mut failures = Vec::new();
 
@@ -463,15 +574,21 @@ fn every_decline_is_justified_or_pinned() {
             .filter(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         let verdict = probe(build);
         let line = match (&derived, &verdict, expect) {
-            (Some(c), Verdict::Carrier(dim, sigma), Expect::Derived) => format!(
-                "  DERIVED     {name:22} {} slot(s); probe agrees: dim ≤ {dim}, σ = ({})\n",
-                c.slots,
-                sigma.join(", ")
-            ),
-            (None, Verdict::Carrier(dim, sigma), Expect::CoveredElsewhere(op)) => format!(
-                "  GRAPH-FORM  {name:22} graph declines; carrier exists (dim ≤ {dim}, σ = ({})) — covered by {op}\n",
-                sigma.join(", ")
-            ),
+            (Some(c), Verdict::Carrier(comps, sigma), Expect::Derived) => {
+                confirm_carrier_across_seeds(name, build, &mut failures);
+                format!(
+                    "  DERIVED     {name:22} {} slot(s); probe agrees (3 seeds): σ = ({}), {comps} sketch slot(s)\n",
+                    c.slots,
+                    sigma.join(", ")
+                )
+            }
+            (None, Verdict::Carrier(comps, sigma), Expect::CoveredElsewhere(op)) => {
+                confirm_carrier_across_seeds(name, build, &mut failures);
+                format!(
+                    "  GRAPH-FORM  {name:22} graph declines; carrier exists (3 seeds: σ = ({}), ≤ {comps} slots) — covered by {op}\n",
+                    sigma.join(", ")
+                )
+            }
             (
                 None,
                 Verdict::Separated {
@@ -482,20 +599,20 @@ fn every_decline_is_justified_or_pinned() {
                 },
                 Expect::JustifiedDecline,
             ) => format!(
-                "  JUSTIFIED   {name:22} every sketch separated — e.g. σ = ({}) \
-                 collides on {p:?} / {q:?}, split by suffix {suffix:?}\n",
+                "  JUSTIFIED   {name:22} every sketch separated — minimal witness: \
+                 σ = ({}) collides on {p:?} / {q:?}, split by {suffix:?}\n",
                 sigma.join(", ")
             ),
             (d, v, e) => {
                 let got = match (d.is_some(), v) {
-                    (true, Verdict::Carrier(dim, s)) => {
-                        format!("derives; probe dim ≤ {dim} via ({})", s.join(", "))
+                    (true, Verdict::Carrier(comps, s)) => {
+                        format!("derives; probe agrees via ({}), ≤ {comps} slots", s.join(", "))
                     }
                     (true, Verdict::Separated { .. }) => {
                         "derives, but the probe separated every sketch (pool too weak)".into()
                     }
-                    (false, Verdict::Carrier(dim, s)) => format!(
-                        "DECLINED, but σ = ({}) is a dim-≤{dim} carrier — FUSION MISS",
+                    (false, Verdict::Carrier(comps, s)) => format!(
+                        "DECLINED, but σ = ({}) is a ≤{comps}-slot carrier — FUSION MISS",
                         s.join(", ")
                     ),
                     (false, Verdict::Separated { .. }) => "declined; probe separated".into(),
@@ -554,9 +671,9 @@ fn random_declines_survive_the_probe() {
             continue; // sound by the existing oracle; nothing to check
         }
         match probe(build) {
-            Verdict::Carrier(dim, sigma) => {
+            Verdict::Carrier(comps, sigma) => {
                 let line = format!(
-                    "  seed {seed:2}: declined, σ = ({}) is a dim-≤{dim} carrier — {}\n",
+                    "  seed {seed:2}: declined, σ = ({}) is a ≤{comps}-slot carrier — {}\n",
                     sigma.join(", "),
                     pinned.get(&seed).copied().unwrap_or("UNPINNED MISS")
                 );
@@ -644,6 +761,124 @@ fn inspect_flagged_seeds() {
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
         let g = build(input("X", &[n], Dtype::F32), n);
         println!("seed {seed}: derives={} {:?}\n", derive(&g, n).is_ok(), g);
+    }
+}
+
+// ── witnesses escalated into proofs: growing fooling families (§3.2) ─────────
+//
+// A `Separated` verdict is one fooling pair; the theory's standard (Theorem
+// 5.3) is a growing fooling FAMILY: k pairwise-separated prefixes force
+// state ≥ log₂ k bits. The sharp version restricts the family to prefixes
+// that all share the SAME answer h — every separation then proves state
+// beyond the output itself, which is what "not streamable" means. For a
+// function whose answer determines its futures (sum, max, lse) such a
+// family cannot exceed one member; for a true wall it grows with prefix
+// length, without bound. A decline then ships with a theorem, not a survey
+// result.
+
+/// A maximal-by-greedy set of length-`plen` prefixes agreeing bit-exactly on
+/// h yet pairwise separated by some sampled suffix (at the policy tolerance).
+/// Suffix length grows WITH the prefix: a suffix of b elements can only move
+/// a rank statistic b places, so fixed-length suffixes see a constant-width
+/// window around the middle and the family would plateau spuriously.
+fn fooling_family(build: Build, plen: usize, seed: u64) -> Vec<Vec<f64>> {
+    let mut rng = Lcg(seed);
+    let pres: Vec<Vec<f64>> = (0..800)
+        .map(|_| (0..plen).map(|_| rng.q()).collect())
+        .collect();
+    let mut sufs: Vec<Vec<f64>> = vec![Vec::new()];
+    for _ in 0..25 {
+        let len = 1 + (rng.next() >> 40) as usize % plen;
+        sufs.push((0..len).map(|_| rng.q()).collect());
+    }
+    let futures: Vec<Vec<f64>> = pres
+        .iter()
+        .map(|p| {
+            sufs.iter()
+                .map(|s| {
+                    let mut xs = p.clone();
+                    xs.extend_from_slice(s);
+                    run_h(build, &xs)
+                })
+                .collect()
+        })
+        .collect();
+    let separated = |a: usize, b: usize| {
+        (0..sufs.len()).any(|s| {
+            let (fa, fb) = (futures[a][s], futures[b][s]);
+            (fa - fb).abs() > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
+        })
+    };
+    // bucket by the answer, grow the family greedily inside each h-class
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for i in 0..pres.len() {
+        buckets.entry(futures[i][0].to_bits()).or_default().push(i);
+    }
+    let mut best: Vec<usize> = Vec::new();
+    for members in buckets.values() {
+        let mut family: Vec<usize> = Vec::new();
+        for &i in members {
+            if family.iter().all(|&j| separated(i, j)) {
+                family.push(i);
+            }
+        }
+        if family.len() > best.len() {
+            best = family;
+        }
+    }
+    best.into_iter().map(|i| pres[i].clone()).collect()
+}
+
+#[test]
+fn fooling_families_grow_only_at_true_walls() {
+    let same_answer_family = |build: Build, plen: usize| fooling_family(build, plen, 0xFA71).len();
+
+    // The walls: the same-answer family grows with prefix length — the
+    // refutation is a loop, and each k prints as state ≥ log₂ k bits.
+    let cahm: Build = |x, n| {
+        let m = reduce(x.clone(), n, BinOp::Monoid(Monoid::Max));
+        let half = map(MapOp::Mul, vec![m, konst(0.5)]);
+        reduce(indicator_lt(half, x), n, BinOp::Monoid(Monoid::Add))
+    };
+    // The two walls grow at different rates — median's classes are multisets
+    // (polynomial in length), count-above-half-max's are counts against a
+    // coarse threshold (linear, and slow on a 9-symbol alphabet) — so each
+    // asserts its own growth floor over the measured range.
+    for (name, build, floor) in [
+        ("median", median_graph as Build, 16usize),
+        ("count_above_half_max", cahm, 4),
+    ] {
+        let sizes: Vec<usize> = [4usize, 6, 8]
+            .iter()
+            .map(|&l| same_answer_family(build, l))
+            .collect();
+        println!(
+            "{name}: same-answer fooling family {sizes:?} at lengths [4, 6, 8] \
+             → state ≥ {:.1} bits and growing",
+            (sizes[2] as f64).log2()
+        );
+        assert!(
+            sizes[2] > sizes[0],
+            "{name}: the family must grow with prefix length: {sizes:?}"
+        );
+        assert!(
+            sizes[2] >= floor,
+            "{name}: at least {floor} mutually-separated same-answer prefixes at length 8: {sizes:?}"
+        );
+    }
+
+    // The controls: an answer that determines its futures admits NO
+    // same-answer separation — the family machinery finds exactly one
+    // member, at every length. A false separation here would be the policy
+    // tolerance misfiring.
+    let sum: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::Add));
+    let mx: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::Max));
+    let lse: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::LogSumExp));
+    for (name, build) in [("sum", sum), ("max", mx), ("lse", lse)] {
+        for plen in [5usize, 9] {
+            let k = same_answer_family(build, plen);
+            assert_eq!(k, 1, "{name} at length {plen}: family of {k} — the answer IS the state");
+        }
     }
 }
 
