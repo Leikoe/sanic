@@ -41,9 +41,14 @@ impl Lcg {
     }
 }
 
-fn approx(a: f64, b: f64) {
-    let tol = 1e-9 * (1.0 + a.abs().max(b.abs()));
-    assert!((a - b).abs() <= tol, "approx failed: {a} vs {b}");
+/// Every comparison reads the one tolerance policy (`verify::rel_tolerance`);
+/// `terms` is the reduction length the compared values accumulate over.
+fn approx_within(a: f64, b: f64, terms: usize) {
+    let tol = sanic::verify::rel_tolerance(Dtype::F64, terms) * (1.0 + a.abs().max(b.abs()));
+    assert!(
+        (a - b).abs() <= tol,
+        "approx failed: {a} vs {b} (n = {terms})"
+    );
 }
 
 /// A derived carrier must agree with itself under a tree split (associativity)
@@ -53,8 +58,8 @@ fn check(car: &Carrier, items: &[Vec<f64>], reference: &[f64]) {
     let tree = car.tree_fold(items);
     assert_eq!(folded.len(), reference.len());
     for i in 0..folded.len() {
-        approx(folded[i], reference[i]);
-        approx(tree[i], reference[i]); // tree == sequential ⇒ associative
+        approx_within(folded[i], reference[i], items.len());
+        approx_within(tree[i], reference[i], items.len()); // tree == sequential ⇒ associative
     }
 }
 
@@ -703,7 +708,7 @@ fn flash_attention_associative_all_splits() {
         let r = car.fold_acc(&items[split..]);
         let merged = car.project(&car.merge(&l, &r));
         for i in 0..whole.len() {
-            approx(whole[i], merged[i]);
+            approx_within(whole[i], merged[i], items.len());
         }
     }
 }

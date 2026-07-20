@@ -25,6 +25,11 @@ use sanic::partition::{Schedule, partition_many};
 use sanic::runtime::Session;
 use sanic::rustgen::emit_schedule;
 
+/// The one tolerance policy (`verify::rel_tolerance`) at this file's chain
+/// length: a decode step chains a handful of folds whose summed extents stay
+/// under 64 in these toys.
+const CHAIN_TERMS: usize = 64;
+
 struct Lcg(u64);
 impl Lcg {
     fn f(&mut self) -> f64 {
@@ -168,7 +173,8 @@ fn incremental_decode_equals_prefill() {
         for vi in 0..v.extent() {
             let got = logits.at(&[(v, vi)].into_iter().collect());
             let want = reference.at(&[(s, p), (v, vi)].into_iter().collect());
-            let tol = 1e-9 * (1.0 + got.abs().max(want.abs()));
+            let tol = sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS)
+                * (1.0 + got.abs().max(want.abs()));
             assert!(
                 (got - want).abs() <= tol,
                 "step {p}, vocab {vi}: decode {got} vs prefill {want}"
@@ -191,7 +197,8 @@ fn incremental_decode_equals_prefill() {
             let c: HashMap<Axis, usize> = [(t, ti), (dk, ki)].into_iter().collect();
             let (a, b) = (ck.at(&c), k_ref.at(&c));
             assert!(
-                (a - b).abs() <= 1e-9 * (1.0 + a.abs()),
+                (a - b).abs()
+                    <= sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + a.abs()),
                 "cache_k[{ti},{ki}]"
             );
         }

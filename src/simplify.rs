@@ -357,19 +357,25 @@ fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
     if cst(s) == Some(0.0) {
         return Some(konst(0.0)); // Σ 0 = 0 for any extent
     }
-    // Σ(k · x) → k · Σx when k is invariant along the axis (defer-scale)
-    if let Some(m) = as_map(s, MapOp::Mul) {
-        let (l, r) = (&m[0], &m[1]);
-        if !l.shape().contains(&axis) {
+    // Σ(k · x) → k · Σx when k is invariant along the axis (defer-scale).
+    // The whole binary product TREE is searched, not just the two direct
+    // operands: hoisting is closed under association and operand order, so a
+    // scale buried as `q·(k·c)` still leaves and the variant factors rebuild
+    // as a clean contraction — the canonical form `derive`'s syntactic
+    // matcher contracts for (see `other_axis_folds`).
+    if as_map(s, MapOp::Mul).is_some() {
+        let (mut inv, mut var) = (Vec::new(), Vec::new());
+        split_product(s, axis, &mut inv, &mut var);
+        if !inv.is_empty() && !var.is_empty() {
+            let product = |factors: Vec<Node>| {
+                factors
+                    .into_iter()
+                    .reduce(|a, b| map(MapOp::Mul, vec![a, b]))
+                    .unwrap()
+            };
             return Some(map(
                 MapOp::Mul,
-                vec![l.clone(), reduce(r.clone(), axis, op)],
-            ));
-        }
-        if !r.shape().contains(&axis) {
-            return Some(map(
-                MapOp::Mul,
-                vec![r.clone(), reduce(l.clone(), axis, op)],
+                vec![product(inv), reduce(product(var), axis, op)],
             ));
         }
     }
@@ -378,4 +384,18 @@ fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
         return Some(map(MapOp::Neg, vec![reduce(n[0].clone(), axis, op)]));
     }
     None
+}
+
+/// Split a binary `Mul` tree into its atomic factors, sorted by whether they
+/// carry `axis` (variant) or not (invariant). In-order traversal, so the
+/// rebuilt products keep the source's operand order.
+fn split_product(n: &Node, axis: Axis, inv: &mut Vec<Node>, var: &mut Vec<Node>) {
+    if let Some(m) = as_map(n, MapOp::Mul) {
+        split_product(&m[0], axis, inv, var);
+        split_product(&m[1], axis, inv, var);
+    } else if n.shape().contains(&axis) {
+        var.push(n.clone());
+    } else {
+        inv.push(n.clone());
+    }
 }

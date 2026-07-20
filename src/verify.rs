@@ -44,6 +44,31 @@ impl fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 /// Verify one IR root.
+/// The one tolerance policy every numerical oracle reads (CRITIQUE.md §1.3):
+/// the permitted RELATIVE drift between two evaluations of the same value
+/// that differ only in accumulation order, per accumulation dtype and
+/// reduction length. Reordered summation drifts by at most ~n·ε times the
+/// condition slack of the surrounding arithmetic; the policy charges one
+/// multiply for the length and a fixed slack of 64 for the carrier
+/// vocabulary's transcendentals (exp/log/sqrt). Pass the dtype the values
+/// are ACCUMULATED in (the interpreter and the Rust oracle are `F64`), and
+/// `terms` = the folded extent (1 for pointwise values).
+///
+/// When a tolerance is a policy, a tightening regression is meaningful; when
+/// it is a literal, it is a vibe.
+pub fn rel_tolerance(dtype: Dtype, terms: usize) -> f64 {
+    let eps = match dtype {
+        Dtype::F64 => f64::EPSILON,
+        Dtype::F32 => f32::EPSILON as f64,
+        Dtype::F16 => 9.77e-4, // 2⁻¹⁰
+        Dtype::BF16 => 7.82e-3, // 2⁻⁷
+        // Integer accumulation is exact; a dequantized comparison happens in
+        // float and should pass that dtype instead.
+        Dtype::I8 | Dtype::I4 => 0.0,
+    };
+    64.0 * eps * terms.max(1) as f64
+}
+
 pub fn verify(node: &Node) -> Result<(), VerifyError> {
     verify_many(std::slice::from_ref(node))
 }

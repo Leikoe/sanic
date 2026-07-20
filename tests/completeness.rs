@@ -236,7 +236,11 @@ fn probe(build: Build) -> Verdict {
                 pairs += 1;
                 for s in 0..sufs.len() {
                     let (fa, fb) = (futures[a][s], futures[b][s]);
-                    if (fa - fb).abs() > 1e-9 * (1.0 + fa.abs().max(fb.abs())) {
+                    // Separation at the semantics-quotient tolerance (theory
+                    // §5.4): the one policy, at the probe's stream length.
+                    let tol = sanic::verify::rel_tolerance(Dtype::F64, 12)
+                        * (1.0 + fa.abs().max(fb.abs()));
+                    if (fa - fb).abs() > tol {
                         last_witness = Some((a, b, s, names.clone()));
                         continue 'sigma; // separated — next candidate
                     }

@@ -38,7 +38,11 @@ fn assert_close(x: &Value, y: &Value) {
     for (a, b) in x.data.iter().zip(&y.data) {
         worst = worst.max((a - b).abs() / (1.0 + a.abs().max(b.abs())));
     }
-    assert!(worst < 1e-9, "max relative error {worst:e}");
+    // the one tolerance policy at this file's deepest fold chain
+    assert!(
+        worst < sanic::verify::rel_tolerance(Dtype::F64, 64),
+        "max relative error {worst:e}"
+    );
 }
 
 // ── the four primitive movements, against hand references ────────────────────

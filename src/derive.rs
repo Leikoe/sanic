@@ -853,6 +853,16 @@ pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
 /// separate GEMM). A free map worth keeping WHOLE wraps only plain
 /// reductions — wrapping a contraction, it must stay decomposed so the matmul
 /// machinery still sees it.
+///
+/// The contraction pattern is SYNTACTIC — literally `Reduce{Add, Map{Mul}}` —
+/// and that is a contract, not an accident: `verify` fixes `Mul` at arity 2,
+/// so a product chain is nested binary `Mul`s whose TOP node matches this
+/// pattern under every association and operand order (`Σ (q·k)·s` and
+/// `Σ q·(k·s)` both match; `partition`'s tests lock that they schedule
+/// identically). What the pattern does require is that the reduce sit
+/// directly on the multiply — an interposed no-op (`x·1`, `x + 0`) would
+/// declassify the contraction, which is `simplify`'s side of the contract:
+/// units are folded away before graphs reach here.
 fn other_axis_folds(
     node: &Node,
     axis: Axis,

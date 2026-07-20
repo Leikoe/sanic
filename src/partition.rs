@@ -165,6 +165,8 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         .map(|s| s.to_string())
         .collect();
     let stages = order_in_place(p.stages, &graph_inputs);
+    #[cfg(debug_assertions)]
+    assert_stage_order(&stages, &graph_inputs);
     let sched = Schedule { stages, outputs };
     // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like
     // tinygrad's DEBUG — the compilation made inspectable.
@@ -172,6 +174,30 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         sched.debug_dump();
     }
     sched
+}
+
+/// Legality made a check: a partition is valid iff its stage quotient is
+/// acyclic (kernel_fusion_theory.md, Theorem 2.1). Cutting at the derive
+/// frontier can only produce convex blocks, so this holds by construction —
+/// the assertion converts "true today" into "checked forever", and will catch
+/// the first feature (cover plans, epilogue motion across stages) that breaks
+/// it. Reading a graph input is exempt: an in-place update legitimately
+/// writes that name later (`order_in_place` puts the writer after every
+/// reader of the old value).
+#[cfg(debug_assertions)]
+fn assert_stage_order(stages: &[Stage], graph_inputs: &HashSet<String>) {
+    let mut written: HashSet<&str> = HashSet::new();
+    for (i, stage) in stages.iter().enumerate() {
+        for read in stage_reads(stage) {
+            assert!(
+                written.contains(read) || graph_inputs.contains(read),
+                "stage {i} (`{}`) reads `{read}` before any stage writes it — \
+                 the stage quotient is not topologically ordered",
+                stage_output(stage)
+            );
+        }
+        written.insert(stage_output(stage));
+    }
 }
 
 pub(crate) fn stage_output(s: &Stage) -> &str {
@@ -1760,6 +1786,78 @@ mod tests {
 
     fn add_r() -> BinOp {
         BinOp::Monoid(Monoid::Add)
+    }
+
+    // Canonical form is a CONTRACT that `simplify` establishes and this test
+    // holds (`derive::other_axis_folds`'s doc): the contraction matcher is
+    // syntactic, so a scaled score spelled with the scale INSIDE the reduce —
+    // under any association or operand order — must, once simplified, hoist
+    // to the canonical scale-outside form and schedule identically to it:
+    // one flash kernel, k streamed, three slots. A de-canonicalized spelling
+    // silently flipping `keep_map_whole` (and with it the partition shape)
+    // is exactly the regression this pins.
+    #[test]
+    fn decanonicalized_gemm_simplifies_to_the_canonical_schedule() {
+        let (s, k, d, e) = (
+            axis("s", 1024),
+            axis("k", 1024),
+            axis("d", 64),
+            axis("e", 64),
+        );
+        let q = input("Q", &[s, d], Dtype::F32);
+        let kk = input("K", &[k, d], Dtype::F32);
+        let v = input("V", &[k, e], Dtype::F32);
+        let scaled_scores: Vec<NodeRef> = vec![
+            // canonical: the contraction reduced clean, scale outside
+            map(
+                MapOp::Mul,
+                vec![matmul(q.clone(), kk.clone(), d), konst(0.125)],
+            ),
+            // scale inside the reduce, left-associated: Σ (q·k)·c
+            reduce(
+                map(
+                    MapOp::Mul,
+                    vec![map(MapOp::Mul, vec![q.clone(), kk.clone()]), konst(0.125)],
+                ),
+                d,
+                add_r(),
+            ),
+            // scale inside, right-associated: Σ q·(k·c)
+            reduce(
+                map(
+                    MapOp::Mul,
+                    vec![q.clone(), map(MapOp::Mul, vec![kk.clone(), konst(0.125)])],
+                ),
+                d,
+                add_r(),
+            ),
+            // scale inside, commuted: Σ (c·k)·q
+            reduce(
+                map(
+                    MapOp::Mul,
+                    vec![map(MapOp::Mul, vec![konst(0.125), kk.clone()]), q.clone()],
+                ),
+                d,
+                add_r(),
+            ),
+        ];
+        let shapes: Vec<(usize, Axis, usize)> = scaled_scores
+            .into_iter()
+            .map(|scored| {
+                let attn = matmul(softmax(scored, k), v.clone(), k);
+                let attn = crate::simplify::simplify_many(&[attn]).pop().unwrap();
+                let sched = partition(&attn, &DeviceProfile::toy());
+                let Stage::Fused { spec, .. } = &sched.stages[sched.stages.len() - 1] else {
+                    panic!("expected a fused flash stage")
+                };
+                (sched.stages.len(), spec.streaming_axis, spec.carrier.slots)
+            })
+            .collect();
+        assert!(
+            shapes.iter().all(|sh| *sh == shapes[0]),
+            "every simplified spelling must schedule identically: {shapes:?}"
+        );
+        assert_eq!(shapes[0], (1, k, 3), "one flash kernel, (m, ℓ, o)");
     }
 
     // Plain attention over raw tensors: nothing to cut → exactly one kernel.

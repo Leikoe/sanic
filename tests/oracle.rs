@@ -61,9 +61,10 @@ fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
     Value::from_fn(axes, |_| rng.f())
 }
 
-/// Assert two tensors are equal up to floating tolerance, regardless of axis
+/// Assert two tensors are equal up to floating tolerance (the one policy in
+/// `verify::rel_tolerance`; `terms` = the folded extent), regardless of axis
 /// storage order.
-fn assert_close(x: &Value, y: &Value) {
+fn assert_close(x: &Value, y: &Value, terms: usize) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(
         x.shape, y.shape,
@@ -71,7 +72,7 @@ fn assert_close(x: &Value, y: &Value) {
         x.axes, y.axes
     );
     for (i, (a, b)) in x.data.iter().zip(&y.data).enumerate() {
-        let tol = 1e-9 * (1.0 + a.abs().max(b.abs()));
+        let tol = sanic::verify::rel_tolerance(Dtype::F64, terms) * (1.0 + a.abs().max(b.abs()));
         assert!((a - b).abs() <= tol, "cell {i}: {a} vs {b}");
     }
 }
@@ -82,7 +83,7 @@ fn assert_kernel_matches_reference(node: &NodeRef, axis: Axis, env: &Env) {
     let reference = eval(node, env);
     let carrier = derive(node, axis).expect("axis is derivable");
     let via_kernel = run_carrier(node, axis, &carrier, env);
-    assert_close(&via_kernel, &reference);
+    assert_close(&via_kernel, &reference, axis.extent());
 }
 
 // ── multi-head attention: contraction-in-body under a 4-axis grid ────────────
@@ -245,7 +246,7 @@ fn argmax_matches_hand() {
         }
         arg as f64
     });
-    assert_close(&got, &want);
+    assert_close(&got, &want, v.extent());
 }
 
 // ── KV-cache row write, expressed with the existing basis ────────────────────
@@ -296,7 +297,7 @@ fn kv_cache_write_matches_hand() {
             cache.at(c)
         }
     });
-    assert_close(&got, &want);
+    assert_close(&got, &want, 1);
 }
 
 // ── RoPE rotation is really a rotation (graph vs hand-computed reference) ─────
@@ -325,7 +326,7 @@ fn rope_rotation_is_correct() {
             theta.sin() * q0 + theta.cos() * q1
         }
     });
-    assert_close(&got, &want);
+    assert_close(&got, &want, 1);
 }
 
 // ── RoPE'd attention derives to ONE fused flash kernel, computed correctly ────

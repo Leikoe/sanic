@@ -191,11 +191,15 @@ fn direct_attention_is_one_metal_kernel() {
     let outputs = program.run([("q", q), ("k", k), ("v", v)]);
     let actual = metal.read_tensor_f32(&outputs[0]);
     let expected = [2.990_715, 4.320_953_4, 4.009_285, 5.679_046_6];
+    // the f32-Metal-vs-reference comparison reads the one policy in F32
     assert!(
         actual
             .iter()
             .zip(expected)
-            .all(|(actual, expected)| (actual - expected).abs() < 1e-5)
+            .all(|(actual, expected): (&f32, f32)| {
+                let tol = sanic::verify::rel_tolerance(Dtype::F32, 2) * (1.0 + expected.abs() as f64);
+                ((actual - expected).abs() as f64) < tol
+            })
     );
 }
 
