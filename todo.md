@@ -21,7 +21,9 @@ page is substrate we need so the moat is usable on real workloads.
 
 - **`derive`** — the core. Reconstructs online-softmax (rescale), deferred
   normalizers (defer-div), fused elementwise, multi-slot tuples, affine/SSM
-  scans. 25 law tests: `tree_fold == fold == reference`.
+  scans. Associative carrier families are checked with
+  `tree_fold == fold == reference`; k-best's current sequential-only insertion
+  carrier is checked against the reference separately.
 - **`analyze` / `plan` / `cost` / `partition`** — classify axes, pick tiles by
   analytical roofline, split a whole graph at the derive frontier. A full
   transformer block + logits head lowers to 13 kernels with the attention core
@@ -60,6 +62,44 @@ page is substrate we need so the moat is usable on real workloads.
 - **`emit_rust`** — the derived kernel as compilable Rust (scalar + tiled), for
   a single carrier (superseded by `rustgen` for whole schedules).
 
+- **Axes carry extents; labels are diagnostic** *(2026-07-17)* — the extent
+  is written once at the mint
+  (`axis("s", 512)`) — so every shape is derivable from any graph and the
+  `Extents` side-tables are GONE from the whole pipeline. `eval(node, env)`,
+  `partition(node, dev)`, `plan(node, dev)`, `grad(loss, wrt)`,
+  `Schedule::execute(env)`, `Session::new()`, `Value::from_fn(axes, f)`,
+  `volume(node)` — every extents/f64-map parameter deleted crate-wide (the
+  dual usize/f64 map wart with it). Axis labels do not participate in
+  equality, hashing, broadcasting, or shape resolution. `Extent::Dynamic` considered and
+  DEFERRED, stated: no consumer exists (interp/plan/emitters all need
+  concrete sizes; runtime dynamism is data-dependent bounds inside fixed
+  shapes — the honest-window pattern); the enum is a mechanical widening
+  when the first dynamic-shape workload lands.
+
+- **Explicit graph frontend (`src/tensor.rs`)** *(new, 2026-07-17)* — the
+  graph-building surface separates symbolic `TensorExpr` from concrete
+  `Tensor` data. `GraphBuilder::input` allocates dense `InputId`s; ordinary
+  Rust functions compose expressions; `finish(outputs)` freezes a reusable
+  `Graph`; `Graph::run([tensors])` binds concrete buffers by input order.
+  Dimensions are positional: operators use integer indices, elementwise
+  operations follow Torch trailing-dimension broadcasting, and `matmul`
+  assumes `(m, k) @ (k, n)`. Internal axes still carry extents, but labels
+  are diagnostics only. The
+  frontend delegates graph semantics to the IR; `tests/tensor.rs` covers
+  reusable execution, dense IDs, multiple outputs, and foreign-graph
+  rejection. `examples/llama3.rs` is the current frontend fixture.
+
+- **One-example policy while the API churns** *(2026-07-17)* — migrating
+  every example on every surface change is too costly, so `llama3.rs` is the
+  ONE example kept current. It is the graph-builder fixture: a compact Llama
+  3 decoder graph used to iterate on modeling ergonomics. Everything
+  else — gpt2, trinity, mnist, shakespeare, and the guided tours — is parked
+  UNMIGRATED in `examples/attic/` (cargo doesn't build it; see its README for
+  the revival recipe). The TESTS are the API-correctness net and stay fully
+  green — the capstone claims those examples established (HF-matching logits,
+  tok/s ladders) are history in this file, not things re-verified per commit.
+  Revive the attic in one batch when the surface settles.
+
 - **Movement ops (`Reindex`)** *(new)* — slice / zero-pad / reshape-split /
   windows as ONE affine-reindex operator beside `View`. Convolution is
   `window + flatten + matmul` — **one implicit-GEMM kernel, no im2col
@@ -93,7 +133,7 @@ page is substrate we need so the moat is usable on real workloads.
   splits, a 1024² flash does not (`tests/group.rs`). The cost model now
   distinguishes latency-hiding occupancy (compute) from memory-level
   parallelism (bandwidth: `lanes_per_block`, `Device::mem_lanes`).
-- **Storage dtypes, priced AND real** *(new)* — `input_dt(name, axes,
+- **Storage dtypes, priced AND real** *(new)* — `input(name, axes,
   Dtype::I4)` declares a buffer's storage width; the planner bills each
   input's true bytes (int4 < int8 < f16 for the same GEMV), and the Metal
   backend now reads **typed device buffers**: `half` widens on load, packed
@@ -213,7 +253,7 @@ Additive to the IR, no algebra changes:
   scale, dequantized *inside* the GEMM lift automatically (elementwise fuses
   into the contraction). One fused kernel, no materialized dequant weight,
   no new op — verified interp / compiled Rust / GPU.
-- **Storage dtype → cost** — [done]. `input_dt(…, Dtype::I8/I4)` declares a
+- **Storage dtype → cost** — [done]. `input(…, Dtype::I8/I4)` declares a
   buffer's storage width; the planner prices each input's true bytes, so
   int-quantized weights earn their bandwidth win in the ranking
   (int4 < int8 < f16 on a memory-bound GEMV, `plan::tests`).
@@ -256,11 +296,12 @@ Decided per op, decomposition over new node kinds in every case:
   argmax is **one kernel**. Replaced the original `Σ i·[x == max]`
   composition (two kernels, and unsound to fuse: it differs on ties).
 - **top-k** — `BinOp::TopK`: sorted (value, index) lists of length ≤ k form
-  a tuple monoid (merge-take-k; streaming-side combine is the singleton
-  insert), so EVERY rank's value or index is one independent fold over the
-  raw scores — no mask-the-winner chain, first-max-wins across the whole
-  selection, GPU-verified with planted exact ties. Split reductions decline
-  (the singleton insert is not a two-list merge; guarded).
+  a tuple monoid under merge-take-k, but the current carrier implements only
+  singleton insertion. EVERY rank's value or index is still one independent
+  sequential fold over the raw scores — no mask-the-winner chain,
+  first-max-wins across the whole selection, GPU-verified with planted exact
+  ties. Tree and split reductions decline until combine handles two full
+  lists (guarded).
 - **scatter-add** — `ir::scatter_add`, a one-hot contraction: the inverse of
   gather with order-free collision handling — exactly gather's adjoint,
   which M8 leans on. Dense O(n·m) as a graph; atomics are a backend concern.
@@ -353,8 +394,8 @@ plus the honest-window early exit. `vs_mlx.md` has the full ledger.
 
 **GPT-2 (124M), real OpenAI weights, matches HuggingFace.**
 `cargo run --release --example gpt2`: the official `model.safetensors` loads
-through a dependency-free reader (`src/safetensors.rs`, BF16/F16/F32 all
-decode), the 12-layer network is built as plain IR — LayerNorm from basis
+through a dependency-free reader (BF16/F16/F32 all decoded; since replaced
+by the `safetensors` crate), the 12-layer network is built as plain IR — LayerNorm from basis
 ops, learned positions as `gather(wpe, iota(s))`, the fused qkv weight split
 host-side, GELU as a tanh composition, weight-tied logits — `partition_many`
 splits it into **223 kernels in 0.18 s**, and the whole schedule dispatches
@@ -483,7 +524,8 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   views/reindexes/gathers with the AXIS TRANSLATED at each boundary
   (below a flatten the entanglement lives on the members), placing retry
   cuts as deep as the algebra allows. The count ladder then continued on
-  theory, not tuning: `BinOp::ArgMax` and `BinOp::TopK` (tuple monoids —
+  theory, not tuning: `BinOp::ArgMax` and `BinOp::TopK` (pair monoid and
+  sequential k-best insertion, respectively —
   the old `Σ i·[x == max]` spelling is tie-unsound to fuse, and the
   mask-the-winner chain wasted a fold per rank) collapsed routing to a
   score fold + 8 independent rank folds; sharing stopped being a fusion
@@ -605,7 +647,8 @@ provably bit-identical (masked tail = exact f32 no-op; coop bound
 clamped to the split width so no lane merges identity — the −∞ edge);
 prefill causal flash gets per-row windows from the same detector; flash
 class 2.01 → 0.51 ms, GPU-tested at four positions vs the full oracle.
-CLOSED: tokenizer encoder (2026-07-13) — `src/bpe.rs`, GPT-2 byte-level
+CLOSED: tokenizer encoder (2026-07-13) — `src/bpe.rs` (since deleted in
+favor of the `tokenizers` crate), GPT-2 byte-level
 BPE in the dependency-free house style (the pre-tokenizer regex
 hand-rolled as its ordered-alternative matcher), held to HuggingFace
 tokenizations generated on this repo's own vocab files (`tests/bpe.rs`,

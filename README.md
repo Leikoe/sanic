@@ -20,6 +20,9 @@ certificate (fold left-to-right, O(1) state) and the parallelism certificate
 (combine blocks in any order). That one fact, applied by structural recursion,
 is what lets the *same* code derive `sum`, `softmax`, FlashAttention,
 RMSNorm-fused GEMMs, argmax and top-k with no special case for any of them.
+Top-k is currently the one caveat: its carrier performs correct one-pass
+k-best insertion, but does not yet implement the two-list merge required to
+license tree or split-reduction execution.
 
 ## Why it's fast on the GPU
 
@@ -70,18 +73,15 @@ SGD loop that converges, and split reductions.
 ## Run it
 
 ```
-cargo run --example derive   # print structure maps + derived carriers
-cargo run --example mha      # naive multi-head attention → FlashAttention
-cargo run --example mla      # DeepSeek MLA, standard & absorbed → same kernel
-cargo run --example llm      # a transformer block, split into 13 kernels
-cargo run --release --example gpt2 --prompt "…"   # GPT-2 on the GPU
-cargo run --release --example trinity             # 5.5B MoE on a laptop
-cargo run --release --example mnist  # train an MLP on MNIST end to end, on the GPU
-cargo test                   # 153 tests (incl. rustc-compiled and GPU-dispatched)
+cargo run --example direct_attention
+cargo test
 ```
 
-`cargo run --example derive` prints the streaming carrier it reconstructs for
-attention — no template involved:
+The current frontend constructs immutable nodes directly and compiles one or
+more output roots; no explicit graph builder is required. Larger historical
+model fixtures are parked in `examples/attic/` while they migrate to this
+surface. The engine still derives the streaming attention carrier from the
+naive graph:
 
 ```
 structure map

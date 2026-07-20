@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::cost::DeviceProfile;
+use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 use sanic::partition::partition;
 
@@ -63,7 +63,7 @@ fn main() {
     let n = ext[&dm] as f64;
 
     let mut rng = Lcg(0xADE1A1DE);
-    let mut r = |axes: &[Axis]| Tensor::from_fn(axes, &ext, |_| rng.f());
+    let mut r = |axes: &[Axis]| Value::from_fn(axes, &ext, |_| rng.f());
     let env: Env = [
         ("X", r(&[s, dm])),
         ("g1", r(&[dm])),
@@ -81,12 +81,12 @@ fn main() {
     .collect();
 
     // one transformer block + logits head (same graph as examples/llm.rs)
-    let x = input("X", &[s, dm]);
-    let xn = rmsnorm(x.clone(), input("g1", &[dm]), n, dm);
+    let x = input("X", &[s, dm], Dtype::F32);
+    let xn = rmsnorm(x.clone(), input("g1", &[dm], Dtype::F32), n, dm);
     let xn_kv = rename(xn.clone(), s, t);
-    let q = matmul(xn, input("Wq", &[h, dk, dm]), dm);
-    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm]), dm);
-    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm]), dm);
+    let q = matmul(xn, input("Wq", &[h, dk, dm], Dtype::F32), dm);
+    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32), dm);
+    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32), dm);
     let scores = matmul(q, k, dk);
     let scaled = map(
         MapOp::Mul,
@@ -95,22 +95,22 @@ fn main() {
     let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
     let attn = matmul(softmax(masked, t), vv, t);
     let flat = flatten(attn, &[h, dv], dmv);
-    let o = matmul(flat, input("Wo", &[dmv, dm]), dmv);
+    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32), dmv);
     let res1 = map(MapOp::Add, vec![o, x]);
-    let hn = rmsnorm(res1.clone(), input("g2", &[dm]), n, dm);
-    let gate = matmul(hn.clone(), input("Wg", &[f, dm]), dm);
-    let up = matmul(hn, input("Wu", &[f, dm]), dm);
+    let hn = rmsnorm(res1.clone(), input("g2", &[dm], Dtype::F32), n, dm);
+    let gate = matmul(hn.clone(), input("Wg", &[f, dm], Dtype::F32), dm);
+    let up = matmul(hn, input("Wu", &[f, dm], Dtype::F32), dm);
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = reduce(
-        map(MapOp::Mul, vec![act, input("Wd", &[f, dm])]),
+        map(MapOp::Mul, vec![act, input("Wd", &[f, dm], Dtype::F32)]),
         f,
         add_r(),
     );
     let yb = map(MapOp::Add, vec![mlp, res1]);
-    let logits = matmul(yb, input("W_lm", &[v, dm]), dm);
+    let logits = matmul(yb, input("W_lm", &[v, dm], Dtype::F32), dm);
 
     // lower → schedule
-    let sched = partition(&logits, &Device::toy(), &f64ext);
+    let sched = partition(&logits, &DeviceProfile::toy(), &f64ext);
     println!("{}", sched.render());
 
     // execute the schedule, and compute the naive reference

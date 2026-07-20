@@ -15,8 +15,7 @@ use std::collections::HashMap;
 
 use crate::codegen::{Gen, Lang, buffers, carrier_expr, carrier_expr_map, offset, san, value};
 use crate::derive::Carrier;
-use crate::interp::Extents;
-use crate::ir::{Axis, MapOp, Monoid, Node, output_axes};
+use crate::kernel_ir::{Axis, MapOp, Monoid, NodeRef as Node};
 use crate::partition::{Schedule, Stage};
 
 // ── the Rust target ──────────────────────────────────────────────────────────
@@ -122,14 +121,13 @@ fn params_and_args(node: &Node) -> (String, Vec<&'static str>) {
 fn grid_loops(
     grid: &[Axis],
     coord: &mut HashMap<Axis, String>,
-    ext: &Extents,
     g: &mut Gen,
 ) -> (Vec<String>, Vec<String>) {
     let mut open = Vec::new();
     for &a in grid {
         let iv = g.fresh("i");
         coord.insert(a, iv.clone());
-        open.push(format!("for {iv} in 0..{} {{", ext[&a]));
+        open.push(format!("for {iv} in 0..{} {{", a.extent()));
     }
     (open, grid.iter().map(|_| "}".to_string()).collect())
 }
@@ -142,20 +140,19 @@ fn emit_fused(
     carrier: &Carrier,
     stream: Axis,
     fold_node: &Node,
-    ext: &Extents,
 ) -> (String, Vec<&'static str>) {
     assert_eq!(
         carrier.project.len(),
         1,
         "rustgen fused kernel needs a scalar projection"
     );
-    let grid = output_axes(fold_node);
-    let grid_ext: usize = grid.iter().map(|a| ext[a]).product::<usize>().max(1);
+    let grid = fold_node.shape();
+    let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(fold_node);
 
     let mut g = Gen::new();
     let mut coord: HashMap<Axis, String> = HashMap::new();
-    let (open, close) = grid_loops(&grid, &mut coord, ext, &mut g);
+    let (open, close) = grid_loops(&grid, &mut coord, &mut g);
 
     let mut src = vec![
         format!("pub fn {fname}({params}) -> Vec<f64> {{"),
@@ -178,9 +175,9 @@ fn emit_fused(
     let items: Vec<String> = carrier
         .leaves
         .iter()
-        .map(|l| value(&RUST, l, &cs, ext, &mut g, &mut sbody))
+        .map(|l| value(&RUST, l, &cs, &mut g, &mut sbody))
         .collect();
-    src.push(format!("for {sv} in 0..{} {{", ext[&stream]));
+    src.push(format!("for {sv} in 0..{} {{", stream.extent()));
     src.extend(sbody);
     src.push(format!("let x = [{}];", items.join(", ")));
     src.push(format!(
@@ -216,10 +213,10 @@ fn emit_fused(
     for &i in &pitems {
         let leaf = &carrier.leaves[i];
         assert!(
-            !crate::ir::all_axes(leaf).contains(&stream),
+            !crate::kernel_ir::all_axes(leaf).contains(&stream),
             "a projection may only read stream-invariant leaves"
         );
-        let e = value(&RUST, leaf, &coord, ext, &mut g, &mut src);
+        let e = value(&RUST, leaf, &coord, &mut g, &mut src);
         let v = g.fresh("pv");
         src.push(format!("let {v} = {e};"));
         pv.insert(i, v);
@@ -231,7 +228,7 @@ fn emit_fused(
         &|i| format!("acc[{i}]"),
         &|_| unreachable!("B slot in a projection"),
     );
-    src.push(format!("outb[{}] = {proj};", offset(&grid, &coord, ext)));
+    src.push(format!("outb[{}] = {proj};", offset(&grid, &coord)));
     src.extend(close);
     src.push("    outb".into());
     src.push("}".into());
@@ -240,14 +237,14 @@ fn emit_fused(
 
 /// A straight-line kernel (elementwise cone, gather, monoidal scan-as-reduce):
 /// grid over the output axes, write [`value`] of the spliced graph.
-fn emit_pointwise(fname: &str, exec: &Node, ext: &Extents) -> (String, Vec<&'static str>) {
-    let grid = output_axes(exec);
-    let grid_ext: usize = grid.iter().map(|a| ext[a]).product::<usize>().max(1);
+fn emit_pointwise(fname: &str, exec: &Node) -> (String, Vec<&'static str>) {
+    let grid = exec.shape();
+    let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(exec);
 
     let mut g = Gen::new();
     let mut coord: HashMap<Axis, String> = HashMap::new();
-    let (open, close) = grid_loops(&grid, &mut coord, ext, &mut g);
+    let (open, close) = grid_loops(&grid, &mut coord, &mut g);
 
     let mut src = vec![
         format!("pub fn {fname}({params}) -> Vec<f64> {{"),
@@ -255,9 +252,9 @@ fn emit_pointwise(fname: &str, exec: &Node, ext: &Extents) -> (String, Vec<&'sta
     ];
     src.extend(open);
     let mut body = Vec::new();
-    let v = value(&RUST, exec, &coord, ext, &mut g, &mut body);
+    let v = value(&RUST, exec, &coord, &mut g, &mut body);
     src.extend(body);
-    src.push(format!("outb[{}] = {v};", offset(&grid, &coord, ext)));
+    src.push(format!("outb[{}] = {v};", offset(&grid, &coord)));
     src.extend(close);
     src.push("    outb".into());
     src.push("}".into());
@@ -283,7 +280,7 @@ pub struct Program {
 /// Lower a whole schedule to Rust: one function per stage plus a `run` driver
 /// threading intermediates by name — the codegen analog of
 /// [`Schedule::execute`].
-pub fn emit_schedule(sched: &Schedule, ext: &Extents) -> Program {
+pub fn emit_schedule(sched: &Schedule) -> Program {
     let mut fns: Vec<String> = Vec::new();
     let mut driver: Vec<String> = Vec::new();
     let mut produced: Vec<&'static str> = Vec::new();
@@ -319,7 +316,7 @@ pub fn emit_schedule(sched: &Schedule, ext: &Extents) -> Program {
                 let out = spec.output_name.clone();
                 let raw_fn = format!("k_{}_fold", san(&out));
                 let (code, args) =
-                    emit_fused(&raw_fn, &spec.carrier, spec.streaming_axis, fold_node, ext);
+                    emit_fused(&raw_fn, &spec.carrier, spec.streaming_axis, fold_node);
                 fns.push(code);
                 driver.push(format!(
                     "    let {} = {raw_fn}({});",
@@ -330,7 +327,7 @@ pub fn emit_schedule(sched: &Schedule, ext: &Extents) -> Program {
                 if let Some(epi) = epilogue_node {
                     note_inputs(epi, &produced, &mut inputs);
                     let epi_fn = format!("k_{}_epi", san(&out));
-                    let (code, args) = emit_pointwise(&epi_fn, epi, ext);
+                    let (code, args) = emit_pointwise(&epi_fn, epi);
                     fns.push(code);
                     driver.push(format!(
                         "    let {} = {epi_fn}({});",
@@ -340,7 +337,7 @@ pub fn emit_schedule(sched: &Schedule, ext: &Extents) -> Program {
                 }
                 produced_axes.insert(
                     out.clone(),
-                    output_axes(epilogue_node.as_ref().unwrap_or(fold_node)),
+                    epilogue_node.as_ref().unwrap_or(fold_node).shape(),
                 );
             }
             Stage::Elementwise { output, exec, .. }
@@ -348,7 +345,7 @@ pub fn emit_schedule(sched: &Schedule, ext: &Extents) -> Program {
             | Stage::Sequential { output, exec, .. } => {
                 note_inputs(exec, &produced, &mut inputs);
                 let fname = format!("k_{}", san(output));
-                let (code, args) = emit_pointwise(&fname, exec, ext);
+                let (code, args) = emit_pointwise(&fname, exec);
                 fns.push(code);
                 driver.push(format!(
                     "    let {} = {fname}({});",
@@ -356,7 +353,7 @@ pub fn emit_schedule(sched: &Schedule, ext: &Extents) -> Program {
                     arglist(&args)
                 ));
                 produced.push(leak(output));
-                produced_axes.insert(output.clone(), output_axes(exec));
+                produced_axes.insert(output.clone(), exec.shape());
             }
             Stage::Infeasible { output, .. } => {
                 panic!("rustgen: cannot emit an infeasible stage producing `{output}`")

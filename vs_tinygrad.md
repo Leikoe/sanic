@@ -1,6 +1,6 @@
 # sanic vs tinygrad
 
-A code-level comparison against tinygrad at `afeb5c708` (2026-07-11, vendored
+A code-level comparison against tinygrad at `f315df29a` (2026-07-17, vendored
 at `references/tinygrad`). All tinygrad citations are file:line in that tree.
 The short version: the two projects **independently converged on the same
 scheduling substrate** (kernels = shared loop ranges, movement = index
@@ -12,24 +12,29 @@ That one difference is why sanic derives FlashAttention from naive
 
 ## Where the designs converged (independently)
 
-**tinygrad deleted the ShapeTracker.** The strides+mask view machinery that
-defined tinygrad for years is gone — zero hits in the tree. Movement ops
+**tinygrad deleted the ShapeTracker from the production package.** The
+strides+mask view machinery that defined tinygrad for years is gone (a few
+tests and stale comments still name it). Movement ops
 (`RESHAPE/PERMUTE/EXPAND/PAD/SHRINK/FLIP`) are now first-class graph nodes
 (`tinygrad/uop/__init__.py:98-123`) that the "rangeify" pass lowers into
 index arithmetic over explicit loop variables (`RANGE` UOps): SHRINK is an
 index offset, PERMUTE reorders index vars, PAD attaches a validity mask,
 RESHAPE is div/mod re-decomposition simplified symbolically
-(`tinygrad/schedule/indexing.py:131-148`, `:115-128`). After scheduling,
+(`tinygrad/schedule/indexing.py:147-165`, `:132-145`). After scheduling,
 movement ops no longer exist — only index expressions.
 
-That is the same move as sanic's `View`: reindexing as a structural, zero-
-cost operator, resolved at planning time. Sanic's `rename`/`flatten` are a
-2-op subset of tinygrad's 6 (no pad/shrink/flip, no masks, no symbolic
-extents).
+That is the same move as sanic's `View` and affine `Reindex`: reindexing as
+structural index arithmetic instead of a copy. Sanic already expresses
+rename/flatten, split, slice, zero-pad, flip, and sliding windows with those
+two nodes. Tinygrad's version is more general because its indices, extents,
+and validity masks share one symbolic UOp language. Sanic also still encodes
+pure axis-order changes by adding zero-valued `Iota` arithmetic
+(`TensorExpr::with_axis_order`), which is a frontend workaround rather than a
+sound long-term representation of layout.
 
 **The same fusion substrate.** In tinygrad, *two ops share a kernel iff they
 share loop ranges*: a single-consumer producer inherits its consumer's
-ranges and fuses (`indexing.py:194-196`); boundaries appear where ranges
+ranges and fuses (`indexing.py:211-213`); boundaries appear where ranges
 can't flow. In sanic, *everything one `derive` call swallows is one kernel*,
 and cuts land at the carrier's leaves. Both replaced op-category fusion
 rules with a structural criterion. Neither has a pattern library.
@@ -37,7 +42,7 @@ rules with a structural criterion. Neither has a pattern library.
 **The same multi-consumer logic — theirs is finer.** When a DAG-shared node
 is indexed identically by all consumers, tinygrad recomputes/fuses it
 (validity masks OR'd); where consumers' index expressions differ, it
-materializes **only those axes** (`indexing.py:197-221`). Sanic's partitioner
+materializes **only those axes** (`indexing.py:214-238`). Sanic's partitioner
 materializes a shared node whole (`partition.rs`, the `shared` barrier).
 Same rule, but tinygrad's per-axis partial realize is strictly more precise
 — worth stealing.
@@ -53,7 +58,7 @@ expressions.
 tinygrad's kernel cut between dependent reductions is unconditional at
 default settings: a REDUCE closes its ranges, and any producer that feeds a
 *second* reduce over ended ranges is forced to materialize
-(`ending_ranges`, `indexing.py:224-233`). Consequences, from their own code
+(`ending_ranges`, `indexing.py:240-250`). Consequences, from their own code
 and tests:
 
 - **softmax is 3 kernels** — max, exp/sum, div — stated verbatim in
@@ -86,10 +91,10 @@ tinygrad has **no axis names**: REDUCE's arg is a *count* of leading axes,
 RANGE ids are counters tagged with a hardware role (`AxisType`:
 GLOBAL/LOCAL/LOOP/REDUCE/UPCAST/…, `uop/ops.py:17-20`), and einops-style
 names in `rearrange`/`einsum` are surface sugar compiled straight to
-permute/reshape (`mixin/movement.py:347-390`). Positional axes sidestep the
-capture problem entirely — and make a question like "is this axis foldable
-at this node" unaskable, which is fine for tinygrad because it never asks
-it.
+permute/reshape/reduce (`mixin/movement.py:365-405`,
+`mixin/op.py:417-455`). Positional axes sidestep the capture problem
+entirely — and make a question like "is this axis foldable at this node"
+unaskable, which is fine for tinygrad because it never asks it.
 
 Sanic bets the other way: named axes carry semantic identity across the
 graph, which is what the per-(node, axis) classification and the carrier's
@@ -97,6 +102,144 @@ slot spans are built on — and which is why sanic needed scoping semantics
 (`Reduce` binds, `View` re-binds). The two decisions are coupled: **the
 algebra needs axis identity; syntactic fusion doesn't.** Any "derive-first"
 compiler will have to make sanic's choice.
+
+## What `tinyspec` teaches us about our IR
+
+Tinygrad's formal spec is not merely its executable verifier. `spec/tinyspec.tex`
+defines one UOp dialect from tensor graphs through command buffers: a UOp is
+`(op, src, arg, tag)` with derived `dtype`, `shape`, `device`, `addrspace`, and
+`min_max` (`spec/tinyspec.tex:41-43`, `:248-288`). The same vocabulary includes
+pure movement and arithmetic, functions and tuples, loads/stores and ordering,
+loop ranges, barriers, WMMA, and compiled programs (`:67-245`). Its last table
+names the whole lowering pipeline from callification and rangeification through
+register/memory planning and rendering (`:440-453`).
+
+That is a more important idea than any particular UOp: **one representation
+carries facts forward, while each compiler phase admits only a checked subset.**
+The executable `type_verify` makes that second half real with `spec_tensor` and
+`spec_program` (`tinygrad/uop/spec.py:35-44`, `:134-223`).
+
+Sanic should learn from that without copying the single-dialect boundary
+literally:
+
+| concern | tinygrad | sanic today | design verdict |
+|---|---|---|---|
+| semantic unit | one UOp union across phases | nine pure `NodeKind`s, then `Carrier`, `Stage`, and `KernelSpec` | Sanic's phase separation is clearer; shared scalar/index sublanguages should stop being duplicated |
+| axes | positional shapes; schedule `RANGE`s get `AxisType` | opaque semantic axis identities with scoped `View`/`Reindex` binders | Sanic's identity is required for per-(node, axis) algebra; preserve it, but give split loops separate schedule identities |
+| reductions | `ADD/MAX/MUL` over leading positional axes | named-axis scalar monoids plus argmax, top-k, affine and non-associative declarations | Sanic is algebraically stronger, but `BinOp` currently conflates scalar result semantics, tuple carrier state, and recurrence classification |
+| movement | explicit tensor movement ops lowered to symbolic range indices and validity masks | `View` plus affine `Reindex`, with `Gather` for data-dependent access | The convergence is good; Sanic still needs a general symbolic integer/validity language, not more movement constructors |
+| effects | `LOAD/STORE/AFTER/GROUP/SINK` in the dialect | tensor DAG stays pure; ordered stages and runtime commits carry effects | Purity is a strength worth keeping; a typed lower command IR should replace implicit vector order and string-named buffers |
+| derived facts | dtype, shape, device, address space, value interval, sharding axis | output axes, structure, carrier spans, storage-byte dtype, roofline | Sanic's algebraic facts are unique; dtype, symbolic extent, device and bounds facts are far too weak |
+| reusable graphs | `FUNCTION/PARAM/TUPLE/GETTUPLE/CALL` | whole graphs have multiple roots; individual nodes are single-valued | Product values or multi-result reducers are needed before adding more tuple-like special reductions |
+
+### Sanic's genuine strengths
+
+**The algebra is semantic, executable IR.** Tinygrad records that a handful of
+scalar ops are associative, but its formal language has no representation for
+an accumulator with `lift/combine/project`, no slot spans, and no proof target
+connecting a tree fold to the original tensor program. For the laws it fully
+implements, Sanic's carrier is a real compiler object with an identity,
+symbolic merge, projection, and leaves. That is why online softmax and weighted
+online softmax can be *derived* from ordinary graphs instead of introduced as
+opaque calls.
+
+**Axis identity makes the algebra local and compositional.** Named identity is
+not frontend decoration: it lets the same axis be free at one node, reduced at
+another, rebound by a view, and classified independently everywhere. Tinygrad's
+positional ranges are excellent scheduling objects; they cannot express this
+semantic question without reconstructing provenance.
+
+**The semantic graph is pure.** A KV-cache update remains a pure expression,
+and the runtime commits it only after the schedule finishes. This keeps alias
+and ordering arguments out of carrier derivation. Tinygrad's one dialect gains
+rewrite uniformity by including effects; Sanic gains a smaller proof surface by
+introducing them only after the math is settled.
+
+**There is an independent oracle.** Dense `eval`, executable carriers,
+interpreted schedules, generated Rust, and Metal can be compared layer by
+layer. Tinygrad has vastly broader tests and backends, but Sanic's explicit
+`run_carrier == eval` boundary is unusually strong for the transformation it
+is attempting.
+
+### The design debt exposed by the comparison
+
+1. **One closed basis is currently restated too many times.** `MapOp`,
+   carrier `Expr`, dense evaluation, reverse mode, Rust rendering, and Metal
+   rendering each encode scalar semantics. They can drift: `Tanh` is a legal
+   `MapOp` and exists in both emitters and autodiff, but carrier `Expr` has no
+   `Tanh` and derivation declines it. The right lesson from UOps is to share a
+   typed scalar expression language and make phase capability explicit, not to
+   keep six exhaustive matches synchronized by convention.
+2. **`BinOp` is doing three jobs, and one claimed law is currently false.**
+   Scalar monoids have complete dense semantics. `ArgMax`/`TopK` secretly
+   introduce tuple state and project back to one scalar. The implemented
+   k-best merge inserts a singleton into the left state; it is not the
+   advertised two-list merge, and split reduction explicitly refuses it.
+   Therefore that carrier is a valid sequential streaming algorithm but not
+   yet an associative/tree certificate. `AffineCompose` expects a two-field
+   item that the tensor value system cannot represent, while `NonAssoc` is a
+   scheduling verdict rather than an operator. Before adding reducers, Sanic
+   needs either product values or a closed reducer interface whose input,
+   state, result, identity, combine, and reference semantics agree.
+3. **Dynamic shape is a marker, not symbolic shape.** A dynamic extent can be
+   copied from a bound input, but it cannot express products, quotients,
+   inequalities, or validity. Tinygrad uses the same symbolic integer UOps for
+   shapes, ranges, indices, and min/max bounds. Sanic should build one small
+   integer/index language and reuse it for extents, `View`, `Reindex`, planner
+   constraints, and bounds proofs.
+4. **Axis order is currently smuggled through arithmetic.**
+   `TensorExpr::permute` and `unsqueeze` call `with_axis_order`, which adds
+   `0 * Iota(axis)` terms solely so `Map`'s ordered union produces a desired
+   dimension order. A value-preserving arithmetic node should not carry
+   storage layout. Shape/order needs an explicit semantic representation that
+   lowers to index expressions.
+5. **Semantic axes and scheduled loops need distinct identities.** Today a
+   `KernelSpec` assigns roles directly to semantic axes. Split reductions,
+   vector lanes, workgroup axes, padding, and tensor-core fragments create new
+   loops that are not new tensor dimensions. Tinygrad's `AxisType` table makes
+   this separation explicit. Sanic should preserve semantic-axis provenance
+   while lowering to independently splittable loop ranges.
+6. **The pure/effect boundary needs a real lower IR.** Keeping `Store` out of
+   `NodeKind` is correct, but `Vec<Stage>` execution order plus string buffer
+   names will not support memory reuse, barriers, async copies, atomics, or
+   multi-device dependencies cleanly. Add a typed command/buffer graph after
+   partitioning; do not contaminate the algebraic tensor IR to get it.
+7. **Dtype must become semantics before serious codegen.** Sanic's `Dtype`
+   currently prices storage bytes while the oracle computes `f64`. That was a
+   useful bootstrap, but casts, accumulation dtype, integer ops, overflow,
+   vector types, and quantized loads need derived type rules like tinygrad's.
+
+The resulting architecture is deliberately not tinygrad's single union:
+
+```text
+pure tensor DAG (semantic axes, dtype, symbolic extents)
+        ↓ algebraic analysis
+carrier certificate (lift / associative combine / project)
+        ↓ partition + range lowering
+typed command DAG (buffers, loop ranges, effects, dependencies)
+        ↓ target selection
+instructions / source / binary
+```
+
+The layers should share scalar and symbolic-index expressions and carry
+provenance between them. They should not share every operation or admit every
+node in every phase.
+
+## Executable verification, not a frozen language spec
+
+Sanic's `src/verify.rs` is an internal graph-boundary verifier, not a formal
+language document and not a stability promise. A bottom-up DAG walk rejects
+wrong `Map` arity, inconsistent declarations of one input buffer, duplicate or
+zero-sized axes, invalid `TopK` parameters, ill-scoped `View` groups, wrong
+flatten extents, and statically out-of-bounds unpadded affine reindexes.
+Dynamic affine bounds are rechecked after graph inputs are concretized.
+
+That borrows Tinygrad's useful discipline—malformed IR should fail at a named
+boundary—from `type_verify`, without pretending Sanic's early IR is finished.
+It checks structural well-formedness, not algebraic truth: carrier identity,
+associativity, and reference equivalence remain separate obligations. The
+verifier should change freely with the IR and stay smaller than the semantics
+it protects.
 
 ## Per-kernel optimization: measured beam vs analytical enumeration
 
@@ -164,8 +307,9 @@ The claim above is now a number, on the same M1 Pro, batch-1 KV decode:
 
 Where the 1.9× on Trinity comes from, per component: their `Tensor.topk`
 lowers to a 37-kernel bitonic-sort cascade per router (sanic: one k-best
-fold per rank — the tuple monoid tinygrad's syntactic criterion cannot
-see); attention is ~15 kernels/layer against one derived flash fold (the
+streaming insertion per rank; it still needs a true associative two-list
+merge before it licenses split/tree execution); attention is ~15
+kernels/layer against one derived flash fold (the
 dependent-reduce cut, measured); norms are un-fusable two-pass pairs where
 sanic's stream-invariant rule dissolves the second pass into every
 consumer GEMM. The purely-lazy 72k blowup — each sort stage re-walking the

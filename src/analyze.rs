@@ -7,7 +7,8 @@
 //! classified, with the derived accumulator attached wherever one exists.
 
 use crate::derive::{self, Carrier};
-use crate::ir::{self, Axis, Node, NodeKind};
+use crate::kernel_ir as ir;
+use crate::kernel_ir::{Axis, Node as NodeKind, NodeRef as Node};
 
 /// How parallel an axis is, best to worst. `Ord` follows that order, so the
 /// join of two structures is `max` — the least parallel input wins.
@@ -243,7 +244,7 @@ impl Report {
                 Parallelism::Opaque => "runtime gather",
                 Parallelism::Sequential => "serial — no fold",
             };
-            out += &format!("  {:<4} {:<18} → {}\n", a.axis.label(), tag, action);
+            out += &format!("  {:<4} {:<18} → {}\n", a.axis.name, tag, action);
             if let Some(c) = &a.carrier {
                 for line in c.render().lines() {
                     out += &format!("         {line}\n");

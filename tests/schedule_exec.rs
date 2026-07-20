@@ -11,11 +11,9 @@
 //! preserve the semantics — on a real multi-head transformer block, not a
 //! single kernel in isolation.
 
-use std::collections::HashMap;
-
-use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
-use sanic::ir::*;
+use sanic::cost::DeviceProfile;
+use sanic::interp::{Env, Value, eval};
+use sanic::kernel_ir::*;
 use sanic::partition::partition;
 
 struct Lcg(u64);
@@ -30,11 +28,11 @@ impl Lcg {
     }
 }
 
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
-fn assert_close(x: &Tensor, y: &Tensor) {
+fn assert_close(x: &Value, y: &Value) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(x.shape, y.shape, "shape: {:?} vs {:?}", x.axes, y.axes);
     let mut worst = 0.0f64;
@@ -44,16 +42,11 @@ fn assert_close(x: &Tensor, y: &Tensor) {
     assert!(worst < 1e-9, "max relative error {worst:e}");
 }
 
-/// f64 extents (for the planner) from usize extents (for execution).
-fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
-    ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
-}
-
 fn add_r() -> BinOp {
     BinOp::Monoid(Monoid::Add)
 }
 
-fn rmsnorm(x: Node, g: Node, n: f64, ax: Axis) -> Node {
+fn rmsnorm(x: NodeRef, g: NodeRef, n: f64, ax: Axis) -> NodeRef {
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), ax, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
@@ -63,33 +56,36 @@ fn rmsnorm(x: Node, g: Node, n: f64, ax: Axis) -> Node {
 // ── a focused case: flash attention + residual epilogue + output GEMM ────────
 #[test]
 fn attention_block_schedule_executes_to_reference() {
-    let (s, t, dm, dk, dv) = (axis("s"), axis("t"), axis("dm"), axis("dk"), axis("dv"));
-    let ext: Extents = [(s, 4), (t, 4), (dm, 6), (dk, 5), (dv, 6)]
-        .into_iter()
-        .collect();
+    let (s, t, dm, dk, dv) = (
+        axis("s", 4),
+        axis("t", 4),
+        axis("dm", 6),
+        axis("dk", 5),
+        axis("dv", 6),
+    );
     let mut rng = Lcg(0xBEEF);
     let env: Env = [
-        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
-        ("Wq", rand_tensor(&[dk, dm], &ext, &mut rng)),
-        ("Wk", rand_tensor(&[dk, dm], &ext, &mut rng)),
-        ("Wv", rand_tensor(&[dv, dm], &ext, &mut rng)),
-        ("Wo", rand_tensor(&[dm, dv], &ext, &mut rng)),
+        ("X", rand_tensor(&[s, dm], &mut rng)),
+        ("Wq", rand_tensor(&[dk, dm], &mut rng)),
+        ("Wk", rand_tensor(&[dk, dm], &mut rng)),
+        ("Wv", rand_tensor(&[dv, dm], &mut rng)),
+        ("Wo", rand_tensor(&[dm, dv], &mut rng)),
     ]
     .into_iter()
     .collect();
 
-    let x = input("X", &[s, dm]);
+    let x = input("X", &[s, dm], Dtype::F32);
     let xk = rename(x.clone(), s, t);
-    let q = matmul(x.clone(), input("Wq", &[dk, dm]), dm); // [s, dk]
-    let k = matmul(xk.clone(), input("Wk", &[dk, dm]), dm); // [t, dk]
-    let v = matmul(xk, input("Wv", &[dv, dm]), dm); // [t, dv]
+    let q = matmul(x.clone(), input("Wq", &[dk, dm], Dtype::F32), dm); // [s, dk]
+    let k = matmul(xk.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [t, dk]
+    let v = matmul(xk, input("Wv", &[dv, dm], Dtype::F32), dm); // [t, dv]
     let attn = attention(q, k, v, dk, t); // [s, dv]
-    let o = matmul(attn, input("Wo", &[dm, dv]), dv); // [s, dm]
+    let o = matmul(attn, input("Wo", &[dm, dv], Dtype::F32), dv); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
-    let sched = partition(&y, &Device::toy(), &as_f64(&ext));
-    let executed = sched.execute(&env, &ext);
-    let reference = eval(&y, &env, &ext);
+    let sched = partition(&y, &DeviceProfile::toy());
+    let executed = sched.execute(&env);
+    let reference = eval(&y, &env);
     assert_close(&executed, &reference);
 }
 
@@ -100,87 +96,74 @@ fn attention_block_schedule_executes_to_reference() {
 #[test]
 fn full_transformer_block_schedule_executes_to_reference() {
     let (v, s, t, dm, h, dk, dv, dmv, f) = (
-        axis("v"),
-        axis("s"),
-        axis("t"),
-        axis("dm"),
-        axis("h"),
-        axis("dk"),
-        axis("dv"),
-        axis("dmv"),
-        axis("f"),
+        axis("v", 16),
+        axis("s", 4),
+        axis("t", 4),
+        axis("dm", 8),
+        axis("h", 2),
+        axis("dk", 4),
+        axis("dv", 4),
+        axis("dmv", 8), // h · dv
+        axis("f", 12),
     );
-    let ext: Extents = [
-        (v, 16),
-        (s, 4),
-        (t, 4),
-        (dm, 8),
-        (h, 2),
-        (dk, 4),
-        (dv, 4),
-        (dmv, 8), // h · dv
-        (f, 12),
-    ]
-    .into_iter()
-    .collect();
-    let n = ext[&dm] as f64;
+    let n = dm.extent() as f64;
 
     let mut rng = Lcg(0x5A5A_1234);
     let env: Env = [
-        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
-        ("g1", rand_tensor(&[dm], &ext, &mut rng)),
-        ("g2", rand_tensor(&[dm], &ext, &mut rng)),
-        ("Wq", rand_tensor(&[h, dk, dm], &ext, &mut rng)),
-        ("Wk", rand_tensor(&[h, dk, dm], &ext, &mut rng)),
-        ("Wv", rand_tensor(&[h, dv, dm], &ext, &mut rng)),
-        ("Wo", rand_tensor(&[dmv, dm], &ext, &mut rng)),
-        ("Wg", rand_tensor(&[f, dm], &ext, &mut rng)),
-        ("Wu", rand_tensor(&[f, dm], &ext, &mut rng)),
-        ("Wd", rand_tensor(&[f, dm], &ext, &mut rng)),
-        ("W_lm", rand_tensor(&[v, dm], &ext, &mut rng)),
+        ("X", rand_tensor(&[s, dm], &mut rng)),
+        ("g1", rand_tensor(&[dm], &mut rng)),
+        ("g2", rand_tensor(&[dm], &mut rng)),
+        ("Wq", rand_tensor(&[h, dk, dm], &mut rng)),
+        ("Wk", rand_tensor(&[h, dk, dm], &mut rng)),
+        ("Wv", rand_tensor(&[h, dv, dm], &mut rng)),
+        ("Wo", rand_tensor(&[dmv, dm], &mut rng)),
+        ("Wg", rand_tensor(&[f, dm], &mut rng)),
+        ("Wu", rand_tensor(&[f, dm], &mut rng)),
+        ("Wd", rand_tensor(&[f, dm], &mut rng)),
+        ("W_lm", rand_tensor(&[v, dm], &mut rng)),
     ]
     .into_iter()
     .collect();
 
-    let x = input("X", &[s, dm]);
-    let xn = rmsnorm(x.clone(), input("g1", &[dm]), n, dm);
+    let x = input("X", &[s, dm], Dtype::F32);
+    let xn = rmsnorm(x.clone(), input("g1", &[dm], Dtype::F32), n, dm);
     let xn_kv = rename(xn.clone(), s, t);
 
-    let q = matmul(xn, input("Wq", &[h, dk, dm]), dm); // [s, h, dk]
-    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm]), dm); // [t, h, dk]
-    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm]), dm); // [t, h, dv]
+    let q = matmul(xn, input("Wq", &[h, dk, dm], Dtype::F32), dm); // [s, h, dk]
+    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32), dm); // [t, h, dk]
+    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32), dm); // [t, h, dv]
 
     let scores = matmul(q, k, dk); // [s, h, t]
     let scaled = map(
         MapOp::Mul,
-        vec![scores, konst(1.0 / (ext[&dk] as f64).sqrt())],
+        vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())],
     );
     let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
     let attn = matmul(softmax(masked, t), vv, t); // [s, h, dv]
 
     let flat = flatten(attn, &[h, dv], dmv); // [s, dmv]
-    let o = matmul(flat, input("Wo", &[dmv, dm]), dmv); // [s, dm]
+    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32), dmv); // [s, dm]
     let res1 = map(MapOp::Add, vec![o, x]);
 
-    let hn = rmsnorm(res1.clone(), input("g2", &[dm]), n, dm);
-    let gate = matmul(hn.clone(), input("Wg", &[f, dm]), dm); // [s, f]
-    let up = matmul(hn, input("Wu", &[f, dm]), dm); // [s, f]
+    let hn = rmsnorm(res1.clone(), input("g2", &[dm], Dtype::F32), n, dm);
+    let gate = matmul(hn.clone(), input("Wg", &[f, dm], Dtype::F32), dm); // [s, f]
+    let up = matmul(hn, input("Wu", &[f, dm], Dtype::F32), dm); // [s, f]
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = reduce(
-        map(MapOp::Mul, vec![act, input("Wd", &[f, dm])]),
+        map(MapOp::Mul, vec![act, input("Wd", &[f, dm], Dtype::F32)]),
         f,
         add_r(),
     );
     let yb = map(MapOp::Add, vec![mlp, res1]);
 
-    let logits = matmul(yb, input("W_lm", &[v, dm]), dm); // [s, v]
+    let logits = matmul(yb, input("W_lm", &[v, dm], Dtype::F32), dm); // [s, v]
 
-    let sched = partition(&logits, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&logits, &DeviceProfile::toy());
     assert!(
         sched.kernel_count() >= 10,
         "expected a multi-kernel schedule"
     );
-    let executed = sched.execute(&env, &ext);
-    let reference = eval(&logits, &env, &ext);
+    let executed = sched.execute(&env);
+    let reference = eval(&logits, &env);
     assert_close(&executed, &reference);
 }

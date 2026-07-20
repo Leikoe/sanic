@@ -1,65 +1,107 @@
-//! Derive streaming kernels from algebra, not templates.
+//! Direct, positional tensor graphs compiled into algebraically derived
+//! streaming kernels.
 //!
-//! One fact does all the work: a computation can be streamed in one pass and
-//! parallelized in a tree along an axis **iff it is an associative fold along
-//! that axis**. Everything here is that fact applied by structural recursion:
+//! Construct immutable [`Node`](ir::Node) values directly, compile one root or
+//! an ordered tuple/vector of roots with [`Compile::compile`], then bind
+//! backend buffers by input name with [`Program::run`]. Dimension identity is
+//! local to each node's ordered shape: an operator such as `reduce(x, 1, op)`
+//! always addresses shape index `1`.
 //!
-//! * [`ir`] — five compute node kinds plus two structural operators: `View`
-//!   (rename / flatten) and `Reindex` (slice / pad / split / windows — affine
-//!   index maps; axes are scoped variables). Matmul, softmax, attention,
-//!   convolution, argmax, top-k and scatter-add are compositions
-//! * [`analyze`] — classify every (node, axis): FREE / MONOIDAL / OPAQUE /
-//!   SEQUENTIAL, and build the structure map
-//! * [`derive`] — turn each foldable axis into a concrete accumulator
-//! * [`cost`] — device model, feasibility, roofline; ranks, never validates
-//!   (legality is already settled)
-//! * [`plan`] — pick the streamed axis, a tile that fits SRAM, and whether a
-//!   fold should run as a two-stage split reduction
-//! * [`partition`] — split a whole graph (or several roots at once) into
-//!   kernels: the derive frontier is the fusion boundary, so cuts land
-//!   exactly where the algebra stops
-//! * [`grad`] — reverse-mode autodiff over the closed basis; backward graphs
-//!   are ordinary IR and go through the same pipeline as any forward graph
-//! * [`runtime`] — stateful sessions: persistent buffers, multi-output steps,
-//!   commit-after-execute updates (the KV-cache decode loop, optimizer state)
-//! * [`interp`] — a dense reference interpreter: the correctness oracle. It
-//!   evaluates the naive graph *and* drives a derived carrier on real
-//!   tensors, so `run_carrier == eval` certifies the generated kernel
-//!   computes the real math, not just that it folds consistently
-//! * [`codegen`] / [`rustgen`] / [`emit_metal`] — one shared node→code
-//!   recursion behind a `Lang` trait; whole schedules lower to compilable
-//!   Rust (verified by `rustc`-compile-and-run) and to Metal (dispatched on
-//!   the Apple GPU by the tests)
-//! * [`emit_rust`] — a single derived kernel as compilable Rust
+//! ```
+//! use sanic::{BinOp, Compile, CpuDevice, Dtype, Monoid, axis, input, reduce};
 //!
-//! The headline: given naive `softmax(QKᵀ)·V` as a dataflow graph, `derive`
-//! reconstructs the FlashAttention `(m, ℓ, o)` running accumulator from
-//! composition rules alone. The property tests in `tests/laws.rs` hold every
-//! derivation to `tree_fold == fold == reference` on random data — the
-//! associativity and correctness certificates in one assertion.
+//! let d = axis("d", 2);
+//! let x = input("x", [d, d], Dtype::F32);
+//! let rows = reduce(x, 1usize, BinOp::Monoid(Monoid::Add));
+//!
+//! let cpu = CpuDevice::new();
+//! let program = rows.compile(&cpu)?;
+//! let x = cpu.buffer([2, 2], Dtype::F32, [1.0, 2.0, 3.0, 4.0])?;
+//! let outputs = program.run([("x", x)]);
+//! assert_eq!(outputs[0].data(), &[3.0, 7.0]);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
+/// `SANIC_DEBUG` level, parsed once — the shape of tinygrad's `DEBUG`.
+/// `1` dumps the compiled schedule (see [`partition`]); `2` additionally
+/// times every kernel at runtime and prints one line per launch.
+pub(crate) fn debug_level() -> u32 {
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("SANIC_DEBUG")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// A `width`-character bar filled to `fraction` of its length,
+/// eighth-block resolution — the hotspot column of the `SANIC_DEBUG=2`
+/// runtime dumps.
+pub(crate) fn debug_bar(fraction: f64, width: usize) -> String {
+    const PARTIAL: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
+    let mut bar = "█".repeat(eighths / 8);
+    if eighths % 8 > 0 {
+        bar.push_str(PARTIAL[eighths % 8 - 1]);
+    }
+    let filled = eighths.div_ceil(8);
+    bar.push_str(&" ".repeat(width - filled));
+    bar
+}
+
+#[doc(hidden)]
 pub mod analyze;
-pub mod bpe;
+#[doc(hidden)]
 pub mod codegen;
+pub mod compile;
 pub mod cost;
+#[doc(hidden)]
 pub mod derive;
+#[doc(hidden)]
 pub mod emit_metal;
+#[doc(hidden)]
 pub mod emit_rust;
+#[doc(hidden)]
 pub mod grad;
+#[doc(hidden)]
 pub mod interp;
 pub mod ir;
+#[doc(hidden)]
+pub mod kernel_ir;
 #[cfg(target_os = "macos")]
 pub mod metal;
+pub mod nn;
+#[doc(hidden)]
 pub mod partition;
+#[doc(hidden)]
 pub mod plan;
+#[doc(hidden)]
 pub mod runtime;
+#[doc(hidden)]
 pub mod rustgen;
-pub mod safetensors;
+#[doc(hidden)]
 pub mod simplify;
+#[doc(hidden)]
+pub mod verify;
 
+#[cfg(target_os = "macos")]
+pub use compile::MetalBuffer;
+pub use compile::{
+    Backend, Buffer, Compile, CompileError, CpuBuffer, CpuDevice, Program, RootItem, Roots,
+    RunError,
+};
+pub use ir::*;
+#[cfg(target_os = "macos")]
+pub use metal::MetalDevice;
+
+// Transitional compiler-engine exports used by the low-level law suite. New
+// graph construction goes through `ir` and `Compile`.
+#[doc(hidden)]
 pub use analyze::{
     AxisReport, Parallelism, Report, Structure, analyze, analyze_all, streamable, structure,
 };
+#[doc(hidden)]
 pub use derive::{Carrier, Expr, SlotKind, derive};
-pub use interp::{Env, Extents, Tensor, eval, run_carrier};
-pub use ir::*;
+#[doc(hidden)]
+pub use interp::{Env, Value, eval, run_carrier};

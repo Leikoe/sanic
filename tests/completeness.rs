@@ -42,8 +42,8 @@
 use std::collections::HashMap;
 
 use sanic::derive::derive;
-use sanic::interp::{Env, Extents, Tensor, eval};
-use sanic::ir::*;
+use sanic::interp::{Env, Value, eval};
+use sanic::kernel_ir::*;
 
 // ── streams over a quantized alphabet ────────────────────────────────────────
 
@@ -88,55 +88,16 @@ fn suffixes(rng: &mut Lcg, count: usize) -> Vec<Vec<f64>> {
 
 /// A syllabus program: a scalar function of one streamed input, given as an
 /// IR graph builder so `derive` can be asked about the exact same object.
-type Build = fn(Node, Axis) -> Node;
+type Build = fn(NodeRef, Axis) -> NodeRef;
 
 fn run_h(build: Build, xs: &[f64]) -> f64 {
-    let n = axis("n");
-    let g = build(input("X", &[n]), n);
-    // every axis in these single-stream programs (n, or a rename of n like
-    // the median graph's rank axis) has the stream's extent
-    let mut ext: Extents = Extents::new();
-    collect_axes(&g, &mut ext, xs.len());
-    ext.insert(n, xs.len());
+    let n = axis("n", xs.len());
+    let g = build(input("X", &[n], Dtype::F32), n);
     let x = xs.to_vec();
-    let env: Env = [("X", Tensor::from_fn(&[n], &ext, |c| x[c[&n]]))]
+    let env: Env = [("X", Value::from_fn(&[n], |c| x[c[&n]]))]
         .into_iter()
         .collect();
-    eval(&g, &env, &ext).data[0]
-}
-
-fn collect_axes(node: &Node, ext: &mut Extents, extent: usize) {
-    match node.as_ref() {
-        NodeKind::Input { axes, .. } => {
-            for &a in axes {
-                ext.insert(a, extent);
-            }
-        }
-        NodeKind::Iota { axis } => {
-            ext.insert(*axis, extent);
-        }
-        NodeKind::Const { .. } => {}
-        NodeKind::Map { inputs, .. } => {
-            for i in inputs {
-                collect_axes(i, ext, extent);
-            }
-        }
-        NodeKind::Reduce { src, axis, .. } | NodeKind::Scan { src, axis, .. } => {
-            ext.insert(*axis, extent);
-            collect_axes(src, ext, extent);
-        }
-        NodeKind::View { src, groups } => {
-            for (_, to) in groups {
-                ext.insert(*to, extent);
-            }
-            collect_axes(src, ext, extent);
-        }
-        NodeKind::Reindex { src, .. } => collect_axes(src, ext, extent),
-        NodeKind::Gather { src, index, .. } => {
-            collect_axes(src, ext, extent);
-            collect_axes(index, ext, extent);
-        }
-    }
+    eval(&g, &env).data[0]
 }
 
 // ── the sketch pool: known bounded-state stream functions ────────────────────
@@ -302,7 +263,7 @@ enum Expect {
     JustifiedDecline,
 }
 
-fn indicator_lt(a: Node, b: Node) -> Node {
+fn indicator_lt(a: NodeRef, b: NodeRef) -> NodeRef {
     map(MapOp::Lt, vec![a, b])
 }
 
@@ -314,7 +275,11 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
             (|x, n| reduce(x, n, BinOp::Monoid(Monoid::Add))) as Build,
             Derived,
         ),
-        ("max", |x, n| reduce(x, n, BinOp::Monoid(Monoid::Max)), Derived),
+        (
+            "max",
+            |x, n| reduce(x, n, BinOp::Monoid(Monoid::Max)),
+            Derived,
+        ),
         (
             "sumsq",
             |x, n| {
@@ -404,14 +369,10 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
                 );
                 argmax(masked, n)
             },
-            CoveredElsewhere("BinOp::TopK — the k-best tuple monoid"),
+            CoveredElsewhere("BinOp::TopK — sequential k-best insertion (full monoid merge TODO)"),
         ),
         // ── genuinely outside constant-state streaming ───────────────────────
-        (
-            "median",
-            median_graph,
-            JustifiedDecline,
-        ),
+        ("median", median_graph, JustifiedDecline),
         (
             "count_above_half_max",
             |x, n| {
@@ -430,8 +391,8 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
 /// Lower median, tie-safe: the element with at most ⌊(len−1)/2⌋ strictly
 /// smaller and at most ⌈(len−1)/2⌉ strictly greater values. Rank counting
 /// needs the whole stream per element — the shape of a true non-fold.
-fn median_graph(x: Node, n: Axis) -> Node {
-    let j = axis("mj");
+fn median_graph(x: NodeRef, n: Axis) -> NodeRef {
+    let j = axis("mj", n.extent());
     let xj = view(x.clone(), vec![(vec![n], j)]);
     let ones = map(MapOp::Mul, vec![xj.clone(), konst(0.0)]);
     let len = reduce(
@@ -448,12 +409,12 @@ fn median_graph(x: Node, n: Axis) -> Node {
     // integer ranks vs half-integer thresholds: rank ≤ t ⇔ rank < t + 0.5
     let m_lo = map(
         MapOp::Mul,
-        vec![
-            map(MapOp::Sub, vec![len.clone(), konst(1.0)]),
-            konst(0.5),
-        ],
+        vec![map(MapOp::Sub, vec![len.clone(), konst(1.0)]), konst(0.5)],
     );
-    let hi_bound = map(MapOp::Sub, vec![len, map(MapOp::Add, vec![m_lo.clone(), konst(0.5)])]);
+    let hi_bound = map(
+        MapOp::Sub,
+        vec![len, map(MapOp::Add, vec![m_lo.clone(), konst(0.5)])],
+    );
     let ok_lo = indicator_lt(n_less, map(MapOp::Add, vec![m_lo, konst(0.5)]));
     let ok_hi = indicator_lt(n_greater, map(MapOp::Add, vec![hi_bound, konst(0.5)]));
     let hit = map(MapOp::Mul, vec![ok_lo, ok_hi]);
@@ -470,7 +431,7 @@ fn median_graph(x: Node, n: Axis) -> Node {
 
 #[test]
 fn every_decline_is_justified_or_pinned() {
-    let n = axis("n");
+    let n = axis("n", 8);
     let mut report = String::from(
         "\nLEDGER — semantic carrier probe vs the deriver\n\
          (pool: 9 bounded-state folds; sketches h + ≤4 slots; alphabet 9 × [-2,2];\n\
@@ -483,7 +444,7 @@ fn every_decline_is_justified_or_pinned() {
         // hides a producer fold. (`derive` alone answers a weaker question —
         // "does the root stream over its leaves" — median's rank reduces,
         // say, are legal leaves but each is its own kernel.)
-        let derived = derive(&build(input("X", &[n]), n), n)
+        let derived = derive(&build(input("X", &[n], Dtype::F32), n), n)
             .filter(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         let verdict = probe(build);
         let line = match (&derived, &verdict, expect) {
@@ -545,7 +506,7 @@ fn every_decline_is_justified_or_pinned() {
 /// This is the standing tripwire that replaces "we'll notice in a benchmark".
 #[test]
 fn random_declines_survive_the_probe() {
-    let n = axis("n");
+    let n = axis("n", 8);
     // Discovered-by-this-harness gaps, pinned deliberately (seed → note).
     // An empty map is the goal state; entries here are open, EXPLAINED work.
     // This sweep's first run flagged THIRTEEN seeds; ten became the
@@ -572,9 +533,8 @@ fn random_declines_survive_the_probe() {
     for seed in 0..24u64 {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
-        let g = build(input("X", &[n]), n);
-        let one_pass = derive(&g, n)
-            .is_some_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
+        let g = build(input("X", &[n], Dtype::F32), n);
+        let one_pass = derive(&g, n).is_some_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         if one_pass {
             continue; // sound by the existing oracle; nothing to check
         }
@@ -610,9 +570,9 @@ thread_local! {
 
 /// Small expression over (x, iota, consts, one nested same-axis fold),
 /// reduced at the top — the shape real workloads decline in.
-fn random_program(x: Node, n: Axis, seed: u64) -> Node {
+fn random_program(x: NodeRef, n: Axis, seed: u64) -> NodeRef {
     let mut s = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
-    let leaf = |s: &mut Lcg, x: &Node| -> Node {
+    let leaf = |s: &mut Lcg, x: &NodeRef| -> NodeRef {
         match (s.next() >> 30) % 4 {
             0 => x.clone(),
             1 => iota(n),
@@ -649,13 +609,13 @@ fn random_program(x: Node, n: Axis, seed: u64) -> Node {
     reduce(e, n, top)
 }
 
-fn contains_fold(node: &Node) -> bool {
+fn contains_fold(node: &NodeRef) -> bool {
     match node.as_ref() {
-        NodeKind::Reduce { .. } | NodeKind::Scan { .. } => true,
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
-        NodeKind::Map { inputs, .. } => inputs.iter().any(contains_fold),
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => contains_fold(src),
-        NodeKind::Gather { src, index, .. } => contains_fold(src) || contains_fold(index),
+        Node::Reduce { .. } | Node::Scan { .. } => true,
+        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => false,
+        Node::Map { inputs, .. } => inputs.iter().any(contains_fold),
+        Node::View { src, .. } | Node::Reindex { src, .. } => contains_fold(src),
+        Node::Gather { src, index, .. } => contains_fold(src) || contains_fold(index),
     }
 }
 
@@ -663,11 +623,11 @@ fn contains_fold(node: &Node) -> bool {
 #[test]
 #[ignore]
 fn inspect_flagged_seeds() {
-    let n = axis("n");
+    let n = axis("n", 8);
     for seed in [7u64, 13, 23] {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
-        let g = build(input("X", &[n]), n);
+        let g = build(input("X", &[n], Dtype::F32), n);
         println!("seed {seed}: derives={} {:?}\n", derive(&g, n).is_some(), g);
     }
 }

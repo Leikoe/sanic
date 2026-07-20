@@ -18,9 +18,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
-use sanic::ir::*;
+use sanic::cost::DeviceProfile;
+use sanic::interp::{Env, Value, eval};
+use sanic::kernel_ir::*;
 use sanic::partition::{Schedule, partition_many};
 use sanic::runtime::Session;
 use sanic::rustgen::emit_schedule;
@@ -36,47 +36,40 @@ impl Lcg {
         ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
-}
-fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
-    ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
-}
-
-struct DecodeModel {
-    sched: Schedule,
-    ext: Extents,
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
 /// The single-head attention LM decode step: cache updates + logits.
 /// Axes: t = cache length (max sequence), dm = model, dk/dv = head, v = vocab.
-fn decode_step(
-    t: Axis,
-    dm: Axis,
-    dk: Axis,
-    dv: Axis,
-    v: Axis,
-    ext: &Extents,
-) -> DecodeModel {
-    let x = input("x", &[dm]); // current token's embedding
-    let pos = input("pos", &[]); // current position, as data
+fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
+    let x = input("x", &[dm], Dtype::F32); // current token's embedding
+    let pos = input("pos", &[], Dtype::F32); // current position, as data
 
-    let new_k = matmul(x.clone(), input("Wk", &[dk, dm]), dm); // [dk]
-    let new_v = matmul(x.clone(), input("Wv", &[dv, dm]), dm); // [dv]
-    let q = matmul(x, input("Wq", &[dk, dm]), dm); // [dk]
+    let new_k = matmul(x.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [dk]
+    let new_v = matmul(x.clone(), input("Wv", &[dv, dm], Dtype::F32), dm); // [dv]
+    let q = matmul(x, input("Wq", &[dk, dm], Dtype::F32), dm); // [dk]
 
     // cache row writes: updated[t,·] = where(t == pos, new, cache[t,·])
     let ck = map(
         MapOp::Where,
-        vec![one_hot(t, pos.clone()), new_k, input("cache_k", &[t, dk])],
+        vec![
+            one_hot(t, pos.clone()),
+            new_k,
+            input("cache_k", &[t, dk], Dtype::F32),
+        ],
     ); // [t, dk]
     let cv = map(
         MapOp::Where,
-        vec![one_hot(t, pos.clone()), new_v, input("cache_v", &[t, dv])],
+        vec![
+            one_hot(t, pos.clone()),
+            new_v,
+            input("cache_v", &[t, dv], Dtype::F32),
+        ],
     ); // [t, dv]
 
     // attention over the updated cache; positions beyond `pos` masked out
-    let scale = konst(1.0 / (ext[&dk] as f64).sqrt());
+    let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(MapOp::Mul, vec![matmul(q, ck.clone(), dk), scale]); // [t]
     let future = map(MapOp::Lt, vec![pos, iota(t)]); // t > pos
     let masked = map(
@@ -88,68 +81,51 @@ fn decode_step(
     );
     let att = softmax(masked, t);
     let out = matmul(att, cv.clone(), t); // [dv]
-    let logits = matmul(out, input("Wl", &[v, dv]), dv); // [v]
+    let logits = matmul(out, input("Wl", &[v, dv], Dtype::F32), dv); // [v]
 
-    let sched = partition_many(
+    partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
-        &Device::toy(),
-        &as_f64(ext),
-    );
-    DecodeModel {
-        sched,
-        ext: ext.clone(),
-    }
+        &DeviceProfile::toy(),
+    )
 }
 
 /// The prefill reference: full causal attention over all T positions at once,
 /// evaluated by the oracle. Row `s` of its logits is what decode step `s`
 /// must produce.
-fn prefill_logits(
-    s: Axis,
-    t2: Axis,
-    dm: Axis,
-    dk: Axis,
-    dv: Axis,
-    v: Axis,
-    env: &Env,
-    ext: &Extents,
-) -> Tensor {
-    let x = input("X", &[s, dm]);
+fn prefill_logits(s: Axis, t2: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis, env: &Env) -> Value {
+    let x = input("X", &[s, dm], Dtype::F32);
     let xt = rename(x.clone(), s, t2);
-    let q = matmul(x, input("Wq", &[dk, dm]), dm); // [s, dk]
-    let k = matmul(xt.clone(), input("Wk", &[dk, dm]), dm); // [t2, dk]
-    let vv = matmul(xt, input("Wv", &[dv, dm]), dm); // [t2, dv]
-    let scale = konst(1.0 / (ext[&dk] as f64).sqrt());
+    let q = matmul(x, input("Wq", &[dk, dm], Dtype::F32), dm); // [s, dk]
+    let k = matmul(xt.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [t2, dk]
+    let vv = matmul(xt, input("Wv", &[dv, dm], Dtype::F32), dm); // [t2, dv]
+    let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(MapOp::Mul, vec![matmul(q, k, dk), scale]);
     let masked = map(MapOp::Add, vec![scores, causal_mask(s, t2)]);
     let att = softmax(masked, t2);
     let out = matmul(att, vv, t2); // [s, dv]
-    let logits = matmul(out, input("Wl", &[v, dv]), dv); // [s, v]
-    eval(&logits, env, ext)
+    let logits = matmul(out, input("Wl", &[v, dv], Dtype::F32), dv); // [s, v]
+    eval(&logits, env)
 }
 
 // ── the theorem, on the interpreter runtime ──────────────────────────────────
 #[test]
 fn incremental_decode_equals_prefill() {
-    let (t, s, t2, dm, dk, dv, v) = (
-        axis("t"),
-        axis("s"),
-        axis("t2"),
-        axis("dm"),
-        axis("dk"),
-        axis("dv"),
-        axis("v"),
-    );
     let steps = 6usize;
-    let ext: Extents = [(t, steps), (s, steps), (t2, steps), (dm, 8), (dk, 5), (dv, 6), (v, 10)]
-        .into_iter()
-        .collect();
+    let (t, s, t2, dm, dk, dv, v) = (
+        axis("t", steps),
+        axis("s", steps),
+        axis("t2", steps),
+        axis("dm", 8),
+        axis("dk", 5),
+        axis("dv", 6),
+        axis("v", 10),
+    );
     let mut rng = Lcg(0xDEC0DE);
-    let wq = rand_tensor(&[dk, dm], &ext, &mut rng);
-    let wk = rand_tensor(&[dk, dm], &ext, &mut rng);
-    let wv = rand_tensor(&[dv, dm], &ext, &mut rng);
-    let wl = rand_tensor(&[v, dv], &ext, &mut rng);
-    let xs = rand_tensor(&[s, dm], &ext, &mut rng); // all T token embeddings
+    let wq = rand_tensor(&[dk, dm], &mut rng);
+    let wk = rand_tensor(&[dk, dm], &mut rng);
+    let wv = rand_tensor(&[dv, dm], &mut rng);
+    let wl = rand_tensor(&[v, dv], &mut rng);
+    let xs = rand_tensor(&[s, dm], &mut rng); // all T token embeddings
 
     // the reference: one full causal prefill
     let prefill_env: Env = [
@@ -161,38 +137,35 @@ fn incremental_decode_equals_prefill() {
     ]
     .into_iter()
     .collect();
-    let reference = prefill_logits(s, t2, dm, dk, dv, v, &prefill_env, &ext);
+    let reference = prefill_logits(s, t2, dm, dk, dv, v, &prefill_env);
 
     // the decode session: persistent caches, one step per position
-    let model = decode_step(t, dm, dk, dv, v, &ext);
+    let sched = decode_step(t, dm, dk, dv, v);
     assert!(
-        model.sched.stages.len() >= 5,
+        sched.stages.len() >= 5,
         "expected a multi-kernel decode step:\n{}",
-        model.sched.render()
+        sched.render()
     );
 
-    let mut sess = Session::new(model.ext.clone());
+    let mut sess = Session::new();
     sess.bind("Wq", wq);
     sess.bind("Wk", wk);
     sess.bind("Wv", wv);
     sess.bind("Wl", wl);
-    sess.bind("cache_k", Tensor::from_fn(&[t, dk], &ext, |_| 0.0));
-    sess.bind("cache_v", Tensor::from_fn(&[t, dv], &ext, |_| 0.0));
+    sess.bind("cache_k", Value::from_fn(&[t, dk], |_| 0.0));
+    sess.bind("cache_v", Value::from_fn(&[t, dv], |_| 0.0));
 
     for p in 0..steps {
-        let row = Tensor::from_fn(&[dm], &ext, |c| {
+        let row = Value::from_fn(&[dm], |c| {
             let coord: HashMap<Axis, usize> = [(s, p), (dm, c[&dm])].into_iter().collect();
             xs.at(&coord)
         });
         sess.bind("x", row);
         sess.bind_scalar("pos", p as f64);
-        sess.step(
-            &model.sched,
-            &[("ck_new", "cache_k"), ("cv_new", "cache_v")],
-        );
+        sess.step(&sched, &[("ck_new", "cache_k"), ("cv_new", "cache_v")]);
 
         let logits = sess.get("logits");
-        for vi in 0..ext[&v] {
+        for vi in 0..v.extent() {
             let got = logits.at(&[(v, vi)].into_iter().collect());
             let want = reference.at(&[(s, p), (v, vi)].into_iter().collect());
             let tol = 1e-9 * (1.0 + got.abs().max(want.abs()));
@@ -206,19 +179,21 @@ fn incremental_decode_equals_prefill() {
     // and the caches now hold exactly the prefill K/V
     let k_ref = eval(
         &matmul(
-            rename(input("X", &[s, dm]), s, t),
-            input("Wk", &[dk, dm]),
+            rename(input("X", &[s, dm], Dtype::F32), s, t),
+            input("Wk", &[dk, dm], Dtype::F32),
             dm,
         ),
         &prefill_env,
-        &ext,
     );
     let ck = sess.get("cache_k");
     for ti in 0..steps {
-        for ki in 0..ext[&dk] {
+        for ki in 0..dk.extent() {
             let c: HashMap<Axis, usize> = [(t, ti), (dk, ki)].into_iter().collect();
             let (a, b) = (ck.at(&c), k_ref.at(&c));
-            assert!((a - b).abs() <= 1e-9 * (1.0 + a.abs()), "cache_k[{ti},{ki}]");
+            assert!(
+                (a - b).abs() <= 1e-9 * (1.0 + a.abs()),
+                "cache_k[{ti},{ki}]"
+            );
         }
     }
 }
@@ -226,25 +201,22 @@ fn incremental_decode_equals_prefill() {
 // ── the same loop, compiled: caches persist across a real host loop ──────────
 #[test]
 fn incremental_decode_compiles_and_equals_prefill() {
-    let (t, s, t2, dm, dk, dv, v) = (
-        axis("t"),
-        axis("s"),
-        axis("t2"),
-        axis("dm"),
-        axis("dk"),
-        axis("dv"),
-        axis("v"),
-    );
     let steps = 5usize;
-    let ext: Extents = [(t, steps), (s, steps), (t2, steps), (dm, 6), (dk, 4), (dv, 5), (v, 8)]
-        .into_iter()
-        .collect();
+    let (t, s, t2, dm, dk, dv, v) = (
+        axis("t", steps),
+        axis("s", steps),
+        axis("t2", steps),
+        axis("dm", 6),
+        axis("dk", 4),
+        axis("dv", 5),
+        axis("v", 8),
+    );
     let mut rng = Lcg(0xDEC0DED);
-    let wq = rand_tensor(&[dk, dm], &ext, &mut rng);
-    let wk = rand_tensor(&[dk, dm], &ext, &mut rng);
-    let wv = rand_tensor(&[dv, dm], &ext, &mut rng);
-    let wl = rand_tensor(&[v, dv], &ext, &mut rng);
-    let xs = rand_tensor(&[s, dm], &ext, &mut rng);
+    let wq = rand_tensor(&[dk, dm], &mut rng);
+    let wk = rand_tensor(&[dk, dm], &mut rng);
+    let wv = rand_tensor(&[dv, dm], &mut rng);
+    let wl = rand_tensor(&[v, dv], &mut rng);
+    let xs = rand_tensor(&[s, dm], &mut rng);
 
     let prefill_env: Env = [
         ("X", xs.clone()),
@@ -255,19 +227,23 @@ fn incremental_decode_compiles_and_equals_prefill() {
     ]
     .into_iter()
     .collect();
-    let reference = prefill_logits(s, t2, dm, dk, dv, v, &prefill_env, &ext);
+    let reference = prefill_logits(s, t2, dm, dk, dv, v, &prefill_env);
     let expected: Vec<f64> = (0..steps)
         .flat_map(|p| {
-            (0..ext[&v])
+            (0..v.extent())
                 .map(|vi| reference.at(&[(s, p), (v, vi)].into_iter().collect()))
                 .collect::<Vec<f64>>()
         })
         .collect();
 
-    let model = decode_step(t, dm, dk, dv, v, &ext);
-    let program = emit_schedule(&model.sched, &ext);
+    let sched = decode_step(t, dm, dk, dv, v);
+    let program = emit_schedule(&sched);
     assert_eq!(
-        program.outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        program
+            .outputs
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
         vec!["ck_new", "cv_new", "logits"],
         "run must return the cache updates and the logits"
     );
@@ -302,17 +278,17 @@ fn incremental_decode_compiles_and_equals_prefill() {
     ));
     main.push_str(&format!(
         "    let mut b_cache_k: Vec<f64> = vec![0.0; {}];\n",
-        steps * ext[&dk]
+        steps * dk.extent()
     ));
     main.push_str(&format!(
         "    let mut b_cache_v: Vec<f64> = vec![0.0; {}];\n",
-        steps * ext[&dv]
+        steps * dv.extent()
     ));
     main.push_str("    let mut got: Vec<f64> = Vec::new();\n");
     main.push_str(&format!("    for p in 0..{steps} {{\n"));
     main.push_str(&format!(
         "        let b_x: Vec<f64> = xs[p*{dm_n}..(p+1)*{dm_n}].to_vec();\n",
-        dm_n = ext[&dm]
+        dm_n = dm.extent()
     ));
     main.push_str("        let b_pos: Vec<f64> = vec![p as f64];\n");
     let args: Vec<String> = program

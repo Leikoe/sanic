@@ -25,7 +25,7 @@ fn show(title: &str, node: &Node, ax: Axis) {
 fn main() {
     // mean = (Σx) / (Σ1)  →  strengthened to (sum, count)
     let a = axis("a");
-    let x = input("X", &[a]);
+    let x = input("X", &[a], Dtype::F32);
     let mean = map(
         MapOp::Div,
         vec![reduce(x.clone(), a, add()), reduce(konst(1.0), a, add())],
@@ -50,9 +50,9 @@ fn main() {
     // (m, ℓ, o) accumulator (the online-softmax rescale plus the deferred
     // divide by the normalizer).
     let (sq, k, d, e_ax) = (axis("sq"), axis("k"), axis("d"), axis("e"));
-    let q = input("Q", &[sq, d]);
-    let kk = input("K", &[k, d]);
-    let v = input("V", &[k, e_ax]);
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e_ax], Dtype::F32);
     let attn = attention(q, kk, v, d, k);
     println!("── attention: softmax(QKᵀ)·V (every axis, auto-discovered) ──");
     print!("{}", analyze_all(&attn).render());
@@ -60,6 +60,6 @@ fn main() {
 
     // the time axis of a tanh-RNN: a non-associative recurrence → refused.
     let (t, h) = (axis("t"), axis("h"));
-    let rnn = tanh_rnn(input("H", &[t, h]), t);
+    let rnn = tanh_rnn(input("H", &[t, h], Dtype::F32), t);
     show("tanh-RNN time axis", &rnn, t);
 }

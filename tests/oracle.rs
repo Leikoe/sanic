@@ -15,14 +15,14 @@
 use std::collections::HashMap;
 
 use sanic::derive::derive;
-use sanic::interp::{Env, Extents, Tensor, eval, run_carrier};
-use sanic::ir::*;
+use sanic::interp::{Env, Value, eval, run_carrier};
+use sanic::kernel_ir::*;
 
 /// A computed RoPE rotation matrix `R[pos, p, j, i]` (extent 2 on i, j): the
 /// 2×2 rotation by θ = pos·freq_p, freq_p = exp(p·c) — synthesized from indices
 /// with `cos`/`sin`/`exp`, no rotation tensor in memory. `R·q` (contracting i)
 /// rotates each (q[p,0], q[p,1]) pair, which is exactly RoPE.
-fn rope_rotation(pos: Axis, p: Axis, j: Axis, i: Axis, c: f64) -> Node {
+fn rope_rotation(pos: Axis, p: Axis, j: Axis, i: Axis, c: f64) -> NodeRef {
     let freq = map(MapOp::Exp, vec![map(MapOp::Mul, vec![iota(p), konst(c)])]);
     let theta = map(MapOp::Mul, vec![iota(pos), freq]); // [pos, p]
     let lt_ij = map(MapOp::Lt, vec![iota(i), iota(j)]);
@@ -57,13 +57,13 @@ impl Lcg {
     }
 }
 
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
 /// Assert two tensors are equal up to floating tolerance, regardless of axis
 /// storage order.
-fn assert_close(x: &Tensor, y: &Tensor) {
+fn assert_close(x: &Value, y: &Value) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(
         x.shape, y.shape,
@@ -78,10 +78,10 @@ fn assert_close(x: &Tensor, y: &Tensor) {
 
 /// Derive `node` over `axis`, run it on `env`, and require it to reproduce the
 /// naive evaluation of the same graph.
-fn assert_kernel_matches_reference(node: &Node, axis: Axis, env: &Env, ext: &Extents) {
-    let reference = eval(node, env, ext);
+fn assert_kernel_matches_reference(node: &NodeRef, axis: Axis, env: &Env) {
+    let reference = eval(node, env);
     let carrier = derive(node, axis).expect("axis is derivable");
-    let via_kernel = run_carrier(node, axis, &carrier, env, ext);
+    let via_kernel = run_carrier(node, axis, &carrier, env);
     assert_close(&via_kernel, &reference);
 }
 
@@ -92,33 +92,30 @@ fn assert_kernel_matches_reference(node: &Node, axis: Axis, env: &Env, ext: &Ext
 #[test]
 fn multihead_flash_matches_naive() {
     let (b, h, sq, k, d, e) = (
-        axis("b"),
-        axis("h"),
-        axis("sq"),
-        axis("k"),
-        axis("d"),
-        axis("e"),
+        axis("b", 2),
+        axis("h", 3),
+        axis("sq", 5),
+        axis("k", 7),
+        axis("d", 4),
+        axis("e", 6),
     );
-    let ext: Extents = [(b, 2), (h, 3), (sq, 5), (k, 7), (d, 4), (e, 6)]
-        .into_iter()
-        .collect();
     let mut rng = Lcg(0xA11CE);
     let env: Env = [
-        ("Q", rand_tensor(&[b, h, sq, d], &ext, &mut rng)),
-        ("K", rand_tensor(&[b, h, k, d], &ext, &mut rng)),
-        ("V", rand_tensor(&[b, h, k, e], &ext, &mut rng)),
+        ("Q", rand_tensor(&[b, h, sq, d], &mut rng)),
+        ("K", rand_tensor(&[b, h, k, d], &mut rng)),
+        ("V", rand_tensor(&[b, h, k, e], &mut rng)),
     ]
     .into_iter()
     .collect();
 
     let mha = attention(
-        input("Q", &[b, h, sq, d]),
-        input("K", &[b, h, k, d]),
-        input("V", &[b, h, k, e]),
+        input("Q", &[b, h, sq, d], Dtype::F32),
+        input("K", &[b, h, k, d], Dtype::F32),
+        input("V", &[b, h, k, e], Dtype::F32),
         d,
         k,
     );
-    assert_kernel_matches_reference(&mha, k, &env, &ext);
+    assert_kernel_matches_reference(&mha, k, &env);
 }
 
 // ── RMSNorm-fused projection: the `defer-div` derivation on real tensors ──────
@@ -127,40 +124,42 @@ fn multihead_flash_matches_naive() {
 // project. This is llm.rs kernel [0] (`fold dm`, 2 slots, defer-div).
 #[test]
 fn rmsnorm_fused_projection_matches_naive() {
-    let (s, dm, f) = (axis("s"), axis("dm"), axis("f"));
+    let (s, dm, f) = (axis("s", 4), axis("dm", 16), axis("f", 5));
     let n = 16.0;
-    let ext: Extents = [(s, 4), (dm, 16), (f, 5)].into_iter().collect();
     let mut rng = Lcg(R_MS);
     let env: Env = [
-        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
-        ("g", rand_tensor(&[dm], &ext, &mut rng)),
-        ("W", rand_tensor(&[f, dm], &ext, &mut rng)),
+        ("X", rand_tensor(&[s, dm], &mut rng)),
+        ("g", rand_tensor(&[dm], &mut rng)),
+        ("W", rand_tensor(&[f, dm], &mut rng)),
     ]
     .into_iter()
     .collect();
 
-    let x = input("X", &[s, dm]);
-    let g = input("g", &[dm]);
+    let x = input("X", &[s, dm], Dtype::F32);
+    let g = input("g", &[dm], Dtype::F32);
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), dm, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
     let xn = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom]);
-    let q = matmul(xn, input("W", &[f, dm]), dm);
+    let q = matmul(xn, input("W", &[f, dm], Dtype::F32), dm);
 
-    assert_kernel_matches_reference(&q, dm, &env, &ext);
+    assert_kernel_matches_reference(&q, dm, &env);
 }
 
 // ── logsumexp: the max/Σexp pair projected by log(s)+m ───────────────────────
 #[test]
 fn logsumexp_matches_naive() {
-    let (r, k) = (axis("r"), axis("k"));
-    let ext: Extents = [(r, 4), (k, 9)].into_iter().collect();
+    let (r, k) = (axis("r", 4), axis("k", 9));
     let mut rng = Lcg(0x15E);
-    let env: Env = [("X", rand_tensor(&[r, k], &ext, &mut rng))]
+    let env: Env = [("X", rand_tensor(&[r, k], &mut rng))]
         .into_iter()
         .collect();
-    let lse = reduce(input("X", &[r, k]), k, BinOp::Monoid(Monoid::LogSumExp));
-    assert_kernel_matches_reference(&lse, k, &env, &ext);
+    let lse = reduce(
+        input("X", &[r, k], Dtype::F32),
+        k,
+        BinOp::Monoid(Monoid::LogSumExp),
+    );
+    assert_kernel_matches_reference(&lse, k, &env);
 }
 
 // ── quantized matmul: dequant fuses into the GEMM lift, automatically ────────
@@ -170,48 +169,50 @@ fn logsumexp_matches_naive() {
 // This is the heart of quantized inference, generated with no new op.
 #[test]
 fn quantized_matmul_dequant_fuses() {
-    let (s, dm, o) = (axis("s"), axis("dm"), axis("o"));
-    let ext: Extents = [(s, 4), (dm, 12), (o, 6)].into_iter().collect();
+    let (s, dm, o) = (axis("s", 4), axis("dm", 12), axis("o", 6));
     let mut rng = Lcg(0x9114A7);
     // integer-valued quantized weights (int4-ish range), per-channel scale
-    let qw = Tensor::from_fn(&[o, dm], &ext, |_| (rng.f() * 8.0).round());
+    let qw = Value::from_fn(&[o, dm], |_| (rng.f() * 8.0).round());
     let env: Env = [
-        ("X", rand_tensor(&[s, dm], &ext, &mut rng)),
+        ("X", rand_tensor(&[s, dm], &mut rng)),
         ("qW", qw),
-        (
-            "scale",
-            Tensor::from_fn(&[o], &ext, |_| 0.05 * (rng.f() + 1.5)),
-        ),
+        ("scale", Value::from_fn(&[o], |_| 0.05 * (rng.f() + 1.5))),
     ]
     .into_iter()
     .collect();
 
     let dw = map(
         MapOp::Mul,
-        vec![input("qW", &[o, dm]), input("scale", &[o])],
+        vec![
+            input("qW", &[o, dm], Dtype::F32),
+            input("scale", &[o], Dtype::F32),
+        ],
     );
-    let y = matmul(input("X", &[s, dm]), dw, dm);
+    let y = matmul(input("X", &[s, dm], Dtype::F32), dw, dm);
 
     // one fused kernel — the dequant rode the lift (or deferred), not a separate pass
     let carrier = derive(&y, dm).expect("quantized matmul derives");
     assert!(carrier.rules.contains(&"fold"));
-    assert_kernel_matches_reference(&y, dm, &env, &ext);
+    assert_kernel_matches_reference(&y, dm, &env);
 }
 
 // ── plain contraction (matmul) across a 2-axis grid ──────────────────────────
 #[test]
 fn matmul_kernel_matches_naive() {
-    let (i, j, k) = (axis("i"), axis("j"), axis("k"));
-    let ext: Extents = [(i, 5), (j, 6), (k, 8)].into_iter().collect();
+    let (i, j, k) = (axis("i", 5), axis("j", 6), axis("k", 8));
     let mut rng = Lcg(0x2468);
     let env: Env = [
-        ("A", rand_tensor(&[i, k], &ext, &mut rng)),
-        ("B", rand_tensor(&[k, j], &ext, &mut rng)),
+        ("A", rand_tensor(&[i, k], &mut rng)),
+        ("B", rand_tensor(&[k, j], &mut rng)),
     ]
     .into_iter()
     .collect();
-    let mm = matmul(input("A", &[i, k]), input("B", &[k, j]), k);
-    assert_kernel_matches_reference(&mm, k, &env, &ext);
+    let mm = matmul(
+        input("A", &[i, k], Dtype::F32),
+        input("B", &[k, j], Dtype::F32),
+        k,
+    );
+    assert_kernel_matches_reference(&mm, k, &env);
 }
 
 fn add_r() -> BinOp {
@@ -224,16 +225,15 @@ fn add_r() -> BinOp {
 // the index sum reading it).
 #[test]
 fn argmax_matches_hand() {
-    let (r, v) = (axis("r"), axis("v"));
-    let ext: Extents = [(r, 5), (v, 20)].into_iter().collect();
+    let (r, v) = (axis("r", 5), axis("v", 20));
     let mut rng = Lcg(0xA6A5);
-    let logits = rand_tensor(&[r, v], &ext, &mut rng);
+    let logits = rand_tensor(&[r, v], &mut rng);
     let env: Env = [("L", logits.clone())].into_iter().collect();
 
-    let am = argmax(input("L", &[r, v]), v);
-    let got = eval(&am, &env, &ext);
+    let am = argmax(input("L", &[r, v], Dtype::F32), v);
+    let got = eval(&am, &env);
 
-    let want = Tensor::from_fn(&[r], &ext, |c| {
+    let want = Value::from_fn(&[r], |c| {
         let ri = c[&r];
         let (mut best, mut arg) = (f64::NEG_INFINITY, 0);
         for vi in 0..20 {
@@ -254,22 +254,21 @@ fn argmax_matches_hand() {
 // writing in place is runtime orchestration; the *kernel* generates today.)
 #[test]
 fn kv_cache_write_matches_hand() {
-    let (t, d) = (axis("t"), axis("d"));
-    let ext: Extents = [(t, 8), (d, 4)].into_iter().collect();
+    let (t, d) = (axis("t", 8), axis("d", 4));
     let mut rng = Lcg(0x1CACE);
-    let cache = rand_tensor(&[t, d], &ext, &mut rng);
-    let new_k = rand_tensor(&[d], &ext, &mut rng);
+    let cache = rand_tensor(&[t, d], &mut rng);
+    let new_k = rand_tensor(&[d], &mut rng);
     let pos = 5usize;
     let env: Env = [
         ("cache", cache.clone()),
         ("new_k", new_k.clone()),
-        ("pos", Tensor::scalar(pos as f64)),
+        ("pos", Value::scalar(pos as f64)),
     ]
     .into_iter()
     .collect();
 
     let it = iota(t);
-    let pos_in = input("pos", &[]);
+    let pos_in = input("pos", &[], Dtype::F32);
     let is_pos = map(
         MapOp::Sub,
         vec![
@@ -282,11 +281,15 @@ fn kv_cache_write_matches_hand() {
     ); // 1 where t == pos, else 0
     let updated = map(
         MapOp::Where,
-        vec![is_pos, input("new_k", &[d]), input("cache", &[t, d])],
+        vec![
+            is_pos,
+            input("new_k", &[d], Dtype::F32),
+            input("cache", &[t, d], Dtype::F32),
+        ],
     );
-    let got = eval(&updated, &env, &ext);
+    let got = eval(&updated, &env);
 
-    let want = Tensor::from_fn(&[t, d], &ext, |c| {
+    let want = Value::from_fn(&[t, d], |c| {
         if c[&t] == pos {
             new_k.at(&HashMap::from([(d, c[&d])]))
         } else {
@@ -299,20 +302,19 @@ fn kv_cache_write_matches_hand() {
 // ── RoPE rotation is really a rotation (graph vs hand-computed reference) ─────
 #[test]
 fn rope_rotation_is_correct() {
-    let (s, p, j, i) = (axis("s"), axis("p"), axis("j"), axis("i"));
-    let ext: Extents = [(s, 5), (p, 4), (j, 2), (i, 2)].into_iter().collect();
+    let (s, p, j, i) = (axis("s", 5), axis("p", 4), axis("j", 2), axis("i", 2));
     let c = -0.5;
     let mut rng = Lcg(0x60E5);
-    let q = rand_tensor(&[s, p, i], &ext, &mut rng);
+    let q = rand_tensor(&[s, p, i], &mut rng);
     let env: Env = [("Q", q.clone())].into_iter().collect();
 
     // rotated_Q[s,p,j] = Σ_i R[s,p,j,i]·Q[s,p,i]
     let r = rope_rotation(s, p, j, i, c);
-    let qr = matmul(input("Q", &[s, p, i]), r, i);
-    let got = eval(&qr, &env, &ext);
+    let qr = matmul(input("Q", &[s, p, i], Dtype::F32), r, i);
+    let got = eval(&qr, &env);
 
     // hand reference: rotate each pair by θ = s·exp(p·c)
-    let want = Tensor::from_fn(&[s, p, j], &ext, |cd| {
+    let want = Value::from_fn(&[s, p, j], |cd| {
         let (si, pi, ji) = (cd[&s], cd[&p], cd[&j]);
         let theta = si as f64 * (pi as f64 * c).exp();
         let q0 = q.at(&HashMap::from([(s, si), (p, pi), (i, 0)]));
@@ -334,40 +336,37 @@ fn rope_rotation_is_correct() {
 #[test]
 fn rope_flash_attention_matches_naive() {
     let (s, t, p, i, j, dk, e) = (
-        axis("s"),
-        axis("t"),
-        axis("p"),
-        axis("i"),
-        axis("j"),
-        axis("dk"),
-        axis("e"),
+        axis("s", 5),
+        axis("t", 5),
+        axis("p", 4),
+        axis("i", 2),
+        axis("j", 2),
+        axis("dk", 8),
+        axis("e", 6),
     );
-    let ext: Extents = [(s, 5), (t, 5), (p, 4), (i, 2), (j, 2), (dk, 8), (e, 6)]
-        .into_iter()
-        .collect();
     let c = -0.4;
     let mut rng = Lcg(0x60EA77);
     let env: Env = [
-        ("Q", rand_tensor(&[s, p, i], &ext, &mut rng)),
-        ("K", rand_tensor(&[t, p, i], &ext, &mut rng)),
-        ("V", rand_tensor(&[t, e], &ext, &mut rng)),
+        ("Q", rand_tensor(&[s, p, i], &mut rng)),
+        ("K", rand_tensor(&[t, p, i], &mut rng)),
+        ("V", rand_tensor(&[t, e], &mut rng)),
     ]
     .into_iter()
     .collect();
 
     let rq = rope_rotation(s, p, j, i, c);
     let rk = rope_rotation(t, p, j, i, c);
-    let qr = matmul(input("Q", &[s, p, i]), rq, i); // [s, p, j]
-    let kr = matmul(input("K", &[t, p, i]), rk, i); // [t, p, j]
+    let qr = matmul(input("Q", &[s, p, i], Dtype::F32), rq, i); // [s, p, j]
+    let kr = matmul(input("K", &[t, p, i], Dtype::F32), rk, i); // [t, p, j]
     let scores = matmul(flatten(qr, &[p, j], dk), flatten(kr, &[p, j], dk), dk); // [s, t]
-    let attn = matmul(softmax(scores, t), input("V", &[t, e]), t);
+    let attn = matmul(softmax(scores, t), input("V", &[t, e], Dtype::F32), t);
 
     let carrier = derive(&attn, t).expect("RoPE flash derives");
     assert!(
         carrier.rules.contains(&"rescale"),
         "online-softmax coupling present"
     );
-    assert_kernel_matches_reference(&attn, t, &env, &ext);
+    assert_kernel_matches_reference(&attn, t, &env);
 }
 
 // ── a computed cosine relative-position bias fused into attention ─────────────
@@ -377,24 +376,27 @@ fn rope_flash_attention_matches_naive() {
 // the ALiBi/rotary family, expressed as a plain composition.
 #[test]
 fn cosine_relative_bias_attention_matches_naive() {
-    let (s, t, dk, dv) = (axis("s"), axis("t"), axis("dk"), axis("dv"));
-    let ext: Extents = [(s, 6), (t, 6), (dk, 8), (dv, 5)].into_iter().collect();
+    let (s, t, dk, dv) = (axis("s", 6), axis("t", 6), axis("dk", 8), axis("dv", 5));
     let mut rng = Lcg(0xC0517E);
     let env: Env = [
-        ("Q", rand_tensor(&[s, dk], &ext, &mut rng)),
-        ("K", rand_tensor(&[t, dk], &ext, &mut rng)),
-        ("V", rand_tensor(&[t, dv], &ext, &mut rng)),
+        ("Q", rand_tensor(&[s, dk], &mut rng)),
+        ("K", rand_tensor(&[t, dk], &mut rng)),
+        ("V", rand_tensor(&[t, dv], &mut rng)),
     ]
     .into_iter()
     .collect();
 
-    let scores = matmul(input("Q", &[s, dk]), input("K", &[t, dk]), dk);
+    let scores = matmul(
+        input("Q", &[s, dk], Dtype::F32),
+        input("K", &[t, dk], Dtype::F32),
+        dk,
+    );
     let rel = map(MapOp::Sub, vec![iota(s), iota(t)]);
     let bias = map(MapOp::Cos, vec![map(MapOp::Mul, vec![rel, konst(0.1)])]);
     let biased = map(MapOp::Add, vec![scores, bias]);
-    let attn = matmul(softmax(biased, t), input("V", &[t, dv]), t);
+    let attn = matmul(softmax(biased, t), input("V", &[t, dv], Dtype::F32), t);
 
-    assert_kernel_matches_reference(&attn, t, &env, &ext);
+    assert_kernel_matches_reference(&attn, t, &env);
 }
 
 // a distinct nonzero seed constant, spelled to read as "RMS"

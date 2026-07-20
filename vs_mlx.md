@@ -327,7 +327,7 @@ then narrowed).
 **f16 attention weights (2026-07-13): 23.3 → 20.3 ms/step, ~21 ms/token
 wall (~46 tok/s).** The self-inflicted f32 doubling undone: the five
 attention projections (q/k/v/gate/o) now upload the checkpoint's bf16 as
-f16 (`input_dt(…, Dtype::F16)` + the existing typed-load path; bf16→f16
+f16 (`input(…, Dtype::F16)` + the existing typed-load path; bf16→f16
 is exact in f16's normal range). −413 MB resident, projection classes
 each halve their bytes/step. And the 0.010 near-tie at token 1 flips the
 OTHER way under f16 rounding: Trinity now emits a **full greedy SEQUENCE

@@ -11,9 +11,9 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
-use sanic::ir::*;
+use sanic::cost::DeviceProfile;
+use sanic::interp::{Env, Value, eval};
+use sanic::kernel_ir::*;
 use sanic::partition::{Stage, partition};
 
 struct Lcg(u64);
@@ -27,14 +27,11 @@ impl Lcg {
         ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
-}
-fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
-    ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
-fn assert_close(x: &Tensor, y: &Tensor) {
+fn assert_close(x: &Value, y: &Value) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(x.shape, y.shape, "shape: {:?} vs {:?}", x.axes, y.axes);
     let mut worst = 0.0f64;
@@ -48,14 +45,13 @@ fn assert_close(x: &Tensor, y: &Tensor) {
 
 #[test]
 fn slice_reads_the_shifted_range() {
-    let (n, m) = (axis("n"), axis("m"));
-    let ext: Extents = [(n, 10), (m, 4)].into_iter().collect();
+    let (n, m) = (axis("n", 10), axis("m", 4));
     let mut rng = Lcg(11);
-    let x = rand_tensor(&[n], &ext, &mut rng);
+    let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let sl = slice(input("X", &[n]), n, m, 3);
-    let got = eval(&sl, &env, &ext);
+    let sl = slice(input("X", &[n], Dtype::F32), n, m, 3);
+    let got = eval(&sl, &env);
     assert_eq!(got.axes, vec![m]);
     for i in 0..4 {
         assert_eq!(got.data[i], x.data[i + 3]);
@@ -64,48 +60,52 @@ fn slice_reads_the_shifted_range() {
 
 #[test]
 fn pad_reads_zero_outside() {
-    let (n, p) = (axis("n"), axis("p"));
-    let ext: Extents = [(n, 5), (p, 9)].into_iter().collect(); // lo=2, hi=2
+    let (n, p) = (axis("n", 5), axis("p", 9)); // lo=2, hi=2
     let mut rng = Lcg(12);
-    let x = rand_tensor(&[n], &ext, &mut rng);
+    let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let pd = pad(input("X", &[n]), n, p, 2);
-    let got = eval(&pd, &env, &ext);
+    let pd = pad(input("X", &[n], Dtype::F32), n, p, 2);
+    let got = eval(&pd, &env);
     for i in 0..9usize {
-        let want = if (2..7).contains(&i) { x.data[i - 2] } else { 0.0 };
+        let want = if (2..7).contains(&i) {
+            x.data[i - 2]
+        } else {
+            0.0
+        };
         assert_eq!(got.data[i], want, "position {i}");
     }
 }
 
 #[test]
 fn split_is_the_inverse_of_flatten() {
-    let (h, w, f) = (axis("h"), axis("w"), axis("f"));
-    let (h2, w2) = (axis("h2"), axis("w2"));
-    let ext: Extents = [(h, 3), (w, 4), (f, 12), (h2, 3), (w2, 4)]
-        .into_iter()
-        .collect();
+    let (h, w, f) = (axis("h", 3), axis("w", 4), axis("f", 12));
+    let (h2, w2) = (axis("h2", 3), axis("w2", 4));
     let mut rng = Lcg(13);
-    let x = rand_tensor(&[h, w], &ext, &mut rng);
+    let x = rand_tensor(&[h, w], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     // flatten [h,w] → f, then split f → (h2, w2): the identity, relabeled.
-    let round = split(flatten(input("X", &[h, w]), &[h, w], f), f, h2, w2, 4);
-    let got = eval(&round, &env, &ext);
+    let round = split(
+        flatten(input("X", &[h, w], Dtype::F32), &[h, w], f),
+        f,
+        h2,
+        w2,
+    );
+    let got = eval(&round, &env);
     assert_eq!(got.axes, vec![h2, w2]);
     assert_eq!(got.data, x.data, "split ∘ flatten must be the identity");
 }
 
 #[test]
 fn window_matches_the_hand_window() {
-    let (n, o, k) = (axis("n"), axis("o"), axis("k"));
-    let ext: Extents = [(n, 8), (o, 3), (k, 3)].into_iter().collect(); // stride 2
+    let (n, o, k) = (axis("n", 8), axis("o", 3), axis("k", 3)); // stride 2
     let mut rng = Lcg(14);
-    let x = rand_tensor(&[n], &ext, &mut rng);
+    let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let wd = window(input("X", &[n]), n, o, k, 2, 1);
-    let got = eval(&wd, &env, &ext);
+    let wd = window(input("X", &[n], Dtype::F32), n, o, k, 2, 1);
+    let got = eval(&wd, &env);
     for oi in 0..3 {
         for ki in 0..3 {
             let c: HashMap<Axis, usize> = [(o, oi), (k, ki)].into_iter().collect();
@@ -119,29 +119,26 @@ fn window_matches_the_hand_window() {
 #[test]
 fn conv1d_is_one_derived_kernel_and_matches_hand() {
     let (ci, w0, o, kk, r, co) = (
-        axis("ci"),
-        axis("w0"),
-        axis("o"),
-        axis("k"),
-        axis("r"),
-        axis("co"),
+        axis("ci", 3),
+        axis("w0", 12),
+        axis("o", 10),
+        axis("k", 3),
+        axis("r", 9),
+        axis("co", 4),
     );
-    let ext: Extents = [(ci, 3), (w0, 12), (o, 10), (kk, 3), (r, 9), (co, 4)]
-        .into_iter()
-        .collect();
     let mut rng = Lcg(0xC04D);
-    let x = rand_tensor(&[ci, w0], &ext, &mut rng);
-    let w = rand_tensor(&[co, ci, kk], &ext, &mut rng);
+    let x = rand_tensor(&[ci, w0], &mut rng);
+    let w = rand_tensor(&[co, ci, kk], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
-    let xw = window(input("X", &[ci, w0]), w0, o, kk, 1, 1); // [ci, o, k]
+    let xw = window(input("X", &[ci, w0], Dtype::F32), w0, o, kk, 1, 1); // [ci, o, k]
     let xf = flatten(xw, &[ci, kk], r); // [r, o]
-    let wf = flatten(input("W", &[co, ci, kk]), &[ci, kk], r); // [co, r]
+    let wf = flatten(input("W", &[co, ci, kk], Dtype::F32), &[ci, kk], r); // [co, r]
     let conv = matmul(xf, wf, r); // [o, co]
 
     // the naive semantics equal a hand-written convolution
-    let got = eval(&conv, &env, &ext);
-    let hand = Tensor::from_fn(&[o, co], &ext, |c| {
+    let got = eval(&conv, &env);
+    let hand = Value::from_fn(&[o, co], |c| {
         let mut acc = 0.0;
         for c_i in 0..3 {
             for k_i in 0..3 {
@@ -157,13 +154,18 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
 
     // it partitions to ONE fused kernel (implicit GEMM over the flattened
     // reduction axis), and the schedule reproduces the reference
-    let sched = partition(&conv, &Device::toy(), &as_f64(&ext));
-    assert_eq!(sched.stages.len(), 1, "conv must be one kernel:\n{}", sched.render());
+    let sched = partition(&conv, &DeviceProfile::toy());
+    assert_eq!(
+        sched.stages.len(),
+        1,
+        "conv must be one kernel:\n{}",
+        sched.render()
+    );
     let Stage::Fused { spec, .. } = &sched.stages[0] else {
         panic!("expected a fused stage")
     };
     assert_eq!(spec.streaming_axis, r, "streams the flattened (ci,k) axis");
-    let executed = sched.execute(&env, &ext);
+    let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }
 
@@ -172,37 +174,24 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
 #[test]
 fn conv2d_is_one_derived_kernel_and_matches_hand() {
     let (ci, h0, w0, oh, ow, kh, kw, r, co) = (
-        axis("ci"),
-        axis("h0"),
-        axis("w0"),
-        axis("oh"),
-        axis("ow"),
-        axis("kh"),
-        axis("kw"),
-        axis("r"),
-        axis("co"),
+        axis("ci", 2),
+        axis("h0", 7),
+        axis("w0", 8),
+        axis("oh", 5),
+        axis("ow", 6),
+        axis("kh", 3),
+        axis("kw", 3),
+        axis("r", 18), // ci·kh·kw
+        axis("co", 4),
     );
-    let ext: Extents = [
-        (ci, 2),
-        (h0, 7),
-        (w0, 8),
-        (oh, 5),
-        (ow, 6),
-        (kh, 3),
-        (kw, 3),
-        (r, 18), // ci·kh·kw
-        (co, 4),
-    ]
-    .into_iter()
-    .collect();
     let mut rng = Lcg(0xC0442D);
-    let x = rand_tensor(&[ci, h0, w0], &ext, &mut rng);
-    let w = rand_tensor(&[co, ci, kh, kw], &ext, &mut rng);
+    let x = rand_tensor(&[ci, h0, w0], &mut rng);
+    let w = rand_tensor(&[co, ci, kh, kw], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
     // both spatial axes window in a single Reindex node
     let xw = reindex(
-        input("X", &[ci, h0, w0]),
+        input("X", &[ci, h0, w0], Dtype::F32),
         vec![
             (h0, vec![(1, oh), (1, kh)], 0),
             (w0, vec![(1, ow), (1, kw)], 0),
@@ -210,11 +199,11 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
         false,
     ); // [ci, oh, kh, ow, kw]
     let xf = flatten(xw, &[ci, kh, kw], r); // [r, oh, ow]
-    let wf = flatten(input("W", &[co, ci, kh, kw]), &[ci, kh, kw], r); // [co, r]
+    let wf = flatten(input("W", &[co, ci, kh, kw], Dtype::F32), &[ci, kh, kw], r); // [co, r]
     let conv = matmul(xf, wf, r); // [oh, ow, co]
 
-    let got = eval(&conv, &env, &ext);
-    let hand = Tensor::from_fn(&[oh, ow, co], &ext, |c| {
+    let got = eval(&conv, &env);
+    let hand = Value::from_fn(&[oh, ow, co], |c| {
         let mut acc = 0.0;
         for c_i in 0..2 {
             for kh_i in 0..3 {
@@ -235,9 +224,14 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &Device::toy(), &as_f64(&ext));
-    assert_eq!(sched.stages.len(), 1, "conv2d must be one kernel:\n{}", sched.render());
-    let executed = sched.execute(&env, &ext);
+    let sched = partition(&conv, &DeviceProfile::toy());
+    assert_eq!(
+        sched.stages.len(),
+        1,
+        "conv2d must be one kernel:\n{}",
+        sched.render()
+    );
+    let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }
 
@@ -245,32 +239,29 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
 
 #[test]
 fn padded_conv1d_matches_hand() {
-    let (ci, w0, p0, o, kk, r, co) = (
-        axis("ci"),
-        axis("w0"),
-        axis("p0"),
-        axis("o"),
-        axis("k"),
-        axis("r"),
-        axis("co"),
-    );
     // SAME: pad by 1 both sides, window k=3 stride 1 → output extent = input's
-    let ext: Extents = [(ci, 2), (w0, 6), (p0, 8), (o, 6), (kk, 3), (r, 6), (co, 3)]
-        .into_iter()
-        .collect();
+    let (ci, w0, p0, o, kk, r, co) = (
+        axis("ci", 2),
+        axis("w0", 6),
+        axis("p0", 8),
+        axis("o", 6),
+        axis("k", 3),
+        axis("r", 6),
+        axis("co", 3),
+    );
     let mut rng = Lcg(0xADC0FFEE);
-    let x = rand_tensor(&[ci, w0], &ext, &mut rng);
-    let w = rand_tensor(&[co, ci, kk], &ext, &mut rng);
+    let x = rand_tensor(&[ci, w0], &mut rng);
+    let w = rand_tensor(&[co, ci, kk], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
-    let xp = pad(input("X", &[ci, w0]), w0, p0, 1); // [ci, p0]
+    let xp = pad(input("X", &[ci, w0], Dtype::F32), w0, p0, 1); // [ci, p0]
     let xw = window(xp, p0, o, kk, 1, 1); // [ci, o, k]
     let xf = flatten(xw, &[ci, kk], r);
-    let wf = flatten(input("W", &[co, ci, kk]), &[ci, kk], r);
+    let wf = flatten(input("W", &[co, ci, kk], Dtype::F32), &[ci, kk], r);
     let conv = matmul(xf, wf, r); // [o, co]
 
-    let got = eval(&conv, &env, &ext);
-    let hand = Tensor::from_fn(&[o, co], &ext, |c| {
+    let got = eval(&conv, &env);
+    let hand = Value::from_fn(&[o, co], |c| {
         let mut acc = 0.0;
         for c_i in 0..2 {
             for k_i in 0..3 {
@@ -289,9 +280,9 @@ fn padded_conv1d_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&conv, &DeviceProfile::toy());
     assert_eq!(sched.stages.len(), 1, "padded conv is still one kernel");
-    let executed = sched.execute(&env, &ext);
+    let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }
 
@@ -299,17 +290,16 @@ fn padded_conv1d_matches_hand() {
 
 #[test]
 fn maxpool_is_one_kernel_and_matches_hand() {
-    let (c, w0, o, kk) = (axis("c"), axis("w0"), axis("o"), axis("k"));
-    let ext: Extents = [(c, 3), (w0, 8), (o, 4), (kk, 2)].into_iter().collect();
+    let (c, w0, o, kk) = (axis("c", 3), axis("w0", 8), axis("o", 4), axis("k", 2));
     let mut rng = Lcg(0x9001);
-    let x = rand_tensor(&[c, w0], &ext, &mut rng);
+    let x = rand_tensor(&[c, w0], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let xw = window(input("X", &[c, w0]), w0, o, kk, 2, 1); // [c, o, k]
+    let xw = window(input("X", &[c, w0], Dtype::F32), w0, o, kk, 2, 1); // [c, o, k]
     let pool = reduce(xw, kk, BinOp::Monoid(Monoid::Max)); // [c, o]
 
-    let got = eval(&pool, &env, &ext);
-    let hand = Tensor::from_fn(&[c, o], &ext, |cd| {
+    let got = eval(&pool, &env);
+    let hand = Value::from_fn(&[c, o], |cd| {
         let base = cd[&o] * 2;
         let a: HashMap<Axis, usize> = [(c, cd[&c]), (w0, base)].into_iter().collect();
         let b: HashMap<Axis, usize> = [(c, cd[&c]), (w0, base + 1)].into_iter().collect();
@@ -317,9 +307,9 @@ fn maxpool_is_one_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&pool, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&pool, &DeviceProfile::toy());
     assert_eq!(sched.stages.len(), 1, "pooling is one kernel");
-    let executed = sched.execute(&env, &ext);
+    let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }
 
@@ -332,15 +322,18 @@ fn maxpool_is_one_kernel_and_matches_hand() {
 // same online-softmax accumulator.
 #[test]
 fn sliding_window_attention_is_one_flash_kernel() {
-    let (s, t, j, d, e) = (axis("s"), axis("t"), axis("j"), axis("d"), axis("e"));
     let (ns, w) = (10usize, 4usize);
-    let ext: Extents = [(s, ns), (t, ns), (j, w), (d, 5), (e, 6)]
-        .into_iter()
-        .collect();
+    let (s, t, j, d, e) = (
+        axis("s", ns),
+        axis("t", ns),
+        axis("j", w),
+        axis("d", 5),
+        axis("e", 6),
+    );
     let mut rng = Lcg(0x51D3);
-    let q = rand_tensor(&[s, d], &ext, &mut rng);
-    let k = rand_tensor(&[t, d], &ext, &mut rng);
-    let v = rand_tensor(&[t, e], &ext, &mut rng);
+    let q = rand_tensor(&[s, d], &mut rng);
+    let k = rand_tensor(&[t, d], &mut rng);
+    let v = rand_tensor(&[t, e], &mut rng);
     let env: Env = [("Q", q.clone()), ("K", k.clone()), ("V", v.clone())]
         .into_iter()
         .collect();
@@ -348,17 +341,17 @@ fn sliding_window_attention_is_one_flash_kernel() {
     // key position read at (s, j): t = s + j − (w−1); j ranges over the window
     let off = -((w - 1) as i64);
     let kw = reindex(
-        input("K", &[t, d]),
+        input("K", &[t, d], Dtype::F32),
         vec![(t, vec![(1, s), (1, j)], off)],
         true,
     ); // [s, j, d]
     let vw = reindex(
-        input("V", &[t, e]),
+        input("V", &[t, e], Dtype::F32),
         vec![(t, vec![(1, s), (1, j)], off)],
         true,
     ); // [s, j, e]
 
-    let scores = matmul(input("Q", &[s, d]), kw, d); // [s, j]
+    let scores = matmul(input("Q", &[s, d], Dtype::F32), kw, d); // [s, j]
     // mask out positions before the sequence start: s + j < w−1
     let invalid = map(
         MapOp::Lt,
@@ -377,7 +370,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
     let attn = matmul(softmax(masked, j), vw, j); // [s, e]
 
     // hand reference: masked softmax over the valid window positions
-    let hand = Tensor::from_fn(&[s, e], &ext, |c| {
+    let hand = Value::from_fn(&[s, e], |c| {
         let si = c[&s];
         let lo = si as i64 - (w as i64 - 1);
         let positions: Vec<usize> = (lo.max(0)..=si as i64).map(|p| p as usize).collect();
@@ -406,11 +399,11 @@ fn sliding_window_attention_is_one_flash_kernel() {
             .sum()
     });
 
-    let got = eval(&attn, &env, &ext);
+    let got = eval(&attn, &env);
     assert_close(&got, &hand);
 
     // one fused flash kernel streaming the WINDOW axis
-    let sched = partition(&attn, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&attn, &DeviceProfile::toy());
     assert_eq!(
         sched.stages.len(),
         1,
@@ -420,8 +413,14 @@ fn sliding_window_attention_is_one_flash_kernel() {
     let Stage::Fused { spec, .. } = &sched.stages[0] else {
         panic!("expected a fused stage")
     };
-    assert_eq!(spec.streaming_axis, j, "streams the window axis, not the sequence");
-    assert_eq!(spec.carrier.slots, 3, "the online-softmax (m, ℓ, o) carrier");
-    let executed = sched.execute(&env, &ext);
+    assert_eq!(
+        spec.streaming_axis, j,
+        "streams the window axis, not the sequence"
+    );
+    assert_eq!(
+        spec.carrier.slots, 3,
+        "the online-softmax (m, ℓ, o) carrier"
+    );
+    let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }

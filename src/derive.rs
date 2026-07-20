@@ -24,8 +24,10 @@
 //!   pulled out of a linear reduction by distributivity and is applied once,
 //!   at the end.
 //! * `k-best` — an index-carrying selection ([`BinOp::ArgMax`] /
-//!   [`BinOp::TopK`]): sorted (value, index) lists of length ≤ k form a
-//!   tuple monoid, so argmax and every top-k rank are single folds.
+//!   [`BinOp::TopK`]): argmax has a true pair monoid; top-k's current carrier
+//!   inserts one streamed item into a sorted list, so every rank is one
+//!   sequential fold but tree/split execution remains disabled until combine
+//!   implements a full two-list merge.
 //! * `invariant` — a reduction over an axis its operand does not vary along:
 //!   `Σ = n·value` (the count is itself a slot), `max/min/lse = value (+ln n)`.
 //! * `lattice` — `reduce_m(max/min(z, c))` for m ∈ {Max, Min} and `c`
@@ -58,7 +60,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
-use crate::ir::{Axis, BinOp, MapOp, Monoid, Node, NodeKind, output_axes};
+use crate::kernel_ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── symbolic expressions over carrier slots ──────────────────────────────────
 
@@ -462,7 +464,11 @@ pub enum SlotKind {
     /// Index slot `rank` of a k-best selection; `vbase`/`ibase` are the
     /// rank-0 value/index slots. Same singleton-insert caveat as
     /// [`SlotKind::KBestVal`].
-    KBestIdx { vbase: usize, ibase: usize, rank: usize },
+    KBestIdx {
+        vbase: usize,
+        ibase: usize,
+        rank: usize,
+    },
 }
 
 /// What streaming a sub-expression over the axis produced so far.
@@ -589,7 +595,7 @@ impl Ctx {
 fn invariant_along(e: &Expr, axis: Axis, ctx: &Ctx) -> bool {
     items_of(e)
         .iter()
-        .all(|&i| !crate::ir::output_axes(&ctx.leaves[i].0).contains(&axis))
+        .all(|&i| !ctx.leaves[i].0.shape().contains(&axis))
 }
 
 /// The slot indices (`F`) an expression reads.
@@ -805,10 +811,7 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
     };
     if is_free && (!is_map || keep_map_whole) {
         // The leaf's free axes are its output shape minus the streamed axis.
-        let free = output_axes(node)
-            .into_iter()
-            .filter(|a| *a != axis)
-            .collect();
+        let free = node.shape().into_iter().filter(|a| *a != axis).collect();
         return Some(S::Pe {
             raw: Expr::Item(ctx.leaf(node, free)),
             shift: None,
@@ -837,10 +840,7 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 ctx.leaves.truncate(save.1);
                 ctx.memo.truncate(save.2);
                 ctx.rules = save.3;
-                let free = output_axes(node)
-                    .into_iter()
-                    .filter(|a| *a != axis)
-                    .collect();
+                let free = node.shape().into_iter().filter(|a| *a != axis).collect();
                 return Some(S::Pe {
                     raw: Expr::Item(ctx.leaf(node, free)),
                     shift: None,
@@ -876,11 +876,8 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             return None;
         }
         let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
-        let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
-        let idx_slot = ctx.push_slot(
-            SlotKind::ArgIdx { max_slot },
-            Expr::Item(iota_leaf),
-        );
+        let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
+        let idx_slot = ctx.push_slot(SlotKind::ArgIdx { max_slot }, Expr::Item(iota_leaf));
         // The index ranges over whatever grid rows the max does — its `into`
         // (an iota) says nothing about that, so inherit the span.
         ctx.slots[idx_slot].span = ctx.slots[max_slot].span.clone();
@@ -912,26 +909,39 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 } else {
                     cst(f64::NEG_INFINITY)
                 };
-                ctx.push_slot(SlotKind::KBestVal { base: vbase, rank: r }, into);
+                ctx.push_slot(
+                    SlotKind::KBestVal {
+                        base: vbase,
+                        rank: r,
+                    },
+                    into,
+                );
             }
             vbase
         });
         // A value-only query needs no index half; an index query needs both
         // (reusing the value half if a prior query built it).
         let ibase = if idx {
-            let found = ctx.slots.iter().position(|sl| {
-                matches!(sl.kind, SlotKind::KBestIdx { vbase: v, rank: 0, .. } if v == vbase)
-            });
+            let found = ctx.slots.iter().position(
+                |sl| matches!(sl.kind, SlotKind::KBestIdx { vbase: v, rank: 0, .. } if v == vbase),
+            );
             found.unwrap_or_else(|| {
                 let ibase = ctx.slots.len();
-                let iota_leaf = ctx.leaf(&crate::ir::iota(axis), Vec::new());
+                let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
                 for r in 0..k {
                     let into = if r == 0 {
                         Expr::Item(iota_leaf)
                     } else {
                         cst(0.0)
                     };
-                    ctx.push_slot(SlotKind::KBestIdx { vbase, ibase, rank: r }, into);
+                    ctx.push_slot(
+                        SlotKind::KBestIdx {
+                            vbase,
+                            ibase,
+                            rank: r,
+                        },
+                        into,
+                    );
                 }
                 ibase
             })
@@ -971,10 +981,7 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 ctx.rules.insert("defer-add");
                 let slot = ctx.push_slot(SlotKind::Plain(Monoid::Add), raw);
                 let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
-                return Some(S::Coll(padd(
-                    Expr::F(slot),
-                    pmul(off, Expr::F(cnt)),
-                )));
+                return Some(S::Coll(padd(Expr::F(slot), pmul(off, Expr::F(cnt)))));
             }
             let S::Pe { raw, shift, post } = s else {
                 return None; // a shifted/deferred form we cannot re-reduce
@@ -1427,7 +1434,11 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
                 } else {
                     ewhere(
                         elt(Expr::A(vbase + rank), bv.clone()),
-                        ewhere(elt(Expr::A(vbase + rank - 1), bv), Expr::A(ibase + rank - 1), bi),
+                        ewhere(
+                            elt(Expr::A(vbase + rank - 1), bv),
+                            Expr::A(ibase + rank - 1),
+                            bi,
+                        ),
                         Expr::A(ibase + rank),
                     )
                 }

@@ -1,756 +1,805 @@
-//! The IR: a closed compute basis plus one structural operator, and the
-//! algebraic laws each operator carries.
+//! Public positional tensor IR.
 //!
-//! Matmul, softmax, attention, silu, SSM scans and everything else are
-//! compositions of the basis (constructors at the bottom of the file). That
-//! is the whole trick: an analysis that handles the basis handles every
-//! composite, with no special cases and no pattern library. The elementwise
-//! vocabulary is a *closed* enum of scalar primitives, so the deriver can be
-//! total over it — there is no open set of named ops to special-case.
-//!
-//! Axes are variables, not strings: an [`Axis`] is a fresh integer identity
-//! with a label used only for printing. `Reduce` binds its axis; `View`
-//! re-binds names (rename) or merges index spaces (flatten) without moving
-//! data. Because axes are host-language values, Rust's own lexical scoping
-//! is the axis scoping — pass the same `Axis` where two tensors share an
-//! index space, mint a fresh one where they don't.
+//! A dimension is identified only by its position in a node's ordered shape.
+//! [`Axis`] carries display metadata and an extent; it is never a graph-wide
+//! variable or an equality key. Compiler passes lower these nodes into their
+//! own scoped loop representation.
 
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-pub type Node = Rc<NodeKind>;
+pub use crate::kernel_ir::{BinOp, Dtype, Extent, MapOp, Monoid};
 
-// ── axes ─────────────────────────────────────────────────────────────────────
+/// A shared reference to an immutable graph node.
+pub type NodeRef = Rc<Node>;
 
-/// An axis variable. Identity is the id; the label is only for printing —
-/// two calls to `axis("s")` make two *different* variables.
-#[derive(Clone, Copy, Debug)]
+/// Metadata for one position in a node's shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Axis {
-    id: u32,
-    label: &'static str,
-}
-
-static NEXT_AXIS: AtomicU32 = AtomicU32::new(0);
-
-/// Mint a fresh axis variable with a printing label.
-pub fn axis(label: &'static str) -> Axis {
-    Axis {
-        id: NEXT_AXIS.fetch_add(1, Ordering::Relaxed),
-        label,
-    }
+    pub name: &'static str,
+    pub extent: Extent,
 }
 
 impl Axis {
-    pub fn label(self) -> &'static str {
-        self.label
+    pub const fn new(name: &'static str, extent: Extent) -> Self {
+        Axis { name, extent }
+    }
+
+    /// The concrete extent required by the current interpreter and compiler.
+    pub fn extent(self) -> usize {
+        match self.extent {
+            Extent::Static(value) => value,
+            Extent::Dynamic => panic!("axis `{}` has a dynamic extent", self.name),
+        }
+    }
+
+    pub const fn is_dynamic(self) -> bool {
+        matches!(self.extent, Extent::Dynamic)
     }
 }
 
-impl PartialEq for Axis {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-impl Eq for Axis {}
-impl std::hash::Hash for Axis {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-impl PartialOrd for Axis {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Axis {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id.cmp(&other.id)
-    }
-}
 impl fmt::Display for Axis {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.label)
+        f.write_str(self.name)
     }
 }
 
-// ── operator laws ────────────────────────────────────────────────────────────
-
-/// The associative reductions. Every variant is a monoid — associative, with
-/// the identity below. These laws are the only thing the engine trusts:
-/// declare a false one and the derived kernels are wrong. So the enum is tiny.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Monoid {
-    Add,
-    Mul,
-    Max,
-    Min,
-    LogSumExp,
-}
-
-impl Monoid {
-    pub fn identity(self) -> f64 {
-        match self {
-            Monoid::Add => 0.0,
-            Monoid::Mul => 1.0,
-            Monoid::Max | Monoid::LogSumExp => f64::NEG_INFINITY,
-            Monoid::Min => f64::INFINITY,
-        }
-    }
-
-    /// True for the "plus" of its semiring — the op a constant factor
-    /// distributes over (`Σ c·xᵢ = c·Σ xᵢ`). This is what lets a normalizer
-    /// be pulled out of a reduction and applied once at the end.
-    pub fn is_additive(self) -> bool {
-        matches!(self, Monoid::Add | Monoid::LogSumExp)
+/// A compact axis descriptor.
+pub fn axis(name: &'static str, extent: impl Into<Extent>) -> Axis {
+    Axis {
+        name,
+        extent: extent.into(),
     }
 }
 
-/// The operator a `Reduce` or `Scan` folds with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp {
-    Monoid(Monoid),
-    /// Composition of affine maps `h ↦ A·h + b`. Associative with an identity,
-    /// so an SSM / linear recurrence streams even though it is not a scalar
-    /// monoid.
-    AffineCompose,
-    /// Index-carrying maximum: the reduce's VALUE is the position of the
-    /// first maximum along the axis. Associative over `(max, idx)` pairs
-    /// with first-max-wins tie-breaking — a tuple monoid, not a scalar one,
-    /// so it ships its own two-slot carrier (like `AffineCompose`). This is
-    /// what makes argmax / top-k selection ONE fold instead of a
-    /// max-then-indicator-sum pair (which also differs on ties).
-    ArgMax,
-    /// One projection of a k-best selection: the `rank`-th largest value
-    /// (`idx: false`) or its position (`idx: true`), first-max-wins on ties.
-    /// The k sorted (value, index) pairs form a tuple monoid — sorted lists
-    /// of length ≤ k under merge-take-k — so the whole selection is ONE fold
-    /// into a 2k-slot carrier; each rank projects a slot. This is what makes
-    /// top-k routing k independent single-kernel folds instead of k rounds
-    /// of (max, mask-the-winner) chained through materialized cuts.
-    TopK { k: u8, rank: u8, idx: bool },
-    /// A non-associative step, e.g. `tanh(W·h + x)`. No legal fold exists; an
-    /// axis governed by one of these is strictly serial.
-    NonAssoc(&'static str),
+/// One source-dimension affine index:
+/// `(source dimension, (coefficient, output dimension) terms, offset)`.
+pub type AffineIndex = (usize, Vec<(i64, usize)>, i64);
+
+/// One output dimension of a storage-preserving view.
+///
+/// `sources` are positions in the source shape. A singleton insertion has no
+/// source positions and must have extent one.
+#[derive(Clone, Debug)]
+pub struct ViewDim {
+    pub sources: Vec<usize>,
+    pub axis: Axis,
 }
-
-impl BinOp {
-    /// Associative with an identity — i.e. foldable.
-    pub fn is_monoid(self) -> bool {
-        !matches!(self, BinOp::NonAssoc(_))
-    }
-
-    pub fn is_additive(self) -> bool {
-        matches!(self, BinOp::Monoid(m) if m.is_additive())
-    }
-}
-
-// ── the closed elementwise basis ─────────────────────────────────────────────
-
-/// The scalar primitives. This set is CLOSED: every elementwise computation
-/// in a graph is a composition of these, so the deriver and the emitters can
-/// be total over it. (tinygrad proves the same idea at scale: a dozen ALU
-/// ops, everything else derived.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MapOp {
-    // binary
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Max,
-    Min,
-    /// `a < b`, producing 1.0 / 0.0 — with `Where`, this is how masks are
-    /// *computed* instead of loaded.
-    Lt,
-    // unary
-    Neg,
-    Recip,
-    Exp,
-    Log,
-    Sqrt,
-    Tanh,
-    Sin,
-    Cos,
-    // ternary
-    /// `cond != 0 ? a : b`.
-    Where,
-}
-
-impl MapOp {
-    pub fn arity(self) -> usize {
-        match self {
-            MapOp::Neg
-            | MapOp::Recip
-            | MapOp::Exp
-            | MapOp::Log
-            | MapOp::Sqrt
-            | MapOp::Tanh
-            | MapOp::Sin
-            | MapOp::Cos => 1,
-            MapOp::Where => 3,
-            _ => 2,
-        }
-    }
-
-    /// Does this op preserve linearity in its arguments? (Scaling and
-    /// addition do; `exp` and friends do not.)
-    pub fn preserves_linear(self) -> bool {
-        matches!(
-            self,
-            MapOp::Add | MapOp::Sub | MapOp::Mul | MapOp::Div | MapOp::Neg
-        )
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            MapOp::Add => "add",
-            MapOp::Sub => "sub",
-            MapOp::Mul => "mul",
-            MapOp::Div => "div",
-            MapOp::Max => "max",
-            MapOp::Min => "min",
-            MapOp::Lt => "lt",
-            MapOp::Neg => "neg",
-            MapOp::Recip => "recip",
-            MapOp::Exp => "exp",
-            MapOp::Log => "log",
-            MapOp::Sqrt => "sqrt",
-            MapOp::Tanh => "tanh",
-            MapOp::Sin => "sin",
-            MapOp::Cos => "cos",
-            MapOp::Where => "where",
-        }
-    }
-}
-
-// ── storage dtypes ───────────────────────────────────────────────────────────
-
-/// The STORAGE width of an input buffer — what a load actually moves over the
-/// bus, which is what the cost model must price (int4 weights read 8× fewer
-/// bytes than f32). Semantically the oracle still computes in f64: dtype is a
-/// statement about bytes, not about values, until real byte storage lands in
-/// the buffer model. Quantized *arithmetic* is already expressible without
-/// it (dequant fuses into the GEMM lift); this prices the bandwidth win.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype {
-    F64,
-    F32,
-    F16,
-    /// bfloat16 — the top 16 bits of an f32, so a load widens by
-    /// `bits << 16` (exact, full f32 range). It is the dtype most
-    /// checkpoints ship in, and it is BYTE-IDENTICAL to those bytes, so a
-    /// bf16 input can bind zero-copy straight from the file (unlike f16,
-    /// which needs a host conversion pass).
-    BF16,
-    I8,
-    I4,
-}
-
-impl Dtype {
-    /// Bytes per element (f64 so a half-byte int4 is representable).
-    pub fn bytes(self) -> f64 {
-        match self {
-            Dtype::F64 => 8.0,
-            Dtype::F32 => 4.0,
-            Dtype::F16 | Dtype::BF16 => 2.0,
-            Dtype::I8 => 1.0,
-            Dtype::I4 => 0.5,
-        }
-    }
-}
-
-// ── nodes ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-pub enum NodeKind {
-    /// Raw data. Depends on no axis. `dtype` is the buffer's declared storage
-    /// width — pricing information for the planner, not a change of
-    /// semantics; `None` prices at the device's compute dtype.
+pub enum Node {
     Input {
-        name: &'static str,
-        axes: Vec<Axis>,
-        dtype: Option<Dtype>,
+        name: String,
+        shape: Vec<Axis>,
+        dtype: Dtype,
     },
-    /// A literal scalar. No axes, no storage.
-    Const { v: f64 },
-    /// The index along an axis, as a value (0, 1, 2, …). Free to compute —
-    /// this is what makes aranges and causal masks cost no memory traffic.
-    Iota { axis: Axis },
-    /// Elementwise / broadcast application of a basis op.
-    Map { op: MapOp, inputs: Vec<Node> },
-    /// Folds `axis` with `op`; the result no longer carries `axis`.
-    Reduce { src: Node, axis: Axis, op: BinOp },
-    /// Prefix recurrence over `axis`; foldable iff `op` is associative.
-    Scan { src: Node, axis: Axis, op: BinOp },
-    /// `src[index[...]]` — data-dependent access along `axis`.
-    Gather { src: Node, index: Node, axis: Axis },
-    /// Reindexing — the one structural operator: no computation, no copy,
-    /// just new names for the same values. Each group maps source axes to
-    /// one fresh output axis: `[s] → t` is a rename, `[h, dv] → dm` is a
-    /// flatten. A consumed source axis goes out of scope above the view; a
-    /// grouped output inherits the joined structure of its members.
+    Const {
+        v: f64,
+    },
+    Iota {
+        axis: Axis,
+    },
+    /// Coordinate along one positional dimension of `src`, broadcast over
+    /// the rest of `src`'s shape.
+    Coordinate {
+        src: NodeRef,
+        dim: usize,
+    },
+    Map {
+        op: MapOp,
+        inputs: Vec<NodeRef>,
+    },
+    Reduce {
+        src: NodeRef,
+        dim: usize,
+        op: BinOp,
+    },
+    Scan {
+        src: NodeRef,
+        dim: usize,
+        op: BinOp,
+    },
+    Gather {
+        src: NodeRef,
+        index: NodeRef,
+        dim: usize,
+    },
     View {
-        src: Node,
-        groups: Vec<(Vec<Axis>, Axis)>,
+        src: NodeRef,
+        dims: Vec<ViewDim>,
     },
-    /// Affine reindexing — the movement vocabulary past rename/flatten. Each
-    /// mapped source axis reads the index `Σ coef·i(out_axis) + offset`
-    /// (signed arithmetic); with `padded`, an out-of-range read is 0.0
-    /// instead of an error. Like `View`, no computation and no copy — only
-    /// index arithmetic. Slice, zero-pad, reshape-split, sliding windows and
-    /// reversal are all this one operator (constructors below). A mapped
-    /// source axis goes out of scope above the node; the term axes are the
-    /// (possibly shared) output axes that drive it.
     Reindex {
-        src: Node,
-        /// (source axis, terms over output axes, constant offset).
-        map: Vec<(Axis, Vec<(i64, Axis)>, i64)>,
+        src: NodeRef,
+        shape: Vec<Axis>,
+        map: Vec<AffineIndex>,
         padded: bool,
     },
 }
 
-// ── constructors ─────────────────────────────────────────────────────────────
-
-pub fn input(name: &'static str, axes: &[Axis]) -> Node {
-    Rc::new(NodeKind::Input {
-        name,
-        axes: axes.to_vec(),
-        dtype: None,
-    })
-}
-
-/// An input with an explicit storage dtype — how quantized weights tell the
-/// planner they cost 1 (or 0.5) bytes of bandwidth per element.
-pub fn input_dt(name: &'static str, axes: &[Axis], dtype: Dtype) -> Node {
-    Rc::new(NodeKind::Input {
-        name,
-        axes: axes.to_vec(),
-        dtype: Some(dtype),
-    })
-}
-
-/// Every input that DECLARES a storage dtype, by name (first declaration
-/// wins). Inputs without one price at the device's compute dtype.
-pub fn input_dtypes(node: &Node) -> Vec<(&'static str, Dtype)> {
-    fn go(
-        n: &Node,
-        out: &mut Vec<(&'static str, Dtype)>,
-        seen: &mut std::collections::HashSet<*const NodeKind>,
-    ) {
-        // Walk each DAG node once — exponential on shared backward graphs
-        // otherwise (dtypes dedup by name, so first-reach is equivalent).
-        if !seen.insert(std::rc::Rc::as_ptr(n)) {
-            return;
-        }
-        match n.as_ref() {
-            NodeKind::Input {
-                name,
-                dtype: Some(d),
-                ..
-            } => {
-                if !out.iter().any(|(m, _)| m == name) {
-                    out.push((name, *d));
-                }
-            }
-            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out, seen)),
-            NodeKind::Reduce { src, .. }
-            | NodeKind::Scan { src, .. }
-            | NodeKind::View { src, .. }
-            | NodeKind::Reindex { src, .. } => go(src, out, seen),
-            NodeKind::Gather { src, index, .. } => {
-                go(src, out, seen);
-                go(index, out, seen);
-            }
-        }
+impl Node {
+    /// Ordered output shape. Positions, not `Axis` values, identify dimensions.
+    pub fn shape(&self) -> Vec<Axis> {
+        shape_memo(self, &mut std::collections::HashMap::new())
     }
-    let mut out = Vec::new();
-    go(node, &mut out, &mut std::collections::HashSet::new());
-    out
 }
 
-pub fn konst(v: f64) -> Node {
-    Rc::new(NodeKind::Const { v })
+fn shape_memo(
+    node: &Node,
+    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
+) -> Vec<Axis> {
+    (*shape_rc(node, cache)).clone()
 }
 
-pub fn iota(axis: Axis) -> Node {
-    Rc::new(NodeKind::Iota { axis })
-}
-
-pub fn map(op: MapOp, inputs: Vec<Node>) -> Node {
-    debug_assert_eq!(op.arity(), inputs.len(), "{op:?} arity");
-    Rc::new(NodeKind::Map { op, inputs })
-}
-
-pub fn reduce(src: Node, axis: Axis, op: BinOp) -> Node {
-    Rc::new(NodeKind::Reduce { src, axis, op })
-}
-
-pub fn scan(src: Node, axis: Axis, op: BinOp) -> Node {
-    Rc::new(NodeKind::Scan { src, axis, op })
-}
-
-pub fn gather(src: Node, index: Node, axis: Axis) -> Node {
-    Rc::new(NodeKind::Gather { src, index, axis })
-}
-
-pub fn view(src: Node, groups: Vec<(Vec<Axis>, Axis)>) -> Node {
-    Rc::new(NodeKind::View { src, groups })
-}
-
-/// The same values under a different axis variable — `X[s,·]` seen as `X[t,·]`.
-pub fn rename(src: Node, from: Axis, to: Axis) -> Node {
-    view(src, vec![(vec![from], to)])
-}
-
-/// Merge a group of axes into one (`[h, dv] → dm`); extent(to) is the
-/// product of the members' extents.
-pub fn flatten(src: Node, group: &[Axis], to: Axis) -> Node {
-    view(src, vec![(group.to_vec(), to)])
-}
-
-pub fn reindex(src: Node, map: Vec<(Axis, Vec<(i64, Axis)>, i64)>, padded: bool) -> Node {
-    Rc::new(NodeKind::Reindex { src, map, padded })
-}
-
-/// A contiguous slice along one axis: `out[i] = src[i + start]`. `to` is a
-/// fresh, shorter axis (its declared extent is the slice length).
-pub fn slice(src: Node, from: Axis, to: Axis, start: usize) -> Node {
-    reindex(src, vec![(from, vec![(1, to)], start as i64)], false)
-}
-
-/// Zero-pad along one axis: `out[i] = src[i − lo]`, 0.0 outside. `to` is a
-/// fresh axis whose declared extent is `lo + extent(from) + hi`.
-pub fn pad(src: Node, from: Axis, to: Axis, lo: usize) -> Node {
-    reindex(src, vec![(from, vec![(1, to)], -(lo as i64))], true)
-}
-
-/// Split one axis into `(outer, inner)` — the inverse of [`flatten`]:
-/// `out[o, i] = src[o·inner_extent + i]`. `inner_extent` must equal the
-/// declared extent of `inner`.
-pub fn split(src: Node, from: Axis, outer: Axis, inner: Axis, inner_extent: usize) -> Node {
-    reindex(
-        src,
-        vec![(from, vec![(inner_extent as i64, outer), (1, inner)], 0)],
-        false,
-    )
-}
-
-/// Sliding windows along `from`: output `(out, k)` reads
-/// `src[out·stride + k·dilation]` — convolution and pooling are a `window`
-/// followed by a [`reduce`] over `k`. `out` may be an *existing* axis to
-/// share an index space (sliding-window attention rides the query axis).
-/// Compose with [`pad`] for SAME-style windows that hang off the ends.
-pub fn window(src: Node, from: Axis, out: Axis, k: Axis, stride: usize, dilation: usize) -> Node {
-    reindex(
-        src,
-        vec![(from, vec![(stride as i64, out), (dilation as i64, k)], 0)],
-        false,
-    )
-}
-
-// ── shape and axis queries ───────────────────────────────────────────────────
-
-/// The axes of a node's output — its shape, inferred. A reduce drops its
-/// axis; a gather swaps the indexed axis for the index's axes; a view
-/// remaps. This is what tells the deriver which free axes an accumulator
-/// slot spans.
-pub fn output_axes(node: &Node) -> Vec<Axis> {
-    // Memoized by pointer WITHIN one call: the IR is a DAG, and this is
-    // called at every node by the roofline (`count_flops`, grid/volume) —
-    // an unmemoized walk re-derives shared subtrees once per path to them,
-    // which profiling showed to be the dominant cost of partitioning.
-    // A fresh cache per call keeps it pure and stale-pointer-free.
-    output_axes_memo(node, &mut std::collections::HashMap::new())
-}
-
-/// The number of elements a node's output holds — the product of its shape's
-/// extents (`1` for a scalar). This is the size a materialized buffer for the
-/// node needs; a stage's dispatch grid may be smaller (a packed fold writes
-/// several elements per thread), so allocation keys off THIS, never the grid.
-pub fn volume(node: &Node, ext: &std::collections::HashMap<Axis, usize>) -> usize {
-    output_axes(node).iter().map(|a| ext[a]).product::<usize>().max(1)
-}
-
-fn output_axes_memo(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Vec<Axis> {
-    (*output_axes_rc(node, cache)).clone()
-}
-
-fn output_axes_rc(node: &Node, cache: &mut std::collections::HashMap<*const NodeKind, Rc<Vec<Axis>>>) -> Rc<Vec<Axis>> {
-    let key = Rc::as_ptr(node);
-    if let Some(v) = cache.get(&key) {
-        return v.clone();
+fn shape_rc(
+    node: &Node,
+    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
+) -> Rc<Vec<Axis>> {
+    let key = std::ptr::from_ref(node);
+    if let Some(shape) = cache.get(&key) {
+        return shape.clone();
     }
-    let union = |mut acc: Vec<Axis>, more: &[Axis]| {
-        for &a in more {
-            if !acc.contains(&a) {
-                acc.push(a);
-            }
+    let shape = match node {
+        Node::Input { shape, .. } => shape.clone(),
+        Node::Const { .. } => Vec::new(),
+        Node::Iota { axis } => vec![*axis],
+        Node::Coordinate { src, dim } => {
+            let shape = shape_memo(src, cache);
+            assert_dim(&shape, *dim, "coordinate");
+            shape
         }
-        acc
-    };
-    let out: Vec<Axis> = match node.as_ref() {
-        NodeKind::Input { axes, .. } => axes.clone(),
-        NodeKind::Const { .. } => Vec::new(),
-        NodeKind::Iota { axis } => vec![*axis],
-        NodeKind::Map { inputs, .. } => inputs.iter().fold(Vec::new(), |acc, i| {
-            let ia = output_axes_rc(i, cache);
-            union(acc, &ia)
-        }),
-        NodeKind::Reduce { src, axis, .. } => output_axes_rc(src, cache)
-            .iter()
-            .copied()
-            .filter(|a| a != axis)
-            .collect(),
-        NodeKind::Scan { src, .. } => (*output_axes_rc(src, cache)).clone(),
-        NodeKind::Gather { src, index, axis } => {
-            let kept: Vec<Axis> = output_axes_rc(src, cache)
+        Node::Map { inputs, .. } => broadcast_shapes(
+            &inputs
                 .iter()
-                .copied()
-                .filter(|a| a != axis)
+                .map(|input| shape_memo(input, cache))
+                .collect::<Vec<_>>(),
+            "map",
+        ),
+        Node::Reduce { src, dim, .. } => {
+            let mut shape = shape_memo(src, cache);
+            assert_dim(&shape, *dim, "reduce");
+            shape.remove(*dim);
+            shape
+        }
+        Node::Scan { src, dim, .. } => {
+            let shape = shape_memo(src, cache);
+            assert_dim(&shape, *dim, "scan");
+            shape
+        }
+        Node::Gather { src, index, dim } => {
+            let source = shape_memo(src, cache);
+            let index = shape_memo(index, cache);
+            assert_dim(&source, *dim, "gather");
+            let mut output = Vec::with_capacity(source.len() - 1 + index.len());
+            output.extend_from_slice(&source[..*dim]);
+            output.extend(index);
+            output.extend_from_slice(&source[*dim + 1..]);
+            output
+        }
+        Node::View { dims, .. } => dims.iter().map(|dim| dim.axis).collect(),
+        Node::Reindex { shape, .. } => shape.clone(),
+    };
+    let shape = Rc::new(shape);
+    cache.insert(key, shape.clone());
+    shape
+}
+
+fn assert_dim(shape: &[Axis], dim: usize, op: &str) {
+    assert!(
+        dim < shape.len(),
+        "{op}: dimension {dim} is out of range for rank {}",
+        shape.len()
+    );
+}
+
+fn broadcast_shapes(shapes: &[Vec<Axis>], op: &str) -> Vec<Axis> {
+    let rank = shapes.iter().map(Vec::len).max().unwrap_or(0);
+    let mut output = Vec::with_capacity(rank);
+    for output_dim in 0..rank {
+        let mut selected: Option<Axis> = None;
+        for shape in shapes {
+            let Some(input_dim) = output_dim.checked_sub(rank - shape.len()) else {
+                continue;
+            };
+            let candidate = shape[input_dim];
+            selected = Some(match selected {
+                None => candidate,
+                Some(current) => match (current.extent, candidate.extent) {
+                    (Extent::Static(1), _) => candidate,
+                    (_, Extent::Static(1)) => current,
+                    (left, right) if left == right => current,
+                    _ => panic!(
+                        "{op}: dimensions with extents {:?} and {:?} cannot broadcast",
+                        current.extent, candidate.extent
+                    ),
+                },
+            });
+        }
+        output.push(selected.expect("broadcast output dimension has no source"));
+    }
+    output
+}
+
+/// Conversion for positional operator arguments.
+///
+/// `usize` addresses a dimension from the front and `isize` additionally
+/// supports negative indices from the back.
+pub trait Dimension {
+    fn resolve(self, shape: &[Axis], op: &str) -> usize;
+}
+
+impl Dimension for usize {
+    fn resolve(self, shape: &[Axis], op: &str) -> usize {
+        assert_dim(shape, self, op);
+        self
+    }
+}
+
+impl Dimension for isize {
+    fn resolve(self, shape: &[Axis], op: &str) -> usize {
+        let rank = shape.len() as isize;
+        let dim = if self < 0 { rank + self } else { self };
+        assert!(
+            (0..rank).contains(&dim),
+            "{op}: dimension {self} is out of range for rank {rank}"
+        );
+        dim as usize
+    }
+}
+
+pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> NodeRef {
+    Rc::new(Node::Input {
+        name: name.into(),
+        shape: shape.as_ref().to_vec(),
+        dtype,
+    })
+}
+
+pub fn konst(v: f64) -> NodeRef {
+    Rc::new(Node::Const { v })
+}
+
+pub fn iota(axis: Axis) -> NodeRef {
+    Rc::new(Node::Iota { axis })
+}
+
+/// The positional index along `dim`, broadcast over the shape of `src`.
+pub fn coordinate(src: NodeRef, dim: impl Dimension) -> NodeRef {
+    let dim = dim.resolve(&src.shape(), "coordinate");
+    Rc::new(Node::Coordinate { src, dim })
+}
+
+pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
+    assert_eq!(op.arity(), inputs.len(), "{op:?} arity");
+    // Validate broadcasting at construction so malformed graphs fail locally.
+    let _ = broadcast_shapes(
+        &inputs.iter().map(|input| input.shape()).collect::<Vec<_>>(),
+        op.name(),
+    );
+    Rc::new(Node::Map { op, inputs })
+}
+
+pub fn reduce(src: NodeRef, dim: impl Dimension, op: BinOp) -> NodeRef {
+    let dim = dim.resolve(&src.shape(), "reduce");
+    Rc::new(Node::Reduce { src, dim, op })
+}
+
+pub fn scan(src: NodeRef, dim: impl Dimension, op: BinOp) -> NodeRef {
+    let dim = dim.resolve(&src.shape(), "scan");
+    Rc::new(Node::Scan { src, dim, op })
+}
+
+pub fn gather(src: NodeRef, index: NodeRef, dim: impl Dimension) -> NodeRef {
+    let dim = dim.resolve(&src.shape(), "gather");
+    Rc::new(Node::Gather { src, index, dim })
+}
+
+pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
+    let source = src.shape();
+    let mut consumed = vec![false; source.len()];
+    for dim in &dims {
+        if dim.sources.is_empty() {
+            assert_eq!(
+                dim.axis.extent,
+                Extent::Static(1),
+                "view: a source-free dimension must be a static singleton"
+            );
+        }
+        let mut product = Some(1usize);
+        for &source_dim in &dim.sources {
+            assert_dim(&source, source_dim, "view");
+            assert!(
+                !std::mem::replace(&mut consumed[source_dim], true),
+                "view: source dimension {source_dim} is consumed more than once"
+            );
+            product = match (product, source[source_dim].extent) {
+                (Some(acc), Extent::Static(value)) => acc.checked_mul(value),
+                _ => None,
+            };
+        }
+        if let (Some(expected), Extent::Static(actual)) = (product, dim.axis.extent) {
+            assert_eq!(
+                actual, expected,
+                "view: output extent {actual} does not match source product {expected}"
+            );
+        }
+    }
+    assert!(
+        consumed.into_iter().all(|value| value),
+        "view: every source dimension must be consumed exactly once"
+    );
+    Rc::new(Node::View { src, dims })
+}
+
+pub trait IntoViewDims {
+    fn into_view_dims(self, source: &[Axis]) -> Vec<ViewDim>;
+}
+
+impl IntoViewDims for Vec<(Vec<usize>, Axis)> {
+    fn into_view_dims(self, _source: &[Axis]) -> Vec<ViewDim> {
+        self.into_iter()
+            .map(|(sources, axis)| ViewDim { sources, axis })
+            .collect()
+    }
+}
+
+/// Build a positional view. Groups are listed in output order.
+pub fn view(src: NodeRef, dims: impl IntoViewDims) -> NodeRef {
+    let shape = src.shape();
+    positional_view(src, dims.into_view_dims(&shape))
+}
+
+pub fn rename(src: NodeRef, from: impl Dimension, to: Axis) -> NodeRef {
+    let source = src.shape();
+    let from = from.resolve(&source, "rename");
+    let dims = source
+        .iter()
+        .enumerate()
+        .map(|(index, &axis)| ViewDim {
+            sources: vec![index],
+            axis: if index == from { to } else { axis },
+        })
+        .collect();
+    positional_view(src, dims)
+}
+
+/// Swap two dimensions without copying storage.
+pub fn transpose(src: NodeRef, dim0: impl Dimension, dim1: impl Dimension) -> NodeRef {
+    let source = src.shape();
+    let dim0 = dim0.resolve(&source, "transpose");
+    let dim1 = dim1.resolve(&source, "transpose");
+    let dims = (0..source.len())
+        .map(|output_dim| {
+            let source_dim = if output_dim == dim0 {
+                dim1
+            } else if output_dim == dim1 {
+                dim0
+            } else {
+                output_dim
+            };
+            ViewDim {
+                sources: vec![source_dim],
+                axis: source[source_dim],
+            }
+        })
+        .collect();
+    positional_view(src, dims)
+}
+
+pub trait Dimensions {
+    fn resolve_all(self, shape: &[Axis], op: &str) -> Vec<usize>;
+}
+
+impl Dimensions for &[usize] {
+    fn resolve_all(self, shape: &[Axis], op: &str) -> Vec<usize> {
+        self.iter().map(|&dim| dim.resolve(shape, op)).collect()
+    }
+}
+
+pub fn flatten<G: Dimensions>(src: NodeRef, group: G, to: Axis) -> NodeRef {
+    let source = src.shape();
+    let group = group.resolve_all(&source, "flatten");
+    assert!(!group.is_empty(), "flatten: group cannot be empty");
+    let first = *group.iter().min().unwrap();
+    let mut dims = Vec::new();
+    for (index, &axis) in source.iter().enumerate() {
+        if index == first {
+            dims.push(ViewDim {
+                sources: group.clone(),
+                axis: to,
+            });
+        } else if !group.contains(&index) {
+            dims.push(ViewDim {
+                sources: vec![index],
+                axis,
+            });
+        }
+    }
+    positional_view(src, dims)
+}
+
+pub fn positional_reindex(
+    src: NodeRef,
+    shape: Vec<Axis>,
+    map: Vec<AffineIndex>,
+    padded: bool,
+) -> NodeRef {
+    let source = src.shape();
+    assert_eq!(
+        map.len(),
+        source.len(),
+        "reindex: every source dimension must be mapped exactly once"
+    );
+    let mut seen = vec![false; source.len()];
+    for (source_dim, terms, _) in &map {
+        assert_dim(&source, *source_dim, "reindex source");
+        assert!(
+            !std::mem::replace(&mut seen[*source_dim], true),
+            "reindex: source dimension {source_dim} is mapped more than once"
+        );
+        for &(_, output_dim) in terms {
+            assert_dim(&shape, output_dim, "reindex output");
+        }
+    }
+    Rc::new(Node::Reindex {
+        src,
+        shape,
+        map,
+        padded,
+    })
+}
+
+pub fn slice(src: NodeRef, from: impl Dimension, to: Axis, start: usize) -> NodeRef {
+    let source = src.shape();
+    let from = from.resolve(&source, "slice");
+    let mut shape = source.clone();
+    shape[from] = to;
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(dim, _)| {
+            (
+                dim,
+                vec![(1, dim)],
+                if dim == from { start as i64 } else { 0 },
+            )
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
+pub fn pad(src: NodeRef, from: impl Dimension, to: Axis, lo: usize) -> NodeRef {
+    let source = src.shape();
+    let from = from.resolve(&source, "pad");
+    let mut shape = source.clone();
+    shape[from] = to;
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(dim, _)| {
+            (
+                dim,
+                vec![(1, dim)],
+                if dim == from { -(lo as i64) } else { 0 },
+            )
+        })
+        .collect();
+    positional_reindex(src, shape, map, true)
+}
+
+pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> NodeRef {
+    let source = src.shape();
+    let from = from.resolve(&source, "split");
+    let mut shape = source.clone();
+    shape.splice(from..=from, [outer, inner]);
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            if source_dim == from {
+                (
+                    source_dim,
+                    vec![(inner.extent() as i64, from), (1, from + 1)],
+                    0,
+                )
+            } else {
+                let output_dim = if source_dim < from {
+                    source_dim
+                } else {
+                    source_dim + 1
+                };
+                (source_dim, vec![(1, output_dim)], 0)
+            }
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
+pub fn window(
+    src: NodeRef,
+    from: impl Dimension,
+    out: Axis,
+    kernel: Axis,
+    stride: usize,
+    dilation: usize,
+) -> NodeRef {
+    let source = src.shape();
+    let from = from.resolve(&source, "window");
+    let mut shape = source.clone();
+    shape.splice(from..=from, [out, kernel]);
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            if source_dim == from {
+                (
+                    source_dim,
+                    vec![(stride as i64, from), (dilation as i64, from + 1)],
+                    0,
+                )
+            } else {
+                let output_dim = if source_dim < from {
+                    source_dim
+                } else {
+                    source_dim + 1
+                };
+                (source_dim, vec![(1, output_dim)], 0)
+            }
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
+pub fn volume(node: &NodeRef) -> usize {
+    node.shape()
+        .into_iter()
+        .map(Axis::extent)
+        .product::<usize>()
+        .max(1)
+}
+
+/// Rebuild `roots` with maximal sharing: separately constructed but
+/// structurally identical subtrees collapse into ONE node. This runs BEFORE
+/// lowering (see [`crate::compile`]), which mints fresh scoped axes per node
+/// — after that, two copies of the same public subtree are axis-distinct and
+/// can never merge again. One table spans all roots. A subtree that is
+/// already canonical keeps its original `Rc`.
+pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
+    let mut canonical: std::collections::HashMap<String, NodeRef> = std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<*const Node, NodeRef> = std::collections::HashMap::new();
+    roots
+        .iter()
+        .map(|root| canonicalize_node(root, &mut canonical, &mut memo))
+        .collect()
+}
+
+fn canonicalize_node(
+    node: &NodeRef,
+    canonical: &mut std::collections::HashMap<String, NodeRef>,
+    memo: &mut std::collections::HashMap<*const Node, NodeRef>,
+) -> NodeRef {
+    if let Some(n) = memo.get(&Rc::as_ptr(node)) {
+        return n.clone();
+    }
+    // Children first; keep the ORIGINAL `Rc` when nothing beneath changed.
+    let rebuilt = match node.as_ref() {
+        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
+        Node::Map { op, inputs } => {
+            let ins: Vec<NodeRef> = inputs
+                .iter()
+                .map(|i| canonicalize_node(i, canonical, memo))
                 .collect();
-            let ia = output_axes_rc(index, cache);
-            union(kept, &ia)
-        }
-        NodeKind::View { src, groups } => {
-            let mut out: Vec<Axis> = Vec::new();
-            for a in output_axes_rc(src, cache).iter().copied() {
-                if let Some((_, to)) = groups.iter().find(|(members, _)| members.contains(&a)) {
-                    if !out.contains(to) {
-                        out.push(*to);
-                    }
-                } else if !out.contains(&a) {
-                    out.push(a);
-                }
+            if ins.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+                node.clone()
+            } else {
+                Rc::new(Node::Map {
+                    op: *op,
+                    inputs: ins,
+                })
             }
-            out
         }
-        // A mapped source axis is replaced, in place, by the axes its index
-        // is computed from; unmapped axes pass through.
-        NodeKind::Reindex { src, map, .. } => {
-            let mut out: Vec<Axis> = Vec::new();
-            for a in output_axes_rc(src, cache).iter().copied() {
-                if let Some((_, terms, _)) = map.iter().find(|(m, _, _)| *m == a) {
-                    for (_, t) in terms {
-                        if !out.contains(t) {
-                            out.push(*t);
-                        }
-                    }
-                } else if !out.contains(&a) {
-                    out.push(a);
-                }
+        Node::Coordinate { src, dim } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Coordinate { src: s, dim: *dim })
             }
-            out
+        }
+        Node::Reduce { src, dim, op } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Reduce {
+                    src: s,
+                    dim: *dim,
+                    op: *op,
+                })
+            }
+        }
+        Node::Scan { src, dim, op } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Scan {
+                    src: s,
+                    dim: *dim,
+                    op: *op,
+                })
+            }
+        }
+        Node::Gather { src, index, dim } => {
+            let s = canonicalize_node(src, canonical, memo);
+            let i = canonicalize_node(index, canonical, memo);
+            if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+                node.clone()
+            } else {
+                Rc::new(Node::Gather {
+                    src: s,
+                    index: i,
+                    dim: *dim,
+                })
+            }
+        }
+        Node::View { src, dims } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::View {
+                    src: s,
+                    dims: dims.clone(),
+                })
+            }
+        }
+        Node::Reindex {
+            src,
+            shape,
+            map,
+            padded,
+        } => {
+            let s = canonicalize_node(src, canonical, memo);
+            if Rc::ptr_eq(&s, src) {
+                node.clone()
+            } else {
+                Rc::new(Node::Reindex {
+                    src: s,
+                    shape: shape.clone(),
+                    map: map.clone(),
+                    padded: *padded,
+                })
+            }
         }
     };
-    let out = Rc::new(out);
-    cache.insert(key, out.clone());
+    let out = canonical
+        .entry(shallow_key(&rebuilt))
+        .or_insert(rebuilt)
+        .clone();
+    memo.insert(Rc::as_ptr(node), out.clone());
     out
 }
 
-/// Every `Input` leaf and its axes, in first-seen order. May repeat a name if
-/// the same tensor is reached along several paths — callers dedup as needed.
-/// `Const` and `Iota` carry no storage and are not reported.
-pub fn input_axes(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    collect_input_axes(node, &mut out, &mut seen);
-    out
-}
-
-fn collect_input_axes(
-    node: &Node,
-    out: &mut Vec<(&'static str, Vec<Axis>)>,
-    seen: &mut std::collections::HashSet<*const NodeKind>,
-) {
-    // Walk each DAG node once. Without this the per-PATH result is exponential
-    // in a backward graph's sharing (both time AND output size — a diamond
-    // doubles it per level). Consumers dedup by name and read only byte volume
-    // (`plan`), which is invariant under the rename/flatten relabeling below, so
-    // keeping the first-reached occurrence is equivalent.
-    if !seen.insert(Rc::as_ptr(node)) {
-        return;
-    }
-    match node.as_ref() {
-        NodeKind::Input { name, axes, .. } => out.push((name, axes.clone())),
-        NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-        NodeKind::Map { inputs, .. } => {
-            for i in inputs {
-                collect_input_axes(i, out, seen);
-            }
+/// One node's structure with children identified by POINTER — valid as an
+/// identity key exactly when the children are already canonical.
+fn shallow_key(n: &NodeRef) -> String {
+    let p = |c: &NodeRef| Rc::as_ptr(c) as usize;
+    match n.as_ref() {
+        Node::Input { name, shape, dtype } => format!("I{name}{shape:?}{dtype:?}"),
+        Node::Const { v } => format!("C{}", v.to_bits()),
+        Node::Iota { axis } => format!("O{axis:?}"),
+        Node::Coordinate { src, dim } => format!("D{dim}.{}", p(src)),
+        Node::Map { op, inputs } => {
+            format!("M{op:?}{:?}", inputs.iter().map(p).collect::<Vec<_>>())
         }
-        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
-            collect_input_axes(src, out, seen);
-        }
-        NodeKind::Gather { src, index, .. } => {
-            collect_input_axes(src, out, seen);
-            collect_input_axes(index, out, seen);
-        }
-        // A view relabels: report the inputs below under the viewed names, so
-        // shape-based modeling (SRAM, traffic) sees what the consumer reads.
-        NodeKind::View { src, groups } => {
-            let before = out.len();
-            collect_input_axes(src, out, seen);
-            for (_, axes) in out[before..].iter_mut() {
-                let mut mapped: Vec<Axis> = Vec::new();
-                for a in axes.iter() {
-                    match groups.iter().find(|(members, _)| members.contains(a)) {
-                        Some((_, to)) => {
-                            if !mapped.contains(to) {
-                                mapped.push(*to);
-                            }
-                        }
-                        None => {
-                            if !mapped.contains(a) {
-                                mapped.push(*a);
-                            }
-                        }
-                    }
-                }
-                *axes = mapped;
-            }
-        }
-        // Same for an affine reindex: a mapped axis is reported as the axes
-        // driving it (a windowed input reads as out×k — the naive traffic,
-        // which is what the consumer-side model should price).
-        NodeKind::Reindex { src, map, .. } => {
-            let before = out.len();
-            collect_input_axes(src, out, seen);
-            for (_, axes) in out[before..].iter_mut() {
-                let mut mapped: Vec<Axis> = Vec::new();
-                for a in axes.iter() {
-                    match map.iter().find(|(m, _, _)| m == a) {
-                        Some((_, terms, _)) => {
-                            for (_, t) in terms {
-                                if !mapped.contains(t) {
-                                    mapped.push(*t);
-                                }
-                            }
-                        }
-                        None => {
-                            if !mapped.contains(a) {
-                                mapped.push(*a);
-                            }
-                        }
-                    }
-                }
-                *axes = mapped;
-            }
-        }
+        Node::Reduce { src, dim, op } => format!("R{op:?}{dim}.{}", p(src)),
+        Node::Scan { src, dim, op } => format!("S{op:?}{dim}.{}", p(src)),
+        Node::Gather { src, index, dim } => format!("G{dim}.{}.{}", p(src), p(index)),
+        Node::View { src, dims } => format!("V{dims:?}.{}", p(src)),
+        Node::Reindex {
+            src,
+            shape,
+            map,
+            padded,
+        } => format!("X{shape:?}{map:?}{padded}.{}", p(src)),
     }
 }
 
-/// Every `Input` leaf's name, deduped, in first-seen order.
-pub fn leaf_names(node: &Node) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for (name, _) in input_axes(node) {
-        if !out.contains(&name) {
-            out.push(name);
+// ── derived compositions ────────────────────────────────────────────────────
+
+/// Batched matrix multiplication, contracting the left last dimension with
+/// the right penultimate dimension: `[..., m, k] @ [..., k, n]`.
+pub fn matmul(a: NodeRef, b: NodeRef) -> NodeRef {
+    let left_shape = a.shape();
+    let right_shape = b.shape();
+
+    // Build a common positional iteration space by inserting singleton
+    // dimensions: left [..., m, k, 1], right [..., 1, k, n].
+    assert!(
+        left_shape.len() >= 2 && right_shape.len() >= 2,
+        "matmul requires rank >= 2"
+    );
+    assert_eq!(
+        left_shape.last().unwrap().extent,
+        right_shape[right_shape.len() - 2].extent,
+        "matmul contraction extents must match"
+    );
+    let singleton = axis("singleton", 1);
+    let left = positional_view(
+        a,
+        left_shape
+            .iter()
+            .enumerate()
+            .map(|(dim, &axis)| ViewDim {
+                sources: vec![dim],
+                axis,
+            })
+            .chain([ViewDim {
+                sources: Vec::new(),
+                axis: singleton,
+            }])
+            .collect(),
+    );
+    let right_insert = right_shape.len() - 2;
+    let right = positional_view(
+        b,
+        right_shape
+            .iter()
+            .enumerate()
+            .flat_map(|(dim, &axis)| {
+                let leading = (dim == right_insert).then_some(ViewDim {
+                    sources: Vec::new(),
+                    axis: singleton,
+                });
+                leading.into_iter().chain([ViewDim {
+                    sources: vec![dim],
+                    axis,
+                }])
+            })
+            .collect(),
+    );
+    let product = map(MapOp::Mul, vec![left, right]);
+    let contract = product.shape().len() - 2;
+    reduce(product, contract, BinOp::Monoid(Monoid::Add))
+}
+
+fn unsqueeze_at(src: NodeRef, dim: usize) -> NodeRef {
+    let source = src.shape();
+    assert!(dim <= source.len(), "unsqueeze dimension out of range");
+    let singleton = axis("singleton", 1);
+    let mut dims = Vec::with_capacity(source.len() + 1);
+    for output_dim in 0..=source.len() {
+        if output_dim == dim {
+            dims.push(ViewDim {
+                sources: Vec::new(),
+                axis: singleton,
+            });
+        } else {
+            let source_dim = if output_dim < dim {
+                output_dim
+            } else {
+                output_dim - 1
+            };
+            dims.push(ViewDim {
+                sources: vec![source_dim],
+                axis: source[source_dim],
+            });
         }
     }
-    out
+    positional_view(src, dims)
 }
 
-/// Every axis the graph touches, in first-seen order — the set the structure
-/// map classifies.
-pub fn all_axes(node: &Node) -> Vec<Axis> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    collect_axes(node, &mut out, &mut seen);
-    out
+pub fn softmax(x: NodeRef, dim: impl Dimension) -> NodeRef {
+    let dim = dim.resolve(&x.shape(), "softmax");
+    let maximum = reduce(x.clone(), dim, BinOp::Monoid(Monoid::Max));
+    let maximum = unsqueeze_at(maximum, dim);
+    let exponent = map(MapOp::Exp, vec![map(MapOp::Sub, vec![x, maximum])]);
+    let normalizer = reduce(exponent.clone(), dim, BinOp::Monoid(Monoid::Add));
+    map(MapOp::Div, vec![exponent, unsqueeze_at(normalizer, dim)])
 }
 
-fn collect_axes(
-    node: &Node,
-    out: &mut Vec<Axis>,
-    seen: &mut std::collections::HashSet<*const NodeKind>,
-) {
-    // A DAG-shared node reached along several paths is walked ONCE: its axes are
-    // already in `out`. Without this, a backward graph's heavy sharing makes the
-    // walk exponential in the sharing depth (measured: a 1-block transformer's
-    // attention gradient took 66s to partition, almost all of it here).
-    if !seen.insert(Rc::as_ptr(node)) {
-        return;
-    }
-    let push = |a: Axis, out: &mut Vec<Axis>| {
-        if !out.contains(&a) {
-            out.push(a);
-        }
-    };
-    match node.as_ref() {
-        NodeKind::Input { axes, .. } => {
-            for &a in axes {
-                push(a, out);
-            }
-        }
-        NodeKind::Const { .. } => {}
-        NodeKind::Iota { axis } => push(*axis, out),
-        NodeKind::Map { inputs, .. } => {
-            for i in inputs {
-                collect_axes(i, out, seen);
-            }
-        }
-        NodeKind::Reduce { src, axis, .. } | NodeKind::Scan { src, axis, .. } => {
-            push(*axis, out);
-            collect_axes(src, out, seen);
-        }
-        NodeKind::Gather { src, index, axis } => {
-            push(*axis, out);
-            collect_axes(src, out, seen);
-            collect_axes(index, out, seen);
-        }
-        NodeKind::View { src, groups } => {
-            for (_, to) in groups {
-                push(*to, out);
-            }
-            collect_axes(src, out, seen);
-        }
-        NodeKind::Reindex { src, map, .. } => {
-            for (_, terms, _) in map {
-                for (_, t) in terms {
-                    push(*t, out);
-                }
-            }
-            collect_axes(src, out, seen);
-        }
-    }
-}
-
-// ── derived operators — compositions, not primitives ─────────────────────────
-
-/// `matmul(A, B; contract=k) = Reduce(Map(×, A, B), k, Add)`.
-pub fn matmul(a: Node, b: Node, contract: Axis) -> Node {
-    reduce(
-        map(MapOp::Mul, vec![a, b]),
-        contract,
-        BinOp::Monoid(Monoid::Add),
-    )
-}
-
-/// Softmax as the textbook dataflow — max, shift, exp, sum, divide — built
-/// from the basis; no fused special form:
-/// ```text
-/// m = Reduce(x, k, Max); e = Exp(x − m); s = Reduce(e, k, Add); e / s
-/// ```
-pub fn softmax(x: Node, k: Axis) -> Node {
-    let m = reduce(x.clone(), k, BinOp::Monoid(Monoid::Max));
-    let e = map(MapOp::Exp, vec![map(MapOp::Sub, vec![x, m])]);
-    let s = reduce(e.clone(), k, BinOp::Monoid(Monoid::Add));
-    map(MapOp::Div, vec![e, s])
-}
-
-/// `attention(Q,K,V) = matmul(softmax(matmul(Q,K; d), k), V; k)`.
-pub fn attention(q: Node, k_in: Node, v: Node, d: Axis, k: Axis) -> Node {
-    let scores = matmul(q, k_in, d);
-    let weights = softmax(scores, k);
-    matmul(weights, v, k)
-}
-
-/// `silu(x) = x · sigmoid(x) = x / (1 + exp(−x))` — a composition, so it
-/// fuses into the lift of a downstream reduction with no special case.
-pub fn silu(x: Node) -> Node {
-    let sig = map(
+pub fn silu(x: NodeRef) -> NodeRef {
+    let sigmoid = map(
         MapOp::Recip,
         vec![map(
             MapOp::Add,
@@ -760,127 +809,42 @@ pub fn silu(x: Node) -> Node {
             ],
         )],
     );
-    map(MapOp::Mul, vec![x, sig])
+    map(MapOp::Mul, vec![x, sigmoid])
 }
 
-/// A causal mask, computed from indices instead of loaded from memory:
-/// `key ≤ query ? 0 : −LARGE`. Costs no traffic — the comparison fuses into
-/// whatever lift consumes it. The mask is a large *finite* negative, not −∞:
-/// an all-masked block would otherwise feed `exp(−∞ − −∞) = NaN` into the
-/// online-softmax rescale — the same edge real flash kernels guard against.
-pub fn causal_mask(query: Axis, key: Axis) -> Node {
+pub fn causal_mask(query: Axis, key: Axis) -> NodeRef {
+    let query_position = unsqueeze_at(iota(query), 1);
+    let key_position = unsqueeze_at(iota(key), 0);
     map(
         MapOp::Where,
         vec![
-            map(MapOp::Lt, vec![iota(query), iota(key)]), // key index > query index
+            map(MapOp::Lt, vec![query_position, key_position]),
             konst(-1e30),
             konst(0.0),
         ],
     )
 }
 
-/// A linear / SSM recurrence `h_t = A_t·h_{t−1} + b_t`: a `Scan` whose step is
-/// affine-map composition — associative, so it streams.
-pub fn ssm_scan(params: Node, t: Axis) -> Node {
-    scan(params, t, BinOp::AffineCompose)
-}
-
-/// A `tanh`-RNN `h_t = tanh(W·h_{t−1} + x_t)`: a non-associative step, so its
-/// time axis is serial. The engine must refuse to fold it.
-pub fn tanh_rnn(x: Node, t: Axis) -> Node {
-    scan(map(MapOp::Tanh, vec![x]), t, BinOp::NonAssoc("tanh_recur"))
-}
-
-/// Embedding lookup: a gather along the vocabulary axis.
-pub fn embedding(table: Node, ids: Node, axis: Axis) -> Node {
-    gather(table, ids, axis)
-}
-
-/// `1.0` where `iota(axis) == v` (an integer-valued node), else `0.0` — a
-/// computed one-hot: equality from two `Lt`s, no Eq op needed. The KV-cache
-/// row write, scatter's collision test and topk's mask are all this.
-pub fn one_hot(axis: Axis, v: Node) -> Node {
-    let it = iota(axis);
+pub(crate) fn causal_mask_like(
+    scores: NodeRef,
+    query_dim: impl Dimension,
+    key_dim: impl Dimension,
+) -> NodeRef {
+    let shape = scores.shape();
+    let query_dim = query_dim.resolve(&shape, "causal_mask query");
+    let key_dim = key_dim.resolve(&shape, "causal_mask key");
     map(
-        MapOp::Sub,
+        MapOp::Where,
         vec![
             map(
-                MapOp::Sub,
-                vec![konst(1.0), map(MapOp::Lt, vec![it.clone(), v.clone()])],
+                MapOp::Lt,
+                vec![
+                    coordinate(scores.clone(), query_dim),
+                    coordinate(scores, key_dim),
+                ],
             ),
-            map(MapOp::Lt, vec![v, it]),
+            konst(-1e30),
+            konst(0.0),
         ],
-    )
-}
-
-/// The index of the FIRST maximum along `axis`, as a value — one
-/// index-carrying fold ([`BinOp::ArgMax`]): the `(max, idx)` tuple monoid
-/// with first-max-wins ties, matching every framework's argmax convention.
-pub fn argmax(x: Node, axis: Axis) -> Node {
-    reduce(x, axis, BinOp::ArgMax)
-}
-
-/// Top-k along `axis` by repeated (max, mask-the-winner): k `(value, index)`
-/// pairs, largest first. Each pair is one [`BinOp::TopK`] fold — the k-best
-/// tuple monoid — so every value/index is a single kernel over the raw
-/// scores, with no mask-the-winner chain between ranks and first-max-wins
-/// ties across the WHOLE selection (the old round decomposition left ties
-/// within a round undefined). A full sort stays out of the supported
-/// fragment on purpose: it is a data-movement network, not a fold, and
-/// nothing in an inference pipeline needs one.
-pub fn topk(x: Node, axis: Axis, k: usize) -> Vec<(Node, Node)> {
-    let q = |rank: usize, idx: bool| {
-        reduce(
-            x.clone(),
-            axis,
-            BinOp::TopK {
-                k: k as u8,
-                rank: rank as u8,
-                idx,
-            },
-        )
-    };
-    (0..k).map(|r| (q(r, false), q(r, true))).collect()
-}
-
-/// ALL k ranks of the top-k selection as ONE tensor over a fresh rank axis
-/// `rk` — and, downstream, one KERNEL. Spelled as Σ_r onehot(rk = r)·rank_r:
-/// the per-rank reduces share one streamed source, so the deriver dedups
-/// their k-best lists into a single set of slots, and the rank one-hots
-/// never touch the streamed axis, so they evaluate at PROJECT time — each
-/// grid point of `rk` selects its slot from the shared list. Eight rank
-/// kernels per MoE layer become one.
-pub fn topk_all(x: Node, axis: Axis, k: usize, rk: Axis, idx: bool) -> Node {
-    let mut sum: Option<Node> = None;
-    for r in 0..k {
-        let q = reduce(
-            x.clone(),
-            axis,
-            BinOp::TopK {
-                k: k as u8,
-                rank: r as u8,
-                idx,
-            },
-        );
-        let term = map(MapOp::Mul, vec![one_hot(rk, konst(r as f64)), q]);
-        sum = Some(match sum {
-            None => term,
-            Some(s) => map(MapOp::Add, vec![s, term]),
-        });
-    }
-    sum.expect("k >= 1")
-}
-
-/// Scatter-add — the inverse of [`gather`], add-combining collisions:
-/// `out[to,·] = Σ_from (index[from] == to) · src[from,·]`. Dense as a graph
-/// (O(n·m) — a one-hot contraction); a device backend may later emit atomics,
-/// but the *semantics* need no new node. Add-combine is chosen because it is
-/// order-free (deterministic under any parallel schedule) and is exactly
-/// gather's backward, so embedding gradients fall out of this constructor.
-pub fn scatter_add(src: Node, index: Node, from: Axis, to: Axis) -> Node {
-    reduce(
-        map(MapOp::Mul, vec![one_hot(to, index), src]),
-        from,
-        BinOp::Monoid(Monoid::Add),
     )
 }

@@ -33,10 +33,10 @@ fn main() {
     // ── standard MLA ─────────────────────────────────────────────────────────
     println!("=== Standard MLA (explicit K/V up-projections) ===\n");
 
-    let c_kv = input("c_kv", &[k, dc]); // compressed KV latent
-    let w_uk = input("W_uk", &[dh, dc]); // key up-projection
-    let w_uv = input("W_uv", &[de, dc]); // value up-projection
-    let q = input("Q", &[sq, dh]); // query (already in head space)
+    let c_kv = input("c_kv", &[k, dc], Dtype::F32); // compressed KV latent
+    let w_uk = input("W_uk", &[dh, dc], Dtype::F32); // key up-projection
+    let w_uv = input("W_uv", &[de, dc], Dtype::F32); // value up-projection
+    let q = input("Q", &[sq, dh], Dtype::F32); // query (already in head space)
 
     let k_proj = matmul(c_kv.clone(), w_uk, dc); // [k, dh]
     let v_proj = matmul(c_kv.clone(), w_uv, dc); // [k, de]
@@ -58,9 +58,9 @@ fn main() {
     // Absorb the key projection into Q once per query block, not per key step.
     // This trades one per-key W_uk load for a single Q·W_uk^T matmul upfront,
     // and contracts over dc < dh — reducing per-key flops.
-    let q_abs = input("Q_abs", &[sq, dc]); // = Q · W_uk^T, pre-computed
-    let c_kv2 = input("c_kv", &[k, dc]); // same compressed latent
-    let w_uv2 = input("W_uv", &[de, dc]); // same value projection
+    let q_abs = input("Q_abs", &[sq, dc], Dtype::F32); // = Q · W_uk^T, pre-computed
+    let c_kv2 = input("c_kv", &[k, dc], Dtype::F32); // same compressed latent
+    let w_uv2 = input("W_uv", &[de, dc], Dtype::F32); // same value projection
 
     let scores2 = matmul(q_abs, c_kv2.clone(), dc); // [sq, k] — contracts dc, not dh
     let weights2 = softmax(scores2, k);
@@ -79,9 +79,9 @@ fn main() {
 
     let sha_car = {
         let (sq2, k2, d2, e2) = (axis("sq"), axis("k"), axis("d"), axis("e"));
-        let q = input("Q", &[sq2, d2]);
-        let kk = input("K", &[k2, d2]);
-        let v = input("V", &[k2, e2]);
+        let q = input("Q", &[sq2, d2], Dtype::F32);
+        let kk = input("K", &[k2, d2], Dtype::F32);
+        let v = input("V", &[k2, e2], Dtype::F32);
         derive(&attention(q, kk, v, d2, k2), k2).unwrap()
     };
 

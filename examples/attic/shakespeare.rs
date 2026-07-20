@@ -19,9 +19,9 @@
 //!   https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 //! ```
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::grad::grad;
-use sanic::interp::{Extents, Tensor};
+use sanic::interp::Value;
 use sanic::ir::*;
 use sanic::partition::partition_many;
 
@@ -42,7 +42,7 @@ fn rms_norm(x: Node, g: &'static str, dm: Axis) -> Node {
     let inv_n = konst(1.0 / D as f64);
     let ms = map(MapOp::Mul, vec![reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), dm, add_r()), inv_n]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![ms, konst(EPS)])]);
-    map(MapOp::Mul, vec![map(MapOp::Div, vec![x, denom]), input(g, &[dm])])
+    map(MapOp::Mul, vec![map(MapOp::Div, vec![x, denom]), input(g, &[dm], Dtype::F32)])
 }
 
 /// GELU (tanh approximation), the activation nanoGPT uses.
@@ -147,27 +147,20 @@ fn main() {
     println!("tinyshakespeare: {} chars, vocab {vsize} — {n_layer}L {D}d {S}ctx ×{batch}b", data.len());
 
     // ── axes ──
-    let (s, dm, vv, pp) = (axis("s"), axis("dm"), axis("v"), axis("p"));
+    let (s, dm, vv, pp) = (axis("s", S), axis("dm", D), axis("v", vsize), axis("p", S));
     // batch is one more parallel axis threaded through every activation; weights
     // carry no `b`, so they stay shared and their gradients sum over the batch.
-    let bb = axis("b");
-    let bs = axis("bs"); // batch·seq flattened — the embedding gather wants a 1-axis index
-    let mut ext: Extents =
-        [(s, S), (dm, D), (vv, vsize), (pp, S), (bb, batch), (bs, batch * S)].into_iter().collect();
-    let per_layer: Vec<[Axis; 4]> = (0..n_layer).map(|_| [axis("dk"), axis("dv"), axis("t"), axis("f")]).collect();
-    for [dk, dv, t, f] in &per_layer {
-        ext.insert(*dk, D);
-        ext.insert(*dv, D);
-        ext.insert(*t, S);
-        ext.insert(*f, F);
-    }
+    let bb = axis("b", batch);
+    let bs = axis("bs", batch * S); // batch·seq flattened — the embedding gather wants a 1-axis index
+    let per_layer: Vec<[Axis; 4]> =
+        (0..n_layer).map(|_| [axis("dk", D), axis("dv", D), axis("t", S), axis("f", F)]).collect();
 
     // ── forward graph: embed → blocks → final norm → tied logits ──
     // ids is a flat [b·s] index (single-axis, as the gather's scatter-add
     // backward requires); split the gathered rows back to [b, s].
-    let tok_flat = gather(input("wte", &[vv, dm]), input("ids", &[bs]), vv); // [dm, bs]
-    let tok = split(tok_flat, bs, bb, s, S); // [dm, b, s]
-    let pos = gather(input("wpe", &[pp, dm]), iota(s), pp); // [dm, s] — shared across the batch
+    let tok_flat = gather(input("wte", &[vv, dm], Dtype::F32), input("ids", &[bs], Dtype::F32), vv); // [dm, bs]
+    let tok = split(tok_flat, bs, bb, s); // [dm, b, s]
+    let pos = gather(input("wpe", &[pp, dm], Dtype::F32), iota(s), pp); // [dm, s] — shared across the batch
     let mut x = map(MapOp::Add, vec![tok, pos]);
     for (l, [dk, dv, t, f]) in per_layer.iter().enumerate() {
         let (dk, dv, t, f) = (*dk, *dv, *t, *f);
@@ -175,28 +168,28 @@ fn main() {
         // attention
         let xn = rms_norm(x.clone(), nm("g1"), dm);
         let xnt = rename(xn.clone(), s, t);
-        let q = matmul(xn, input(nm("Wq"), &[dk, dm]), dm); // [dk, s]
-        let k = matmul(xnt.clone(), input(nm("Wk"), &[dk, dm]), dm); // [dk, t]
-        let v = matmul(xnt, input(nm("Wv"), &[dv, dm]), dm); // [dv, t]
+        let q = matmul(xn, input(nm("Wq"), &[dk, dm], Dtype::F32), dm); // [dk, s]
+        let k = matmul(xnt.clone(), input(nm("Wk"), &[dk, dm], Dtype::F32), dm); // [dk, t]
+        let v = matmul(xnt, input(nm("Wv"), &[dv, dm], Dtype::F32), dm); // [dv, t]
         let scores = map(MapOp::Mul, vec![matmul(q, k, dk), konst(1.0 / (D as f64).sqrt())]);
         let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
         let o = matmul(softmax(masked, t), v, t); // [dv, s]
-        let proj = matmul(o, input(nm("Wo"), &[dm, dv]), dv); // [dm, s]
+        let proj = matmul(o, input(nm("Wo"), &[dm, dv], Dtype::F32), dv); // [dm, s]
         let x1 = map(MapOp::Add, vec![x, proj]);
         // mlp
         let xn2 = rms_norm(x1.clone(), nm("g2"), dm);
-        let hpre = matmul(xn2, input(nm("Wf"), &[f, dm]), dm); // [f, s]
-        let m = matmul(gelu(hpre), input(nm("Wp"), &[dm, f]), f); // [dm, s]
+        let hpre = matmul(xn2, input(nm("Wf"), &[f, dm], Dtype::F32), dm); // [f, s]
+        let m = matmul(gelu(hpre), input(nm("Wp"), &[dm, f], Dtype::F32), f); // [dm, s]
         x = map(MapOp::Add, vec![x1, m]);
     }
     let xf = rms_norm(x, "gf", dm);
-    let logits = matmul(xf, input("wte", &[vv, dm]), dm); // [s, v]  (weight-tied)
+    let logits = matmul(xf, input("wte", &[vv, dm], Dtype::F32), dm); // [s, v]  (weight-tied)
 
     // ── next-token cross-entropy, mean over positions (composed logsumexp) ──
     let mmax = reduce(logits.clone(), vv, BinOp::Monoid(Monoid::Max));
     let sh = map(MapOp::Exp, vec![map(MapOp::Sub, vec![logits.clone(), mmax.clone()])]);
     let lse = map(MapOp::Add, vec![mmax, map(MapOp::Log, vec![reduce(sh, vv, add_r())])]); // [s]
-    let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[bb, s]))]), vv, add_r());
+    let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[bb, s], Dtype::F32))]), vv, add_r());
     // mean over every token in the batch: fold positions AND batch, scale by
     // 1/(B·S). Keeping it a mean (not a sum) holds the gradient scale — and thus
     // `lr` — invariant to batch size, and the scalar keeps `grad` happy.
@@ -207,12 +200,12 @@ fn main() {
     // ── one schedule: logits, loss, and every fused SGD update ──
     let params = weight_list(dm, vv, pp, &per_layer);
     let names: Vec<&'static str> = params.iter().map(|(n, _)| *n).collect();
-    let grads = grad(&loss, &names, &ext);
+    let grads = grad(&loss, &names);
     let mut roots: Vec<(Node, &'static str)> = vec![(logits.clone(), "logits"), (loss.clone(), "loss")];
     for (name, axes) in &params {
         // the update is named after the weight itself — it writes `w` in place
         // (partition orders it after every reader), so no shadow buffer.
-        let upd = map(MapOp::Sub, vec![input(name, axes), map(MapOp::Mul, vec![konst(lr), grads[name].clone()])]);
+        let upd = map(MapOp::Sub, vec![input(name, axes, Dtype::F32), map(MapOp::Mul, vec![konst(lr), grads[name].clone()])]);
         roots.push((upd, name));
     }
     // training-time algebraic simplification: the winner-mask cancels and the
@@ -221,9 +214,8 @@ fn main() {
     let roots: Vec<(Node, &'static str)> =
         sanic::simplify::simplify_many(&raw).into_iter().zip(&roots).map(|(n, (_, nm))| (n, *nm)).collect();
 
-    let ext_f: HashMap<Axis, f64> = ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
-    let sched = partition_many(&roots, &Device::toy(), &ext_f);
-    let program = sanic::emit_metal::emit_schedule_metal_on(&Device::m1_pro(), &sched, &ext);
+    let sched = partition_many(&roots, &DeviceProfile::toy());
+    let program = sanic::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &sched);
     let bindless = program.stages.iter().filter(|s| s.argbuf.is_some()).count();
     println!("training step: {} kernels ({bindless} bindless)", program.stages.len());
 
@@ -237,16 +229,16 @@ fn main() {
     let mut rng = Rng(0xA5A5_1234_5678);
     let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
     for (name, axes) in &program.inputs {
-        let size = axes.iter().map(|a| ext[a]).product::<usize>().max(1);
+        let size = axes.iter().map(|a| a.extent).product::<usize>().max(1);
         if *name == "ids" || *name == "tgt" {
             bufs.insert(name.to_string(), dev.alloc_f32(size));
             continue;
         }
         // weight init: N(0, 0.02) for the matmuls, 1 for the norm gains.
         let init = if name.starts_with('g') {
-            Tensor::from_fn(axes, &ext, |_| 1.0)
+            Value::from_fn(axes, |_| 1.0)
         } else {
-            Tensor::from_fn(axes, &ext, |_| rng.normal(0.02))
+            Value::from_fn(axes, |_| rng.normal(0.02))
         };
         bufs.insert(name.to_string(), dev.from_f64(&init.data));
     }
@@ -308,9 +300,9 @@ fn main() {
     // matmul forward+backward, 12·L·H·Q·T the attention score/value matmuls
     // (H=1 head, Q=D head dim, T=S). Per token that is 6N + 12·L·D·S; one step
     // is B seqs of S tokens, so B·S tokens.
-    let n_params: usize = params.iter().map(|(_, ax)| ax.iter().map(|a| ext[a]).product::<usize>()).sum();
+    let n_params: usize = params.iter().map(|(_, ax)| ax.iter().map(|a| a.extent).product::<usize>()).sum();
     let flops_per_step = ((6 * n_params + 12 * n_layer * D * S) * S * batch) as f64;
-    let peak_flops = Device::m1_pro().peak_flops;
+    let peak_flops = DeviceProfile::m1_pro().peak_flops;
 
     // ── training loop: SGD on next-token prediction ──
     println!("training {steps} steps (lr {lr}) — {n_params} params, {:.0} MFLOP/step…", flops_per_step / 1e6);

@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
+use sanic::cost::DeviceProfile;
 use sanic::ir::*;
 use sanic::partition::partition;
 
@@ -52,7 +52,7 @@ fn main() {
         axis("dmv"), // flattened h·dv
         axis("f"),   // FFN hidden dim
     );
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
     let extents: HashMap<Axis, f64> = [
         (v, 32000.0),
         (s, 2048.0),
@@ -68,14 +68,14 @@ fn main() {
     .collect();
 
     // ── prologue: token embedding — a data-dependent gather ─────────────────
-    let embed = embedding(input("E", &[v, dm]), input("ids", &[s]), v);
+    let embed = embedding(input("E", &[v, dm], Dtype::F32), input("ids", &[s], Dtype::F32), v);
     println!("── prologue: x = E[ids] ──\n");
     print!("{}", partition(&embed, &dev, &extents).render());
 
     // ── one transformer block + logits head, as a single graph ──────────────
-    let x = input("X", &[s, dm]);
-    let g1 = input("g1", &[dm]);
-    let g2 = input("g2", &[dm]);
+    let x = input("X", &[s, dm], Dtype::F32);
+    let g1 = input("g1", &[dm], Dtype::F32);
+    let g2 = input("g2", &[dm], Dtype::F32);
 
     // pre-attention norm; the key/value side is a *view* of the same tensor
     // over the key position variable.
@@ -83,9 +83,9 @@ fn main() {
     let xn_kv = rename(xn.clone(), s, t);
 
     // multi-head QKV projections (h rides along as a free axis)
-    let q = matmul(xn, input("Wq", &[h, dk, dm]), dm); // [s, h, dk]
-    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm]), dm); // [t, h, dk]
-    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm]), dm); // [t, h, dv]
+    let q = matmul(xn, input("Wq", &[h, dk, dm], Dtype::F32), dm); // [s, h, dk]
+    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32), dm); // [t, h, dk]
+    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32), dm); // [t, h, dv]
 
     // attention: scale is a literal, the causal mask is COMPUTED from the
     // position indices — no mask tensor anywhere.
@@ -96,23 +96,23 @@ fn main() {
 
     // merge heads (free), project back to model dim, first residual
     let flat = flatten(attn, &[h, dv], dmv); // [s, dmv]
-    let o = matmul(flat, input("Wo", &[dmv, dm]), dmv); // [s, dm]
+    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32), dmv); // [s, dm]
     let res1 = map(MapOp::Add, vec![o, x]);
 
     // pre-MLP norm, SwiGLU, second residual
     let hn = rmsnorm(res1.clone(), g2, 1024.0, dm);
-    let gate = matmul(hn.clone(), input("Wg", &[f, dm]), dm); // [s, f]
-    let up = matmul(hn, input("Wu", &[f, dm]), dm); // [s, f]
+    let gate = matmul(hn.clone(), input("Wg", &[f, dm], Dtype::F32), dm); // [s, f]
+    let up = matmul(hn, input("Wu", &[f, dm], Dtype::F32), dm); // [s, f]
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = reduce(
-        map(MapOp::Mul, vec![act, input("Wd", &[f, dm])]),
+        map(MapOp::Mul, vec![act, input("Wd", &[f, dm], Dtype::F32)]),
         f,
         add_r(),
     ); // [s, dm]
     let y = map(MapOp::Add, vec![mlp, res1]);
 
     // logits head
-    let logits = matmul(y, input("W_lm", &[v, dm]), dm); // [s, v]
+    let logits = matmul(y, input("W_lm", &[v, dm], Dtype::F32), dm); // [s, v]
 
     println!("\n── transformer block (multi-head, computed causal mask) + logits head ──\n");
     let sched = partition(&logits, &dev, &extents);

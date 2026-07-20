@@ -2,8 +2,9 @@
 //! existing basis (no new node kinds), verified against hand references and
 //! through the partitioned pipeline.
 //!
-//! * `topk` — k rounds of (max, mask-the-winner). Small k is all sampling
-//!   and MoE routing ever need, and each round is an ordinary fold.
+//! * `topk` — one singleton-insert streaming fold over the raw scores per
+//!   requested rank. Small k is all sampling and MoE routing ever need; a
+//!   full two-list merge is still required before tree/split execution.
 //! * `scatter_add` — the inverse of gather as a one-hot contraction,
 //!   add-combining collisions. Order-free (deterministic in parallel), and
 //!   exactly the backward of `gather`, which autodiff (M8) leans on.
@@ -14,9 +15,9 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::Device;
-use sanic::interp::{Env, Extents, Tensor, eval};
-use sanic::ir::*;
+use sanic::cost::DeviceProfile;
+use sanic::interp::{Env, Value, eval};
+use sanic::kernel_ir::*;
 use sanic::partition::{partition, partition_many};
 
 struct Lcg(u64);
@@ -30,33 +31,29 @@ impl Lcg {
         ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
-fn rand_tensor(axes: &[Axis], ext: &Extents, rng: &mut Lcg) -> Tensor {
-    Tensor::from_fn(axes, ext, |_| rng.f())
-}
-fn as_f64(ext: &Extents) -> HashMap<Axis, f64> {
-    ext.iter().map(|(&a, &n)| (a, n as f64)).collect()
+fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
+    Value::from_fn(axes, |_| rng.f())
 }
 
 // ── top-k: values and indices, largest first ─────────────────────────────────
 
 #[test]
 fn topk_matches_a_hand_sort() {
-    let n = axis("n");
-    let ext: Extents = [(n, 12)].into_iter().collect();
+    let n = axis("n", 12);
     let mut rng = Lcg(0x70B5);
-    let x = rand_tensor(&[n], &ext, &mut rng); // continuous → no ties
+    let x = rand_tensor(&[n], &mut rng); // continuous → no ties
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n]), n, k);
+    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
 
     // hand reference: sort (value, index) descending by value
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     for (round, (v, i)) in pairs.iter().enumerate() {
-        let got_v = eval(v, &env, &ext).data[0];
-        let got_i = eval(i, &env, &ext).data[0];
+        let got_v = eval(v, &env).data[0];
+        let got_i = eval(i, &env).data[0];
         assert_eq!(got_v, order[round].0, "value of round {round}");
         assert_eq!(got_i, order[round].1 as f64, "index of round {round}");
     }
@@ -67,15 +64,14 @@ fn topk_matches_a_hand_sort() {
 // executed schedule reproduces the reference.
 #[test]
 fn topk_partitions_and_executes() {
-    let n = axis("n");
-    let ext: Extents = [(n, 16)].into_iter().collect();
+    let n = axis("n", 16);
     let mut rng = Lcg(0x70B52);
-    let x = rand_tensor(&[n], &ext, &mut rng);
+    let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n]), n, k);
-    let names: Vec<(Node, &'static str)> = pairs
+    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
+    let names: Vec<(NodeRef, &'static str)> = pairs
         .iter()
         .enumerate()
         .flat_map(|(r, (v, i))| {
@@ -84,10 +80,10 @@ fn topk_partitions_and_executes() {
             [(v.clone(), vn), (i.clone(), in_)]
         })
         .collect();
-    let sched = partition_many(&names, &Device::toy(), &as_f64(&ext));
+    let sched = partition_many(&names, &DeviceProfile::toy());
 
     let mut run_env = env.clone();
-    sched.execute_env(&mut run_env, &ext);
+    sched.execute_env(&mut run_env);
 
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -105,24 +101,26 @@ fn topk_partitions_and_executes() {
 // `topk_all` builds and the derive rule `project-leaf` makes streamable.
 #[test]
 fn topk_all_is_one_fold_with_shared_slots() {
-    let (n, rk) = (axis("n"), axis("rk"));
     let k = 4usize;
-    let ext: Extents = [(n, 16), (rk, k)].into_iter().collect();
+    let (n, rk) = (axis("n", 16), axis("rk", k));
     let mut rng = Lcg(0xA11);
-    let x = rand_tensor(&[n], &ext, &mut rng);
+    let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let all = topk_all(input("X", &[n]), n, k, rk, true);
+    let all = topk_all(input("X", &[n], Dtype::F32), n, k, rk, true);
 
     // one carrier: k value slots + k index slots, not k separate lists
     let c = sanic::derive::derive(&all, n).expect("topk_all derives over the scored axis");
     assert_eq!(c.slots, 2 * k, "k-best slots shared across rank queries");
-    assert!(c.project_reads_leaves(), "rank one-hot read at project time");
+    assert!(
+        c.project_reads_leaves(),
+        "rank one-hot read at project time"
+    );
     assert!(c.rules.contains(&"project-leaf"), "rules: {:?}", c.rules);
 
     // the carrier equals the naive semantics, per rank
-    let got = sanic::interp::run_carrier(&all, n, &c, &env, &ext);
-    let want = eval(&all, &env, &ext);
+    let got = sanic::interp::run_carrier(&all, n, &c, &env);
+    let want = eval(&all, &env);
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
     for r in 0..k {
@@ -132,10 +130,10 @@ fn topk_all_is_one_fold_with_shared_slots() {
     }
 
     // and the whole thing schedules as ONE kernel
-    let sched = partition(&all, &Device::toy(), &as_f64(&ext));
+    let sched = partition(&all, &DeviceProfile::toy());
     assert_eq!(sched.stages.len(), 1, "one fold for all ranks");
     let mut run_env = env.clone();
-    sched.execute_env(&mut run_env, &ext);
+    sched.execute_env(&mut run_env);
     let out = run_env.get(sched.outputs[0].as_str()).unwrap();
     for r in 0..k {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
@@ -147,25 +145,20 @@ fn topk_all_is_one_fold_with_shared_slots() {
 // WHOLE selection, exactly like the per-rank folds it replaces.
 #[test]
 fn topk_all_ties_match_per_rank_folds() {
-    let (n, rk) = (axis("n"), axis("rk"));
     let k = 3usize;
-    let ext: Extents = [(n, 8), (rk, k)].into_iter().collect();
+    let (n, rk) = (axis("n", 8), axis("rk", k));
     // ties everywhere: [2, 5, 5, 1, 5, 2, 0, 5] — ranks 0..3 are all the 5s,
     // first-seen order 1, 2, 4
     let data = [2.0, 5.0, 5.0, 1.0, 5.0, 2.0, 0.0, 5.0];
-    let x = Tensor::from_fn(&[n], &ext, |c| data[c[&n]]);
+    let x = Value::from_fn(&[n], |c| data[c[&n]]);
     let env: Env = [("X", x)].into_iter().collect();
 
-    let all = topk_all(input("X", &[n]), n, k, rk, true);
-    let got = eval(&all, &env, &ext);
-    let pairs = topk(input("X", &[n]), n, k);
+    let all = topk_all(input("X", &[n], Dtype::F32), n, k, rk, true);
+    let got = eval(&all, &env);
+    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
     for (r, (_, i)) in pairs.iter().enumerate() {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(
-            got.at(&coord),
-            eval(i, &env, &ext).data[0],
-            "rank {r} under ties"
-        );
+        assert_eq!(got.at(&coord), eval(i, &env).data[0], "rank {r} under ties");
     }
     let coord0: HashMap<Axis, usize> = [(rk, 0)].into_iter().collect();
     let coord1: HashMap<Axis, usize> = [(rk, 1)].into_iter().collect();
@@ -178,14 +171,13 @@ fn topk_all_ties_match_per_rank_folds() {
 // Batched top-1 (the MoE router shape): argmax per row.
 #[test]
 fn batched_top1_routes_rows() {
-    let (b, e) = (axis("b"), axis("e"));
-    let ext: Extents = [(b, 5), (e, 8)].into_iter().collect();
+    let (b, e) = (axis("b", 5), axis("e", 8));
     let mut rng = Lcg(0x40E);
-    let gates = rand_tensor(&[b, e], &ext, &mut rng);
+    let gates = rand_tensor(&[b, e], &mut rng);
     let env: Env = [("G", gates.clone())].into_iter().collect();
 
-    let pairs = topk(input("G", &[b, e]), e, 1);
-    let idx = eval(&pairs[0].1, &env, &ext);
+    let pairs = topk(input("G", &[b, e], Dtype::F32), e, 1);
+    let idx = eval(&pairs[0].1, &env);
     for bi in 0..5 {
         let mut best = 0usize;
         for ei in 1..8 {
@@ -206,19 +198,23 @@ fn batched_top1_routes_rows() {
 
 #[test]
 fn scatter_add_matches_hand_with_collisions() {
-    let (i, j, d) = (axis("i"), axis("j"), axis("d"));
-    let ext: Extents = [(i, 7), (j, 4), (d, 3)].into_iter().collect();
+    let (i, j, d) = (axis("i", 7), axis("j", 4), axis("d", 3));
     let mut rng = Lcg(0x5CA7);
-    let src = rand_tensor(&[i, d], &ext, &mut rng);
+    let src = rand_tensor(&[i, d], &mut rng);
     // indices with deliberate collisions and a hole (nothing maps to 2)
     let idx_vals = [0usize, 1, 1, 3, 0, 1, 3];
-    let idx = Tensor::from_fn(&[i], &ext, |c| idx_vals[c[&i]] as f64);
+    let idx = Value::from_fn(&[i], |c| idx_vals[c[&i]] as f64);
     let env: Env = [("S", src.clone()), ("idx", idx)].into_iter().collect();
 
-    let sc = scatter_add(input("S", &[i, d]), input("idx", &[i]), i, j);
-    let got = eval(&sc, &env, &ext);
+    let sc = scatter_add(
+        input("S", &[i, d], Dtype::F32),
+        input("idx", &[i], Dtype::F32),
+        i,
+        j,
+    );
+    let got = eval(&sc, &env);
 
-    let hand = Tensor::from_fn(&[j, d], &ext, |c| {
+    let hand = Value::from_fn(&[j, d], |c| {
         idx_vals
             .iter()
             .enumerate()
@@ -236,9 +232,14 @@ fn scatter_add_matches_hand_with_collisions() {
     }
 
     // and through the pipeline: one fused kernel (a one-hot contraction)
-    let sched = partition(&sc, &Device::toy(), &as_f64(&ext));
-    assert_eq!(sched.stages.len(), 1, "scatter-add is one fold:\n{}", sched.render());
-    let executed = sched.execute(&env, &ext);
+    let sched = partition(&sc, &DeviceProfile::toy());
+    assert_eq!(
+        sched.stages.len(),
+        1,
+        "scatter-add is one fold:\n{}",
+        sched.render()
+    );
+    let executed = sched.execute(&env);
     let exec_p = executed.permuted_to(&got.axes);
     for (a, b) in got.data.iter().zip(&exec_p.data) {
         assert!((a - b).abs() < 1e-12);
@@ -249,17 +250,20 @@ fn scatter_add_matches_hand_with_collisions() {
 // adjointness that makes it gather's backward.
 #[test]
 fn scatter_add_inverts_a_permutation_gather() {
-    let (v, s, v2, d) = (axis("v"), axis("s"), axis("v2"), axis("d"));
-    let ext: Extents = [(v, 5), (s, 5), (v2, 5), (d, 3)].into_iter().collect();
+    let (v, s, v2, d) = (axis("v", 5), axis("s", 5), axis("v2", 5), axis("d", 3));
     let mut rng = Lcg(0x1D);
-    let table = rand_tensor(&[v, d], &ext, &mut rng);
+    let table = rand_tensor(&[v, d], &mut rng);
     let perm = [3usize, 0, 4, 1, 2];
-    let ids = Tensor::from_fn(&[s], &ext, |c| perm[c[&s]] as f64);
+    let ids = Value::from_fn(&[s], |c| perm[c[&s]] as f64);
     let env: Env = [("T", table.clone()), ("ids", ids)].into_iter().collect();
 
-    let gathered = gather(input("T", &[v, d]), input("ids", &[s]), v); // [d, s]
-    let back = scatter_add(gathered, input("ids", &[s]), s, v2); // [d, v2]
-    let got = eval(&back, &env, &ext);
+    let gathered = gather(
+        input("T", &[v, d], Dtype::F32),
+        input("ids", &[s], Dtype::F32),
+        v,
+    ); // [d, s]
+    let back = scatter_add(gathered, input("ids", &[s], Dtype::F32), s, v2); // [d, v2]
+    let got = eval(&back, &env);
     for vi in 0..5 {
         for di in 0..3 {
             let g: HashMap<Axis, usize> = [(v2, vi), (d, di)].into_iter().collect();

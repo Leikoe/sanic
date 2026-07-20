@@ -28,10 +28,10 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::{Device, feasible, kernel_time};
+use sanic::cost::{DeviceProfile, feasible, kernel_time};
 use sanic::derive;
 use sanic::emit_metal::emit_schedule_metal;
-use sanic::interp::{Env, Extents, Tensor, eval};
+use sanic::interp::{Env, Extents, Value, eval};
 use sanic::ir::*;
 use sanic::partition::{Stage, partition_many};
 use sanic::plan::plan_axis;
@@ -79,9 +79,9 @@ fn main() {
     let group_size = 4; // query heads per kv-head (the GQA ratio)
     let head_dim_size = 128;
 
-    let q = input("q", &[batch, q_heads, seq_len, head_dim]);
-    let k = input("k", &[batch, kv_heads, kv_seq_len, head_dim]);
-    let v = input("v", &[batch, kv_heads, kv_seq_len, head_dim]);
+    let q = input("q", &[batch, q_heads, seq_len, head_dim], Dtype::F32);
+    let k = input("k", &[batch, kv_heads, kv_seq_len, head_dim], Dtype::F32);
+    let v = input("v", &[batch, kv_heads, kv_seq_len, head_dim], Dtype::F32);
     // GQA reshape: q_heads → (kv_heads, group). Now each group shares a kv-head.
     let qg = split(q.clone(), q_heads, kv_heads, group, group_size);
     // Scaled dot-product attention, spelled out from the basis:
@@ -109,7 +109,7 @@ fn main() {
     .into_iter()
     .collect();
     let real_price: HashMap<Axis, f64> = real.iter().map(|(&a, &n)| (a, n as f64)).collect();
-    let dev = Device::toy();
+    let dev = DeviceProfile::toy();
 
     step(
         0,
@@ -167,7 +167,7 @@ fn main() {
     step(
         3,
         "plan + cost — choose streamed axis, tile, and block structure",
-        "graph + axis + carrier + Device + extents",
+        "graph + axis + carrier + DeviceProfile + extents",
         "a KernelSpec (block dims, resident state, priced cost)",
     );
     let spec =
@@ -216,7 +216,7 @@ fn main() {
     step(
         4,
         "partition — whole graph → kernels, cutting only where the algebra stops",
-        "the graph + Device + extents",
+        "the graph + DeviceProfile + extents",
         "a Schedule: Stages in execution order",
     );
     let sched = partition_many(&[(attn.clone(), "attn")], &dev, &real_price);
@@ -315,7 +315,7 @@ fn main() {
     .into_iter()
     .collect();
     let mut rng = Lcg(0x5EED_1234_ABCD);
-    let mut r = |axes: &[Axis]| Tensor::from_fn(axes, &verify, |_| rng.f());
+    let mut r = |axes: &[Axis]| Value::from_fn(axes, &verify, |_| rng.f());
     let env: Env = [
         ("q", r(&[batch, q_heads, seq_len, head_dim])),
         ("k", r(&[batch, kv_heads, kv_seq_len, head_dim])),

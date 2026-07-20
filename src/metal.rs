@@ -36,13 +36,13 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
-    MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
+    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption,
+    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLResourceUsage,
+    MTLSize,
 };
 
 use crate::emit_metal::MetalProgram;
-use crate::interp::Extents;
 use crate::partition::Schedule;
 use crate::plan::FoldSched;
 
@@ -117,6 +117,7 @@ pub struct Dispatch {
     pub argbuf: Option<MetalBuf>,
 }
 
+#[derive(Clone)]
 pub struct MetalDevice {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -254,11 +255,7 @@ impl MetalDevice {
     pub fn from_f32(&self, data: &[f32]) -> MetalBuf {
         let buf = self.alloc_bytes(data.len() * 4);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf.contents() as *mut f32,
-                data.len(),
-            )
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len())
         };
         buf
     }
@@ -273,13 +270,7 @@ impl MetalDevice {
     /// Raw bytes — packed int4 nibbles, f16 halves: typed storage uploads.
     pub fn from_bytes(&self, data: &[u8]) -> MetalBuf {
         let buf = self.alloc_bytes(data.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf.contents(),
-                data.len(),
-            )
-        };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents(), data.len()) };
         buf
     }
 
@@ -296,12 +287,13 @@ impl MetalDevice {
         }
         let ptr = std::ptr::NonNull::new(data.as_ptr() as *mut std::ffi::c_void)?;
         let buf = unsafe {
-            self.dev.newBufferWithBytesNoCopy_length_options_deallocator(
-                ptr,
-                data.len(),
-                MTLResourceOptions::StorageModeShared,
-                None, // caller-owned ('static): no deallocator
-            )
+            self.dev
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    ptr,
+                    data.len(),
+                    MTLResourceOptions::StorageModeShared,
+                    None, // caller-owned ('static): no deallocator
+                )
         }?;
         Some(MetalBuf(buf, 0))
     }
@@ -327,36 +319,7 @@ impl MetalDevice {
     pub fn run(&self, dispatches: &[Dispatch]) {
         let cb = self.queue.commandBuffer().expect("command buffer");
         for d in dispatches {
-            let enc = cb.computeCommandEncoder().expect("compute encoder");
-            enc.setComputePipelineState(&d.pipe);
-            if let Some(ab) = &d.argbuf {
-                // bindless: one address table at 0, output at 1, inputs resident
-                unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
-                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
-                for b in &d.inputs {
-                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
-                    enc.useResource_usage(res, MTLResourceUsage::Read);
-                }
-            } else {
-                for (i, b) in d.inputs.iter().enumerate() {
-                    unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
-                }
-                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
-            }
-            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
-            enc.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: d.grid,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: tg,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            enc.endEncoding();
+            encode(&cb, d);
         }
         cb.commit();
         cb.waitUntilCompleted();
@@ -369,44 +332,74 @@ impl MetalDevice {
     pub fn run_timed(&self, dispatches: &[Dispatch]) -> f64 {
         let cb = self.queue.commandBuffer().expect("command buffer");
         for d in dispatches {
-            let enc = cb.computeCommandEncoder().expect("compute encoder");
-            enc.setComputePipelineState(&d.pipe);
-            if let Some(ab) = &d.argbuf {
-                // bindless: one address table at 0, output at 1, inputs resident
-                unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
-                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
-                for b in &d.inputs {
-                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
-                    enc.useResource_usage(res, MTLResourceUsage::Read);
-                }
-            } else {
-                for (i, b) in d.inputs.iter().enumerate() {
-                    unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
-                }
-                unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
-            }
-            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
-            enc.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: d.grid,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: tg,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            enc.endEncoding();
+            encode(&cb, d);
         }
         cb.commit();
         cb.waitUntilCompleted();
-        // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
-        let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
-        let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
-        t1 - t0
+        gpu_seconds(&cb)
     }
+
+    /// One command buffer PER dispatch: each kernel's own GPU residency, in
+    /// order. This is the `SANIC_DEBUG=2` path (tinygrad's `DEBUG=2` also
+    /// synchronizes per kernel to time it) — the per-dispatch submit adds a
+    /// sync floor, so the SUM is not a decode-speed number; [`Self::run_timed`]
+    /// is. Individual kernel times are accurate: GPU start→end, no CPU cost.
+    pub fn run_each_timed(&self, dispatches: &[Dispatch]) -> Vec<f64> {
+        dispatches
+            .iter()
+            .map(|d| {
+                let cb = self.queue.commandBuffer().expect("command buffer");
+                encode(&cb, d);
+                cb.commit();
+                cb.waitUntilCompleted();
+                gpu_seconds(&cb)
+            })
+            .collect()
+    }
+}
+
+/// Encode one kernel launch onto a command buffer — the one encode path
+/// behind [`MetalDevice::run`], [`MetalDevice::run_timed`] and
+/// [`MetalDevice::run_each_timed`].
+fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch) {
+    let enc = cb.computeCommandEncoder().expect("compute encoder");
+    enc.setComputePipelineState(&d.pipe);
+    if let Some(ab) = &d.argbuf {
+        // bindless: one address table at 0, output at 1, inputs resident
+        unsafe { enc.setBuffer_offset_atIndex(Some(&ab.0), ab.1, 0) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, 1) };
+        for b in &d.inputs {
+            let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*b.0);
+            enc.useResource_usage(res, MTLResourceUsage::Read);
+        }
+    } else {
+        for (i, b) in d.inputs.iter().enumerate() {
+            unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+        }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
+    }
+    let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
+    enc.dispatchThreads_threadsPerThreadgroup(
+        MTLSize {
+            width: d.grid,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+}
+
+/// A committed command buffer's GPU residency in seconds.
+fn gpu_seconds(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
+    // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
+    let t0: f64 = unsafe { msg_send![&*cb, GPUStartTime] };
+    let t1: f64 = unsafe { msg_send![&*cb, GPUEndTime] };
+    t1 - t0
 }
 
 /// A captured dispatch sequence in an `MTLIndirectCommandBuffer`: encode
@@ -581,16 +574,12 @@ impl MetalDevice {
 pub fn tune_schedules(
     g: &MetalDevice,
     sched: &Schedule,
-    dev: &crate::cost::Device,
-    ext: &Extents,
+    dev: &crate::cost::DeviceProfile,
     bufs: &HashMap<String, MetalBuf>,
 ) -> HashMap<String, FoldSched> {
     use crate::emit_metal::{canonical_source, emit_fused_metal_sched_with};
     use crate::partition::Stage;
     use crate::plan::{fold_sched, fold_sched_candidates};
-
-    let ext_f: HashMap<crate::ir::Axis, f64> =
-        ext.iter().map(|(&a, &n)| (a, n as f64)).collect();
 
     // group fold stages by canonical class under the ANALYTIC choice
     let mut classes: HashMap<String, (usize, Vec<String>)> = HashMap::new();
@@ -604,15 +593,16 @@ pub fn tune_schedules(
         else {
             continue;
         };
-        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
+        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev);
         let k = emit_fused_metal_sched_with(
             "probe",
             &spec.carrier,
             spec.streaming_axis,
             fold_node,
-            ext,
             analytic,
-            epilogue_node.as_ref().map(|e| (e, spec.output_name.as_str())),
+            epilogue_node
+                .as_ref()
+                .map(|e| (e, spec.output_name.as_str())),
         );
         classes
             .entry(canonical_source(&k))
@@ -632,10 +622,11 @@ pub fn tune_schedules(
         else {
             unreachable!()
         };
-        let epi = epilogue_node.as_ref().map(|e| (e, spec.output_name.as_str()));
-        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &ext_f);
-        let cands =
-            fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &ext_f);
+        let epi = epilogue_node
+            .as_ref()
+            .map(|e| (e, spec.output_name.as_str()));
+        let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev);
+        let cands = fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier);
 
         // emit each candidate; guards fall back to scalar, so dedup by body.
         // Pre-filter by the threadgroup-memory budget the emitter would
@@ -644,7 +635,7 @@ pub fn tune_schedules(
         let mut entries: Vec<(FoldSched, crate::emit_metal::MetalKernel, String)> = Vec::new();
         for (ci, c) in cands.into_iter().enumerate() {
             if c.sgs > 1 {
-                let e_a = c.lane_axis.map(|a| ext[&a]).unwrap_or(1);
+                let e_a = c.lane_axis.map(|a| a.extent()).unwrap_or(1);
                 let sliced: usize = (0..spec.carrier.slots)
                     .filter(|&j| {
                         c.lane_axis
@@ -661,7 +652,6 @@ pub fn tune_schedules(
                 &spec.carrier,
                 spec.streaming_axis,
                 fold_node,
-                ext,
                 c,
                 epi,
             );
@@ -689,9 +679,10 @@ pub fn tune_schedules(
         // the --proto discipline (same math, same buffers, checked), in the
         // loop. A mismatch is an emitter bug surfacing, not a schedule
         // preference; it is reported and never chosen.
-        let out_elems: usize = crate::ir::output_axes(fold_node)
+        let out_elems: usize = fold_node
+            .shape()
             .iter()
-            .map(|a| ext[a])
+            .map(|a| a.extent())
             .product::<usize>()
             .max(1);
         let mut reference: Option<Vec<f32>> = None;
@@ -727,9 +718,10 @@ pub fn tune_schedules(
                     // NaN-poisoned garbage in unwritten intermediates must
                     // FAIL the equivalence, not slip through a vacuous
                     // comparison
-                    let bad = r.iter().zip(&got).any(|(a, b)| {
-                        !((a - b).abs() <= 2e-3 * (1.0 + a.abs().max(b.abs())))
-                    });
+                    let bad = r
+                        .iter()
+                        .zip(&got)
+                        .any(|(a, b)| !((a - b).abs() <= 2e-3 * (1.0 + a.abs().max(b.abs()))));
                     if bad {
                         eprintln!(
                             "tune: candidate {c:?} MISMATCHES the scalar base on \

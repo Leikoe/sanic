@@ -2,7 +2,7 @@
 //!
 //! The derivation layer settles *legality* — what can fuse, and the exact
 //! accumulator. This module is the other half, *profitability*, and it knows
-//! nothing about any particular computation: only `Device`s and `Kernel`s.
+//! nothing about any particular computation: only `DeviceProfile`s and `Kernel`s.
 //! Because every candidate handed in is already legal, the cost model only
 //! has to rank — it can pick a slow plan, never a wrong one. Ranking
 //! accuracy is the bar, not absolute accuracy.
@@ -10,7 +10,7 @@
 /// The device the scheduler is parameterized by. All hardware numbers live
 /// here; everything else is device-agnostic.
 #[derive(Debug, Clone, Copy)]
-pub struct Device {
+pub struct DeviceProfile {
     pub sram_bytes: f64,      // shared memory / SRAM per resident block
     pub regfile_bytes: f64,   // register file per block
     pub hbm_bandwidth: f64,   // bytes / second
@@ -27,10 +27,10 @@ pub struct Device {
     pub mem_lanes: f64,
 }
 
-impl Device {
+impl DeviceProfile {
     /// A plausible accelerator-class toy (≈ A100 fp16, order of magnitude).
     pub fn toy() -> Self {
-        Device {
+        DeviceProfile {
             sram_bytes: 163_840.0, // 160 KiB
             regfile_bytes: 256_000.0,
             hbm_bandwidth: 2.0e12, // 2 TB/s
@@ -50,8 +50,8 @@ impl Device {
     /// fold reaches the DRAM ceiling while a 2.3k-lane one reaches ~2% of
     /// it — saturation needs tens of thousands of scalar load streams.
     pub fn m1_pro() -> Self {
-        Device {
-            sram_bytes: 32_768.0,  // threadgroup memory
+        DeviceProfile {
+            sram_bytes: 32_768.0, // threadgroup memory
             regfile_bytes: 256_000.0,
             hbm_bandwidth: 2.0e11, // 200 GB/s unified
             peak_flops: 5.0e12,    // 16 cores × 128 lanes × FMA × ~1.3 GHz
@@ -88,7 +88,7 @@ pub struct Kernel {
 // ── feasibility ──────────────────────────────────────────────────────────────
 
 /// A kernel is feasible iff its per-block working set fits the device.
-pub fn feasible(dev: &Device, k: &Kernel) -> bool {
+pub fn feasible(dev: &DeviceProfile, k: &Kernel) -> bool {
     k.sram_per_block <= dev.sram_bytes && k.regs_per_block <= dev.regfile_bytes
 }
 
@@ -97,7 +97,7 @@ pub fn feasible(dev: &Device, k: &Kernel) -> bool {
 /// Effective occupancy ∈ (0, 1]: how much of the machine the kernel keeps
 /// busy. Bounded by how many blocks fit in SRAM / registers and by how much
 /// independent work exists, normalized against the latency-hiding floor.
-pub fn occupancy(dev: &Device, k: &Kernel) -> f64 {
+pub fn occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let by_sram = (dev.sram_bytes / k.sram_per_block).floor();
     let by_reg = (dev.regfile_bytes / k.regs_per_block).floor();
     let resident = by_sram.min(by_reg).min(k.parallel_blocks).max(1.0);
@@ -109,7 +109,7 @@ pub fn occupancy(dev: &Device, k: &Kernel) -> f64 {
 /// tiny output grid (a matvec, a huge softmax denominator) cannot keep
 /// enough loads in flight — which is exactly why re-associating it into a
 /// split reduction pays even when it is memory-bound.
-pub fn mem_occupancy(dev: &Device, k: &Kernel) -> f64 {
+pub fn mem_occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let lanes = (k.parallel_blocks * k.lanes_per_block).max(1.0);
     (lanes / dev.mem_lanes).clamp(1.0 / 64.0, 1.0)
 }
@@ -118,7 +118,7 @@ pub fn mem_occupancy(dev: &Device, k: &Kernel) -> f64 {
 /// plus a fixed launch cost. Compute is divided by block occupancy (latency
 /// hiding needs resident warps); bandwidth by memory occupancy (saturation
 /// needs loads in flight).
-pub fn kernel_time(dev: &Device, k: &Kernel) -> f64 {
+pub fn kernel_time(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
     let memory = k.hbm_bytes / (dev.hbm_bandwidth * mem_occupancy(dev, k));
     compute.max(memory) + dev.launch_overhead
@@ -126,7 +126,7 @@ pub fn kernel_time(dev: &Device, k: &Kernel) -> f64 {
 
 /// Total time for a schedule. `None` if any kernel is infeasible — an
 /// infeasible schedule has no cost, it simply cannot run.
-pub fn schedule_time(dev: &Device, kernels: &[Kernel]) -> Option<f64> {
+pub fn schedule_time(dev: &DeviceProfile, kernels: &[Kernel]) -> Option<f64> {
     if kernels.iter().all(|k| feasible(dev, k)) {
         Some(kernels.iter().map(|k| kernel_time(dev, k)).sum())
     } else {
@@ -139,7 +139,7 @@ pub fn schedule_time(dev: &Device, kernels: &[Kernel]) -> Option<f64> {
 /// Inner search: the cheapest feasible kernel from a family of candidates
 /// (typically one per tile size).
 pub fn best_tile<T>(
-    dev: &Device,
+    dev: &DeviceProfile,
     candidates: impl IntoIterator<Item = (T, Kernel)>,
 ) -> Option<(T, Kernel)> {
     candidates
@@ -150,7 +150,7 @@ pub fn best_tile<T>(
 
 /// Outer search: the cheapest feasible schedule (fusion partition) among
 /// candidate plans. Returns its index and total cost; `None` if none fit.
-pub fn cheapest(dev: &Device, plans: &[&[Kernel]]) -> Option<(usize, f64)> {
+pub fn cheapest(dev: &DeviceProfile, plans: &[&[Kernel]]) -> Option<(usize, f64)> {
     plans
         .iter()
         .enumerate()
@@ -177,7 +177,7 @@ mod tests {
     // occupancy is bounded, and a worse working set never raises it.
     #[test]
     fn occupancy_is_bounded_and_monotone() {
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
         let small = occupancy(&dev, &kernel(1e9, 1e6, 8_000.0, 1e6));
         let big = occupancy(&dev, &kernel(1e9, 1e6, 80_000.0, 1e6));
         assert!(small > 0.0 && small <= 1.0);
@@ -187,7 +187,7 @@ mod tests {
     // schedule_time sums feasible kernels and rejects an infeasible one.
     #[test]
     fn schedule_time_rejects_infeasible() {
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
         let ok = kernel(1e9, 1e6, 16_000.0, 1e4);
         let too_big = kernel(1e9, 1e6, dev.sram_bytes + 1.0, 1e4);
         assert!(schedule_time(&dev, &[ok.clone(), ok.clone()]).is_some());
@@ -197,7 +197,7 @@ mod tests {
     // best_tile picks the minimum-time feasible candidate.
     #[test]
     fn best_tile_picks_cheapest_feasible() {
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
         // tile 4 is infeasible; among the feasible, more parallelism wins
         let cands = vec![
             (1usize, kernel(1e10, 1e6, 16_000.0, 1.0)),
@@ -211,7 +211,7 @@ mod tests {
     // cheapest picks the lower-cost feasible plan and skips infeasible ones.
     #[test]
     fn cheapest_plan_wins() {
-        let dev = Device::toy();
+        let dev = DeviceProfile::toy();
         let cheap = vec![kernel(1e9, 1e6, 16_000.0, 1e4)];
         let dear = vec![kernel(1e12, 1e6, 16_000.0, 1e4)];
         let dead = vec![kernel(1e6, 1e6, dev.sram_bytes + 1.0, 1e4)];
