@@ -38,6 +38,11 @@
 //! argmax, σ = (h, max, argmax, max2, len) for the second-rank index —
 //! which is exactly the alarm that would have fired long before a kernel
 //! count against MLX did. Run with `--nocapture` to read the ledger.
+//!
+//! The probe's admitted blind spot is its pool. The SECOND oracle at the
+//! bottom of this file — the Hankel rank test of the theory doc's §5.7 —
+//! needs no pool: carrier dimension is measured as the numerical rank of
+//! the futures matrix H[p, s] = h(p·s), exact per coordinate system.
 
 use std::collections::HashMap;
 
@@ -61,6 +66,11 @@ impl Lcg {
     /// and exact ties must be common, or the probe can conclude nothing.
     fn q(&mut self) -> f64 {
         ((self.next() >> 33) % 9) as f64 * 0.5 - 2.0
+    }
+    /// Continuous in [-2, 2] — the rank test wants generic streams, where the
+    /// probe wanted collisions.
+    fn c(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0
     }
 }
 
@@ -630,5 +640,242 @@ fn inspect_flagged_seeds() {
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
         let g = build(input("X", &[n], Dtype::F32), n);
         println!("seed {seed}: derives={} {:?}\n", derive(&g, n).is_ok(), g);
+    }
+}
+
+// ── the second oracle: the Hankel rank test (pool-free) ──────────────────────
+//
+// The collision probe sees only through its sketch pool, and says so. The
+// dimension criterion (kernel_fusion_theory.md §5.7) needs no pool: the
+// Nerode quotient is itself the minimal carrier, so carrier dimension is the
+// numerical rank of the futures matrix H[p, s] = h(p·s). Practice notes, all
+// load-bearing:
+//
+// * columns are CENTERED — an additive carrier produces the affine family
+//   H[p,s] = state(p)·w(s) + g(s), whose raw rank exceeds the parameter
+//   dimension by one;
+// * verdicts read the RELATIVE spectrum σᵢ/σ₁ and require a visible gap;
+// * the test is exact PER COORDINATE SYSTEM: a full-rank verdict is
+//   ambiguous between a true wall (median) and a missing rewrite (raw
+//   softmax·V — the trailing division curves the futures). Appendix A of the
+//   theory doc: the loop is rewrite-candidate → rank → extract, never
+//   rank → extract. Both halves are pinned as regressions below;
+// * run right-to-left too — bidirectional low rank certifies an associative
+//   merge exists (third homomorphism theorem) with no carrier vocabulary;
+// * rank GROWING with prefix length is the refutation trend of a true wall.
+
+/// H rows = prefixes, columns = suffix × output-coordinate (multi-output
+/// functions stack column blocks). `reversed` streams right-to-left:
+/// h(suffix · prefix) — the merge-existence direction.
+fn futures_matrix(
+    builds: &[Build],
+    plen: usize,
+    rows: usize,
+    n_sufs: usize,
+    reversed: bool,
+    seed: u64,
+) -> Vec<Vec<f64>> {
+    let mut rng = Lcg(seed);
+    let pres: Vec<Vec<f64>> = (0..rows)
+        .map(|_| (0..plen).map(|_| rng.c()).collect())
+        .collect();
+    let sufs: Vec<Vec<f64>> = (0..n_sufs)
+        .map(|_| (0..3).map(|_| rng.c()).collect())
+        .collect();
+    pres.iter()
+        .map(|p| {
+            let mut row = Vec::new();
+            for s in &sufs {
+                let xs: Vec<f64> = if reversed {
+                    s.iter().chain(p.iter()).copied().collect()
+                } else {
+                    p.iter().chain(s.iter()).copied().collect()
+                };
+                for b in builds {
+                    row.push(run_h(*b, &xs));
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+/// Singular values by one-sided Jacobi — adequate for these small matrices.
+fn singular_values(mut a: Vec<Vec<f64>>) -> Vec<f64> {
+    // orthogonalize columns; needs rows ≥ cols, so transpose if wider
+    if a[0].len() > a.len() {
+        a = (0..a[0].len())
+            .map(|j| a.iter().map(|r| r[j]).collect())
+            .collect();
+    }
+    let n = a[0].len();
+    for _ in 0..60 {
+        let mut off = 0.0f64;
+        for p in 0..n {
+            for q in p + 1..n {
+                let (mut app, mut aqq, mut apq) = (0.0, 0.0, 0.0);
+                for row in &a {
+                    app += row[p] * row[p];
+                    aqq += row[q] * row[q];
+                    apq += row[p] * row[q];
+                }
+                let scale = (app * aqq).sqrt().max(1e-300);
+                off = off.max(apq.abs() / scale);
+                if apq.abs() <= 1e-15 * scale {
+                    continue;
+                }
+                let zeta = (aqq - app) / (2.0 * apq);
+                let t = zeta.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt());
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = c * t;
+                for row in a.iter_mut() {
+                    let (rp, rq) = (row[p], row[q]);
+                    row[p] = c * rp - s * rq;
+                    row[q] = s * rp + c * rq;
+                }
+            }
+        }
+        if off < 1e-13 {
+            break;
+        }
+    }
+    let mut sv: Vec<f64> = (0..n)
+        .map(|j| a.iter().map(|r| r[j] * r[j]).sum::<f64>().sqrt())
+        .collect();
+    sv.sort_by(|x, y| y.partial_cmp(x).unwrap());
+    sv
+}
+
+/// Center each column (the affine-rank unit), then the relative spectrum
+/// σᵢ/σ₁, descending.
+fn relative_spectrum(mut h: Vec<Vec<f64>>) -> Vec<f64> {
+    let rows = h.len() as f64;
+    for j in 0..h[0].len() {
+        let mean = h.iter().map(|r| r[j]).sum::<f64>() / rows;
+        for r in h.iter_mut() {
+            r[j] -= mean;
+        }
+    }
+    let mut sv = singular_values(h);
+    let top = sv[0].max(1e-300);
+    for v in sv.iter_mut() {
+        *v /= top;
+    }
+    sv
+}
+
+/// Numerical rank at relative threshold `tol`. A cut must show a decade of
+/// gap; a spectrum that never crosses `tol` is full rank (no tail at all).
+fn rank_with_gap(spectrum: &[f64], tol: f64) -> Option<usize> {
+    let r = spectrum.iter().take_while(|&&v| v > tol).count();
+    if r == spectrum.len() {
+        return Some(r);
+    }
+    if r == 0 {
+        return Some(0);
+    }
+    (spectrum[r - 1] / spectrum[r].max(1e-300) > 10.0).then_some(r)
+}
+
+#[test]
+fn rank_oracle_measures_small_carriers() {
+    // Σx — one slot; centering pays the affine unit, the rank is the carrier.
+    let sum: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::Add));
+    let spec = relative_spectrum(futures_matrix(&[sum], 6, 40, 12, false, 0xA11CE));
+    assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σ spectrum: {spec:?}");
+
+    // Σx², same shape, different lift — still one measured slot.
+    let sumsq: Build = |x, n| {
+        reduce(
+            map(MapOp::Mul, vec![x.clone(), x]),
+            n,
+            BinOp::Monoid(Monoid::Add),
+        )
+    };
+    let spec = relative_spectrum(futures_matrix(&[sumsq], 6, 40, 12, false, 0xB0B));
+    assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σx² spectrum: {spec:?}");
+}
+
+#[test]
+fn rank_oracle_reports_attention_ambiguous_raw_and_small_deferred() {
+    // softmax·v in RAW coordinates (value channel v = x², keeping the
+    // one-input Build shape): the trailing division makes the futures a
+    // CURVED family. A smooth curved family's spectrum decays steadily —
+    // fast, but with no decade gap anywhere and no numerically-zero tail —
+    // which is precisely the AMBIGUOUS verdict of theory §5.7: it cannot
+    // distinguish a true wall from a missing rewrite, so it must route into
+    // the rewrite search rather than terminate the analysis.
+    let raw: Build = |x, n| {
+        let e = map(MapOp::Exp, vec![x.clone()]);
+        let v = map(MapOp::Mul, vec![x.clone(), x]);
+        let num = reduce(
+            map(MapOp::Mul, vec![e.clone(), v]),
+            n,
+            BinOp::Monoid(Monoid::Add),
+        );
+        let den = reduce(e, n, BinOp::Monoid(Monoid::Add));
+        map(MapOp::Div, vec![num, den])
+    };
+    let spec = relative_spectrum(futures_matrix(&[raw], 6, 40, 12, false, 0xF1A5));
+    assert_eq!(
+        rank_with_gap(&spec, 1e-8),
+        None,
+        "raw softmax·v must have NO clean gap (curved family): {spec:?}"
+    );
+    assert!(
+        *spec.last().unwrap() > 1e-12,
+        "raw softmax·v must have no numerically-zero tail: {spec:?}"
+    );
+
+    // One rewrite collapses it (Theorem 5.2 + the exp homomorphism): in the
+    // DEFERRED coordinates (ℓ, o) = (Σeˣ, Σeˣ·v) the measured rank is
+    // exactly 2 — the carrier as a number, not a design. The running max
+    // contributes nothing here: it is numerical stabilization, not semantic
+    // state (Appendix A).
+    let ell: Build = |x, n| reduce(map(MapOp::Exp, vec![x]), n, BinOp::Monoid(Monoid::Add));
+    let o: Build = |x, n| {
+        let e = map(MapOp::Exp, vec![x.clone()]);
+        let v = map(MapOp::Mul, vec![x.clone(), x]);
+        reduce(map(MapOp::Mul, vec![e, v]), n, BinOp::Monoid(Monoid::Add))
+    };
+    let spec = relative_spectrum(futures_matrix(&[ell, o], 6, 40, 12, false, 0xF1A5));
+    assert_eq!(
+        rank_with_gap(&spec, 1e-8),
+        Some(2),
+        "deferred (ℓ, o) spectrum: {spec:?}"
+    );
+
+    // Right-to-left, same coordinates: low rank in BOTH directions is the
+    // merge-existence certificate (third homomorphism theorem) — an
+    // associative ⊗ exists before anyone writes it down.
+    let spec = relative_spectrum(futures_matrix(&[ell, o], 6, 40, 12, true, 0xF1A5));
+    assert_eq!(
+        rank_with_gap(&spec, 1e-8),
+        Some(2),
+        "reversed (ℓ, o) spectrum: {spec:?}"
+    );
+}
+
+#[test]
+fn rank_oracle_corroborates_the_median_wall() {
+    // Median: the measured rank tracks the SAMPLE SIZE — every enlargement
+    // of the futures matrix finds new independent directions, the spectrum
+    // never plateaus. That is the refutation trend of a true wall, read with
+    // no sketch vocabulary at all; a streamable function's rank plateaus at
+    // its carrier dimension no matter how many samples are thrown at it
+    // (the (ℓ, o) test above: 2, at every size). The collision probe's
+    // separating witness and the fooling family settle the claim; this
+    // corroborates it from a second, independent instrument.
+    let effective_rank = |n_sufs: usize| {
+        let spec =
+            relative_spectrum(futures_matrix(&[median_graph], 8, n_sufs + 8, n_sufs, false, 0x3D1A));
+        spec.iter().take_while(|&&v| v > 1e-8).count()
+    };
+    for n_sufs in [8usize, 16, 24] {
+        let r = effective_rank(n_sufs);
+        assert!(
+            r >= n_sufs - 1,
+            "median rank must track the sample size, never plateau: {r} of {n_sufs}"
+        );
     }
 }

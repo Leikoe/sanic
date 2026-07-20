@@ -344,6 +344,94 @@ fn logsumexp_carrier() {
     check(&car, &items, &[reference]);
 }
 
+// ── magnitude tiers: the rescale coupling exercised for its numerical purpose ─
+// Everything above operates near ±3, where a naive unshifted Σexp never
+// overflows — the online-softmax coupling was verified for its algebra but
+// never for the regime it exists for. These tiers center the scores at ±50,
+// ±88 (the f32 exp overflow boundary — the GPU oracle's tier), ±300, and
+// ±710 (past f64 exp overflow at ~709.8), plant the true maximum first and
+// last in the stream, and hold the carrier — sequential AND tree-split — to
+// a stable two-pass reference at exactly the magnitudes where the naive
+// fold visibly does not survive.
+
+/// Score streams centered at `center`, with the true maximum planted at
+/// `max_pos`: the adversarial cases for a rescaling merge (a late max forces
+/// every accumulated slot to rescale; an early max forces the tail to ride
+/// far below it).
+fn planted_scores(center: f64, n: usize, max_pos: usize, seed: u64) -> Vec<f64> {
+    let mut rng = Lcg::new(seed);
+    let mut scores: Vec<f64> = (0..n).map(|_| center + rng.next_f64()).collect();
+    scores[max_pos] = center + 5.0;
+    scores
+}
+
+#[test]
+fn attention_rescale_survives_overflow_magnitudes() {
+    let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
+    let q = input("Q", &[sq, d], Dtype::F32);
+    let kk = input("K", &[k, d], Dtype::F32);
+    let v = input("V", &[k, e], Dtype::F32);
+    let car = derive(&attention(q, kk, v, d, k), k).unwrap();
+
+    let n = 23;
+    for &center in &[50.0, 88.0, 300.0, 710.0, -710.0] {
+        for max_pos in [0, n - 1] {
+            let scores = planted_scores(center, n, max_pos, 42);
+            let mut rng = Lcg::new(7);
+            let items: Vec<Vec<f64>> = scores.iter().map(|&s| vec![s, rng.next_f64()]).collect();
+
+            // The stable two-pass reference: shift by the true max.
+            let max = scores.iter().fold(f64::NEG_INFINITY, |a, &s| a.max(s));
+            let denom: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+            let numer: f64 = items.iter().map(|p| (p[0] - max).exp() * p[1]).sum();
+            check(&car, &items, &[numer / denom]);
+
+            // The tier has teeth: past f64 exp overflow the NAIVE unshifted
+            // fold is not even finite — the carrier's agreement above is not
+            // an agreement between two computations that both happen to work.
+            if center >= 710.0 {
+                let naive: f64 = items.iter().map(|p| p[0].exp() * p[1]).sum::<f64>()
+                    / scores.iter().map(|s| s.exp()).sum::<f64>();
+                assert!(!naive.is_finite(), "naive fold must overflow at ±{center}");
+            }
+        }
+    }
+}
+
+#[test]
+fn logsumexp_rescale_survives_overflow_magnitudes() {
+    let a = axis("a", 23);
+    let x = input("X", &[a], Dtype::F32);
+    let m = reduce(x.clone(), a, max_r());
+    let e = map(
+        MapOp::Exp,
+        vec![map(MapOp::Sub, vec![x.clone(), m.clone()])],
+    );
+    let s = reduce(e, a, add_r());
+    let lse = map(MapOp::Add, vec![map(MapOp::Log, vec![s]), m]);
+    let car = derive(&lse, a).unwrap();
+
+    let n = 23;
+    for &center in &[50.0, 88.0, 300.0, 710.0, -710.0] {
+        for max_pos in [0, n - 1] {
+            let scores = planted_scores(center, n, max_pos, 11);
+            let items: Vec<Vec<f64>> = scores.iter().map(|&s| vec![s]).collect();
+
+            let max = scores.iter().fold(f64::NEG_INFINITY, |a, &s| a.max(s));
+            let reference = max + scores.iter().map(|s| (s - max).exp()).sum::<f64>().ln();
+            check(&car, &items, &[reference]);
+
+            if center >= 710.0 {
+                let naive = scores.iter().map(|s| s.exp()).sum::<f64>().ln();
+                assert!(
+                    naive.is_infinite(),
+                    "naive logsumexp must overflow at ±{center}"
+                );
+            }
+        }
+    }
+}
+
 // ── real-workload attention: scale and mask fuse into the lift ───────────────
 // softmax(scores·scale + mask)·V — the production form. The compound score
 // expression fuses into the per-element lift (`fused-map`), and the carrier is
