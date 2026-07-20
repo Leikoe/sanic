@@ -192,6 +192,10 @@ pub struct AxisReport {
     /// FREE axes are grid dimensions; OPAQUE / SEQUENTIAL have no one-pass
     /// form; a MONOIDAL axis without a carrier folds in a sub-expression.
     pub carrier: Option<Carrier>,
+    /// Why a MONOIDAL axis nonetheless has no carrier at this node — the
+    /// deriver's claim, kept so the report can say it and a census can
+    /// bucket it.
+    pub decline: Option<derive::Decline>,
 }
 
 /// The structure map: every axis classified, accumulators attached.
@@ -205,14 +209,18 @@ pub fn analyze(node: &Node, axes: &[Axis]) -> Report {
         .iter()
         .map(|&a| {
             let structure = structure(node, a);
-            let carrier = match structure.level {
-                Parallelism::Monoidal => derive::derive(node, a),
-                _ => None,
+            let (carrier, decline) = match structure.level {
+                Parallelism::Monoidal => match derive::derive(node, a) {
+                    Ok(c) => (Some(c), None),
+                    Err(d) => (None, Some(d)),
+                },
+                _ => (None, None),
             };
             AxisReport {
                 axis: a,
                 structure,
                 carrier,
+                decline,
             }
         })
         .collect();
@@ -249,6 +257,9 @@ impl Report {
                 for line in c.render().lines() {
                     out += &format!("         {line}\n");
                 }
+            }
+            if let Some(d) = &a.decline {
+                out += &format!("         {d}\n");
             }
         }
         out

@@ -55,8 +55,32 @@
 //! property-tested against a reference, and transcribed to real code by the
 //! emitters. The FlashAttention `(m, ℓ, o)` accumulator is never written down
 //! anywhere in this repository; it is constructed by this fold.
+//!
+//! ## The semantics quotient
+//!
+//! Every law used here — associativity of the slot monoids, and the peephole
+//! rewrites `(n/d)·c → (n·c)/d` (`pmul`), `x − x → 0`, `exp(0) → 1`
+//! (`pexp_sub`) — is a law of *reals with rounding*: values are treated as
+//! real numbers, and a derived kernel may differ from a reference evaluation
+//! by rounding drift only (`tests/laws.rs` bounds the drift, including at
+//! magnitudes where a naively-ordered fold visibly overflows and the carrier
+//! must not). Non-finite values are OUTSIDE the quotient: under `inf`/`NaN`
+//! inputs, a `Div` by zero, or an intermediate that overflows in one order
+//! but not the other, the derived carrier and the reference are just two
+//! different IEEE programs — neither order is "the" answer, and no law here
+//! claims one.
+//!
+//! ## Declines are claims
+//!
+//! `derive` returns `Result`, and the `Err` is a [`Decline`]: the axis, the
+//! sub-expression where composition stopped, the first rule that had no
+//! case, and the streaming state that had been reached. A decline is not an
+//! apology — it is the claim "no bounded carrier composes here" — and it is
+//! held to that claim by `tests/completeness.rs`, which probes declined
+//! programs for semantically existing carriers. `partition` records the
+//! `Decline` on the `Infeasible` stage it emits in the fold's stead.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
@@ -431,6 +455,61 @@ fn render_expr(e: &Expr, parent: u8) -> String {
     if p < parent { format!("({s})") } else { s }
 }
 
+// ── declines ─────────────────────────────────────────────────────────────────
+
+/// Why a derivation declined: the first composition rule that had no case.
+///
+/// `rule` is a small stable vocabulary — one name per missing case in this
+/// file — so declines can be bucketed into a census; `reached` says which
+/// streaming state composition had gotten to when it stopped.
+#[derive(Debug, Clone)]
+pub struct Decline {
+    pub axis: Axis,
+    /// The sub-expression whose composition rule had no case.
+    pub at: Node,
+    /// The missing case, e.g. `"sum-of-coupled"`, `"two-exp-domains"`.
+    pub rule: &'static str,
+    /// The streaming state(s) reached when composition stopped.
+    pub reached: String,
+}
+
+impl std::fmt::Display for Decline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "decline over {}: {} ({}) at {}",
+            self.axis.name,
+            self.rule,
+            self.reached,
+            node_head(&self.at)
+        )
+    }
+}
+
+fn decline(at: &Node, axis: Axis, rule: &'static str, reached: impl Into<String>) -> Decline {
+    Decline {
+        axis,
+        at: at.clone(),
+        rule,
+        reached: reached.into(),
+    }
+}
+
+/// The top-level constructor of a node, for one-line diagnostics.
+fn node_head(n: &Node) -> String {
+    match n.as_ref() {
+        NodeKind::Input { name, .. } => format!("input {name}"),
+        NodeKind::Const { v } => format!("const {v}"),
+        NodeKind::Iota { axis } => format!("iota {}", axis.name),
+        NodeKind::Map { op, .. } => format!("map {op:?}"),
+        NodeKind::Reduce { op, axis, .. } => format!("reduce {op:?} over {}", axis.name),
+        NodeKind::Scan { op, axis, .. } => format!("scan {op:?} over {}", axis.name),
+        NodeKind::Gather { .. } => "gather".to_string(),
+        NodeKind::View { .. } => "view".to_string(),
+        NodeKind::Reindex { .. } => "reindex".to_string(),
+    }
+}
+
 // ── the deriver ──────────────────────────────────────────────────────────────
 
 /// One accumulator slot under construction.
@@ -504,6 +583,28 @@ enum S {
     Coll(Expr),
 }
 
+/// The streaming state a sub-derivation reached, in a decline's words.
+fn reached(s: &S) -> String {
+    match s {
+        S::Pe { shift, post, .. } => {
+            let mut d = String::from("per-element");
+            if shift.is_some() {
+                d.push_str(", riding a running max");
+            }
+            if !is1(post) {
+                d.push_str(", with a deferred factor");
+            }
+            d
+        }
+        S::PeOff { .. } => "per-element minus its running max (only exp consumes this)".into(),
+        S::PeExt { .. } => {
+            "per-element coupled to a collapsed max/min (only max/min consumes this)".into()
+        }
+        S::PeAdd { .. } => "per-element plus a collapsed offset".into(),
+        S::Coll(_) => "collapsed".into(),
+    }
+}
+
 /// A collapsed expression, if this value is (or can be promoted to) one:
 /// genuine `Coll`s, and per-element values that read no element fields — a
 /// literal constant is the same on every element, so it is a valid collapsed
@@ -533,6 +634,25 @@ fn plain_pe(s: &S) -> Option<Expr> {
     }
 }
 
+/// A node key that compares by identity and KEEPS ITS NODE ALIVE. Holding the
+/// `Rc` is what makes an address-based map sound: an address can be reused
+/// only after its node is dropped, and an entry here prevents that for as
+/// long as the map lives.
+#[derive(Clone)]
+struct ByAddr(Node);
+
+impl PartialEq for ByAddr {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ByAddr {}
+impl std::hash::Hash for ByAddr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Rc::as_ptr(&self.0), state)
+    }
+}
+
 struct Ctx {
     slots: Vec<Slot>,
     /// Each leaf (a sub-expression free along the axis) and its free axes.
@@ -541,11 +661,14 @@ struct Ctx {
     /// computed in-body or materialized by another kernel.
     leaves: Vec<(Node, Vec<Axis>)>,
     /// Memoizes `go` per node so DAG-shared sub-expressions map to the same
-    /// slots instead of registering duplicates.
-    memo: Vec<(*const NodeKind, S)>,
+    /// slots instead of registering duplicates (and so the walk stays linear
+    /// on backward graphs). `memo_log` records insertion order so a failed
+    /// map decomposition can roll its entries back.
+    memo: HashMap<ByAddr, S>,
+    memo_log: Vec<ByAddr>,
     rules: BTreeSet<&'static str>,
     /// Memoizes `other_axis_folds` per node — the free-map-vs-contraction check.
-    other_folds: std::collections::HashMap<*const NodeKind, (bool, bool)>,
+    other_folds: HashMap<ByAddr, (bool, bool)>,
 }
 
 impl Ctx {
@@ -660,10 +783,11 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     out
 }
 
-/// Derive the streaming carrier for folding `node` over `axis`. `None` when
-/// the axis is not foldable (serial or data-dependent) or the expression
-/// leaves the supported fragment.
-pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
+/// Derive the streaming carrier for folding `node` over `axis`. The `Err` is
+/// a [`Decline`] naming the first composition rule that had no case — a
+/// serial or data-dependent axis, an expression outside the supported
+/// fragment, or a target that never collapses the axis.
+pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
     // An affine / SSM scan folds under a known monoid (affine-map
     // composition), not under the compositional rules. It is the one extra
     // carrier the library ships.
@@ -674,15 +798,16 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
     } = node.as_ref()
         && *sc == axis
     {
-        return Some(affine_scan_carrier());
+        return Ok(affine_scan_carrier());
     }
 
     let mut ctx = Ctx {
         slots: Vec::new(),
         leaves: Vec::new(),
-        memo: Vec::new(),
+        memo: HashMap::new(),
+        memo_log: Vec::new(),
         rules: BTreeSet::new(),
-        other_folds: std::collections::HashMap::new(),
+        other_folds: HashMap::new(),
     };
     let s = go(node, axis, &mut ctx)?;
 
@@ -691,14 +816,24 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
     // caller should target the reduction that consumes it instead.
     let project = match s {
         S::Coll(e) => vec![e],
-        S::Pe { .. } | S::PeOff { .. } | S::PeExt { .. } | S::PeAdd { .. } => return None,
+        s => {
+            return Err(decline(
+                node,
+                axis,
+                "still-per-element",
+                format!(
+                    "{} — no scalar projection; target the reduction that consumes it",
+                    reached(&s)
+                ),
+            ));
+        }
     };
 
     let (into, combine, identity) = assemble(&ctx.slots);
     let spans = ctx.slots.iter().map(|s| s.span.clone()).collect();
     let kinds = ctx.slots.iter().map(|s| s.kind).collect();
     let leaves = ctx.leaves.iter().map(|(n, _)| n.clone()).collect();
-    Some(Carrier {
+    Ok(Carrier {
         slots: ctx.slots.len(),
         leaves,
         into,
@@ -721,13 +856,13 @@ pub fn derive(node: &Node, axis: Axis) -> Option<Carrier> {
 fn other_axis_folds(
     node: &Node,
     axis: Axis,
-    cache: &mut std::collections::HashMap<*const NodeKind, (bool, bool)>,
+    cache: &mut HashMap<ByAddr, (bool, bool)>,
 ) -> (bool, bool) {
     // Memoized per node (the streamed axis is fixed for a whole derivation):
     // a DAG-shared subtree is classified once. Unmemoized, this re-walks shared
     // subtrees and is exponential on backward graphs.
-    let ptr = Rc::as_ptr(node);
-    if let Some(&r) = cache.get(&ptr) {
+    let key = ByAddr(node.clone());
+    if let Some(&r) = cache.get(&key) {
         return r;
     }
     let is_contraction = matches!(node.as_ref(),
@@ -763,26 +898,27 @@ fn other_axis_folds(
             other_axis_folds(src, axis, cache)
         }
     };
-    cache.insert(ptr, result);
+    cache.insert(key, result);
     result
 }
 
 /// Stream `node` over `axis`, registering reductions-over-axis as slots.
 /// Memoized per node, so DAG-shared sub-expressions register once.
-fn go(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
-    let ptr = Rc::as_ptr(node);
-    if let Some((_, s)) = ctx.memo.iter().find(|(p, _)| *p == ptr) {
-        return Some(s.clone());
+fn go(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
+    let key = ByAddr(node.clone());
+    if let Some(s) = ctx.memo.get(&key) {
+        return Ok(s.clone());
     }
     let s = go_uncached(node, axis, ctx)?;
-    ctx.memo.push((ptr, s.clone()));
-    Some(s)
+    ctx.memo.insert(key.clone(), s.clone());
+    ctx.memo_log.push(key);
+    Ok(s)
 }
 
-fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
+fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
     // A literal lifts to a constant expression, never a leaf.
     if let NodeKind::Const { v } = node.as_ref() {
-        return Some(S::Pe {
+        return Ok(S::Pe {
             raw: cst(*v),
             shift: None,
             post: cst(1.0),
@@ -812,7 +948,7 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
     if is_free && (!is_map || keep_map_whole) {
         // The leaf's free axes are its output shape minus the streamed axis.
         let free = node.shape().into_iter().filter(|a| *a != axis).collect();
-        return Some(S::Pe {
+        return Ok(S::Pe {
             raw: Expr::Item(ctx.leaf(node, free)),
             shift: None,
             post: cst(1.0),
@@ -822,73 +958,86 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
     match node.as_ref() {
         NodeKind::Map { op, inputs } => {
             // Roll back on failure: a half-decomposed map must not leave
-            // orphan slots or leaves behind.
+            // orphan slots, leaves, or memo entries behind.
             let save = (
                 ctx.slots.len(),
                 ctx.leaves.len(),
-                ctx.memo.len(),
+                ctx.memo_log.len(),
                 ctx.rules.clone(),
             );
-            if let Some(s) = map_op(*op, inputs, axis, ctx) {
-                return Some(s);
-            }
+            let declined = match map_op(node, *op, inputs, axis, ctx) {
+                Ok(s) => return Ok(s),
+                Err(d) => d,
+            };
             // An elementwise composition the fold can't stream through that
             // is nonetheless FREE along the axis is still a legal per-element
             // input: keep the whole map as a leaf instead of failing.
             if structure(node, axis).level == Parallelism::Free {
                 ctx.slots.truncate(save.0);
                 ctx.leaves.truncate(save.1);
-                ctx.memo.truncate(save.2);
+                for key in ctx.memo_log.drain(save.2..) {
+                    ctx.memo.remove(&key);
+                }
                 ctx.rules = save.3;
                 let free = node.shape().into_iter().filter(|a| *a != axis).collect();
-                return Some(S::Pe {
+                return Ok(S::Pe {
                     raw: Expr::Item(ctx.leaf(node, free)),
                     shift: None,
                     post: cst(1.0),
                 });
             }
-            None
+            Err(declined)
         }
 
-        NodeKind::Reduce { src, axis: red, op } if *red == axis => reduce_op(src, *op, axis, ctx),
+        NodeKind::Reduce { src, axis: red, op } if *red == axis => {
+            reduce_op(node, src, *op, axis, ctx)
+        }
 
         // A reduction over a different axis collapses something orthogonal;
-        // if it is not FREE along our axis we are outside the supported set.
-        _ => None,
+        // anything not FREE along our axis and not a reduction over it is
+        // outside the carrier algebra. Name the classification for the census.
+        _ => {
+            let (rule, why) = match structure(node, axis).level {
+                Parallelism::Sequential => {
+                    ("sequential", "a non-associative recurrence along the axis")
+                }
+                Parallelism::Opaque => ("opaque", "data-dependent access along the axis"),
+                _ => (
+                    "not-streamed",
+                    "not free along the axis and not a reduction over it",
+                ),
+            };
+            Err(decline(node, axis, rule, why))
+        }
     }
 }
 
-/// Reduce `src` over `axis` with monoid `op`, allocating slot(s).
-fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
+/// Reduce `src` over `axis` with monoid `op`, allocating slot(s). `node` is
+/// the reduction itself — the site a decline reports.
+fn reduce_op(node: &Node, src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
     // Index-carrying maximum: two slots — the running max of the streamed
     // values, and the index (an iota leaf) that first achieved it.
     if let BinOp::ArgMax = op {
         let s = go(src, axis, ctx)?;
-        let S::Pe {
-            raw,
-            shift: None,
-            post,
-        } = s
-        else {
-            return None;
+        let Some(raw) = plain_pe(&s) else {
+            return Err(decline(node, axis, "argmax-of-coupled", reached(&s)));
         };
-        if !is1(&post) {
-            return None;
-        }
         let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
         let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
         let idx_slot = ctx.push_slot(SlotKind::ArgIdx { max_slot }, Expr::Item(iota_leaf));
         // The index ranges over whatever grid rows the max does — its `into`
         // (an iota) says nothing about that, so inherit the span.
         ctx.slots[idx_slot].span = ctx.slots[max_slot].span.clone();
-        return Some(S::Coll(Expr::F(idx_slot)));
+        return Ok(S::Coll(Expr::F(idx_slot)));
     }
     // k-best selection: one carrier holds the whole sorted (value, index)
     // k-list; each `rank` projects one slot. Ranks > 0 contribute the
     // identity per element (a singleton list is rank 0 only).
     if let BinOp::TopK { k, rank, idx } = op {
         let s = go(src, axis, ctx)?;
-        let raw = plain_pe(&s)?;
+        let Some(raw) = plain_pe(&s) else {
+            return Err(decline(node, axis, "topk-of-coupled", reached(&s)));
+        };
         let k = k as usize;
         // One selection, many queries: if this derivation already carries
         // the k-list over the same streamed values, REUSE its slots. Eight
@@ -958,10 +1107,16 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
         }
         ctx.rules.insert("k-best");
         let slot = if idx { ibase } else { vbase } + rank as usize;
-        return Some(S::Coll(Expr::F(slot)));
+        return Ok(S::Coll(Expr::F(slot)));
     }
     let BinOp::Monoid(m) = op else {
-        return None; // non-associative / affine handled elsewhere
+        // non-associative / affine handled elsewhere
+        return Err(decline(
+            node,
+            axis,
+            "non-monoid-reduce",
+            "the reduction operator has no declared monoid",
+        ));
     };
     let s = go(src, axis, ctx)?;
 
@@ -974,17 +1129,19 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             if let Some(e) = as_coll(&s) {
                 ctx.rules.insert("invariant");
                 let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
-                return Some(S::Coll(pmul(e, Expr::F(cnt))));
+                return Ok(S::Coll(pmul(e, Expr::F(cnt))));
             }
             // Σ(z + c) = Σz + n·c — the offset leaves through a count slot.
             if let S::PeAdd { raw, off } = s {
                 ctx.rules.insert("defer-add");
                 let slot = ctx.push_slot(SlotKind::Plain(Monoid::Add), raw);
                 let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
-                return Some(S::Coll(padd(Expr::F(slot), pmul(off, Expr::F(cnt)))));
+                return Ok(S::Coll(padd(Expr::F(slot), pmul(off, Expr::F(cnt)))));
             }
-            let S::Pe { raw, shift, post } = s else {
-                return None; // a shifted/deferred form we cannot re-reduce
+            let (raw, shift, post) = match s {
+                S::Pe { raw, shift, post } => (raw, shift, post),
+                // a max-coupled intermediate only exp / max/min may consume
+                other => return Err(decline(node, axis, "sum-of-coupled", reached(&other))),
             };
             let kind = match shift {
                 Some(max_slot) => {
@@ -999,7 +1156,7 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 // applied once, in `project`.
                 ctx.rules.insert("defer-div");
             }
-            Some(S::Coll(pmul(post, Expr::F(slot))))
+            Ok(S::Coll(pmul(post, Expr::F(slot))))
         }
 
         Monoid::LogSumExp => {
@@ -1007,23 +1164,15 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             if let Some(e) = as_coll(&s) {
                 ctx.rules.insert("invariant");
                 let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
-                return Some(S::Coll(padd(e, log(Expr::F(cnt)))));
+                return Ok(S::Coll(padd(e, log(Expr::F(cnt)))));
             }
-            let S::Pe {
-                raw,
-                shift: None,
-                post,
-            } = s
-            else {
-                return None;
+            let Some(raw) = plain_pe(&s) else {
+                return Err(decline(node, axis, "lse-of-coupled", reached(&s)));
             };
-            if !is1(&post) {
-                return None;
-            }
             let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
             ctx.rules.insert("rescale");
             let sum_slot = ctx.push_slot(SlotKind::ExpShifted { max_slot }, cst(1.0));
-            Some(S::Coll(padd(log(Expr::F(sum_slot)), Expr::F(max_slot))))
+            Ok(S::Coll(padd(log(Expr::F(sum_slot)), Expr::F(max_slot))))
         }
 
         // max / min / product: plain monoid slots; nothing rides, nothing defers.
@@ -1035,7 +1184,15 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 && let Some(e) = as_coll(&s)
             {
                 ctx.rules.insert("invariant");
-                return Some(S::Coll(e));
+                return Ok(S::Coll(e));
+            }
+            if matches!(m, Monoid::Mul) && matches!(s, S::Coll(_)) {
+                return Err(decline(
+                    node,
+                    axis,
+                    "power",
+                    "Π over an axis-invariant value is valueⁿ — no closed slot form",
+                ));
             }
             // Lattice distributivity: reduce_m(max/min(z, c)) = max/min
             // applied AFTER reduce_m(z) — for every m, j ∈ {Max, Min}.
@@ -1044,7 +1201,7 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             {
                 ctx.rules.insert("lattice");
                 let slot = ctx.push_slot(SlotKind::Plain(m), raw.clone());
-                return Some(S::Coll(if *is_max {
+                return Ok(S::Coll(if *is_max {
                     emax(Expr::F(slot), coll.clone())
                 } else {
                     emin(Expr::F(slot), coll.clone())
@@ -1056,19 +1213,25 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             {
                 ctx.rules.insert("defer-add");
                 let slot = ctx.push_slot(SlotKind::Plain(m), raw.clone());
-                return Some(S::Coll(padd(Expr::F(slot), off.clone())));
+                return Ok(S::Coll(padd(Expr::F(slot), off.clone())));
             }
-            let S::Pe {
-                raw,
-                shift: None,
-                post,
-            } = s
-            else {
-                return None;
+            let (raw, post) = match s {
+                S::Pe {
+                    raw,
+                    shift: None,
+                    post,
+                } => (raw, post),
+                other => {
+                    let rule = match m {
+                        Monoid::Mul => "product-of-coupled",
+                        _ => "extremum-of-coupled",
+                    };
+                    return Err(decline(node, axis, rule, reached(&other)));
+                }
             };
             if is1(&post) {
                 let slot = ctx.push_slot(SlotKind::Plain(m), raw);
-                return Some(S::Coll(Expr::F(slot)));
+                return Ok(S::Coll(Expr::F(slot)));
             }
             // Deferred scale under an order reduction: the sign of the
             // factor decides which extremum survives — max(c·z) is c·max(z)
@@ -1076,7 +1239,12 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             // dispatch on the sign at project time. (Mul keeps declining:
             // the factor would need an n-th power.)
             if matches!(m, Monoid::Mul) {
-                return None;
+                return Err(decline(
+                    node,
+                    axis,
+                    "deferred-scale-under-product",
+                    "Π(c·z) would need the factor's n-th power",
+                ));
             }
             ctx.rules.insert("defer-scale");
             let mx = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw.clone());
@@ -1086,7 +1254,7 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 Monoid::Min => (mn, mx),
                 _ => unreachable!(),
             };
-            Some(S::Coll(ewhere(
+            Ok(S::Coll(ewhere(
                 elt(cst(0.0), post.clone()),
                 pmul(post.clone(), Expr::F(pos)),
                 pmul(post, Expr::F(neg)),
@@ -1096,24 +1264,25 @@ fn reduce_op(src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Option<S> {
 }
 
 /// Combine the streamed inputs of an elementwise map. Total over the closed
-/// basis (an op the fold genuinely can't stream through returns None and the
-/// caller falls back to a whole-map leaf when legal).
-fn map_op(op: MapOp, inputs: &[Node], axis: Axis, ctx: &mut Ctx) -> Option<S> {
+/// basis (an op the fold genuinely can't stream through declines, and the
+/// caller falls back to a whole-map leaf when legal). `node` is the map
+/// itself — the site a decline reports.
+fn map_op(node: &Node, op: MapOp, inputs: &[Node], axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
     match op {
-        MapOp::Add => binop(Bin::Add, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Sub => binop(Bin::Sub, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Mul => binop(Bin::Mul, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Div => binop(Bin::Div, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Max => binop(Bin::Max, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Min => binop(Bin::Min, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Lt => binop(Bin::Lt, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Add => binop(node, Bin::Add, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Sub => binop(node, Bin::Sub, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Mul => binop(node, Bin::Mul, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Div => binop(node, Bin::Div, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Max => binop(node, Bin::Max, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Min => binop(node, Bin::Min, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Lt => binop(node, Bin::Lt, &inputs[0], &inputs[1], axis, ctx),
 
-        MapOp::Neg => unary(&inputs[0], axis, ctx, |e| sub(cst(0.0), e)),
-        MapOp::Recip => unary(&inputs[0], axis, ctx, |e| pdiv(cst(1.0), e)),
-        MapOp::Log => unary(&inputs[0], axis, ctx, log),
-        MapOp::Sqrt => unary(&inputs[0], axis, ctx, esqrt),
-        MapOp::Sin => unary(&inputs[0], axis, ctx, esin),
-        MapOp::Cos => unary(&inputs[0], axis, ctx, ecos),
+        MapOp::Neg => unary(node, &inputs[0], axis, ctx, |e| sub(cst(0.0), e)),
+        MapOp::Recip => unary(node, &inputs[0], axis, ctx, |e| pdiv(cst(1.0), e)),
+        MapOp::Log => unary(node, &inputs[0], axis, ctx, log),
+        MapOp::Sqrt => unary(node, &inputs[0], axis, ctx, esqrt),
+        MapOp::Sin => unary(node, &inputs[0], axis, ctx, esin),
+        MapOp::Cos => unary(node, &inputs[0], axis, ctx, ecos),
 
         // exp is where the online-softmax coupling is discovered: exp of
         // `x − m` (a per-element value minus its own running max) rides the
@@ -1123,12 +1292,12 @@ fn map_op(op: MapOp, inputs: &[Node], axis: Axis, ctx: &mut Ctx) -> Option<S> {
         MapOp::Exp => {
             let s = go(&inputs[0], axis, ctx)?;
             if let Some(e) = as_coll(&s) {
-                return Some(S::Coll(exp(e)));
+                return Ok(S::Coll(exp(e)));
             }
             match s {
                 S::PeOff { raw, max_slot } => {
                     let m_into = ctx.slots[max_slot].into.clone();
-                    Some(S::Pe {
+                    Ok(S::Pe {
                         raw: pexp_sub(raw, m_into),
                         shift: Some(max_slot),
                         post: cst(1.0),
@@ -1138,29 +1307,41 @@ fn map_op(op: MapOp, inputs: &[Node], axis: Axis, ctx: &mut Ctx) -> Option<S> {
                     raw,
                     shift: None,
                     post,
-                } if is1(&post) => Some(S::Pe {
+                } if is1(&post) => Ok(S::Pe {
                     raw: exp(raw),
                     shift: None,
                     post: cst(1.0),
                 }),
-                _ => None,
+                other => Err(decline(node, axis, "exp-of-coupled", reached(&other))),
             }
         }
 
         // The fold has no closed form for tanh; the whole-map-leaf fallback
         // in `go_uncached` covers the free-along-axis case.
-        MapOp::Tanh => None,
+        MapOp::Tanh => Err(decline(node, axis, "tanh", "no closed fold form for tanh")),
 
         MapOp::Where => {
             let c = go(&inputs[0], axis, ctx)?;
             let a = go(&inputs[1], axis, ctx)?;
             let b = go(&inputs[2], axis, ctx)?;
             if let (Some(c), Some(a), Some(b)) = (as_coll(&c), as_coll(&a), as_coll(&b)) {
-                return Some(S::Coll(ewhere(c, a, b)));
+                return Ok(S::Coll(ewhere(c, a, b)));
             }
-            let (c, a, b) = (plain_pe(&c)?, plain_pe(&a)?, plain_pe(&b)?);
-            Some(S::Pe {
-                raw: ewhere(c, a, b),
+            let (Some(cc), Some(aa), Some(bb)) = (plain_pe(&c), plain_pe(&a), plain_pe(&b)) else {
+                return Err(decline(
+                    node,
+                    axis,
+                    "where-of-coupled",
+                    format!(
+                        "cond {}; then {}; else {}",
+                        reached(&c),
+                        reached(&a),
+                        reached(&b)
+                    ),
+                ));
+            };
+            Ok(S::Pe {
+                raw: ewhere(cc, aa, bb),
                 shift: None,
                 post: cst(1.0),
             })
@@ -1170,13 +1351,21 @@ fn map_op(op: MapOp, inputs: &[Node], axis: Axis, ctx: &mut Ctx) -> Option<S> {
 
 /// A unary op that applies the same expression transform in both the
 /// per-element and collapsed worlds.
-fn unary(x: &Node, axis: Axis, ctx: &mut Ctx, f: impl Fn(Expr) -> Expr) -> Option<S> {
+fn unary(
+    node: &Node,
+    x: &Node,
+    axis: Axis,
+    ctx: &mut Ctx,
+    f: impl Fn(Expr) -> Expr,
+) -> Result<S, Decline> {
     let s = go(x, axis, ctx)?;
     if let Some(e) = as_coll(&s) {
-        return Some(S::Coll(f(e)));
+        return Ok(S::Coll(f(e)));
     }
-    let raw = plain_pe(&s)?;
-    Some(S::Pe {
+    let Some(raw) = plain_pe(&s) else {
+        return Err(decline(node, axis, "unary-of-coupled", reached(&s)));
+    };
+    Ok(S::Pe {
         raw: f(raw),
         shift: None,
         post: cst(1.0),
@@ -1194,14 +1383,14 @@ enum Bin {
     Lt,
 }
 
-fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
+fn binop(node: &Node, op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
     let a = go(x, axis, ctx)?;
     let b = go(y, axis, ctx)?;
 
     // Both collapsed (or promotable constants) → a scalar combination of
     // reduced values.
     if let (Some(p), Some(q)) = (as_coll(&a), as_coll(&b)) {
-        return Some(S::Coll(match op {
+        return Ok(S::Coll(match op {
             Bin::Add => padd(p, q),
             Bin::Sub => sub(p, q),
             Bin::Mul => pmul(p, q),
@@ -1244,7 +1433,7 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
         };
         if let Some((p, q)) = pq {
             ctx.rules.insert("project-leaf");
-            return Some(S::Coll(pmul(p, q)));
+            return Ok(S::Coll(pmul(p, q)));
         }
     }
 
@@ -1260,7 +1449,7 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
             },
             S::Coll(Expr::F(i)),
         ) if is1(&post) && matches!(ctx.slots[i].kind, SlotKind::Plain(Monoid::Max)) => {
-            Some(S::PeOff { raw, max_slot: i })
+            Ok(S::PeOff { raw, max_slot: i })
         }
 
         // Per-element × / ÷ a value GENUINELY collapsed over the same axis
@@ -1271,12 +1460,12 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
         // once after the downstream reduction. This is where `defer-div`
         // comes from.
         (Bin::Mul, S::Pe { raw, shift, post }, S::Coll(q))
-        | (Bin::Mul, S::Coll(q), S::Pe { raw, shift, post }) => Some(S::Pe {
+        | (Bin::Mul, S::Coll(q), S::Pe { raw, shift, post }) => Ok(S::Pe {
             raw,
             shift,
             post: pmul(post, q),
         }),
-        (Bin::Div, S::Pe { raw, shift, post }, S::Coll(q)) => Some(S::Pe {
+        (Bin::Div, S::Pe { raw, shift, post }, S::Coll(q)) => Ok(S::Pe {
             raw,
             shift,
             post: pdiv(post, q),
@@ -1299,7 +1488,7 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                     (plain_pe(&b).unwrap(), c)
                 }
             };
-            Some(S::PeExt {
+            Ok(S::PeExt {
                 raw,
                 coll,
                 is_max: matches!(op, Bin::Max),
@@ -1316,18 +1505,18 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                     (plain_pe(&b).unwrap(), c)
                 }
             };
-            Some(S::PeAdd { raw, off })
+            Ok(S::PeAdd { raw, off })
         }
         (Bin::Sub, a, b) if plain_pe(&a).is_some() && matches!(b, S::Coll(_)) => {
             let S::Coll(c) = b else { unreachable!() };
-            Some(S::PeAdd {
+            Ok(S::PeAdd {
                 raw: plain_pe(&a).unwrap(),
                 off: sub(cst(0.0), c),
             })
         }
         (Bin::Sub, a, b) if matches!(a, S::Coll(_)) && plain_pe(&b).is_some() => {
             let S::Coll(c) = a else { unreachable!() };
-            Some(S::PeAdd {
+            Ok(S::PeAdd {
                 raw: sub(cst(0.0), plain_pe(&b).unwrap()),
                 off: c,
             })
@@ -1347,13 +1536,30 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 shift: s2,
                 post: p2,
             },
-        ) => Some(S::Pe {
-            raw: pmul(r1, r2),
-            shift: merge_shift(s1, s2)?,
-            post: pmul(p1, p2),
-        }),
+        ) => {
+            let Some(shift) = merge_shift(s1, s2) else {
+                return Err(decline(
+                    node,
+                    axis,
+                    "two-exp-domains",
+                    "the factors ride two distinct running maxes",
+                ));
+            };
+            Ok(S::Pe {
+                raw: pmul(r1, r2),
+                shift,
+                post: pmul(p1, p2),
+            })
+        }
         (op, a, b) => {
-            let (r1, r2) = (plain_pe(&a)?, plain_pe(&b)?);
+            let (Some(r1), Some(r2)) = (plain_pe(&a), plain_pe(&b)) else {
+                return Err(decline(
+                    node,
+                    axis,
+                    "binop-of-coupled",
+                    format!("lhs {}; rhs {}", reached(&a), reached(&b)),
+                ));
+            };
             let raw = match op {
                 Bin::Add => padd(r1, r2),
                 Bin::Sub => sub(r1, r2),
@@ -1363,7 +1569,7 @@ fn binop(op: Bin, x: &Node, y: &Node, axis: Axis, ctx: &mut Ctx) -> Option<S> {
                 Bin::Lt => elt(r1, r2),
                 Bin::Mul => unreachable!("handled above"),
             };
-            Some(S::Pe {
+            Ok(S::Pe {
                 raw,
                 shift: None,
                 post: cst(1.0),
@@ -1376,7 +1582,7 @@ fn merge_shift(a: Option<usize>, b: Option<usize>) -> Option<Option<usize>> {
     match (a, b) {
         (None, x) | (x, None) => Some(x),
         (Some(i), Some(j)) if i == j => Some(Some(i)),
-        _ => None, // two distinct exp domains — unsupported
+        _ => None, // two distinct exp domains — the caller declines
     }
 }
 

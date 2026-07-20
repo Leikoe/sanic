@@ -90,9 +90,14 @@ pub enum Stage {
         output: String,
         exec: Node,
     },
-    /// An axis derives here but no block structure fits the device — a real
-    /// finding, reported instead of guessed around.
-    Infeasible { axis: Axis, output: String },
+    /// An axis derives here but the cut graph declines or no block structure
+    /// fits the device — a real finding, reported with its reason instead of
+    /// guessed around.
+    Infeasible {
+        axis: Axis,
+        output: String,
+        why: String,
+    },
 }
 
 /// A whole-graph schedule: kernels in execution order.
@@ -866,7 +871,7 @@ impl Partitioner<'_> {
             if structure(node, axis).level != Parallelism::Monoidal {
                 continue;
             }
-            let Some(c) = derive(node, axis) else {
+            let Ok(c) = derive(node, axis) else {
                 continue;
             };
             // Rank by planned cost on the uncut graph; an unplannable axis
@@ -953,12 +958,16 @@ impl Partitioner<'_> {
         let cut_graph = replace_many(node, &subs, &mut HashMap::new(), &mut self.canon);
 
         // Re-derive and plan on the graph the kernel will actually see.
-        let Some(c2) = derive(&cut_graph, axis) else {
-            self.stages.push(Stage::Infeasible {
-                axis,
-                output: out.to_string(),
-            });
-            return leak(out);
+        let c2 = match derive(&cut_graph, axis) {
+            Ok(c) => c,
+            Err(why) => {
+                self.stages.push(Stage::Infeasible {
+                    axis,
+                    output: out.to_string(),
+                    why: why.to_string(),
+                });
+                return leak(out);
+            }
         };
         match plan_axis(&cut_graph, axis, &c2, self.dev) {
             Some(mut spec) => {
@@ -995,6 +1004,7 @@ impl Partitioner<'_> {
                 self.stages.push(Stage::Infeasible {
                     axis,
                     output: out.to_string(),
+                    why: "no block structure fits the device".to_string(),
                 });
             }
         }
@@ -1571,8 +1581,8 @@ impl Schedule {
                     axis.name,
                     inputs.join(", ")
                 ),
-                Stage::Infeasible { axis, output } => format!(
-                    "{output:<4} = fold `{}` — DERIVES BUT NO BLOCK FITS THE DEVICE",
+                Stage::Infeasible { axis, output, why } => format!(
+                    "{output:<4} = fold `{}` — INFEASIBLE: {why}",
                     axis.name
                 ),
             };
@@ -1667,9 +1677,9 @@ impl Schedule {
                         inputs.join(", ")
                     );
                 }
-                Stage::Infeasible { output, axis } => {
+                Stage::Infeasible { output, axis, why } => {
                     eprintln!(
-                        "  [{i:>3}] {output:<12} = fold `{}` — INFEASIBLE (no block fits)",
+                        "  [{i:>3}] {output:<12} = fold `{}` — INFEASIBLE: {why}",
                         axis.name
                     );
                 }

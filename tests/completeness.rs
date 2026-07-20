@@ -445,6 +445,7 @@ fn every_decline_is_justified_or_pinned() {
         // "does the root stream over its leaves" — median's rank reduces,
         // say, are legal leaves but each is its own kernel.)
         let derived = derive(&build(input("X", &[n], Dtype::F32), n), n)
+            .ok()
             .filter(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         let verdict = probe(build);
         let line = match (&derived, &verdict, expect) {
@@ -534,7 +535,7 @@ fn random_declines_survive_the_probe() {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
         let g = build(input("X", &[n], Dtype::F32), n);
-        let one_pass = derive(&g, n).is_some_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
+        let one_pass = derive(&g, n).is_ok_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         if one_pass {
             continue; // sound by the existing oracle; nothing to check
         }
@@ -628,6 +629,6 @@ fn inspect_flagged_seeds() {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
         let g = build(input("X", &[n], Dtype::F32), n);
-        println!("seed {seed}: derives={} {:?}\n", derive(&g, n).is_some(), g);
+        println!("seed {seed}: derives={} {:?}\n", derive(&g, n).is_ok(), g);
     }
 }

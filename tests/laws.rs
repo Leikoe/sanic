@@ -532,7 +532,7 @@ fn tanh_rnn_is_sequential() {
     assert_eq!(structure(&rnn, t).level, Parallelism::Sequential);
     assert!(!streamable(&rnn, t));
     assert!(
-        derive(&rnn, t).is_none(),
+        derive(&rnn, t).is_err(),
         "refuses to emit an accumulator for a non-associative recurrence"
     );
 }
@@ -571,7 +571,7 @@ fn embedding_is_opaque() {
     let emb = embedding(table, ids, vocab);
     assert_eq!(structure(&emb, vocab).level, Parallelism::Opaque);
     assert!(!streamable(&emb, vocab));
-    assert!(derive(&emb, vocab).is_none());
+    assert!(derive(&emb, vocab).is_err());
 }
 
 // ── per-(node, axis): the middle axis of a double-GEMM is reduced in one
@@ -734,13 +734,13 @@ fn ctc_forward_battle_test() {
     // ── v (vocab, via label gather) → OPAQUE → not foldable ─────────────────
     assert_eq!(structure(&emit, v).level, Parallelism::Opaque);
     assert!(!streamable(&emit, v));
-    assert!(derive(&emit, v).is_none());
+    assert!(derive(&emit, v).is_err());
 
     // ── t (time) → SEQUENTIAL → must REFUSE to fold ─────────────────────────
     assert_eq!(structure(&alpha, t).level, Parallelism::Sequential);
     assert!(!streamable(&alpha, t));
     assert!(
-        derive(&alpha, t).is_none(),
+        derive(&alpha, t).is_err(),
         "must refuse to emit a fold for the non-associative time recurrence"
     );
 
@@ -851,11 +851,11 @@ fn soft_attention_over_logspace_dp() {
 
     // ── OPAQUE: the gather-indexed score input is runtime-determined ────────
     assert_eq!(structure(&kgath, idx).level, Parallelism::Opaque);
-    assert!(derive(&kgath, idx).is_none());
+    assert!(derive(&kgath, idx).is_err());
 
     // ── SEQUENTIAL atom: the recurrent readout serializes across time ───────
     assert_eq!(structure(&recur, t).level, Parallelism::Sequential);
-    assert!(derive(&recur, t).is_none());
+    assert!(derive(&recur, t).is_err());
 
     // ── batch stays FREE through the whole composite ─────────────────────────
     assert_eq!(structure(&recur, b).level, Parallelism::Free);
@@ -986,7 +986,7 @@ fn probe_discovered_laws_are_sound() {
             let len = 3 + trial;
             let n = axis("n", len);
             let g = build(n);
-            let c = derive(&g, n).unwrap_or_else(|| panic!("{name}: must derive"));
+            let c = derive(&g, n).unwrap_or_else(|d| panic!("{name}: must derive, got {d}"));
             // mixed signs, planted ties: the adversarial cases for these laws
             let vals: Vec<f64> = (0..len)
                 .map(|i| {
