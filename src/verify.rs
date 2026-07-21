@@ -16,7 +16,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::kernel_ir::{
-    AffineIndex, Axis, AxisName, BinOp, Dtype, Extent, Node as NodeKind, NodeRef as Node,
+    AffineIndex, Axis, AxisName, Dtype, Extent, Node as NodeKind, NodeRef as Node,
 };
 
 /// The first node that violates the current IR well-formedness rules.
@@ -261,24 +261,12 @@ impl Verifier {
                     )));
                 }
             }
-            NodeKind::Reduce {
-                axis,
-                op: reduction,
-                ..
-            } => {
+            NodeKind::Reduce { axis, .. } => {
                 self.check_axis(*axis, node_index, op)?;
                 // Unlike Scan and Gather, Reduce may bind a fresh axis.
                 // `Reduce(Const(1), n, Add)` is sanic's count primitive, and
                 // folding an invariant over `n` deliberately repeats it
                 // extent(n) times.
-                if let BinOp::TopK { k, rank, .. } = reduction {
-                    if *k == 0 {
-                        return Err(fail("TopK requires k >= 1".into()));
-                    }
-                    if rank >= k {
-                        return Err(fail(format!("TopK rank {rank} is outside k={k}")));
-                    }
-                }
             }
             NodeKind::Scan { src, axis, .. } => {
                 self.check_axis(*axis, node_index, op)?;
@@ -565,7 +553,9 @@ fn op_name(node: &Node) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_ir::{MapOp, Monoid, axis, input, konst, map, reduce, reindex, rename, view};
+    use crate::kernel_ir::{
+        BinOp, MapOp, Monoid, axis, input, konst, map, reduce, reindex, rename, view,
+    };
 
     fn add() -> BinOp {
         BinOp::Monoid(Monoid::Add)
@@ -596,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn checks_axis_scope_and_topk_arguments() {
+    fn checks_axis_scope() {
         let n = axis("n", 4);
         let missing = axis("missing", 4);
         let count = reduce(konst(1.0), missing, add());
@@ -604,17 +594,6 @@ mod tests {
 
         let invalid = crate::kernel_ir::scan(input("X", &[n], Dtype::F32), missing, add());
         assert!(verify(&invalid).unwrap_err().reason.contains("not present"));
-
-        let invalid = reduce(
-            input("X", &[n], Dtype::F32),
-            n,
-            BinOp::TopK {
-                k: 2,
-                rank: 2,
-                idx: false,
-            },
-        );
-        assert!(verify(&invalid).unwrap_err().reason.contains("outside k=2"));
     }
 
     #[test]

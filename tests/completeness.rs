@@ -33,11 +33,12 @@
 //! proof. The pool, the alphabet, and the collision budget bound what the
 //! probe can see, and those bounds are printed rather than hidden.
 //!
-//! Both historical misses are pinned below in their original graph form:
-//! the probe finds their carriers mechanically — σ = (h, max, len) for
-//! argmax, σ = (h, max, argmax, max2, len) for the second-rank index —
-//! which is exactly the alarm that would have fired long before a kernel
-//! count against MLX did. Run with `--nocapture` to read the ledger.
+//! Two historical misses remain in the ledger in their original graph form.
+//! Argmax is covered by its product monoid; bounded ordered selection remains
+//! an explicit compiler gap after removing the former Top-K IR shortcut. The
+//! probe finds both carriers mechanically, which is exactly the alarm that
+//! should fire before a kernel-count comparison does. Run with `--nocapture`
+//! to read the ledger.
 //!
 //! The probe's admitted blind spot is its pool. The SECOND oracle at the
 //! bottom of this file — the Hankel rank test of the theory doc's §5.7 —
@@ -366,6 +367,9 @@ enum Expect {
     /// `derive` declines this GRAPH; the probe finds the carrier; the algebra
     /// covers the function through the op named here. Pinned history.
     CoveredElsewhere(&'static str),
+    /// `derive` declines and the probe exhibits a carrier. This is accepted
+    /// only as named compiler debt, never hidden behind a semantic IR op.
+    KnownFusionGap(&'static str),
     /// `derive` declines and the probe must produce a separating witness.
     JustifiedDecline,
 }
@@ -415,36 +419,6 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
             Derived,
         ),
         ("argmax_op", |x, n| argmax(x, n), Derived),
-        (
-            "top2_val_op",
-            |x, n| {
-                reduce(
-                    x,
-                    n,
-                    BinOp::TopK {
-                        k: 2,
-                        rank: 1,
-                        idx: false,
-                    },
-                )
-            },
-            Derived,
-        ),
-        (
-            "top2_idx_op",
-            |x, n| {
-                reduce(
-                    x,
-                    n,
-                    BinOp::TopK {
-                        k: 2,
-                        rank: 1,
-                        idx: true,
-                    },
-                )
-            },
-            Derived,
-        ),
         // ── the two historical misses, pinned in their original graph form ──
         (
             "argmax_graph",
@@ -465,18 +439,9 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
             CoveredElsewhere("BinOp::ArgMax — the (max, idx) tuple monoid"),
         ),
         (
-            "top2_idx_graph",
-            |x, n| {
-                // mask-the-winner round two: argmax over x with the first
-                // winner's position forced to −∞
-                let first = argmax(x.clone(), n);
-                let masked = map(
-                    MapOp::Where,
-                    vec![one_hot(n, first), konst(f64::NEG_INFINITY), x],
-                );
-                argmax(masked, n)
-            },
-            CoveredElsewhere("BinOp::TopK — sequential k-best insertion (full monoid merge TODO)"),
+            "top2_idx_frontend",
+            |x, n| topk(x, n, 2)[1].1.clone(),
+            KnownFusionGap("derive the bounded ordered-pair carrier from composition"),
         ),
         // ── genuinely outside constant-state streaming ───────────────────────
         ("median", median_graph, JustifiedDecline),
@@ -593,6 +558,13 @@ fn every_decline_is_justified_or_pinned() {
                 confirm_carrier_across_seeds(name, build, &mut failures);
                 format!(
                     "  GRAPH-FORM  {name:22} graph declines; carrier exists (3 seeds: σ = ({}), ≤ {comps} slots) — covered by {op}\n",
+                    sigma.join(", ")
+                )
+            }
+            (None, Verdict::Carrier(comps, sigma), Expect::KnownFusionGap(reason)) => {
+                confirm_carrier_across_seeds(name, build, &mut failures);
+                format!(
+                    "  OPEN GAP    {name:22} graph declines; carrier exists (3 seeds: σ = ({}), ≤ {comps} slots) — {reason}\n",
                     sigma.join(", ")
                 )
             }

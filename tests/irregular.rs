@@ -2,9 +2,9 @@
 //! existing basis (no new node kinds), verified against hand references and
 //! through the partitioned pipeline.
 //!
-//! * `topk` — one singleton-insert streaming fold over the raw scores per
-//!   requested rank. Small k is all sampling and MoE routing ever need; a
-//!   full two-list merge is still required before tree/split execution.
+//! * `topk` — repeated max/argmax and one-hot masking, built by the frontend
+//!   from ordinary graph operations. Carrier discovery for the whole
+//!   composition remains compiler work rather than Top-k semantics.
 //! * `scatter_add` — the inverse of gather as a one-hot contraction,
 //!   add-combining collisions. Order-free (deterministic in parallel), and
 //!   exactly the backward of `gather`, which autodiff (M8) leans on.
@@ -95,53 +95,56 @@ fn topk_partitions_and_executes() {
     }
 }
 
-// ALL ranks of one selection as ONE fold: the rank axis is grid, the k-best
-// list is derived ONCE (slots deduped across the rank queries), and the
-// projection reads the rank one-hot at project time — the composition
-// `topk_all` builds and the derive rule `project-leaf` makes streamable.
+// All ranks assembled over a rank axis. This checks the frontend composition;
+// it deliberately makes no kernel-count promise while carrier inference for
+// bounded ordered selection remains open compiler work.
 #[test]
-fn topk_all_is_one_fold_with_shared_slots() {
+fn topk_all_composition_matches_and_schedules() {
     let k = 4usize;
     let (n, rk) = (axis("n", 16), axis("rk", k));
     let mut rng = Lcg(0xA11);
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let all = topk_all(input("X", &[n], Dtype::F32), n, k, rk, true);
+    let scores = input("X", &[n], Dtype::F32);
+    let all_indices = topk_all(scores.clone(), n, k, rk, true);
+    let all_values = topk_all(scores, n, k, rk, false);
 
-    // one carrier: k value slots + k index slots, not k separate lists
-    let c = sanic::derive::derive(&all, n).expect("topk_all derives over the scored axis");
-    assert_eq!(c.slots, 2 * k, "k-best slots shared across rank queries");
-    assert!(
-        c.project_reads_leaves(),
-        "rank one-hot read at project time"
-    );
-    assert!(c.rules.contains(&"project-leaf"), "rules: {:?}", c.rules);
-
-    // the carrier equals the naive semantics, per rank
-    let got = sanic::interp::run_carrier(&all, n, &c, &env);
-    let want = eval(&all, &env);
+    let expected_indices = eval(&all_indices, &env);
+    let expected_values = eval(&all_values, &env);
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for (r, &(_, expected_index)) in order.iter().take(k).enumerate() {
+    for (r, &(expected_value, expected_index)) in order.iter().take(k).enumerate() {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(got.at(&coord), want.at(&coord), "rank {r}: carrier == eval");
         assert_eq!(
-            got.at(&coord),
+            expected_indices.at(&coord),
             expected_index as f64,
-            "rank {r}: == hand sort"
+            "index at rank {r}"
+        );
+        assert_eq!(
+            expected_values.at(&coord),
+            expected_value,
+            "value at rank {r}"
         );
     }
 
-    // and the whole thing schedules as ONE kernel
-    let sched = partition(&all, &DeviceProfile::toy());
-    assert_eq!(sched.stages.len(), 1, "one fold for all ranks");
+    // The generic graph still runs through the ordinary partitioned pipeline.
+    let sched = partition_many(
+        &[(all_values, "values"), (all_indices, "indices")],
+        &DeviceProfile::toy(),
+    );
     let mut run_env = env.clone();
     sched.execute_env(&mut run_env);
-    let out = run_env.get(sched.outputs[0].as_str()).unwrap();
-    for (r, &(_, expected_index)) in order.iter().take(k).enumerate() {
+    let values = &run_env["values"];
+    let indices = &run_env["indices"];
+    for (r, &(expected_value, expected_index)) in order.iter().take(k).enumerate() {
         let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(out.at(&coord), expected_index as f64, "scheduled rank {r}");
+        assert_eq!(values.at(&coord), expected_value, "scheduled value {r}");
+        assert_eq!(
+            indices.at(&coord),
+            expected_index as f64,
+            "scheduled index {r}"
+        );
     }
 }
 
@@ -196,6 +199,21 @@ fn batched_top1_routes_rows() {
         let got = idx.at(&[(b, bi)].into_iter().collect());
         assert_eq!(got, best as f64, "row {bi}");
     }
+}
+
+#[test]
+#[should_panic(expected = "topk requires k >= 1")]
+fn topk_rejects_an_empty_selection() {
+    let n = axis("n", 4);
+    let _ = topk(input("X", &[n], Dtype::F32), n, 0);
+}
+
+#[test]
+#[should_panic(expected = "topk_all rank axis extent must equal k")]
+fn topk_all_requires_one_rank_axis_position_per_result() {
+    let n = axis("n", 4);
+    let ranks = axis("ranks", 3);
+    let _ = topk_all(input("X", &[n], Dtype::F32), n, 2, ranks, true);
 }
 
 // ── scatter-add: the inverse of gather, collisions summed ────────────────────

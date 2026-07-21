@@ -5,9 +5,7 @@
 //!
 //! Every associative carrier family is held to
 //! `tree_fold == fold == reference` on random data: associativity and
-//! correctness in one assertion. K-best's singleton-insert carrier is checked
-//! against the reference oracle separately and is forbidden from tree/split
-//! execution.
+//! correctness in one assertion.
 
 use sanic::analyze::{Parallelism, analyze, analyze_all, streamable, structure};
 use sanic::derive::{Carrier, Expr, derive};
@@ -956,7 +954,7 @@ fn soft_attention_over_logspace_dp() {
 
 /// The distributive laws the completeness probe forced into the algebra
 /// (invariant reduction, lattice coupling, additive deferral, signed
-/// defer-scale, and the k-best value-only carrier), each held to
+/// defer-scale), each held to
 /// `run_carrier == eval` on random data — including sign flips, which are
 /// exactly where a wrong defer-scale would lie.
 #[test]
@@ -1036,40 +1034,6 @@ fn probe_discovered_laws_are_sound() {
                 mul(mul(iota(n), coll(n, max_r())), coll(n, add_r())),
                 n,
                 max_r(),
-            )
-        }),
-        // k-best values and indices at every rank
-        ("top3_v0", |n| {
-            reduce(
-                x(n),
-                n,
-                BinOp::TopK {
-                    k: 3,
-                    rank: 0,
-                    idx: false,
-                },
-            )
-        }),
-        ("top3_v2", |n| {
-            reduce(
-                x(n),
-                n,
-                BinOp::TopK {
-                    k: 3,
-                    rank: 2,
-                    idx: false,
-                },
-            )
-        }),
-        ("top3_i1", |n| {
-            reduce(
-                x(n),
-                n,
-                BinOp::TopK {
-                    k: 3,
-                    rank: 1,
-                    idx: true,
-                },
             )
         }),
     ];

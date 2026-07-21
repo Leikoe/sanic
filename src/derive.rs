@@ -23,11 +23,8 @@
 //! * `defer-div` — a normalizer (a value folded over the same axis) was
 //!   pulled out of a linear reduction by distributivity and is applied once,
 //!   at the end.
-//! * `k-best` — an index-carrying selection ([`BinOp::ArgMax`] /
-//!   [`BinOp::TopK`]): argmax has a true pair monoid; top-k's current carrier
-//!   inserts one streamed item into a sorted list, so every rank is one
-//!   sequential fold but tree/split execution remains disabled until combine
-//!   implements a full two-list merge.
+//! * `argmax` — an index-carrying maximum becomes the `(max, index)` product
+//!   monoid with first-maximum tie semantics.
 //! * `invariant` — a reduction over an axis its operand does not vary along:
 //!   `Σ = n·value` (the count is itself a slot), `max/min/lse = value (+ln n)`.
 //! * `lattice` — `reduce_m(max/min(z, c))` for m ∈ {Max, Min} and `c`
@@ -339,31 +336,6 @@ impl Carrier {
         self.project.iter().map(|e| eval(e, &env)).collect()
     }
 
-    /// [`Carrier::project`] with per-grid-point leaf values available: a
-    /// projection may read leaves that are CONSTANT along the streamed axis
-    /// (a grid-axis one-hot selecting which slot this output wants — the
-    /// rank-indexed k-best projection). Runners that know the grid point
-    /// use this; stream-varying leaves are meaningless here and the caller
-    /// must not supply them (their slots are NaN-poisoned by
-    /// [`crate::interp::run_carrier`]).
-    pub fn project_with(&self, acc: &[f64], items: &[f64]) -> Vec<f64> {
-        let env = Env {
-            item: Some(items),
-            a: None,
-            b: None,
-            f: Some(acc),
-        };
-        self.project.iter().map(|e| eval(e, &env)).collect()
-    }
-
-    /// Does the projection read any leaf? (If so, only runners that supply
-    /// per-grid-point leaf values — and emitters that render leaf loads in
-    /// project scope — can drive this carrier; split/cooperative schedules
-    /// decline.)
-    pub fn project_reads_leaves(&self) -> bool {
-        self.project.iter().any(|e| !items_of(e).is_empty())
-    }
-
     /// Exact accumulator size (scalar count) for given axis extents — the
     /// number the scheduler feeds into its SRAM constraint. A slot spanning no
     /// free axes is one scalar; a slot spanning `{sq, e}` is
@@ -533,21 +505,6 @@ pub enum SlotKind {
     /// The index half of an index-carrying maximum: merged as
     /// `a₀ < b₀ ? b_i : a_i` against max slot `max_slot` — first max wins.
     ArgIdx { max_slot: usize },
-    /// Value slot `rank` of a k-best selection (descending, first-max-wins);
-    /// `base` is the rank-0 slot and ranks are contiguous from it. The
-    /// combine is the SINGLETON insert `merge(A, [b])` — exact for
-    /// element-at-a-time streaming, NOT a two-list merge, so split
-    /// reductions must decline (guarded in `run_carrier_split` and
-    /// `plan::mergeable_out_of_order`).
-    KBestVal { base: usize, rank: usize },
-    /// Index slot `rank` of a k-best selection; `vbase`/`ibase` are the
-    /// rank-0 value/index slots. Same singleton-insert caveat as
-    /// [`SlotKind::KBestVal`].
-    KBestIdx {
-        vbase: usize,
-        ibase: usize,
-        rank: usize,
-    },
 }
 
 /// What streaming a sub-expression over the axis produced so far.
@@ -711,45 +668,6 @@ impl Ctx {
         }
         self.slots.len() - 1
     }
-}
-
-/// Every `Item` in `e` references a leaf that never touches `axis`: the
-/// expression is constant along the fold and may evaluate at project time.
-fn invariant_along(e: &Expr, axis: Axis, ctx: &Ctx) -> bool {
-    items_of(e)
-        .iter()
-        .all(|&i| !ctx.leaves[i].0.shape().contains(&axis))
-}
-
-/// The slot indices (`F`) an expression reads.
-fn slots_of(e: &Expr) -> Vec<usize> {
-    fn walk(e: &Expr, out: &mut Vec<usize>) {
-        match e {
-            Expr::F(i) => out.push(*i),
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Max(a, b)
-            | Expr::Min(a, b)
-            | Expr::Lt(a, b) => {
-                walk(a, out);
-                walk(b, out);
-            }
-            Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
-                walk(a, out)
-            }
-            Expr::Where(c, a, b) => {
-                walk(c, out);
-                walk(a, out);
-                walk(b, out);
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(e, &mut out);
-    out
 }
 
 /// The `Item` field indices an expression reads.
@@ -1039,85 +957,6 @@ fn reduce_op(node: &Node, src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> R
         // (an iota) says nothing about that, so inherit the span.
         ctx.slots[idx_slot].span = ctx.slots[max_slot].span.clone();
         return Ok(S::Coll(Expr::F(idx_slot)));
-    }
-    // k-best selection: one carrier holds the whole sorted (value, index)
-    // k-list; each `rank` projects one slot. Ranks > 0 contribute the
-    // identity per element (a singleton list is rank 0 only).
-    if let BinOp::TopK { k, rank, idx } = op {
-        let s = go(src, axis, ctx)?;
-        let Some(raw) = plain_pe(&s) else {
-            return Err(decline(node, axis, "topk-of-coupled", reached(&s)));
-        };
-        let k = k as usize;
-        // One selection, many queries: if this derivation already carries
-        // the k-list over the same streamed values, REUSE its slots. Eight
-        // rank reduces of one score vector become one carrier with eight
-        // projections, not eight list copies.
-        let existing = ctx.slots.iter().position(|sl| {
-            matches!(sl.kind, SlotKind::KBestVal { base, rank: 0 } if {
-                ctx.slots[base..].iter().take(k).filter(|s2|
-                    matches!(s2.kind, SlotKind::KBestVal { base: b2, .. } if b2 == base)
-                ).count() == k
-            }) && sl.into == raw
-        });
-        let vbase = existing.unwrap_or_else(|| {
-            let vbase = ctx.slots.len();
-            for r in 0..k {
-                let into = if r == 0 {
-                    raw.clone()
-                } else {
-                    cst(f64::NEG_INFINITY)
-                };
-                ctx.push_slot(
-                    SlotKind::KBestVal {
-                        base: vbase,
-                        rank: r,
-                    },
-                    into,
-                );
-            }
-            vbase
-        });
-        // A value-only query needs no index half; an index query needs both
-        // (reusing the value half if a prior query built it).
-        let ibase = if idx {
-            let found = ctx.slots.iter().position(
-                |sl| matches!(sl.kind, SlotKind::KBestIdx { vbase: v, rank: 0, .. } if v == vbase),
-            );
-            found.unwrap_or_else(|| {
-                let ibase = ctx.slots.len();
-                let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
-                for r in 0..k {
-                    let into = if r == 0 {
-                        Expr::Item(iota_leaf)
-                    } else {
-                        cst(0.0)
-                    };
-                    ctx.push_slot(
-                        SlotKind::KBestIdx {
-                            vbase,
-                            ibase,
-                            rank: r,
-                        },
-                        into,
-                    );
-                }
-                ibase
-            })
-        } else {
-            usize::MAX
-        };
-        // Every slot of the list ranges over the same grid rows as rank 0.
-        let span0 = ctx.slots[vbase].span.clone();
-        for r in 0..k {
-            ctx.slots[vbase + r].span = span0.clone();
-            if idx {
-                ctx.slots[ibase + r].span = span0.clone();
-            }
-        }
-        ctx.rules.insert("k-best");
-        let slot = if idx { ibase } else { vbase } + rank as usize;
-        return Ok(S::Coll(Expr::F(slot)));
     }
     let BinOp::Monoid(m) = op else {
         // non-associative / affine handled elsewhere
@@ -1424,42 +1263,6 @@ fn binop(
         }));
     }
 
-    // A collapsed value TIMES a per-element factor whose leaves never touch
-    // the axis: the factor is constant along the fold — data in the role of
-    // a promoted literal (a grid-axis one-hot) — so the product is collapsed
-    // too, the factor evaluated at PROJECT time, where the streamed axis is
-    // already gone. This is what lets the eight rank queries of one k-best
-    // selection become a single fold whose projection is rank-indexed by
-    // the grid coordinate (`ir::topk_all`).
-    //
-    // Deliberately NARROW on two counts. Mul only: an additive version
-    // would swallow residual/bias epilogues into the projection. And only
-    // when the collapsed side reads ORDER-SENSITIVE slots (k-best, argmax):
-    // a leaf-reading projection declines the cooperative schedule, so the
-    // absorption is free exactly when the carrier already declines it —
-    // an attention gate over a rescale carrier must stay an epilogue, or
-    // the flash fold falls back to one thread per output.
-    if matches!(op, Bin::Mul) {
-        let order_sensitive = |e: &Expr| {
-            slots_of(e).iter().any(|&i| {
-                matches!(
-                    ctx.slots[i].kind,
-                    SlotKind::KBestVal { .. } | SlotKind::KBestIdx { .. } | SlotKind::ArgIdx { .. }
-                )
-            })
-        };
-        let inv = |s: &S| plain_pe(s).filter(|raw| invariant_along(raw, axis, ctx));
-        let pq = match (&a, &b) {
-            (S::Coll(p), s) if order_sensitive(p) => inv(s).map(|q| (p.clone(), q)),
-            (s, S::Coll(p)) if order_sensitive(p) => inv(s).map(|q| (p.clone(), q)),
-            _ => None,
-        };
-        if let Some((p, q)) = pq {
-            ctx.rules.insert("project-leaf");
-            return Ok(S::Coll(pmul(p, q)));
-        }
-    }
-
     match (op, a, b) {
         // Per-element minus the collapsed running max over the same axis:
         // the online-softmax shift intermediate, consumed by Exp.
@@ -1633,45 +1436,6 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
                 // first max wins: switch to B only on a STRICT improvement
                 ewhere(elt(Expr::A(mx), Expr::B(mx)), Expr::B(i), Expr::A(i))
             }
-            // Insert the incoming element (B's rank-0 pair) into the sorted
-            // list: strict `<` everywhere, so an equal LATER element never
-            // displaces an earlier one — first-max-wins across all ranks.
-            SlotKind::KBestVal { base, rank } => {
-                let b = Expr::B(base);
-                if rank == 0 {
-                    ewhere(elt(Expr::A(base), b.clone()), b, Expr::A(base))
-                } else {
-                    // Displaced at rank r: the new value is the old rank r−1
-                    // (shifted down) if the element sits above it, else the
-                    // element itself lands exactly here.
-                    ewhere(
-                        elt(Expr::A(base + rank), b.clone()),
-                        ewhere(
-                            elt(Expr::A(base + rank - 1), b.clone()),
-                            Expr::A(base + rank - 1),
-                            b,
-                        ),
-                        Expr::A(base + rank),
-                    )
-                }
-            }
-            SlotKind::KBestIdx { vbase, ibase, rank } => {
-                let bv = Expr::B(vbase);
-                let bi = Expr::B(ibase);
-                if rank == 0 {
-                    ewhere(elt(Expr::A(vbase), bv), bi, Expr::A(ibase))
-                } else {
-                    ewhere(
-                        elt(Expr::A(vbase + rank), bv.clone()),
-                        ewhere(
-                            elt(Expr::A(vbase + rank - 1), bv),
-                            Expr::A(ibase + rank - 1),
-                            bi,
-                        ),
-                        Expr::A(ibase + rank),
-                    )
-                }
-            }
             SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();
@@ -1681,8 +1445,6 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
             SlotKind::Plain(m) => m.identity(),
             SlotKind::ExpShifted { .. } => 0.0,
             SlotKind::ArgIdx { .. } => 0.0,
-            SlotKind::KBestVal { .. } => f64::NEG_INFINITY,
-            SlotKind::KBestIdx { .. } => 0.0,
             SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();

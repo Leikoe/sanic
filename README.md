@@ -19,10 +19,10 @@ Associativity is the whole game — it is simultaneously the streaming
 certificate (fold left-to-right, O(1) state) and the parallelism certificate
 (combine blocks in any order). That one fact, applied by structural recursion,
 is what lets the *same* code derive `sum`, `softmax`, FlashAttention,
-RMSNorm-fused GEMMs, argmax and top-k with no special case for any of them.
-Top-k is currently the one caveat: its carrier performs correct one-pass
-k-best insertion, but does not yet implement the two-list merge required to
-license tree or split-reduction execution.
+RMSNorm-fused GEMMs and argmax. Top-k is expressed by the frontend as repeated
+max/argmax plus one-hot masking; deriving its bounded ordered-selection carrier
+from that composition remains an open compiler problem rather than a special
+Top-k operation in the core IR.
 
 ## Why it's fast on the GPU
 

@@ -628,11 +628,7 @@ pub fn emit_fused_metal_sched_with(
 ) -> MetalKernel {
     use std::collections::HashSet;
     let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, epi);
-    if sched.is_scalar()
-        || !mergeable_out_of_order(carrier)
-        || carrier.project.len() != 1
-        || carrier.project_reads_leaves()
-    {
+    if sched.is_scalar() || !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return scalar();
     }
     let s_ext = stream.extent();

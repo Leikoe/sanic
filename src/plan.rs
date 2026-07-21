@@ -354,10 +354,9 @@ impl FoldSched {
 
 /// Can this carrier's partial states be merged out of stream order? Every
 /// `Monoid` is commutative and the ExpShifted rescale merge is symmetric,
-/// so both split freely. ArgIdx ties break by FIRST position and the k-best
-/// combine is a singleton insert, not a two-list merge — an interleaved
-/// lane/simdgroup partition would change their meaning, so they decline
-/// (the same rule `run_carrier_split` guards); AffineStep is sequential.
+/// so both split freely. ArgIdx ties break by FIRST position, so an
+/// interleaved lane/simdgroup partition would change its meaning;
+/// AffineStep is sequential.
 pub fn mergeable_out_of_order(carrier: &Carrier) -> bool {
     carrier
         .kinds
@@ -452,10 +451,7 @@ pub fn fold_sched(
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> FoldSched {
-    if !mergeable_out_of_order(carrier)
-        || carrier.project.len() != 1
-        || carrier.project_reads_leaves()
-    {
+    if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return FoldSched::scalar();
     }
     let ext = |ax: Axis| ax.extent() as f64;
@@ -614,10 +610,7 @@ fn fold_sched_candidates(
     carrier: &Carrier,
 ) -> Vec<FoldSched> {
     let mut cands = vec![FoldSched::scalar()];
-    if !mergeable_out_of_order(carrier)
-        || carrier.project.len() != 1
-        || carrier.project_reads_leaves()
-    {
+    if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return cands;
     }
     let ext = |ax: Axis| ax.extent() as f64;

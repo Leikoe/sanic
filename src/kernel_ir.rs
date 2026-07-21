@@ -200,21 +200,10 @@ pub enum BinOp {
     /// Index-carrying maximum: the reduce's VALUE is the position of the
     /// first maximum along the axis. Associative over `(max, idx)` pairs
     /// with first-max-wins tie-breaking — a tuple monoid, not a scalar one,
-    /// so it ships its own two-slot carrier (like `AffineCompose`). This is
-    /// what makes argmax / top-k selection ONE fold instead of a
-    /// max-then-indicator-sum pair (which also differs on ties).
+    /// so it ships its own two-slot carrier (like `AffineCompose`). This
+    /// makes argmax one fold instead of a max-then-indicator-sum pair (which
+    /// also differs on ties).
     ArgMax,
-    /// One projection of a k-best selection: the `rank`-th largest value
-    /// (`idx: false`) or its position (`idx: true`), first-max-wins on ties.
-    /// Semantically, sorted lists of length ≤ k form a tuple monoid under
-    /// merge-take-k. The current carrier implements only its singleton-insert
-    /// streaming path: each rank is one kernel over the raw scores, but
-    /// tree/split execution must decline until combine merges two full lists.
-    TopK {
-        k: u8,
-        rank: u8,
-        idx: bool,
-    },
     /// A non-associative step, e.g. `tanh(W·h + x)`. No legal fold exists; an
     /// axis governed by one of these is strictly serial.
     NonAssoc(&'static str),
@@ -1053,49 +1042,57 @@ pub fn argmax(x: NodeRef, axis: Axis) -> NodeRef {
     reduce(x, axis, BinOp::ArgMax)
 }
 
-/// Top-k along `axis`: k `(value, index)` pairs, largest first. Each projection
-/// is one [`BinOp::TopK`] streaming fold over the raw scores, with no
-/// mask-the-winner chain between ranks and first-max-wins ties across the
-/// whole selection. The current carrier inserts one item at a time and is not
-/// valid for tree/split execution until it implements the semantic
-/// merge-take-k operation over two full lists. A full sort stays out of the
-/// supported fragment on purpose: it is a data-movement network, not a fold,
-/// and nothing in an inference pipeline needs one.
+/// Top-k along `axis`, expressed entirely as ordinary graph composition.
+/// Each round selects the first maximum, then masks exactly that position
+/// before the next round. This is deliberately a frontend convenience rather
+/// than an IR operation: deriving the fixed-size selection carrier from this
+/// graph is compiler work, not part of Top-k's semantics.
 pub fn topk(x: NodeRef, axis: Axis, k: usize) -> Vec<(NodeRef, NodeRef)> {
-    let q = |rank: usize, idx: bool| {
-        reduce(
-            x.clone(),
-            axis,
-            BinOp::TopK {
-                k: k as u8,
-                rank: rank as u8,
-                idx,
-            },
-        )
-    };
-    (0..k).map(|r| (q(r, false), q(r, true))).collect()
+    assert!(k > 0, "topk requires k >= 1");
+    assert!(
+        k <= axis.extent(),
+        "topk requires k <= extent({axis}) = {}",
+        axis.extent()
+    );
+
+    let mut remaining = x;
+    let mut selected = Vec::with_capacity(k);
+    for _ in 0..k {
+        let value = reduce(remaining.clone(), axis, BinOp::Monoid(Monoid::Max));
+        let index = argmax(remaining.clone(), axis);
+        remaining = map(
+            MapOp::Where,
+            vec![
+                one_hot(axis, index.clone()),
+                konst(f64::NEG_INFINITY),
+                remaining,
+            ],
+        );
+        selected.push((value, index));
+    }
+    selected
 }
 
-/// ALL k ranks of the top-k selection as ONE tensor over a fresh rank axis
-/// `rk` — and, downstream, one KERNEL. Spelled as Σ_r onehot(rk = r)·rank_r:
-/// the per-rank reduces share one streamed source, so the deriver dedups
-/// their k-best lists into a single set of slots, and the rank one-hots
-/// never touch the streamed axis, so they evaluate at PROJECT time — each
-/// grid point of `rk` selects its slot from the shared list. Eight rank
-/// kernels per MoE layer become one.
-pub fn topk_all(x: NodeRef, axis: Axis, k: usize, rk: Axis, idx: bool) -> NodeRef {
+/// Assemble every selected rank into one tensor over `rank_axis`.
+pub fn topk_all(
+    x: NodeRef,
+    axis: Axis,
+    k: usize,
+    rank_axis: Axis,
+    return_indices: bool,
+) -> NodeRef {
+    assert_eq!(
+        rank_axis.extent(),
+        k,
+        "topk_all rank axis extent must equal k"
+    );
     let mut sum: Option<NodeRef> = None;
-    for r in 0..k {
-        let q = reduce(
-            x.clone(),
-            axis,
-            BinOp::TopK {
-                k: k as u8,
-                rank: r as u8,
-                idx,
-            },
+    for (r, (value, index)) in topk(x, axis, k).into_iter().enumerate() {
+        let selected = if return_indices { index } else { value };
+        let term = map(
+            MapOp::Where,
+            vec![one_hot(rank_axis, konst(r as f64)), selected, konst(0.0)],
         );
-        let term = map(MapOp::Mul, vec![one_hot(rk, konst(r as f64)), q]);
         sum = Some(match sum {
             None => term,
             Some(s) => map(MapOp::Add, vec![s, term]),

@@ -22,8 +22,7 @@ page is substrate we need so the moat is usable on real workloads.
 - **`derive`** — the core. Reconstructs online-softmax (rescale), deferred
   normalizers (defer-div), fused elementwise, multi-slot tuples, affine/SSM
   scans. Associative carrier families are checked with
-  `tree_fold == fold == reference`; k-best's current sequential-only insertion
-  carrier is checked against the reference separately.
+  `tree_fold == fold == reference`.
 - **`analyze` / `plan` / `cost` / `partition`** — classify axes, pick tiles by
   analytical roofline, split a whole graph at the derive frontier. A full
   transformer block + logits head lowers to 13 kernels with the attention core
@@ -303,20 +302,17 @@ loop, `run` returning the (ck, cv, logits) triple), and GPU (persistent
 MTLBuffers, buffer-swap commits, 7 kernels/step × 6 steps). The same
 mechanism runs optimizer state (see M8's SGD loop).
 
-### M7 — Irregular ops that aren't fold+elementwise · [done, sort declined]
-Decided per op, decomposition over new node kinds in every case:
+### M7 — Irregular frontend compositions · [partial, sort declined]
 - **argmax** — `BinOp::ArgMax`, an index-carrying maximum: a (max, idx)
   tuple monoid (first-max-wins ties), derived like any fold via a two-slot
   carrier — the running max plus an `ArgIdx` slot streaming `iota` — so
   argmax is **one kernel**. Replaced the original `Σ i·[x == max]`
   composition (two kernels, and unsound to fuse: it differs on ties).
-- **top-k** — `BinOp::TopK`: sorted (value, index) lists of length ≤ k form
-  a tuple monoid under merge-take-k, but the current carrier implements only
-  singleton insertion. EVERY rank's value or index is still one independent
-  sequential fold over the raw scores — no mask-the-winner chain,
-  first-max-wins across the whole selection, GPU-verified with planted exact
-  ties. Tree and split reductions decline until combine handles two full
-  lists (guarded).
+- **top-k** — a frontend composition of repeated max/argmax and one-hot
+  masking, with first-max-wins ties. The core has no Top-k operation or
+  K-best carrier. Deriving the bounded ordered-pair carrier from this graph is
+  an explicit completeness-ledger gap; until then the ordinary partitioned
+  composition is correct but uses multiple folds.
 - **scatter-add** — `ir::scatter_add`, a one-hot contraction: the inverse of
   gather with order-free collision handling — exactly gather's adjoint,
   which M8 leans on. Dense O(n·m) as a graph; atomics are a backend concern.
@@ -392,7 +388,7 @@ forced: leaves priced in ISSUE ops (`count_issue_ops` — loads, div/mod
 index chains, gather arithmetic, not one flop per element; underpricing
 recompute is what made one-thread-per-output look fine), and hardware
 constants grounded in this machine's own kernels. Order-sensitive carriers
-(first-max-wins `ArgIdx`, k-best's singleton insert, `AffineStep`) decline
+(first-max-wins `ArgIdx`, `AffineStep`) decline
 to scalar — the same rule `emit_split_metal` enforces, tested on planted
 ties. MLX's sdpa-vector and qmv shapes fall out as priced instances; so
 does the *non*-change (the 200k-row lm_head stays scalar — it was already
@@ -448,28 +444,25 @@ compressed-tensors checkpoint **stays packed on device end to end**:
 
 - **GQA is pure axis structure**: q as `[hk, qg, …]`, k/v as `[hk, …]` —
   the shared kv head is a shared axis variable, no repeat_kv tensor.
-- **MoE routing is the M7 composition**: sigmoid scores + expert-bias top-8
-  (each round a named schedule root), weights re-gathered from the raw
-  scores, normalized, `route_scale`d — and the expert weights are fetched by
+- **MoE routing uses the M7 frontend composition**: sigmoid scores +
+  expert-bias top-8, weights re-gathered from the raw scores, normalized,
+  `route_scale`d — and the expert weights are fetched by
   `gather` **over the expert axis of the packed int4 tensors**:
   data-dependent weight selection through a typed load, still one fused
   fold per projection.
 - QK-RMSNorm, sigmoid-gated attention, RoPE on sliding layers only (NoPE
   every 4th), μP embed scaling — all plain basis compositions.
-- **1,856 kernels per decode step** (attention ~27, top-8 routing 10/layer —
-  a score fold plus 8 INDEPENDENT k-best rank folds, no round chain — the
-  MoE itself ~10 — a router fold plus GROUPED gate/up/down folds over a
-  9-slot axis (8 routed + the shared expert as stacked index 128), one
-  vector-indexed gather selecting every expert's packed weights at once);
-  partition 10 s, chunked MSL compile <1 s; 4.7 GB resident;
-  **38 tok/s streaming at 26 ms/token** (4 tok/s before graph execution
-  and cooperative folds). QK-norms fold their flattened
+- The former **1,856 kernels per decode step / 38 tok/s** measurement used
+  the removed Top-k semantic shortcut and is historical. The compositional
+  tree must be remeasured after generic bounded-selection inference lands.
+  QK-norms fold their flattened
   head pair in one kernel, and rotate-half RoPE is a pure `Reindex`
   (src `j2 = 1 − j2`) — no fold at all.
 - **Same machine, same models — the measured ladder** (batch-1 KV decode,
   M1 Pro 16 GB):
 
-  Latencies are the current tree (the ladder climbed 2026-07-13; see
+  Latencies are historical measurements from before the 2026-07-20 Top-k
+  cleanup (the ladder climbed 2026-07-13; see
   `vs_mlx.md` for the per-rung autopsy). The "before" figures are the
   cooperative-fold baseline this arc started from.
 
@@ -539,11 +532,10 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   views/reindexes/gathers with the AXIS TRANSLATED at each boundary
   (below a flatten the entanglement lives on the members), placing retry
   cuts as deep as the algebra allows. The count ladder then continued on
-  theory, not tuning: `BinOp::ArgMax` and `BinOp::TopK` (pair monoid and
-  sequential k-best insertion, respectively —
-  the old `Σ i·[x == max]` spelling is tie-unsound to fuse, and the
-  mask-the-winner chain wasted a fold per rank) collapsed routing to a
-  score fold + 8 independent rank folds; sharing stopped being a fusion
+  theory, not tuning: `BinOp::ArgMax` replaced the old
+  `Σ i·[x == max]` spelling, which is tie-unsound to fuse. A later Top-k
+  shortcut reduced routing kernels but was removed on 2026-07-20 because it
+  encoded a frontend operation in the core; sharing stopped being a fusion
   barrier where recompute is cheap (a residual add per consumer is nothing
   next to a launch + round trip); transcendentals inline when their
   subtree is stream-INVARIANT (a norm's rsqrt hoists out of the loop — so
@@ -684,8 +676,14 @@ Trinity 1,968 → 1,590 kernels, 20.3 → **19.4 ms/step (~22 ms/token
 wall)**, numerics bit-identical (SEQUENCE MATCH holds). Narrowed on
 measurement: Mul-only, order-sensitive carriers only — the general form
 absorbed attention gates into projections, declined the cooperative
-schedule, and cost 8×. CLIMBED: f16
-attention weights (2026-07-13) — the five projections upload bf16→f16
+schedule, and cost 8×.
+REMOVED (2026-07-20): the one-fold Top-k result above depended on a
+`BinOp::TopK` semantic shortcut and K-best-specific carrier machinery in the
+core. Top-k is now a frontend composition of max/argmax, one-hot, and where;
+the completeness ledger names bounded ordered-selection carrier inference as
+an open compiler problem. The old kernel-count and latency figures remain as
+historical measurements, not claims about the current tree.
+CLIMBED: f16 attention weights (2026-07-13) — the five projections upload bf16→f16
 through the existing typed-load path, −413 MB, 23.3 → **20.3 ms/step
 (~21 ms/token)**, and the 0.010 near-tie flips the other way: Trinity now
 greedy-matches the HF reference token-for-token (SEQUENCE MATCH). CLIMBED (2026-07-13): MoE-down leaf placement —
