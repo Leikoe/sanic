@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::codegen::{Gen, Lang, buffers, carrier_expr, carrier_expr_map, offset, san, value};
 use crate::derive::Carrier;
-use crate::kernel_ir::{Axis, MapOp, Monoid, NodeRef as Node};
+use crate::ir::{self, AxisRef, MapOp, Monoid, NodeRef as Node};
 use crate::partition::{Schedule, Stage};
 
 // ── the Rust target ──────────────────────────────────────────────────────────
@@ -119,8 +119,8 @@ fn params_and_args(node: &Node) -> (String, Vec<&'static str>) {
 
 /// Nested `for` headers opening the CPU grid, and the matching closers.
 fn grid_loops(
-    grid: &[Axis],
-    coord: &mut HashMap<Axis, String>,
+    grid: &[AxisRef],
+    coord: &mut HashMap<AxisRef, String>,
     g: &mut Gen,
 ) -> (Vec<String>, Vec<String>) {
     let mut open = Vec::new();
@@ -138,7 +138,7 @@ fn grid_loops(
 fn emit_fused(
     fname: &str,
     carrier: &Carrier,
-    stream: Axis,
+    stream: AxisRef,
     fold_node: &Node,
 ) -> (String, Vec<&'static str>) {
     assert_eq!(
@@ -146,12 +146,13 @@ fn emit_fused(
         1,
         "rustgen fused kernel needs a scalar projection"
     );
-    let grid = fold_node.shape();
+    let grid = ir::axis_refs(fold_node);
     let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(fold_node);
 
     let mut g = Gen::new();
-    let mut coord: HashMap<Axis, String> = HashMap::new();
+    g.axis_aliases = carrier.aliases.clone();
+    let mut coord: HashMap<AxisRef, String> = HashMap::new();
     let (open, close) = grid_loops(&grid, &mut coord, &mut g);
 
     let mut src = vec![
@@ -213,7 +214,7 @@ fn emit_fused(
     for &i in &pitems {
         let leaf = &carrier.leaves[i];
         assert!(
-            !crate::kernel_ir::all_axes(leaf).contains(&stream),
+            !ir::all_axis_refs(leaf).contains(&stream),
             "a projection may only read stream-invariant leaves"
         );
         let e = value(&RUST, leaf, &coord, &mut g, &mut src);
@@ -238,12 +239,12 @@ fn emit_fused(
 /// A straight-line kernel (elementwise cone, gather, monoidal scan-as-reduce):
 /// grid over the output axes, write [`value`] of the spliced graph.
 fn emit_pointwise(fname: &str, exec: &Node) -> (String, Vec<&'static str>) {
-    let grid = exec.shape();
+    let grid = ir::axis_refs(exec);
     let grid_ext: usize = grid.iter().map(|a| a.extent()).product::<usize>().max(1);
     let (params, args) = params_and_args(exec);
 
     let mut g = Gen::new();
-    let mut coord: HashMap<Axis, String> = HashMap::new();
+    let mut coord: HashMap<AxisRef, String> = HashMap::new();
     let (open, close) = grid_loops(&grid, &mut coord, &mut g);
 
     let mut src = vec![
@@ -267,14 +268,14 @@ fn emit_pointwise(fname: &str, exec: &Node) -> (String, Vec<&'static str>) {
 /// list of graph inputs `run` expects.
 pub struct Program {
     pub source: String,
-    pub inputs: Vec<(&'static str, Vec<Axis>)>,
+    pub inputs: Vec<(&'static str, Vec<AxisRef>)>,
     /// Every schedule output, in schedule order: `run` returns the single
     /// output's buffer, or a tuple of them when there are several (a decode
     /// step's cache updates + logits).
-    pub outputs: Vec<(String, Vec<Axis>)>,
+    pub outputs: Vec<(String, Vec<AxisRef>)>,
     /// The last output's axes (the “final answer” of a single-output
     /// schedule).
-    pub output_axes: Vec<Axis>,
+    pub output_axes: Vec<AxisRef>,
 }
 
 /// Lower a whole schedule to Rust: one function per stage plus a `run` driver
@@ -284,9 +285,9 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
     let mut fns: Vec<String> = Vec::new();
     let mut driver: Vec<String> = Vec::new();
     let mut produced: Vec<&'static str> = Vec::new();
-    let mut inputs: Vec<(&'static str, Vec<Axis>)> = Vec::new();
+    let mut inputs: Vec<(&'static str, Vec<AxisRef>)> = Vec::new();
     let note_inputs =
-        |node: &Node, produced: &[&'static str], inputs: &mut Vec<(&'static str, Vec<Axis>)>| {
+        |node: &Node, produced: &[&'static str], inputs: &mut Vec<(&'static str, Vec<AxisRef>)>| {
             for (n, axes) in buffers(node) {
                 if !produced.contains(&n) && !inputs.iter().any(|(m, _)| *m == n) {
                     inputs.push((n, axes));
@@ -294,7 +295,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
             }
         };
 
-    let mut produced_axes: HashMap<String, Vec<Axis>> = HashMap::new();
+    let mut produced_axes: HashMap<String, Vec<AxisRef>> = HashMap::new();
     // every buffer is an owned `Vec<f64>`; call args are `&name[..]`, slicing a
     // `Vec` intermediate and a `&[f64]` run parameter uniformly.
     let arglist = |args: &[&'static str]| -> String {
@@ -337,12 +338,12 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
                 }
                 produced_axes.insert(
                     out.clone(),
-                    epilogue_node.as_ref().unwrap_or(fold_node).shape(),
+                    ir::axis_refs(epilogue_node.as_ref().unwrap_or(fold_node)),
                 );
             }
             Stage::Elementwise { output, exec, .. }
             | Stage::Gather { output, exec, .. }
-            | Stage::Sequential { output, exec, .. } => {
+            | Stage::Fallback { output, exec, .. } => {
                 note_inputs(exec, &produced, &mut inputs);
                 let fname = format!("k_{}", san(output));
                 let (code, args) = emit_pointwise(&fname, exec);
@@ -353,7 +354,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
                     arglist(&args)
                 ));
                 produced.push(leak(output));
-                produced_axes.insert(output.clone(), exec.shape());
+                produced_axes.insert(output.clone(), ir::axis_refs(exec));
             }
             Stage::Infeasible { output, .. } => {
                 panic!("rustgen: cannot emit an infeasible stage producing `{output}`")
@@ -361,7 +362,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
         }
     }
 
-    let outputs: Vec<(String, Vec<Axis>)> = sched
+    let outputs: Vec<(String, Vec<AxisRef>)> = sched
         .outputs
         .iter()
         .map(|n| {

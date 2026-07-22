@@ -45,9 +45,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::kernel_ir::{
-    Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node, gather, konst, map, reduce,
-    reindex, scan, view,
+use crate::ir::{
+    MapOp, Monoid, Node as NodeKind, NodeRef as Node, coordinate, gather, konst, map,
+    positional_reindex, positional_view, reduce, scan,
 };
 
 /// Simplify several roots TOGETHER, in two phases, each to a fixpoint. One
@@ -106,7 +106,20 @@ fn pass(
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {
             hashcons(node.clone(), cse)
         }
+        NodeKind::Coordinate { src, dim } => {
+            let source = pass(src, reconstruct, cse, memo, changed);
+            hashcons(
+                if Rc::ptr_eq(&source, src) {
+                    node.clone()
+                } else {
+                    coordinate(source, *dim)
+                },
+                cse,
+            )
+        }
         NodeKind::Map { op, inputs } => {
+            let output_shape = node.shape();
+            let output_axes = crate::ir::axis_refs(node);
             let ins: Vec<Node> = inputs
                 .iter()
                 .map(|i| pass(i, reconstruct, cse, memo, changed))
@@ -114,63 +127,76 @@ fn pass(
             let rebuilt = match map_rule(*op, &ins, reconstruct) {
                 Some(r) => {
                     *changed = true;
-                    r
+                    preserve_shape(r, &output_shape, &output_axes)
                 }
                 None if same(&ins, inputs) => node.clone(),
                 None => map(*op, ins),
             };
             hashcons(rebuilt, cse)
         }
-        NodeKind::Reduce { src, axis, op } => {
+        NodeKind::Reduce { src, dim, op } => {
+            let output_shape = node.shape();
+            let output_axes = crate::ir::axis_refs(node);
             let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = match reduce_rule(&s, *axis, *op) {
+            let rebuilt = match reduce_rule(&s, *dim, *op) {
                 Some(r) => {
                     *changed = true;
-                    r
+                    preserve_shape(r, &output_shape, &output_axes)
                 }
                 None if Rc::ptr_eq(&s, src) => node.clone(),
-                None => reduce(s, *axis, *op),
+                None => reduce(s, *dim, *op),
             };
             hashcons(rebuilt, cse)
         }
-        NodeKind::Scan { src, axis, op } => {
+        NodeKind::Scan { src, dim, op } => {
             let s = pass(src, reconstruct, cse, memo, changed);
             let rebuilt = if Rc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                scan(s, *axis, *op)
+                scan(s, *dim, *op)
             };
             hashcons(rebuilt, cse)
         }
-        NodeKind::Gather { src, index, axis } => {
+        NodeKind::Gather { src, index, dim } => {
             let s = pass(src, reconstruct, cse, memo, changed);
             let i = pass(index, reconstruct, cse, memo, changed);
             let rebuilt = if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
                 node.clone()
             } else {
-                gather(s, i, *axis)
+                gather(s, i, *dim)
             };
             hashcons(rebuilt, cse)
         }
-        NodeKind::View { src, groups } => {
+        NodeKind::View { src, dims } => {
             let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if Rc::ptr_eq(&s, src) {
+            let identity = dims.len() == s.shape().len()
+                && dims.iter().enumerate().all(|(output_dim, dim)| {
+                    dim.sources == [output_dim] && dim.axis == s.shape()[output_dim]
+                });
+            let rebuilt = if identity {
+                *changed = true;
+                s
+            } else if Rc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                view(s, groups.clone())
+                positional_view(s, dims.clone())
             };
             hashcons(rebuilt, cse)
         }
         NodeKind::Reindex {
             src,
+            shape,
             map: m,
             padded,
         } => {
             let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if Rc::ptr_eq(&s, src) {
+            let rebuilt = if let Some(unwrapped) = cancel_view_reindex(&s, shape, m, *padded) {
+                *changed = true;
+                unwrapped
+            } else if Rc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                reindex(s, m.clone(), *padded)
+                positional_reindex(s, shape.clone(), m.clone(), *padded)
             };
             hashcons(rebuilt, cse)
         }
@@ -182,10 +208,10 @@ fn pass(
 /// Return the canonical node for this shallow structure — two structurally
 /// identical nodes (identical op and identical, already-canonical children)
 /// collapse to one, which is what turns structural equality into a pointer
-/// test for the rewrites below. The key is [`crate::kernel_ir::shallow_key`],
-/// shared with the pipeline-entry [`crate::kernel_ir::canonicalize_many`].
+/// test for the rewrites below. The key is [`crate::ir::shallow_key`], shared
+/// with the pipeline-entry [`crate::ir::canonicalize_many`].
 fn hashcons(node: Node, cse: &mut HashMap<String, Node>) -> Node {
-    cse.entry(crate::kernel_ir::shallow_key(&node))
+    cse.entry(crate::ir::shallow_key(&node))
         .or_insert(node)
         .clone()
 }
@@ -197,9 +223,159 @@ fn same(a: &[Node], b: &[Node]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Rc::ptr_eq(x, y))
 }
 
+/// Cancel a reindex that merely removes singleton dimensions inserted by a
+/// storage view (and/or undoes a permutation of one-to-one view dimensions).
+/// This is the positional `squeeze(unsqueeze(x)) = x` identity. Keeping it
+/// structural is important: autodiff routinely creates the pair while
+/// restoring exact cotangent ranks, and an opaque pair prevents ordinary CSE
+/// and ring cancellation above it.
+fn cancel_view_reindex(
+    node: &Node,
+    output_shape: &[crate::ir::Axis],
+    reindex: &[crate::ir::AffineIndex],
+    padded: bool,
+) -> Option<Node> {
+    if padded {
+        return None;
+    }
+    let NodeKind::View { src, dims } = node.as_ref() else {
+        return None;
+    };
+    if reindex.len() != dims.len() || dims.iter().any(|dim| dim.sources.len() > 1) {
+        return None;
+    }
+
+    let mut output_sources = vec![None; output_shape.len()];
+    for (view_dim, terms, offset) in reindex {
+        if *offset != 0 {
+            return None;
+        }
+        match dims[*view_dim].sources.as_slice() {
+            [] if terms.is_empty() => {}
+            [source_dim] => {
+                let [(coefficient, output_dim)] = terms.as_slice() else {
+                    return None;
+                };
+                if *coefficient != 1
+                    || output_sources.get(*output_dim)?.is_some()
+                    || src.shape()[*source_dim].extent != output_shape[*output_dim].extent
+                {
+                    return None;
+                }
+                output_sources[*output_dim] = Some(*source_dim);
+            }
+            _ => return None,
+        }
+    }
+    let output_sources = output_sources.into_iter().collect::<Option<Vec<_>>>()?;
+    let view_dims = output_sources
+        .iter()
+        .zip(output_shape)
+        .map(|(&source_dim, &axis)| crate::ir::ViewDim {
+            sources: vec![source_dim],
+            axis,
+        })
+        .collect::<Vec<_>>();
+    let identity = view_dims.iter().enumerate().all(|(output_dim, dim)| {
+        dim.sources == [output_dim] && dim.axis == src.shape()[output_dim]
+    });
+    Some(if identity {
+        src.clone()
+    } else {
+        positional_view(src.clone(), view_dims)
+    })
+}
+
+fn preserve_shape(
+    mut node: Node,
+    target: &[crate::ir::Axis],
+    target_axes: &[crate::ir::AxisRef],
+) -> Node {
+    let mut source = node.shape();
+    if source == target {
+        return node;
+    }
+    while source.len() > target.len() {
+        let source_axes = crate::ir::axis_refs(&node);
+        let dim = source
+            .iter()
+            .enumerate()
+            .position(|(dim, axis)| {
+                axis.extent == crate::ir::Extent::Static(1)
+                    && !target_axes.contains(&source_axes[dim])
+            })
+            .or_else(|| {
+                source
+                    .iter()
+                    .position(|axis| axis.extent == crate::ir::Extent::Static(1))
+            })
+            .expect("shape-changing simplification left a non-singleton dimension");
+        node = reduce(node, dim, Monoid::Add);
+        source.remove(dim);
+    }
+    assert!(
+        source.len() <= target.len(),
+        "simplification cannot increase a replacement's rank"
+    );
+    let source_axes = crate::ir::axis_refs(&node);
+    if source.len() == target.len() {
+        let permutation = target_axes
+            .iter()
+            .map(|target_axis| source_axes.iter().position(|axis| axis == target_axis))
+            .collect::<Option<Vec<_>>>();
+        if let Some(permutation) = permutation {
+            return positional_view(
+                node,
+                permutation
+                    .into_iter()
+                    .zip(target.iter().copied())
+                    .map(|(source_dim, axis)| crate::ir::ViewDim {
+                        sources: vec![source_dim],
+                        axis,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    let mut used = vec![false; target.len()];
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, source_axis)| {
+            let exact = target_axes
+                .iter()
+                .enumerate()
+                .find(|(dim, axis)| !used[*dim] && **axis == source_axes[source_dim])
+                .map(|(dim, _)| dim);
+            let trailing = target.len() - source.len() + source_dim;
+            let positional = (!used[trailing] && target[trailing].extent == source_axis.extent)
+                .then_some(trailing);
+            let same_extent = target
+                .iter()
+                .enumerate()
+                .find(|(dim, axis)| !used[*dim] && axis.extent == source_axis.extent)
+                .map(|(dim, _)| dim);
+            let terms = if source_axis.extent == crate::ir::Extent::Static(1) {
+                Vec::new()
+            } else {
+                let target_dim = exact
+                    .or(positional)
+                    .or(same_extent)
+                    .expect("shape-preserving rewrite lost a non-singleton dimension");
+                used[target_dim] = true;
+                vec![(1, target_dim)]
+            };
+            (source_dim, terms, 0)
+        })
+        .collect();
+    positional_reindex(node, target.to_vec(), map, false)
+}
+
 fn cst(n: &Node) -> Option<f64> {
     match n.as_ref() {
         NodeKind::Const { v } => Some(*v),
+        NodeKind::View { src, .. } => cst(src),
+        NodeKind::Reindex { src, padded, .. } => cst(src).filter(|value| !padded || *value == 0.0),
         _ => None,
     }
 }
@@ -211,11 +387,79 @@ fn as_map(n: &Node, want: MapOp) -> Option<&[Node]> {
     }
 }
 
+/// Pull a pointwise map through a common storage view. This gives alignment
+/// one canonical location, so independently constructed `unsqueeze` shells
+/// do not hide otherwise identical elementwise expressions from CSE.
+fn factor_common_view(op: MapOp, inputs: &[Node]) -> Option<Node> {
+    let (first_src, first_dims) = match inputs.first()?.as_ref() {
+        NodeKind::View { src, dims } => (src, dims),
+        _ => return None,
+    };
+    let mut sources = vec![first_src.clone()];
+    for input in &inputs[1..] {
+        let NodeKind::View { src, dims } = input.as_ref() else {
+            return None;
+        };
+        let same_dims = dims.len() == first_dims.len()
+            && dims
+                .iter()
+                .zip(first_dims)
+                .all(|(left, right)| left.sources == right.sources && left.axis == right.axis);
+        if !same_dims {
+            return None;
+        }
+        sources.push(src.clone());
+    }
+    let inner = map(op, sources);
+    // The view's source positions describe the common inner output too.
+    (inner.shape().len() == first_src.shape().len())
+        .then(|| positional_view(inner, first_dims.clone()))
+}
+
+/// Recognize a division either directly or under one shared positional
+/// alignment transform, distributing that transform to the numerator and
+/// denominator. This is algebra over generic pointwise structure, not a
+/// logsumexp pattern.
+fn division_parts(node: &Node) -> Option<(Node, Node)> {
+    if let Some(inputs) = as_map(node, MapOp::Div) {
+        return Some((inputs[0].clone(), inputs[1].clone()));
+    }
+    match node.as_ref() {
+        NodeKind::View { src, dims } => {
+            let inputs = as_map(src, MapOp::Div)?;
+            (inputs.iter().all(|input| input.shape() == src.shape())).then(|| {
+                (
+                    positional_view(inputs[0].clone(), dims.clone()),
+                    positional_view(inputs[1].clone(), dims.clone()),
+                )
+            })
+        }
+        NodeKind::Reindex {
+            src,
+            shape,
+            map: reindex,
+            padded: false,
+        } => {
+            let inputs = as_map(src, MapOp::Div)?;
+            (inputs.iter().all(|input| input.shape() == src.shape())).then(|| {
+                (
+                    positional_reindex(inputs[0].clone(), shape.clone(), reindex.clone(), false),
+                    positional_reindex(inputs[1].clone(), shape.clone(), reindex.clone(), false),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 /// One rewrite of an elementwise op over canonical operands, or `None`. With
 /// `reconstruct`, the log-sum-exp regrouping rewrites are also enabled (phase
 /// 2 — see [`simplify`]).
 fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
     let eq = |a: &Node, b: &Node| Rc::ptr_eq(a, b);
+    if let Some(factored) = factor_common_view(op, ins) {
+        return Some(factored);
+    }
     match op {
         MapOp::Add => {
             let (a, b) = (&ins[0], &ins[1]);
@@ -283,14 +527,14 @@ fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
                 return Some(a.clone());
             }
             // (p / q) · q → p, either order
-            if let Some(d) = as_map(a, MapOp::Div) {
-                if eq(&d[1], b) {
-                    return Some(d[0].clone());
+            if let Some((numerator, denominator)) = division_parts(a) {
+                if eq(&denominator, b) {
+                    return Some(numerator);
                 }
             }
-            if let Some(d) = as_map(b, MapOp::Div) {
-                if eq(&d[1], a) {
-                    return Some(d[0].clone());
+            if let Some((numerator, denominator)) = division_parts(b) {
+                if eq(&denominator, a) {
+                    return Some(numerator);
                 }
             }
             // (p / q) · exp(c) → p · exp(c − log q): fold the division into the
@@ -298,26 +542,30 @@ fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
             // becomes `g·exp(z − (m + log s))` = `g·exp(z − lse)`, which reuses
             // the forward logsumexp instead of recomputing the (max, Σexp) fold.
             if reconstruct {
-                let fold_into_exp = |d: &[Node], e: &[Node]| {
+                let fold_into_exp = |numerator: Node, denominator: Node, e: &[Node]| {
                     map(
                         MapOp::Mul,
                         vec![
-                            d[0].clone(),
+                            numerator,
                             map(
                                 MapOp::Exp,
                                 vec![map(
                                     MapOp::Sub,
-                                    vec![e[0].clone(), map(MapOp::Log, vec![d[1].clone()])],
+                                    vec![e[0].clone(), map(MapOp::Log, vec![denominator])],
                                 )],
                             ),
                         ],
                     )
                 };
-                if let (Some(d), Some(e)) = (as_map(a, MapOp::Div), as_map(b, MapOp::Exp)) {
-                    return Some(fold_into_exp(d, e));
+                if let (Some((numerator, denominator)), Some(e)) =
+                    (division_parts(a), as_map(b, MapOp::Exp))
+                {
+                    return Some(fold_into_exp(numerator, denominator, e));
                 }
-                if let (Some(e), Some(d)) = (as_map(a, MapOp::Exp), as_map(b, MapOp::Div)) {
-                    return Some(fold_into_exp(d, e));
+                if let (Some(e), Some((numerator, denominator))) =
+                    (as_map(a, MapOp::Exp), division_parts(b))
+                {
+                    return Some(fold_into_exp(numerator, denominator, e));
                 }
             }
             match (cst(a), cst(b)) {
@@ -350,8 +598,8 @@ fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
 /// One rewrite of a reduction over a canonical source, or `None`. Only the
 /// `Add`-reduce distributes (it is the additive semiring); the invariant it
 /// pulls out is data that does not carry the reduced axis.
-fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
-    if op != BinOp::Monoid(Monoid::Add) {
+fn reduce_rule(s: &Node, dim: usize, op: Monoid) -> Option<Node> {
+    if op != Monoid::Add {
         return None;
     }
     if cst(s) == Some(0.0) {
@@ -365,7 +613,7 @@ fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
     // matcher contracts for (see `other_axis_folds`).
     if as_map(s, MapOp::Mul).is_some() {
         let (mut inv, mut var) = (Vec::new(), Vec::new());
-        split_product(s, axis, &mut inv, &mut var);
+        split_product(s, Some(dim), &mut inv, &mut var);
         if !inv.is_empty() && !var.is_empty() {
             let product = |factors: Vec<Node>| {
                 factors
@@ -373,15 +621,17 @@ fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
                     .reduce(|a, b| map(MapOp::Mul, vec![a, b]))
                     .unwrap()
             };
+            let variant = product(var);
+            let variant_dim = variant.shape().len() - (s.shape().len() - dim);
             return Some(map(
                 MapOp::Mul,
-                vec![product(inv), reduce(product(var), axis, op)],
+                vec![product(inv), reduce(variant, variant_dim, op)],
             ));
         }
     }
     // Σ(−x) → −Σx
     if let Some(n) = as_map(s, MapOp::Neg) {
-        return Some(map(MapOp::Neg, vec![reduce(n[0].clone(), axis, op)]));
+        return Some(map(MapOp::Neg, vec![reduce(n[0].clone(), dim, op)]));
     }
     None
 }
@@ -389,13 +639,228 @@ fn reduce_rule(s: &Node, axis: Axis, op: BinOp) -> Option<Node> {
 /// Split a binary `Mul` tree into its atomic factors, sorted by whether they
 /// carry `axis` (variant) or not (invariant). In-order traversal, so the
 /// rebuilt products keep the source's operand order.
-fn split_product(n: &Node, axis: Axis, inv: &mut Vec<Node>, var: &mut Vec<Node>) {
+fn split_product(n: &Node, dim: Option<usize>, inv: &mut Vec<Node>, var: &mut Vec<Node>) {
+    // Alignment views commute with an elementwise product. Looking through
+    // them keeps association/operand order irrelevant to factor hoisting
+    // without teaching the scheduler about frontend alignment artifacts.
+    if let NodeKind::View { src, dims } = n.as_ref()
+        && let Some(inputs) = as_map(src, MapOp::Mul)
+        && let Some(output_dim) = dim
+        && let [source_dim] = dims[output_dim].sources.as_slice()
+    {
+        let source_shape = src.shape();
+        for input in inputs {
+            let input_shape = input.shape();
+            let lead = source_shape.len() - input_shape.len();
+            let input_dim = source_dim.checked_sub(lead);
+            let varies = input_dim.is_some_and(|dim| depends_on_dimension(input, dim));
+            if !varies {
+                push_invariant(input.clone(), input_dim, inv);
+                continue;
+            }
+
+            let aligned = if input_shape == source_shape {
+                input.clone()
+            } else {
+                let map = input_shape
+                    .iter()
+                    .enumerate()
+                    .map(|(input_dim, axis)| {
+                        let output_dim = lead + input_dim;
+                        let terms = if axis.extent == crate::ir::Extent::Static(1)
+                            && source_shape[output_dim].extent != crate::ir::Extent::Static(1)
+                        {
+                            Vec::new()
+                        } else {
+                            vec![(1, output_dim)]
+                        };
+                        (input_dim, terms, 0)
+                    })
+                    .collect();
+                positional_reindex(input.clone(), source_shape.clone(), map, false)
+            };
+            let viewed = positional_view(aligned, dims.clone());
+            split_product(&viewed, dim, inv, var);
+        }
+        return;
+    }
+
     if let Some(m) = as_map(n, MapOp::Mul) {
-        split_product(&m[0], axis, inv, var);
-        split_product(&m[1], axis, inv, var);
-    } else if n.shape().contains(&axis) {
+        for input in m {
+            let input_dim = dim.and_then(|output_dim| {
+                output_dim.checked_sub(n.shape().len().saturating_sub(input.shape().len()))
+            });
+            if input_dim.is_some_and(|dim| depends_on_dimension(input, dim)) {
+                split_product(input, input_dim, inv, var);
+            } else {
+                push_invariant(input.clone(), input_dim, inv);
+            }
+        }
+    } else if dim.is_some() {
         var.push(n.clone());
     } else {
-        inv.push(n.clone());
+        // A scalar expanded through singleton-only structural views is still
+        // the scalar. Keeping the shell here would give the hoisted factor a
+        // fake rank and force a separate broadcast kernel.
+        let mut factor = n.clone();
+        loop {
+            let source = match factor.as_ref() {
+                NodeKind::View { src, .. } | NodeKind::Reindex { src, .. }
+                    if src.shape().is_empty()
+                        && factor
+                            .shape()
+                            .iter()
+                            .all(|axis| axis.extent == crate::ir::Extent::Static(1)) =>
+                {
+                    src.clone()
+                }
+                _ => break,
+            };
+            factor = source;
+        }
+        inv.push(factor);
     }
+}
+
+/// Whether changing one output coordinate can change this node's value.
+/// This follows positional dataflow, including affine reindexes whose output
+/// shape may contain dimensions that no source coordinate actually uses.
+fn depends_on_dimension(node: &Node, dim: usize) -> bool {
+    let shape = node.shape();
+    if shape[dim].extent == crate::ir::Extent::Static(1) {
+        return false;
+    }
+    match node.as_ref() {
+        NodeKind::Input { .. } | NodeKind::Iota { .. } => true,
+        NodeKind::Const { .. } => false,
+        NodeKind::Coordinate {
+            dim: coordinate_dim,
+            ..
+        } => dim == *coordinate_dim,
+        NodeKind::Map { inputs, .. } => inputs.iter().any(|input| {
+            dim.checked_sub(shape.len() - input.shape().len())
+                .is_some_and(|input_dim| depends_on_dimension(input, input_dim))
+        }),
+        NodeKind::Reduce {
+            src,
+            dim: reduced_dim,
+            ..
+        } => {
+            let source_dim = dim + usize::from(dim >= *reduced_dim);
+            depends_on_dimension(src, source_dim)
+        }
+        NodeKind::Scan {
+            src, dim: scan_dim, ..
+        } => dim == *scan_dim || depends_on_dimension(src, dim),
+        NodeKind::Gather {
+            src,
+            index,
+            dim: gather_dim,
+        } => {
+            let index_rank = index.shape().len();
+            if dim < *gather_dim {
+                depends_on_dimension(src, dim)
+            } else if dim < *gather_dim + index_rank {
+                true
+            } else {
+                depends_on_dimension(src, dim - index_rank + 1)
+            }
+        }
+        NodeKind::View { src, dims } => dims[dim]
+            .sources
+            .iter()
+            .any(|&source_dim| depends_on_dimension(src, source_dim)),
+        NodeKind::Reindex {
+            src, map, padded, ..
+        } => map.iter().any(|(source_dim, terms, _)| {
+            let coordinate_depends = terms
+                .iter()
+                .any(|(coefficient, output_dim)| *coefficient != 0 && *output_dim == dim);
+            coordinate_depends && (*padded || depends_on_dimension(src, *source_dim))
+        }),
+    }
+}
+
+fn push_invariant(mut node: Node, dim: Option<usize>, inv: &mut Vec<Node>) {
+    if let Some(dim) = dim {
+        node = drop_dimension(node, dim);
+    }
+    // A scalar expanded through singleton-only structural views is still the
+    // scalar. Keeping the shell here would give the hoisted factor a fake
+    // rank and force a separate broadcast kernel.
+    loop {
+        let source = match node.as_ref() {
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. }
+                if src.shape().is_empty()
+                    && node
+                        .shape()
+                        .iter()
+                        .all(|axis| axis.extent == crate::ir::Extent::Static(1)) =>
+            {
+                src.clone()
+            }
+            _ => break,
+        };
+        node = source;
+    }
+    inv.push(node);
+}
+
+/// Select coordinate zero along a dimension already proven invariant. When
+/// the dimension is unused by an affine reindex (the common broadcast case),
+/// remove it directly so a following view/reindex identity can cancel.
+fn drop_dimension(node: Node, dim: usize) -> Node {
+    if let NodeKind::View { src, dims } = node.as_ref()
+        && dims[dim].sources.is_empty()
+    {
+        let mut output = dims.clone();
+        output.remove(dim);
+        return positional_view(src.clone(), output);
+    }
+    if let NodeKind::Reindex {
+        src,
+        shape,
+        map,
+        padded,
+    } = node.as_ref()
+        && map
+            .iter()
+            .all(|(_, terms, _)| terms.iter().all(|(_, output_dim)| *output_dim != dim))
+    {
+        let mut output = shape.clone();
+        output.remove(dim);
+        let map = map
+            .iter()
+            .map(|(source_dim, terms, offset)| {
+                (
+                    *source_dim,
+                    terms
+                        .iter()
+                        .map(|(coefficient, output_dim)| {
+                            (*coefficient, output_dim - usize::from(*output_dim > dim))
+                        })
+                        .collect(),
+                    *offset,
+                )
+            })
+            .collect();
+        return positional_reindex(src.clone(), output, map, *padded);
+    }
+
+    let source = node.shape();
+    let mut output = source.clone();
+    output.remove(dim);
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            let terms = if source_dim == dim {
+                Vec::new()
+            } else {
+                vec![(1, source_dim - usize::from(source_dim > dim))]
+            };
+            (source_dim, terms, 0)
+        })
+        .collect();
+    positional_reindex(node, output, map, false)
 }

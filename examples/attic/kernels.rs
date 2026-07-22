@@ -80,12 +80,12 @@ fn main() {
     let o1 = reduce(
         map(MapOp::Mul, vec![w4.clone(), input("V1", &[k4], Dtype::F32)]),
         k4,
-        BinOp::Monoid(Monoid::Add),
+        Monoid::Add,
     );
     let o2 = reduce(
         map(MapOp::Mul, vec![w4, input("V2", &[k4], Dtype::F32)]),
         k4,
-        BinOp::Monoid(Monoid::Add),
+        Monoid::Add,
     );
     let total = map(MapOp::Add, vec![o1, o2]);
     let mv = derive(&total, k4).unwrap();

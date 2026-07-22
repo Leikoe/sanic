@@ -17,9 +17,9 @@ use std::rc::Rc;
 use safetensors::SafeTensors;
 use sanic::nn::functional::scaled_dot_product_attention;
 use sanic::{
-    Axis, BinOp, Compile, Dtype, MapOp, Monoid, Node, NodeRef, ViewDim, axis, coordinate, flatten,
-    gather, input, iota, konst, map, matmul, positional_reindex, positional_view, reduce, silu,
-    split, transpose,
+    Axis, Compile, Dtype, MapOp, Monoid, Node, NodeRef, ViewDim, axis, coordinate, flatten, gather,
+    input, iota, konst, map, matmul, positional_reindex, positional_view, reduce, silu, split,
+    transpose,
 };
 use tokenizers::Tokenizer;
 
@@ -153,7 +153,7 @@ fn flip(src: NodeRef, dim: usize) -> NodeRef {
 fn rms_norm(x: NodeRef, weight: NodeRef, hidden_dim: usize) -> NodeRef {
     let square = mul(x.clone(), x.clone());
     let mean_square = mul(
-        reduce(square, -1isize, BinOp::Monoid(Monoid::Add)),
+        reduce(square, -1isize, Monoid::Add),
         konst(1.0 / hidden_dim as f64),
     );
     let denominator = unary(
@@ -460,7 +460,7 @@ fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
             Node::Input { name, shape, dtype } => {
                 let shape = shape.iter().copied().map(Axis::extent).collect();
                 let declaration = (shape, *dtype);
-                if let Some(previous) = specs.insert(name.clone(), declaration.clone()) {
+                if let Some(previous) = specs.insert(name.to_string(), declaration.clone()) {
                     assert_eq!(previous, declaration, "incompatible input `{name}`");
                 }
             }

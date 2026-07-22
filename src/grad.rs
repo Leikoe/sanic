@@ -33,9 +33,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::kernel_ir::{
-    Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node, iota, konst, map, reduce,
-    reindex, scatter_add, view,
+use crate::ir::{
+    self, Axis, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ViewDim, konst, map,
+    positional_reindex, positional_view, reduce, scan, split,
 };
 
 /// d(loss)/d(each named input), as graphs. `loss` must be a scalar (no free
@@ -66,41 +66,37 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
         let Some(g) = adj.get(&Rc::as_ptr(node)).cloned() else {
             continue; // the loss does not depend on this node
         };
+        // A map can consume a broadcastable cotangent directly. Keeping the
+        // singleton form produced by a reduction avoids manufacturing an
+        // affine expansion that hides ordinary algebra from simplification.
+        // Structural rules need exact coordinates, so all other nodes still
+        // receive an exact-shape cotangent.
+        let g = if matches!(node.as_ref(), NodeKind::Map { .. }) {
+            g
+        } else {
+            broadcast_to(g, &node.shape())
+        };
         match node.as_ref() {
-            NodeKind::Input { name, axes, .. } => {
+            NodeKind::Input { name, shape, .. } => {
                 if !wrt.contains(name) {
                     continue;
                 }
-                let contrib = reduce_to(g, axes);
+                let contrib = reduce_to(g, shape);
                 match by_name.get_mut(name) {
                     None => {
-                        by_name.insert(name, (axes.clone(), contrib));
+                        by_name.insert(name, (shape.clone(), contrib));
                     }
                     Some((canon, acc)) => {
-                        // relabel this declaration's axes onto the canonical
-                        // ones, positionally — the same rebinding the
-                        // interpreter applies to aliased reads.
                         assert_eq!(
                             canon.len(),
-                            axes.len(),
+                            shape.len(),
                             "grad: input `{name}` declared with different ranks"
                         );
-                        let relabeled = if canon == axes {
-                            contrib
-                        } else {
-                            let groups: Vec<(Vec<Axis>, Axis)> = axes
-                                .iter()
-                                .zip(canon.iter())
-                                .filter(|(a, c)| a != c)
-                                .map(|(a, c)| (vec![*a], *c))
-                                .collect();
-                            view(contrib, groups)
-                        };
-                        *acc = map(MapOp::Add, vec![acc.clone(), relabeled]);
+                        *acc = map(MapOp::Add, vec![acc.clone(), contrib]);
                     }
                 }
             }
-            NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+            NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
 
             NodeKind::Map { op, inputs } => {
                 for (contrib, child) in map_backward(*op, inputs, &g) {
@@ -109,107 +105,83 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
                 }
             }
 
-            NodeKind::Reduce { src, axis, op } => {
-                let mut contrib = match op {
-                    BinOp::Monoid(Monoid::Add) => g.clone(), // broadcast back along `axis`
-                    BinOp::Monoid(Monoid::Max) | BinOp::Monoid(Monoid::Min) => {
+            NodeKind::Reduce { src, dim, op } => {
+                let expanded_g = ir::unsqueeze(g.clone(), *dim);
+                let expanded_result = ir::unsqueeze(node.clone(), *dim);
+                let contrib = match op {
+                    Monoid::Add => expanded_g,
+                    Monoid::Max | Monoid::Min => {
                         // winner mask: 1 where src equals the reduced result
-                        let hit = winner_mask(src, node);
-                        map(MapOp::Mul, vec![g.clone(), hit])
+                        let hit = winner_mask(src, &expanded_result);
+                        map(MapOp::Mul, vec![expanded_g, hit])
                     }
-                    BinOp::Monoid(Monoid::LogSumExp) => {
+                    Monoid::LogSumExp => {
                         // ∂LSE/∂src = exp(src − LSE) — the softmax Jacobian row
                         let sm = map(
                             MapOp::Exp,
-                            vec![map(MapOp::Sub, vec![src.clone(), node.clone()])],
+                            vec![map(MapOp::Sub, vec![src.clone(), expanded_result])],
                         );
-                        map(MapOp::Mul, vec![g.clone(), sm])
+                        map(MapOp::Mul, vec![expanded_g, sm])
                     }
-                    BinOp::Monoid(Monoid::Mul) => panic!(
+                    Monoid::Mul => panic!(
                         "grad: Reduce(Mul) has no gradient here — result/src is \
                          undefined at zeros; rewrite the product or extend the rule"
                     ),
-                    other => panic!("grad: reduce with {other:?} is not differentiable"),
                 };
-                // Reducing an axis the source does not carry folds `n` copies
-                // of the same value: forward = n·src for Add (and shifts LSE
-                // by ln n), so the additive contributions scale by n. Max/Min
-                // of identical copies stay the identity.
-                if !src.shape().contains(axis)
-                    && matches!(
-                        op,
-                        BinOp::Monoid(Monoid::Add) | BinOp::Monoid(Monoid::LogSumExp)
-                    )
-                {
-                    contrib = map(MapOp::Mul, vec![contrib, konst(axis.extent() as f64)]);
-                }
                 add_adj(&mut adj, src, contrib);
             }
 
-            NodeKind::Gather { src, index, axis } => {
-                // adjoint of an indexed read: an add-combined indexed write
-                let idx_axes = index.shape();
-                assert_eq!(
-                    idx_axes.len(),
-                    1,
-                    "grad: gather backward needs a single-axis index (flatten first)"
-                );
-                let scattered = scatter_add(g.clone(), index.clone(), idx_axes[0], *axis);
+            NodeKind::Gather { src, index, dim } => {
+                let scattered = scatter_add(g.clone(), index.clone(), *dim, &src.shape());
                 add_adj(&mut adj, src, scattered);
                 // integer indices carry no gradient
             }
 
-            NodeKind::View { src, groups } => {
-                // the inverse reindexing of the cotangent
-                let mut inv = g.clone();
-                for (members, to) in groups {
-                    inv = match members.len() {
-                        1 => view(inv, vec![(vec![*to], members[0])]), // rename back
-                        2 => {
-                            // flatten ⟵ split (row-major: first member most
-                            // significant, inner extent = the second member's)
-                            crate::kernel_ir::split(inv, *to, members[0], members[1])
-                        }
-                        n => panic!("grad: view backward for {n}-member groups not implemented"),
-                    };
-                }
-                add_adj(&mut adj, src, inv);
+            NodeKind::View { src, dims } => {
+                add_adj(&mut adj, src, invert_view(g, &src.shape(), dims));
             }
 
             NodeKind::Reindex { src, map: rmap, .. } => {
-                let mut inv = g.clone();
-                for (m, terms, off) in rmap {
-                    inv = transpose_axis_map(inv, *m, terms, *off);
-                }
-                add_adj(&mut adj, src, inv);
+                add_adj(
+                    &mut adj,
+                    src,
+                    transpose_reindex(g, &src.shape(), &node.shape(), rmap),
+                );
             }
 
             // A prefix SUM's adjoint is the reversed prefix sum of the
             // cotangent: y_j = Σ_{i≤j} x_i ⇒ ∂L/∂x_i = Σ_{j≥i} g_j —
             // reverse, cumsum, reverse, all existing IR (reversal is a
-            // self-referential Reindex). Max/Min scans (winner masks per
-            // prefix) and the affine scan's adjoint recurrence stay
-            // declined, stated in todo.md.
+            // self-referential Reindex). Other monoid scans need per-prefix
+            // contribution masks and stay declined, stated in todo.md.
             NodeKind::Scan {
                 src,
-                axis,
-                op: BinOp::Monoid(Monoid::Add),
+                dim,
+                op: Monoid::Add,
             } => {
-                let rev = |x: Node| {
-                    let flip = (axis.extent() - 1) as i64;
-                    crate::kernel_ir::reindex(x, vec![(*axis, vec![(-1, *axis)], flip)], false)
+                let reverse = |x: Node| {
+                    let shape = x.shape();
+                    let flip = (shape[*dim].extent() - 1) as i64;
+                    let reindex = shape
+                        .iter()
+                        .enumerate()
+                        .map(|(source_dim, _)| {
+                            if source_dim == *dim {
+                                (source_dim, vec![(-1, source_dim)], flip)
+                            } else {
+                                (source_dim, vec![(1, source_dim)], 0)
+                            }
+                        })
+                        .collect();
+                    positional_reindex(x, shape, reindex, false)
                 };
-                let contrib = rev(crate::kernel_ir::scan(
-                    rev(g.clone()),
-                    *axis,
-                    BinOp::Monoid(Monoid::Add),
-                ));
+                let contrib = reverse(scan(reverse(g.clone()), *dim, Monoid::Add));
                 add_adj(&mut adj, src, contrib);
             }
             NodeKind::Scan { op, .. } => panic!(
                 "grad: {op:?} scan backward is not implemented (Add-scan has \
-                 the reversed-cumsum rule; Max/Min need per-prefix winner \
-                 masks and the affine scan an adjoint recurrence — see todo.md)"
+                 the reversed-cumsum rule; other monoids need per-prefix \
+                 contribution masks — see todo.md)"
             ),
         }
     }
@@ -217,72 +189,152 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
     by_name.into_iter().map(|(n, (_, g))| (n, g)).collect()
 }
 
-/// The transpose of one affine axis map: the cotangent `g` (over the map's
-/// term axes) pushed back to the source axis `m`.
-fn transpose_axis_map(g: Node, m: Axis, terms: &[(i64, Axis)], off: i64) -> Node {
-    match terms {
-        // constant index: the whole cotangent lands on position `off`
-        [] => map(
-            MapOp::Mul,
-            vec![g, crate::kernel_ir::one_hot(m, konst(off as f64))],
-        ),
-        // slice / pad: a = m − off, out-of-range contributes nothing
-        [(1, a)] => reindex(g, vec![(*a, vec![(1, m)], -off)], true),
-        // split: the exact inverse is a flatten view (row-major, checked)
-        [(c1, a1), (1, a2)] if off == 0 && a2.extent() as i64 == *c1 => {
-            view(g, vec![(vec![*a1, *a2], m)])
+fn equal(left: Node, right: Node) -> Node {
+    let left_lt_right = map(MapOp::Lt, vec![left.clone(), right.clone()]);
+    let right_lt_left = map(MapOp::Lt, vec![right, left]);
+    map(
+        MapOp::Mul,
+        vec![
+            map(MapOp::Sub, vec![konst(1.0), left_lt_right]),
+            map(MapOp::Sub, vec![konst(1.0), right_lt_left]),
+        ],
+    )
+}
+
+fn lift_to_shape(src: Node, shape: Vec<Axis>, output_dims: &[usize]) -> Node {
+    assert_eq!(src.shape().len(), output_dims.len());
+    let map = output_dims
+        .iter()
+        .enumerate()
+        .map(|(source_dim, &output_dim)| (source_dim, vec![(1, output_dim)], 0))
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
+/// The gather adjoint as a generic one-hot contraction. The temporary
+/// iteration space is `[source-prefix, index, gathered-axis, source-suffix]`;
+/// summing its index dimensions leaves exactly the source shape.
+fn scatter_add(g: Node, index: Node, dim: usize, source_shape: &[Axis]) -> Node {
+    let index_rank = index.shape().len();
+    let mut iteration = g.shape();
+    iteration.insert(dim + index_rank, source_shape[dim]);
+
+    let g_dims = (0..g.shape().len())
+        .map(|source_dim| {
+            if source_dim < dim + index_rank {
+                source_dim
+            } else {
+                source_dim + 1
+            }
+        })
+        .collect::<Vec<_>>();
+    let lifted_g = lift_to_shape(g, iteration.clone(), &g_dims);
+    let index_dims = (dim..dim + index_rank).collect::<Vec<_>>();
+    let lifted_index = lift_to_shape(index, iteration, &index_dims);
+    let target = ir::coordinate(lifted_g.clone(), dim + index_rank);
+    let mut out = map(MapOp::Mul, vec![lifted_g, equal(target, lifted_index)]);
+    for index_dim in (dim..dim + index_rank).rev() {
+        out = reduce(out, index_dim, Monoid::Add);
+    }
+    out
+}
+
+/// Invert a storage-preserving positional view. Singleton insertions reduce
+/// away, flattened groups split back into their members, and the final view
+/// restores the source dimension order.
+fn invert_view(mut g: Node, source_shape: &[Axis], dims: &[ViewDim]) -> Node {
+    let mut labels = Vec::<usize>::new();
+    let mut current_dim = 0usize;
+    for dim in dims {
+        match dim.sources.as_slice() {
+            [] => {
+                g = ir::squeeze(g, current_dim);
+            }
+            [source_dim] => {
+                labels.push(*source_dim);
+                current_dim += 1;
+            }
+            members => {
+                for member_index in 0..members.len() - 1 {
+                    let outer = source_shape[members[member_index]];
+                    let rest = &members[member_index + 1..];
+                    let inner = if rest.len() == 1 {
+                        source_shape[rest[0]]
+                    } else {
+                        Axis::new(
+                            "view_grad_tail",
+                            Extent::Static(
+                                rest.iter()
+                                    .map(|&source_dim| source_shape[source_dim].extent())
+                                    .product(),
+                            ),
+                        )
+                    };
+                    g = split(g, current_dim + member_index, outer, inner);
+                }
+                labels.extend_from_slice(members);
+                current_dim += members.len();
+            }
         }
-        // stride-1 window: overlap-add — read the cotangent at the mirrored
-        // offset (a1 = m − d·a2 − off) and sum over the window axis
-        [(1, a1), (d, a2)] => reduce(
-            reindex(g, vec![(*a1, vec![(1, m), (-d, *a2)], -off)], true),
-            *a2,
-            BinOp::Monoid(Monoid::Add),
-        ),
-        // dilation-1 window with stride: mirrored, summing the other axis
-        [(st, a1), (1, a2)] if off == 0 => reduce(
-            reindex(g, vec![(*a2, vec![(1, m), (-st, *a1)], -off)], true),
-            *a1,
-            BinOp::Monoid(Monoid::Add),
-        ),
-        // strided AND dilated (or offset) window: the inverse needs a
-        // modular division, which no affine reindex expresses — so scatter
-        // DENSELY through a one-hot contraction instead, exactly like
-        // `scatter_add` (gather's adjoint):
-        //   grad[m] = Σ_{a1,a2} g[a1,a2] · [m = c1·a1 + c2·a2 + off]
-        // O(|g|·|m|) as a graph; the partitioner folds it like any
-        // contraction, and out-of-range forward positions match no m, so a
-        // padded read's dropped cotangent falls out for free.
-        [(c1, a1), (c2, a2)] => {
-            let target = map(
+    }
+
+    let reordered = source_shape
+        .iter()
+        .enumerate()
+        .map(|(source_dim, &axis)| ViewDim {
+            sources: vec![
+                labels
+                    .iter()
+                    .position(|&label| label == source_dim)
+                    .expect("view inverse lost a source dimension"),
+            ],
+            axis,
+        })
+        .collect();
+    positional_view(g, reordered)
+}
+
+/// Generic transpose of an affine reindex. It contracts the cotangent over
+/// every output coordinate against equality masks for all source dimensions.
+/// This is intentionally dense but correct for slices, pads, windows, splits,
+/// and arbitrary affine maps; later fusion can recover an efficient kernel.
+fn transpose_reindex(
+    g: Node,
+    source_shape: &[Axis],
+    output_shape: &[Axis],
+    reindex: &[(usize, Vec<(i64, usize)>, i64)],
+) -> Node {
+    let output_rank = output_shape.len();
+    let mut iteration = output_shape.to_vec();
+    iteration.extend_from_slice(source_shape);
+    let g_dims = (0..output_rank).collect::<Vec<_>>();
+    let lifted = lift_to_shape(g, iteration, &g_dims);
+    let mut out = lifted.clone();
+
+    for (source_dim, terms, offset) in reindex {
+        let mut target = konst(*offset as f64);
+        for (coefficient, output_dim) in terms {
+            target = map(
                 MapOp::Add,
                 vec![
+                    target,
                     map(
-                        MapOp::Add,
+                        MapOp::Mul,
                         vec![
-                            map(MapOp::Mul, vec![konst(*c1 as f64), iota(*a1)]),
-                            map(MapOp::Mul, vec![konst(*c2 as f64), iota(*a2)]),
+                            konst(*coefficient as f64),
+                            ir::coordinate(lifted.clone(), *output_dim),
                         ],
                     ),
-                    konst(off as f64),
                 ],
             );
-            let sel = crate::kernel_ir::one_hot(m, target);
-            reduce(
-                reduce(
-                    map(MapOp::Mul, vec![g, sel]),
-                    *a2,
-                    BinOp::Monoid(Monoid::Add),
-                ),
-                *a1,
-                BinOp::Monoid(Monoid::Add),
-            )
         }
-        _ => panic!(
-            "grad: no transpose for reindex terms {terms:?} (more than two \
-             driving axes; decompose the index map first)"
-        ),
+        let source_coordinate = ir::coordinate(lifted.clone(), output_rank + *source_dim);
+        out = map(MapOp::Mul, vec![out, equal(source_coordinate, target)]);
     }
+    for dim in (0..output_rank).rev() {
+        out = reduce(out, dim, Monoid::Add);
+    }
+    out
 }
 
 /// `1` where `src` equals the reduced `result` (its running max/min), else
@@ -447,16 +499,97 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
     }
 }
 
-/// Sum a cotangent down to `target` axes — the broadcast-backward. Axes the
-/// contribution carries that the operand does not are reduced away with Add.
+fn broadcast_to(n: Node, target: &[Axis]) -> Node {
+    let source = n.shape();
+    assert!(source.len() <= target.len(), "broadcast rank cannot shrink");
+    if source == target {
+        return n;
+    }
+
+    let leading = target.len() - source.len();
+    if leading == 0
+        && source
+            .iter()
+            .zip(target)
+            .all(|(from, to)| from.extent == to.extent)
+    {
+        let dims = target
+            .iter()
+            .enumerate()
+            .map(|(dim, &axis)| ViewDim {
+                sources: vec![dim],
+                axis,
+            })
+            .collect();
+        return positional_view(n, dims);
+    }
+
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, from)| {
+            let output_dim = leading + source_dim;
+            let to = target[output_dim];
+            let terms = if from.extent == to.extent {
+                vec![(1, output_dim)]
+            } else {
+                assert_eq!(
+                    from.extent,
+                    Extent::Static(1),
+                    "cannot broadcast extent {:?} to {:?}",
+                    from.extent,
+                    to.extent
+                );
+                Vec::new()
+            };
+            (source_dim, terms, 0)
+        })
+        .collect();
+    positional_reindex(n, target.to_vec(), map, false)
+}
+
+/// Sum a cotangent down to a trailing-broadcast operand shape, then restore
+/// reduced singleton dimensions in their original positions.
 fn reduce_to(n: Node, target: &[Axis]) -> Node {
-    let mut out = n;
-    for a in out.shape() {
-        if !target.contains(&a) {
-            out = reduce(out, a, BinOp::Monoid(Monoid::Add));
+    let source = n.shape();
+    assert!(source.len() >= target.len(), "gradient rank cannot grow");
+    let leading = source.len() - target.len();
+    let mut reduced = (0..leading).collect::<Vec<_>>();
+    for (target_dim, target_axis) in target.iter().enumerate() {
+        let source_dim = leading + target_dim;
+        if target_axis.extent == Extent::Static(1) && source[source_dim].extent != Extent::Static(1)
+        {
+            reduced.push(source_dim);
         }
     }
-    out
+
+    let mut out = n;
+    for &dim in reduced.iter().rev() {
+        out = reduce(out, dim, Monoid::Add);
+    }
+    let survivors = (0..source.len())
+        .filter(|dim| !reduced.contains(dim))
+        .collect::<Vec<_>>();
+    let dims = target
+        .iter()
+        .enumerate()
+        .map(|(target_dim, &axis)| {
+            let original = leading + target_dim;
+            let survivor = survivors.iter().position(|&dim| dim == original);
+            ViewDim {
+                sources: survivor.into_iter().collect(),
+                // A surviving singleton cannot be relabeled as a larger
+                // dimension by a storage-preserving view. Keep it singleton
+                // here; the explicit reindex below performs the broadcast.
+                axis: survivor
+                    .filter(|_| source[original].extent != axis.extent)
+                    .map(|_| source[original])
+                    .unwrap_or(axis),
+            }
+        })
+        .collect();
+    out = positional_view(out, dims);
+    broadcast_to(out, target)
 }
 
 fn add_adj(adj: &mut HashMap<*const NodeKind, Node>, child: &Node, contrib: Node) {
@@ -481,6 +614,7 @@ fn postorder(node: &Node, seen: &mut Vec<*const NodeKind>, out: &mut Vec<Node>) 
     seen.push(ptr);
     match node.as_ref() {
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+        NodeKind::Coordinate { src, .. } => postorder(src, seen, out),
         NodeKind::Map { inputs, .. } => {
             for i in inputs {
                 postorder(i, seen, out);

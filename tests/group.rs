@@ -13,7 +13,8 @@
 
 use sanic::derive::derive;
 use sanic::interp::{Env, Value, eval, run_carrier_split};
-use sanic::kernel_ir::*;
+use sanic::ir::*;
+use sanic::nn::scaled_dot_product_attention;
 
 struct Lcg(u64);
 impl Lcg {
@@ -27,7 +28,10 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_fn(axes, |_| rng.f())
+    Value::from_shape_fn(
+        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
+        |_| rng.f(),
+    )
 }
 
 /// The one tolerance policy (`verify::rel_tolerance`) at this file's chain
@@ -57,20 +61,25 @@ fn split_flash_equals_eval_for_any_block_count() {
     .into_iter()
     .collect();
 
-    let attn = attention(
+    let key = input("K", &[k, d], Dtype::F32);
+    let stream = axis_refs(&key)[0];
+    let attn = scaled_dot_product_attention(
         input("Q", &[s, d], Dtype::F32),
-        input("K", &[k, d], Dtype::F32),
+        key,
         input("V", &[k, e], Dtype::F32),
-        d,
-        k,
+        None,
+        0.0,
+        false,
+        Some(1.0),
+        false,
     );
     let reference = eval(&attn, &env);
-    let carrier = derive(&attn, k).unwrap();
+    let carrier = derive(&attn, stream).unwrap();
 
     // 1 = the plain kernel; 2/3/7 leave uneven remainders; 9 = one element
     // per chunk, so stage 2's merge does ALL the softmax coupling work.
     for blocks in [1usize, 2, 3, 7, 9] {
-        let got = run_carrier_split(&attn, k, &carrier, blocks, &env);
+        let got = run_carrier_split(&attn, stream, &carrier, blocks, &env);
         assert_close(&got, &reference);
     }
 }
@@ -89,18 +98,23 @@ fn split_causal_flash_handles_identity_partials() {
     .into_iter()
     .collect();
 
-    let scores = matmul(
+    let key = input("K", &[t, dk], Dtype::F32);
+    let stream = axis_refs(&key)[0];
+    let attn = scaled_dot_product_attention(
         input("Q", &[s, dk], Dtype::F32),
-        input("K", &[t, dk], Dtype::F32),
-        dk,
+        key,
+        input("V", &[t, dv], Dtype::F32),
+        None,
+        0.0,
+        true,
+        Some(1.0),
+        false,
     );
-    let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
-    let attn = matmul(softmax(masked, t), input("V", &[t, dv], Dtype::F32), t);
 
     let reference = eval(&attn, &env);
-    let carrier = derive(&attn, t).unwrap();
+    let carrier = derive(&attn, stream).unwrap();
     for blocks in [2usize, 3, 6] {
-        let got = run_carrier_split(&attn, t, &carrier, blocks, &env);
+        let got = run_carrier_split(&attn, stream, &carrier, blocks, &env);
         assert_close(&got, &reference);
     }
 }

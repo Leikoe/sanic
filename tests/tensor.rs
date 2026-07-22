@@ -1,10 +1,9 @@
 use sanic::{
-    BinOp, Compile, CompileError, CpuDevice, Dtype, MapOp, Monoid, RunError, axis, input, map,
-    reduce,
+    Compile, CompileError, CpuDevice, Dtype, MapOp, Monoid, RunError, axis, input, map, reduce,
 };
 
-fn add() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add() -> Monoid {
+    Monoid::Add
 }
 
 #[test]
@@ -90,9 +89,8 @@ fn only_inputs_reachable_from_the_selected_roots_are_compiled() {
 }
 
 /// Two separately built, structurally identical public subtrees become ONE
-/// node. This must happen BEFORE lowering (which mints fresh scoped axes per
-/// node, making copies unmergeable) — it is what lets a RoPE frequency table
-/// built once per layer compile once for the whole model.
+/// node before compiler analysis. This lets a RoPE frequency table built once
+/// per layer compile once for the whole model.
 #[test]
 fn structural_duplicates_canonicalize_to_one_node() {
     let d = axis("d", 8);

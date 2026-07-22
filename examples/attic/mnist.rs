@@ -74,22 +74,22 @@ fn mlp(b: Axis, din: Axis, hid: Axis, cls: Axis) -> Node {
 /// label enters as a computed one-hot (`iota == y`), so no gather, and no
 /// gradient flows to the targets.
 fn cross_entropy(logits: Node, b: Axis, c: Axis, batch: usize) -> Node {
-    let m = reduce(logits.clone(), c, BinOp::Monoid(Monoid::Max)); // [b]
+    let m = reduce(logits.clone(), c, Monoid::Max); // [b]
     let shifted = map(MapOp::Exp, vec![map(MapOp::Sub, vec![logits.clone(), m.clone()])]);
     let lse = map(
         MapOp::Add,
-        vec![m, map(MapOp::Log, vec![reduce(shifted, c, BinOp::Monoid(Monoid::Add))])],
+        vec![m, map(MapOp::Log, vec![reduce(shifted, c, Monoid::Add)])],
     ); // [b]
     let picked = reduce(
         map(MapOp::Mul, vec![logits, one_hot(c, input("y", &[b], Dtype::F32))]),
         c,
-        BinOp::Monoid(Monoid::Add),
+        Monoid::Add,
     ); // [b] — the logit of the correct class
     let per_example = map(MapOp::Sub, vec![lse, picked]);
     map(
         MapOp::Mul,
         vec![
-            reduce(per_example, b, BinOp::Monoid(Monoid::Add)),
+            reduce(per_example, b, Monoid::Add),
             konst(1.0 / batch as f64),
         ],
     )

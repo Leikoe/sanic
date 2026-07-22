@@ -8,11 +8,11 @@
 use sanic::ir::*;
 use sanic::{analyze_all, derive};
 
-fn add() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add() -> Monoid {
+    Monoid::Add
 }
-fn max() -> BinOp {
-    BinOp::Monoid(Monoid::Max)
+fn max() -> Monoid {
+    Monoid::Max
 }
 fn show(title: &str, node: &Node, ax: Axis) {
     println!("── {title} (fold over `{ax}`) ──");
@@ -28,7 +28,10 @@ fn main() {
     let x = input("X", &[a], Dtype::F32);
     let mean = map(
         MapOp::Div,
-        vec![reduce(x.clone(), a, add()), reduce(konst(1.0), a, add())],
+        vec![
+            reduce(x.clone(), a, add()),
+            reduce(ones_like(x), a, add()),
+        ],
     );
     show("mean", &mean, a);
 
@@ -58,8 +61,4 @@ fn main() {
     print!("{}", analyze_all(&attn).render());
     println!();
 
-    // the time axis of a tanh-RNN: a non-associative recurrence → refused.
-    let (t, h) = (axis("t"), axis("h"));
-    let rnn = tanh_rnn(input("H", &[t, h], Dtype::F32), t);
-    show("tanh-RNN time axis", &rnn, t);
 }

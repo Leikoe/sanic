@@ -9,8 +9,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::kernel_ir::{
-    Axis, Dtype, Node as NodeKind, NodeRef as Node, input_axes, input_dtypes, leaf_names,
+use crate::ir::{
+    self, AxisRef, AxisSelector, Dtype, Node as NodeKind, NodeRef as Node, input_axes,
+    input_dtypes, leaf_names,
 };
 
 /// Elements streamed per step along the folded axis.
@@ -23,7 +24,7 @@ const TILE_N: usize = 64;
 #[derive(Debug, Clone)]
 pub struct KernelSpec {
     /// The axis this kernel folds over.
-    pub streaming_axis: Axis,
+    pub streaming_axis: AxisRef,
     pub carrier: Carrier,
     pub input_names: Vec<&'static str>,
     pub output_name: String,
@@ -34,68 +35,83 @@ pub struct KernelSpec {
 /// axis. `None` if nothing fits the device.
 pub fn plan_axis(
     node: &Node,
-    streaming_axis: Axis,
+    streaming_axis: impl AxisSelector,
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> Option<KernelSpec> {
+    let streaming_axis = streaming_axis
+        .resolve_axis(node, "plan_axis")
+        .expect("planning axis is absent from the selected node");
     let b_bytes = dev.dtype_bytes;
     let tn = TILE_N as f64;
 
     // ── axis roles, read off the carrier and the IR ──────────────────────────
-    let out_axes = node.shape();
-    let out_set: HashSet<Axis> = out_axes.iter().copied().collect();
+    let out_axes = ir::axis_refs(node);
+    let out_set: HashSet<AxisRef> = out_axes.iter().copied().collect();
 
     // Each slot spans some free axes per output point. Axes shared by every
     // slot are row/batch/col-tile candidates; axes on only some slots are
     // per-slot columns (attention: m, ℓ span {sq}; o spans {sq, e} → shared
     // sq, column e).
-    let span_union: HashSet<Axis> = carrier
+    let span_union: Vec<AxisRef> = carrier
         .spans
         .iter()
-        .flat_map(|s| s.iter().copied())
-        .collect();
-    let span_intersection: HashSet<Axis> = {
-        let mut inter: HashSet<Axis> = span_union.clone();
+        .flat_map(|span| span.iter().copied())
+        .fold(Vec::new(), |mut axes, axis| {
+            if !axes.contains(&axis) {
+                axes.push(axis);
+            }
+            axes
+        });
+    let span_intersection: HashSet<AxisRef> = {
+        let mut inter: HashSet<AxisRef> = span_union.iter().copied().collect();
         for s in &carrier.spans {
-            let s_set: HashSet<Axis> = s.iter().copied().collect();
+            let s_set: HashSet<AxisRef> = s.iter().copied().collect();
             inter.retain(|ax| s_set.contains(ax));
         }
         inter
     };
-    let col_axes: Vec<Axis> = {
-        let mut v: Vec<Axis> = span_union
-            .iter()
-            .filter(|ax| !span_intersection.contains(ax))
-            .copied()
-            .collect();
-        v.sort();
-        v
-    };
-    let span_schedulable: Vec<Axis> = {
+    let col_axes: Vec<AxisRef> = span_union
+        .iter()
+        .filter(|ax| !span_intersection.contains(ax))
+        .copied()
+        .collect();
+    let span_schedulable: Vec<AxisRef> = {
         // A deferred divisor is intentionally kept whole: tiling an axis
         // absent from its normalizer slot would recompute that normalization
         // once per tile (the giant-vocabulary RMSNorm head). Let partitioning
         // cut the divisor instead. Other partial-span slots, including the
         // structural slot introduced by a flattened attention projection,
         // are cheap and legal to duplicate across tiles.
-        let source = if carrier.rules.contains(&"defer-div") {
-            &span_intersection
+        if carrier.rules.contains(&"defer-div") {
+            span_union
+                .iter()
+                .filter(|axis| span_intersection.contains(axis))
+                .copied()
+                .collect()
         } else {
-            &span_union
-        };
-        let mut v: Vec<Axis> = source.iter().copied().collect();
-        v.sort();
-        v
+            span_union.clone()
+        }
     };
 
     // ── classify inputs ──────────────────────────────────────────────────────
     // Dedup by name: a DAG can reach the same tensor along several paths
     // (softmax forks its scores), but it is physically one tensor. Consts and
     // iotas never appear here — they cost nothing to read.
-    let inputs: Vec<(&'static str, Vec<Axis>)> = {
+    let inputs: Vec<(&'static str, Vec<AxisRef>)> = {
         let mut seen = HashSet::new();
         input_axes(node)
             .into_iter()
+            .map(|(name, axes)| {
+                let mut canonical = Vec::new();
+                for axis in axes {
+                    let axis = carrier.aliases.get(&axis).copied().unwrap_or(axis);
+                    if !canonical.contains(&axis) {
+                        canonical.push(axis);
+                    }
+                }
+                (name, canonical)
+            })
             .filter(|(n, _)| seen.insert(*n))
             .collect()
     };
@@ -134,7 +150,7 @@ pub fn plan_axis(
     // enumerate everything and let the roofline rank. Iteration order breaks
     // cost ties toward simple structures: large row axes first, no col tile
     // first, most batching first.
-    let ext = |ax: Axis| ax.extent() as f64;
+    let ext = |ax: AxisRef| ax.extent() as f64;
     let pows = |limit: f64| {
         let mut v = Vec::new();
         let mut t = 1.0f64;
@@ -151,14 +167,15 @@ pub fn plan_axis(
     // models already price that duplication. Requiring the intersection here
     // made otherwise ordinary projections impossible when one invariant slot
     // accompanied their accumulator.
-    let mut by_extent: Vec<Axis> = span_schedulable.clone();
+    let mut by_extent: Vec<AxisRef> = span_schedulable.clone();
     by_extent.sort_by(|&a, &b| ext(b).total_cmp(&ext(a)));
 
     let mut best_cost: Option<f64> = None;
 
-    let row_options: Vec<Option<Axis>> = by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
+    let row_options: Vec<Option<AxisRef>> =
+        by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
     for &row in &row_options {
-        let col_options: Vec<Option<Axis>> = [None]
+        let col_options: Vec<Option<AxisRef>> = [None]
             .into_iter()
             .chain(
                 by_extent
@@ -168,14 +185,14 @@ pub fn plan_axis(
             )
             .collect();
         for &col in &col_options {
-            let rest: Vec<Axis> = span_schedulable
+            let rest: Vec<AxisRef> = span_schedulable
                 .iter()
                 .copied()
                 .filter(|&a| Some(a) != row && Some(a) != col)
                 .collect();
             // descending bit patterns: all-batch first
             for bits in (0..(1u32 << rest.len().min(8))).rev() {
-                let batch: Vec<Axis> = rest
+                let batch: Vec<AxisRef> = rest
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| bits >> i & 1 == 1)
@@ -188,7 +205,7 @@ pub fn plan_axis(
                 // tile sizes: the streamed axis contributes a TILE_N slab, the
                 // row/col axes their tiles, batch axes nothing, and resident
                 // axes their full extent.
-                let per_block = |axes: &[Axis], tm: f64, tc: f64| -> f64 {
+                let per_block = |axes: &[AxisRef], tm: f64, tc: f64| -> f64 {
                     axes.iter()
                         .map(|&ax| {
                             if ax == streaming_axis {
@@ -315,7 +332,7 @@ pub struct FoldSched {
     /// output point — the generic form of "the attention score does not
     /// depend on the value head dim", read off `Carrier::spans`, and the
     /// license for lane-splitting in-body contractions.
-    pub lane_axis: Option<Axis>,
+    pub lane_axis: Option<AxisRef>,
     /// Split the streamed axis across this many simdgroups per threadgroup
     /// (1 = no split); partial carriers merge in threadgroup memory.
     pub sgs: usize,
@@ -353,15 +370,15 @@ impl FoldSched {
 }
 
 /// Can this carrier's partial states be merged out of stream order? Every
-/// `Monoid` is commutative and the ExpShifted rescale merge is symmetric,
-/// so both split freely. ArgIdx ties break by FIRST position, so an
-/// interleaved lane/simdgroup partition would change its meaning;
-/// AffineStep is sequential.
+/// `Monoid` is commutative; ExpShifted rescaling and extremal-key payload
+/// selection are symmetric, so all three split freely.
 pub fn mergeable_out_of_order(carrier: &Carrier) -> bool {
-    carrier
-        .kinds
-        .iter()
-        .all(|k| matches!(k, SlotKind::Plain(_) | SlotKind::ExpShifted { .. }))
+    carrier.kinds.iter().all(|k| {
+        matches!(
+            k,
+            SlotKind::Plain(_) | SlotKind::ExpShifted { .. } | SlotKind::AtExtremum { .. }
+        )
+    })
 }
 
 /// Operation count of a carrier expression (for pricing slot updates).
@@ -375,9 +392,12 @@ fn expr_ops(e: &Expr) -> f64 {
         | Expr::Max(a, b)
         | Expr::Min(a, b)
         | Expr::Lt(a, b) => 1.0 + expr_ops(a) + expr_ops(b),
-        Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
-            1.0 + expr_ops(a)
-        }
+        Expr::Exp(a)
+        | Expr::Log(a)
+        | Expr::Sqrt(a)
+        | Expr::Tanh(a)
+        | Expr::Sin(a)
+        | Expr::Cos(a) => 1.0 + expr_ops(a),
         Expr::Where(c, a, b) => 1.0 + expr_ops(c) + expr_ops(a) + expr_ops(b),
     }
 }
@@ -392,8 +412,8 @@ fn count_issue_ops(node: &Node) -> f64 {
     let vol = |n: &Node| -> f64 { n.shape().iter().map(|ax| ax.extent() as f64).product() };
     match node.as_ref() {
         NodeKind::Const { .. } => 0.0,
-        NodeKind::Iota { .. } => vol(node),
-        NodeKind::Input { axes, .. } => (1.0 + axes.len() as f64) * vol(node),
+        NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => vol(node),
+        NodeKind::Input { shape, .. } => (1.0 + shape.len() as f64) * vol(node),
         NodeKind::Map { inputs, .. } => inputs.iter().map(count_issue_ops).sum::<f64>() + vol(node),
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
             count_issue_ops(src) + vol(src)
@@ -401,12 +421,12 @@ fn count_issue_ops(node: &Node) -> f64 {
         NodeKind::Gather { src, index, .. } => {
             count_issue_ops(src) + count_issue_ops(index) + 2.0 * vol(node)
         }
-        NodeKind::View { src, groups } => {
-            let split_ops: f64 = groups
+        NodeKind::View { src, dims } => {
+            let split_ops: f64 = dims
                 .iter()
-                .map(|(m, _)| {
-                    if m.len() > 1 {
-                        2.0 * m.len() as f64
+                .map(|dim| {
+                    if dim.sources.len() > 1 {
+                        2.0 * dim.sources.len() as f64
                     } else {
                         0.0
                     }
@@ -414,7 +434,9 @@ fn count_issue_ops(node: &Node) -> f64 {
                 .sum();
             count_issue_ops(src) + split_ops * vol(node)
         }
-        NodeKind::Reindex { src, map, padded } => {
+        NodeKind::Reindex {
+            src, map, padded, ..
+        } => {
             let per = map.len() as f64 * 2.0 + if *padded { 2.0 } else { 0.0 };
             count_issue_ops(src) + per * vol(node)
         }
@@ -426,13 +448,18 @@ fn count_issue_ops(node: &Node) -> f64 {
 /// instead of being issued redundantly by each.
 fn has_simd_reduce(node: &Node) -> bool {
     match node.as_ref() {
-        NodeKind::Reduce { src, axis, .. } => axis.extent() % SIMD == 0 || has_simd_reduce(src),
+        NodeKind::Reduce { src, dim, .. } => {
+            ir::source_axis(src, *dim).extent() % SIMD == 0 || has_simd_reduce(src)
+        }
         NodeKind::Map { inputs, .. } => inputs.iter().any(has_simd_reduce),
         NodeKind::Gather { src, index, .. } => has_simd_reduce(src) || has_simd_reduce(index),
         NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } | NodeKind::Scan { src, .. } => {
             has_simd_reduce(src)
         }
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
+        NodeKind::Input { .. }
+        | NodeKind::Const { .. }
+        | NodeKind::Iota { .. }
+        | NodeKind::Coordinate { .. } => false,
     }
 }
 
@@ -447,16 +474,16 @@ fn has_simd_reduce(node: &Node) -> bool {
 /// machine (a 200k-row head) keeps today's kernel.
 pub fn fold_sched(
     fold_node: &Node,
-    streaming_axis: Axis,
+    streaming_axis: AxisRef,
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> FoldSched {
     if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return FoldSched::scalar();
     }
-    let ext = |ax: Axis| ax.extent() as f64;
+    let ext = |ax: AxisRef| ax.extent() as f64;
     let s_ext = ext(streaming_axis);
-    let out_axes = fold_node.shape();
+    let out_axes = ir::axis_refs(fold_node);
     let out_vol: f64 = out_axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
     let b_bytes = 4.0f64; // the Metal backend computes in f32
 
@@ -481,11 +508,11 @@ pub fn fold_sched(
         + out_vol * b_bytes;
 
     // Per-leaf stats: issue cost of one evaluation, and which axes it reads.
-    let leaf_stats: Vec<(f64, Vec<Axis>, bool)> = carrier
+    let leaf_stats: Vec<(f64, Vec<AxisRef>, bool)> = carrier
         .leaves
         .iter()
         .map(|l| {
-            let axes = l.shape();
+            let axes = ir::axis_refs(l);
             let vol: f64 = axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
             let per_eval = count_issue_ops(l) / vol;
             (per_eval, axes, has_simd_reduce(l))
@@ -606,16 +633,16 @@ pub fn fold_sched(
 /// carriers get only the scalar entry, exactly as the chooser treats them.
 fn fold_sched_candidates(
     fold_node: &Node,
-    streaming_axis: Axis,
+    streaming_axis: AxisRef,
     carrier: &Carrier,
 ) -> Vec<FoldSched> {
     let mut cands = vec![FoldSched::scalar()];
     if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return cands;
     }
-    let ext = |ax: Axis| ax.extent() as f64;
+    let ext = |ax: AxisRef| ax.extent() as f64;
     let s_ext = ext(streaming_axis) as usize;
-    let out_axes = fold_node.shape();
+    let out_axes = ir::axis_refs(fold_node);
     let packed = input_dtypes(fold_node)
         .iter()
         .any(|(_, d)| matches!(d, Dtype::I4));
@@ -656,10 +683,11 @@ fn fold_sched_candidates(
 /// True when the IR reduces an axis that is neither streamed nor in the output
 /// — an inner contraction (the `d` of a matvec), whose intermediate must sit
 /// in SRAM.
-fn has_contraction(node: &Node, streaming: Axis, out_set: &HashSet<Axis>) -> bool {
+fn has_contraction(node: &Node, streaming: AxisRef, out_set: &HashSet<AxisRef>) -> bool {
     match node.as_ref() {
-        NodeKind::Reduce { axis, src, .. } => {
-            (*axis != streaming && !out_set.contains(axis))
+        NodeKind::Reduce { src, dim, .. } => {
+            let axis = ir::source_axis(src, *dim);
+            (axis != streaming && !out_set.contains(&axis))
                 || has_contraction(src, streaming, out_set)
         }
         NodeKind::Map { inputs, .. } => inputs
@@ -672,7 +700,10 @@ fn has_contraction(node: &Node, streaming: Axis, out_set: &HashSet<Axis>) -> boo
         NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
             has_contraction(src, streaming, out_set)
         }
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
+        NodeKind::Input { .. }
+        | NodeKind::Const { .. }
+        | NodeKind::Iota { .. }
+        | NodeKind::Coordinate { .. } => false,
     }
 }
 
@@ -689,22 +720,25 @@ fn count_flops(node: &Node) -> f64 {
 
 fn count_flops_memo(
     node: &Node,
-    oa: &mut HashMap<*const NodeKind, Vec<Axis>>,
+    oa: &mut HashMap<*const NodeKind, Vec<AxisRef>>,
     fc: &mut HashMap<*const NodeKind, f64>,
 ) -> f64 {
     let key = std::rc::Rc::as_ptr(node);
     if let Some(f) = fc.get(&key) {
         return *f;
     }
-    let vol = |n: &Node, oa: &mut HashMap<*const NodeKind, Vec<Axis>>| -> f64 {
+    let vol = |n: &Node, oa: &mut HashMap<*const NodeKind, Vec<AxisRef>>| -> f64 {
         let axes = oa
             .entry(std::rc::Rc::as_ptr(n))
-            .or_insert_with(|| n.shape())
+            .or_insert_with(|| ir::axis_refs(n))
             .clone();
         axes.iter().map(|ax| ax.extent() as f64).product()
     };
     let f = match node.as_ref() {
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => 0.0,
+        NodeKind::Input { .. }
+        | NodeKind::Const { .. }
+        | NodeKind::Iota { .. }
+        | NodeKind::Coordinate { .. } => 0.0,
         NodeKind::Map { inputs, .. } => {
             let child: f64 = inputs.iter().map(|i| count_flops_memo(i, oa, fc)).sum();
             child + vol(node, oa)
@@ -729,7 +763,8 @@ mod tests {
     use super::*;
     use crate::cost::DeviceProfile;
     use crate::derive::{Expr, SlotKind, derive};
-    use crate::kernel_ir::*;
+    use crate::ir::*;
+    use crate::nn::scaled_dot_product_attention;
 
     #[test]
     fn attention_plans_a_feasible_batched_kernel() {
@@ -741,18 +776,23 @@ mod tests {
             axis("d", 64),
             axis("e", 64),
         );
-        let attn = attention(
+        let key = input("K", &[b, h, k, d], Dtype::F32);
+        let key_axis = axis_refs(&key)[2];
+        let attn = scaled_dot_product_attention(
             input("Q", &[b, h, sq, d], Dtype::F32),
-            input("K", &[b, h, k, d], Dtype::F32),
+            key,
             input("V", &[b, h, k, e], Dtype::F32),
-            d,
-            k,
+            None,
+            0.0,
+            false,
+            Some(1.0),
+            false,
         );
-        let c = derive(&attn, k).unwrap();
+        let c = derive(&attn, key_axis).unwrap();
         let dev = DeviceProfile::toy();
-        let spec = plan_axis(&attn, k, &c, &dev).unwrap();
+        let spec = plan_axis(&attn, key_axis, &c, &dev).unwrap();
 
-        assert_eq!(spec.streaming_axis, k);
+        assert_eq!(spec.streaming_axis, key_axis);
         assert!(spec.cost > 0.0);
     }
 
@@ -761,10 +801,11 @@ mod tests {
         // Reduce(X[n], n, Add) → scalar output; no row axis.
         let n = axis("n", 4096);
         let x = input("X", &[n], Dtype::F32);
-        let s = reduce(x, n, BinOp::Monoid(Monoid::Add));
-        let c = derive(&s, n).unwrap();
+        let stream = axis_refs(&x)[0];
+        let s = reduce(x, 0usize, Monoid::Add);
+        let c = derive(&s, stream).unwrap();
         let dev = DeviceProfile::toy();
-        let spec = plan_axis(&s, n, &c, &dev).unwrap();
+        let spec = plan_axis(&s, stream, &c, &dev).unwrap();
 
         assert!(spec.cost > 0.0, "a scalar-output fold still plans");
     }
@@ -776,12 +817,13 @@ mod tests {
             axis("singleton", 1),
             axis("output", 2048),
         );
+        let x = input("X", &[stream, singleton], Dtype::F32);
+        let stream_axis = axis_refs(&x)[0];
         let dot = matmul(
-            input("X", &[stream, singleton], Dtype::F32),
-            input("W", &[output, stream], Dtype::BF16),
-            stream,
+            transpose(x, 0usize, 1usize),
+            transpose(input("W", &[output, stream], Dtype::BF16), 0usize, 1usize),
         );
-        let mut carrier = derive(&dot, stream).unwrap();
+        let mut carrier = derive(&dot, stream_axis).unwrap();
         let invariant = carrier.slots;
         carrier.slots += 1;
         carrier.into.push(Expr::Const(0.0));
@@ -790,7 +832,7 @@ mod tests {
         carrier.spans.push(Vec::new());
         carrier.kinds.push(SlotKind::Plain(Monoid::Add));
 
-        plan_axis(&dot, stream, &carrier, &DeviceProfile::m1_pro())
+        plan_axis(&dot, stream_axis, &carrier, &DeviceProfile::m1_pro())
             .expect("the output axis is a legal tile even if one slot is invariant");
     }
 
@@ -803,9 +845,11 @@ mod tests {
         let dev = DeviceProfile::toy();
 
         let cost_of = |w: NodeRef| {
-            let g = matmul(input("X", &[s, d], Dtype::F32), w, d);
-            let c = derive(&g, d).unwrap();
-            plan_axis(&g, d, &c, &dev).unwrap().cost
+            let x = input("X", &[s, d], Dtype::F32);
+            let stream = axis_refs(&x)[1];
+            let g = matmul(x, transpose(w, 0usize, 1usize));
+            let c = derive(&g, stream).unwrap();
+            plan_axis(&g, stream, &c, &dev).unwrap().cost
         };
         let full = cost_of(input("W", &[f, d], Dtype::F32));
         let int8 = cost_of(input("W8", &[f, d], Dtype::I8));

@@ -14,13 +14,13 @@
 use std::collections::HashMap;
 
 use crate::derive::Expr;
-use crate::kernel_ir::{Axis, BinOp, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
+use crate::ir::{self, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── fresh names ──────────────────────────────────────────────────────────────
 
 pub struct Gen {
     pub n: usize,
-    /// Storage dtypes of the inputs in scope (from [`crate::kernel_ir::input_dtypes`]).
+    /// Storage dtypes of the inputs in scope.
     /// Each load uses its declared representation: packed int4 nibbles,
     /// halfs, or a native float.
     pub dtypes: HashMap<&'static str, Dtype>,
@@ -40,6 +40,10 @@ pub struct Gen {
     /// local, the epilogue's input leaf resolves to it, and the kernel writes
     /// the final value in one pass.
     pub local_inputs: HashMap<String, String>,
+    /// Node-local occurrences that denote the same kernel loop coordinate.
+    /// Filled by carrier emitters; pointwise structural recursion normally
+    /// leaves it empty because it translates coordinates directly.
+    pub axis_aliases: HashMap<AxisRef, AxisRef>,
 }
 
 /// See [`Gen::lane_body`].
@@ -47,7 +51,7 @@ pub struct Gen {
 pub struct LaneBody {
     /// The lane-distributed output axis, if any: a reduce whose subtree
     /// reads it varies per lane and must stay serial.
-    pub avoid_axis: Option<Axis>,
+    pub avoid_axis: Option<AxisRef>,
     pub simd_width: usize,
 }
 
@@ -58,11 +62,55 @@ impl Gen {
             dtypes: HashMap::new(),
             lane_body: None,
             local_inputs: HashMap::new(),
+            axis_aliases: HashMap::new(),
         }
     }
     pub fn fresh(&mut self, tag: &str) -> String {
         self.n += 1;
         format!("{tag}{}", self.n)
+    }
+
+    fn coordinate<'a>(&self, coord: &'a HashMap<AxisRef, String>, axis: AxisRef) -> &'a String {
+        if let Some(value) = coord.get(&axis) {
+            return value;
+        }
+        let target = self.axis_aliases.get(&axis).copied().unwrap_or(axis);
+        coord
+            .iter()
+            .find_map(|(candidate, value)| {
+                (self
+                    .axis_aliases
+                    .get(candidate)
+                    .copied()
+                    .unwrap_or(*candidate)
+                    == target)
+                    .then_some(value)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing coordinate for {axis:?}; available={:?}",
+                    coord.keys().collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn buffer_offset(&self, axes: &[AxisRef], coord: &HashMap<AxisRef, String>) -> String {
+        if axes.is_empty() {
+            return "0".into();
+        }
+        axes.iter()
+            .enumerate()
+            .map(|(index, &axis)| {
+                let stride: usize = axes[index + 1..].iter().map(|axis| axis.extent()).product();
+                let value = self.coordinate(coord, axis);
+                if stride == 1 {
+                    value.clone()
+                } else {
+                    format!("{value}*{stride}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" + ")
     }
 }
 impl Default for Gen {
@@ -85,16 +133,17 @@ pub fn san(name: &str) -> String {
 /// deduped by name in first-seen order. The declared axes are what `offset`
 /// strides over; `View` handling in [`value`] remaps coordinates to read the
 /// buffer under them.
-pub fn buffers(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
-    fn go(n: &Node, out: &mut Vec<(&'static str, Vec<Axis>)>) {
+pub fn buffers(node: &Node) -> Vec<(&'static str, Vec<AxisRef>)> {
+    fn go(n: &Node, out: &mut Vec<(&'static str, Vec<AxisRef>)>) {
         match n.as_ref() {
-            NodeKind::Input { name, axes, .. } => {
+            NodeKind::Input { name, .. } => {
                 if !out.iter().any(|(nm, _)| nm == name) {
-                    out.push((name, axes.clone()));
+                    out.push((name, ir::axis_refs(n)));
                 }
             }
             NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
             NodeKind::Map { inputs, .. } => inputs.iter().for_each(|i| go(i, out)),
+            NodeKind::Coordinate { src, .. } => go(src, out),
             NodeKind::Reduce { src, .. }
             | NodeKind::Scan { src, .. }
             | NodeKind::View { src, .. }
@@ -113,14 +162,19 @@ pub fn buffers(node: &Node) -> Vec<(&'static str, Vec<Axis>)> {
 /// The row-major flat offset of `axes` at the loop-variable coordinate, with
 /// concrete extents baked in as literals. Language-agnostic (integer index
 /// arithmetic is the same in Rust and MSL).
-pub fn offset(axes: &[Axis], coord: &HashMap<Axis, String>) -> String {
+pub fn offset(axes: &[AxisRef], coord: &HashMap<AxisRef, String>) -> String {
     if axes.is_empty() {
         return "0".into();
     }
     let mut terms = Vec::new();
     for (k, a) in axes.iter().enumerate() {
         let stride: usize = axes[k + 1..].iter().map(|x| x.extent()).product();
-        let iv = &coord[a];
+        let iv = coord.get(a).unwrap_or_else(|| {
+            panic!(
+                "missing coordinate for {a:?}; buffer axes={axes:?}; available={:?}",
+                coord.keys().collect::<Vec<_>>()
+            )
+        });
         if stride == 1 {
             terms.push(iv.clone());
         } else {
@@ -205,36 +259,48 @@ pub fn assign(name: &str, val: &str) -> String {
 pub fn value<L: Lang>(
     lang: &L,
     node: &Node,
-    coord: &HashMap<Axis, String>,
+    coord: &HashMap<AxisRef, String>,
     g: &mut Gen,
     out: &mut Vec<String>,
 ) -> String {
     match node.as_ref() {
         NodeKind::Const { v } => lang.lit(*v),
-        NodeKind::Iota { axis } => lang.iota_val(&coord[axis]),
-        NodeKind::Input { name, axes, dtype } => {
+        NodeKind::Iota { .. } => lang.iota_val(g.coordinate(coord, ir::axis_refs(node)[0])),
+        NodeKind::Coordinate { src, dim } => {
+            lang.iota_val(g.coordinate(coord, ir::axis_refs(src)[*dim]))
+        }
+        NodeKind::Input { name, dtype, .. } => {
             if let Some(v) = g.local_inputs.get(*name) {
                 return v.clone();
             }
-            lang.buffer_load(name, &offset(axes, coord), *dtype)
+            lang.buffer_load(name, &g.buffer_offset(&ir::axis_refs(node), coord), *dtype)
         }
         NodeKind::Map { op, inputs } => {
             let a: Vec<String> = inputs
                 .iter()
-                .map(|i| value(lang, i, coord, g, out))
+                .map(|input| {
+                    let mut input_coord = coord.clone();
+                    for output_axis in ir::axis_refs(node) {
+                        let input_axis = ir::map_input_axis(node, input, output_axis);
+                        if input_axis != output_axis
+                            && let Some(index) = coord.get(&output_axis)
+                        {
+                            input_coord.insert(input_axis, index.clone());
+                        }
+                    }
+                    value(lang, input, &input_coord, g, out)
+                })
                 .collect();
             lang.map_op(*op, &a)
         }
-        NodeKind::Reduce { src, axis, op } => {
-            let m = match op {
-                BinOp::Monoid(m) => *m,
-                other => panic!("codegen: reduce with {other:?} is not a monoid"),
-            };
+        NodeKind::Reduce { src, dim, op } => {
+            let axis = ir::source_axis(src, *dim);
+            let m = *op;
             let acc = g.fresh("acc");
             out.push(lang.scalar_decl(&acc, &lang.lit(m.identity())));
             let lv = g.fresh("r");
             let mut coord2 = coord.clone();
-            coord2.insert(*axis, lv.clone());
+            coord2.insert(axis, lv.clone());
             let mut body = Vec::new();
             let ev = value(lang, src, &coord2, g, &mut body);
             // Lane-split the contraction when the scheduled emitter asked
@@ -244,7 +310,9 @@ pub fn value<L: Lang>(
             // the lane-distributed axis).
             let lane_split = g.lane_body.and_then(|lb| {
                 let lane = lang.lane_var()?;
-                let uniform = lb.avoid_axis.is_none_or(|a| !src.shape().contains(&a));
+                let uniform = lb
+                    .avoid_axis
+                    .is_none_or(|a| !ir::axis_refs(src).contains(&a));
                 let merge = lang.simd_lane_merge(&acc, m, lb.simd_width)?;
                 (axis.extent() % lb.simd_width == 0 && uniform).then_some((
                     lane,
@@ -272,31 +340,27 @@ pub fn value<L: Lang>(
             }
             acc
         }
-        NodeKind::Gather { src, index, axis } => {
+        NodeKind::Gather { src, index, dim } => {
+            let axis = ir::source_axis(src, *dim);
             let ie = value(lang, index, coord, g, out);
             let gi = g.fresh("gi");
             out.push(lang.round_index(&gi, &ie));
             let mut coord2 = coord.clone();
-            coord2.insert(*axis, gi);
+            coord2.insert(axis, gi);
             value(lang, src, &coord2, g, out)
         }
-        NodeKind::View { src, groups } => {
+        NodeKind::View { src, .. } => {
             let mut coord2 = coord.clone();
-            for (members, to) in groups {
-                if members.len() == 1 {
-                    // rename: the source axis takes the output axis's index.
-                    coord2.insert(members[0], coord[to].clone());
-                } else {
-                    // flatten: split the merged index (first member most
-                    // significant, so the last runs fastest).
-                    let rem = g.fresh("rem");
-                    out.push(lang.index_decl(&rem, &coord[to], true));
-                    for m in members.iter().rev() {
-                        let iv = g.fresh("m");
-                        out.push(lang.index_decl(&iv, &format!("{rem} % {}", m.extent()), false));
-                        out.push(format!("{rem} /= {};", m.extent()));
-                        coord2.insert(*m, iv);
-                    }
+            for (members, to) in ir::view_groups(node) {
+                // Flatten: split the merged index (first member most
+                // significant, so the last runs fastest).
+                let rem = g.fresh("rem");
+                out.push(lang.index_decl(&rem, g.coordinate(coord, to), true));
+                for member in members.iter().rev() {
+                    let iv = g.fresh("m");
+                    out.push(lang.index_decl(&iv, &format!("{rem} % {}", member.extent()), false));
+                    out.push(format!("{rem} /= {};", member.extent()));
+                    coord2.insert(*member, iv);
                 }
             }
             value(lang, src, &coord2, g, out)
@@ -305,14 +369,14 @@ pub fn value<L: Lang>(
         // padded reads clamp the index (so any setup statements below stay in
         // bounds) and select 0.0 when the raw index was out of range. The
         // codegen twin of the interpreter's `Reindex` arm.
-        NodeKind::Reindex { src, map, padded } => {
+        NodeKind::Reindex { src, padded, .. } => {
             let mut coord2 = coord.clone();
             let mut guards: Vec<String> = Vec::new();
-            for (m, terms, off) in map {
+            for (mapped, terms, off) in ir::resolved_reindex(node) {
                 let mut parts: Vec<String> = terms
                     .iter()
                     .map(|(coef, a)| {
-                        let iv = lang.to_signed(&coord[a]);
+                        let iv = lang.to_signed(g.coordinate(coord, *a));
                         if *coef == 1 {
                             iv
                         } else {
@@ -320,7 +384,7 @@ pub fn value<L: Lang>(
                         }
                     })
                     .collect();
-                if *off != 0 {
+                if off != 0 {
                     parts.push(format!("({off})"));
                 }
                 let val = if parts.is_empty() {
@@ -330,7 +394,7 @@ pub fn value<L: Lang>(
                 };
                 let ri = g.fresh("ri");
                 out.push(lang.signed_index_decl(&ri, &val));
-                let n = m.extent();
+                let n = mapped.extent();
                 let ci = g.fresh("ci");
                 if *padded {
                     guards.push(format!("{ri} >= 0 && {ri} < {n}"));
@@ -338,7 +402,7 @@ pub fn value<L: Lang>(
                 } else {
                     out.push(lang.index_from_signed(&ci, &ri));
                 }
-                coord2.insert(*m, ci);
+                coord2.insert(mapped, ci);
             }
             let v = value(lang, src, &coord2, g, out);
             if guards.is_empty() {
@@ -348,29 +412,21 @@ pub fn value<L: Lang>(
             }
         }
 
-        // A MONOIDAL prefix scan: each output point folds its own prefix —
+        // A prefix scan: each output point folds its own prefix —
         // parallel across points, serial within one (O(n²) work; these are
         // small stages, and correctness comes first — a cost-driven
         // work-efficient scan is a schedule refinement, not new semantics).
-        // Non-associative recurrences stay unemittable, loudly.
-        NodeKind::Scan { src, axis, op } => {
-            let m = match op {
-                BinOp::Monoid(m) => *m,
-                other => panic!(
-                    "codegen: {other:?} scan is not emittable (only monoidal \
-                     prefix scans are; a non-associative recurrence is serial \
-                     by nature and an affine scan's tensor convention is not \
-                     yet defined — see todo.md)"
-                ),
-            };
+        NodeKind::Scan { src, dim, op } => {
+            let axis = ir::source_axis(src, *dim);
+            let m = *op;
             let acc = g.fresh("acc");
             out.push(lang.scalar_decl(&acc, &lang.lit(m.identity())));
             let lv = g.fresh("r");
             let mut coord2 = coord.clone();
-            coord2.insert(*axis, lv.clone());
+            coord2.insert(axis, lv.clone());
             let mut body = Vec::new();
             let ev = value(lang, src, &coord2, g, &mut body);
-            out.push(lang.for_open_upto(&lv, &coord[axis]));
+            out.push(lang.for_open_upto(&lv, g.coordinate(coord, axis)));
             out.extend(body);
             out.push(assign(&acc, &lang.monoid(m, &acc, &ev)));
             out.push("}".into());
@@ -420,6 +476,7 @@ pub fn carrier_expr_map<L: Lang>(
         Expr::Exp(a) => un(MapOp::Exp, a),
         Expr::Log(a) => un(MapOp::Log, a),
         Expr::Sqrt(a) => un(MapOp::Sqrt, a),
+        Expr::Tanh(a) => un(MapOp::Tanh, a),
         Expr::Sin(a) => un(MapOp::Sin, a),
         Expr::Cos(a) => un(MapOp::Cos, a),
         Expr::Where(c, a, b) => lang.map_op(MapOp::Where, &[go(c), go(a), go(b)]),
@@ -431,10 +488,10 @@ pub fn carrier_expr_map<L: Lang>(
 /// axis and return the coordinate map.
 pub fn thread_grid_decode<L: Lang>(
     lang: &L,
-    grid: &[Axis],
+    grid: &[AxisRef],
     g: &mut Gen,
     out: &mut Vec<String>,
-) -> HashMap<Axis, String> {
+) -> HashMap<AxisRef, String> {
     thread_grid_decode_from(lang, "gid", grid, g, out)
 }
 
@@ -443,10 +500,10 @@ pub fn thread_grid_decode<L: Lang>(
 pub fn thread_grid_decode_from<L: Lang>(
     _lang: &L,
     gid_var: &str,
-    grid: &[Axis],
+    grid: &[AxisRef],
     g: &mut Gen,
     out: &mut Vec<String>,
-) -> HashMap<Axis, String> {
+) -> HashMap<AxisRef, String> {
     let mut coord = HashMap::new();
     for (k, &a) in grid.iter().enumerate() {
         let stride: usize = grid[k + 1..].iter().map(|x| x.extent()).product();
@@ -465,6 +522,13 @@ pub fn thread_grid_decode_from<L: Lang>(
 }
 
 /// The output grid (free axes) and its flattened size for a kernel node.
-pub fn grid_of(node: &Node) -> (Vec<Axis>, usize) {
-    (node.shape(), crate::kernel_ir::volume(node))
+pub fn grid_of(node: &Node) -> (Vec<AxisRef>, usize) {
+    (
+        ir::axis_refs(node),
+        node.shape()
+            .iter()
+            .map(|axis| axis.extent())
+            .product::<usize>()
+            .max(1),
+    )
 }

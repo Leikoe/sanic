@@ -18,11 +18,12 @@ H(xs ++ ys) = H(xs) ⊗ H(ys)
 Associativity is the whole game — it is simultaneously the streaming
 certificate (fold left-to-right, O(1) state) and the parallelism certificate
 (combine blocks in any order). That one fact, applied by structural recursion,
-is what lets the *same* code derive `sum`, `softmax`, FlashAttention,
-RMSNorm-fused GEMMs and argmax. Top-k is expressed by the frontend as repeated
-max/argmax plus one-hot masking; deriving its bounded ordered-selection carrier
-from that composition remains an open compiler problem rather than a special
-Top-k operation in the core IR.
+is what lets the *same* code derive `sum`, `softmax`, FlashAttention and
+RMSNorm-fused GEMMs. Argmax and Top-k are frontend compositions of ordinary
+reductions, comparisons, indices and masking. The compiler derives Argmax's
+(extremal key, tied payload) product carrier generically; bounded ordered
+selection for Top-k remains open compiler work rather than a named operation
+in the core IR.
 
 ## Why it's fast on the GPU
 

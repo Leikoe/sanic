@@ -7,7 +7,7 @@
 use sanic::cost::DeviceProfile;
 use sanic::grad::grad;
 use sanic::interp::{Env, Value, eval};
-use sanic::kernel_ir::*;
+use sanic::ir::*;
 use sanic::partition::partition_many;
 use sanic::simplify::simplify_many;
 
@@ -23,41 +23,47 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_fn(axes, |_| rng.f())
+    Value::from_shape_fn(
+        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
+        |_| rng.f(),
+    )
 }
 
 /// Softmax cross-entropy over `[b, c]`, `logsumexp − logit[y]`. `primitive`
 /// uses the `LogSumExp` monoid; otherwise the composition `m + log(Σ exp(x−m))`.
-fn cross_entropy(logits: &NodeRef, b: Axis, c: Axis, primitive: bool) -> NodeRef {
+fn cross_entropy(logits: &NodeRef, primitive: bool) -> NodeRef {
     let lse = if primitive {
-        reduce(logits.clone(), c, BinOp::Monoid(Monoid::LogSumExp))
+        reduce(logits.clone(), 1usize, Monoid::LogSumExp)
     } else {
-        let m = reduce(logits.clone(), c, BinOp::Monoid(Monoid::Max));
+        let m = reduce(logits.clone(), 1usize, Monoid::Max);
         let sh = map(
             MapOp::Exp,
-            vec![map(MapOp::Sub, vec![logits.clone(), m.clone()])],
+            vec![map(
+                MapOp::Sub,
+                vec![logits.clone(), unsqueeze(m.clone(), 1usize)],
+            )],
         );
         map(
             MapOp::Add,
-            vec![
-                m,
-                map(MapOp::Log, vec![reduce(sh, c, BinOp::Monoid(Monoid::Add))]),
-            ],
+            vec![m, map(MapOp::Log, vec![reduce(sh, 1usize, Monoid::Add)])],
         )
     };
     let picked = reduce(
         map(
             MapOp::Mul,
-            vec![logits.clone(), one_hot(c, input("y", &[b], Dtype::F32))],
+            vec![
+                logits.clone(),
+                one_hot_like(
+                    logits.clone(),
+                    1usize,
+                    unsqueeze(input("y", &[logits.shape()[0]], Dtype::F32), 1usize),
+                ),
+            ],
         ),
-        c,
-        BinOp::Monoid(Monoid::Add),
+        1usize,
+        Monoid::Add,
     );
-    reduce(
-        map(MapOp::Sub, vec![lse, picked]),
-        b,
-        BinOp::Monoid(Monoid::Add),
-    )
+    reduce(map(MapOp::Sub, vec![lse, picked]), 0usize, Monoid::Add)
 }
 
 /// The simplifier is a value-preserving identity: the simplified gradient
@@ -69,17 +75,20 @@ fn simplify_preserves_the_gradient() {
     let mut rng = Lcg(0x5117);
     let env: Env = [
         ("Z", rand_tensor(&[b, c], &mut rng)),
-        ("y", Value::from_fn(&[b], |crd| (crd[&b] % 5) as f64)),
+        (
+            "y",
+            Value::from_shape_fn(&[8], |coordinate| (coordinate[0] % 5) as f64),
+        ),
     ]
     .into_iter()
     .collect();
 
-    let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), b, c, false);
+    let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), false);
     let dz = grad(&loss, &["Z"])["Z"].clone();
     let simplified = simplify_many(&[loss, dz.clone()]).pop().unwrap();
 
     let raw = eval(&dz, &env);
-    let simp = eval(&simplified, &env).permuted_to(&raw.axes);
+    let simp = eval(&simplified, &env);
     assert_eq!(raw.shape, simp.shape);
     for (a, b) in raw.data.iter().zip(&simp.data) {
         assert!(
@@ -96,21 +105,23 @@ fn simplify_preserves_the_gradient() {
 #[test]
 fn composed_logsumexp_backward_matches_the_primitive() {
     let (b, c) = (axis("b", 100), axis("c", 10));
-    let kernels = |primitive: bool| {
-        let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), b, c, primitive);
+    let schedule = |primitive: bool| {
+        let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), primitive);
         let dz = grad(&loss, &["Z"])["Z"].clone();
         let roots = simplify_many(&[loss, dz]);
         partition_many(
             &[(roots[0].clone(), "loss"), (roots[1].clone(), "dZ")],
             &DeviceProfile::toy(),
         )
-        .stages
-        .len()
     };
+    let composed = schedule(false);
+    let primitive = schedule(true);
     assert_eq!(
-        kernels(false),
-        kernels(true),
-        "composed backward must derive to the primitive's kernel count"
+        composed.stages.len(),
+        primitive.stages.len(),
+        "composed backward must derive to the primitive's kernel count\ncomposed:\n{}\nprimitive:\n{}",
+        composed.render(),
+        primitive.render()
     );
 }
 
@@ -124,8 +135,8 @@ fn canonicalize_merges_structural_duplicates() {
     let row_energy = |x: &NodeRef| {
         reduce(
             map(MapOp::Mul, vec![x.clone(), x.clone()]),
-            c,
-            BinOp::Monoid(Monoid::Add),
+            1usize,
+            Monoid::Add,
         )
     };
     // Built twice on purpose: equal structure, distinct nodes.
@@ -157,13 +168,7 @@ fn canonicalize_merges_structural_duplicates() {
 fn partition_computes_a_structural_duplicate_once() {
     let (b, c) = (axis("b", 4), axis("c", 6));
     let x = || input("x", &[b, c], Dtype::F32);
-    let row_energy = |x: NodeRef| {
-        reduce(
-            map(MapOp::Mul, vec![x.clone(), x]),
-            c,
-            BinOp::Monoid(Monoid::Add),
-        )
-    };
+    let row_energy = |x: NodeRef| reduce(map(MapOp::Mul, vec![x.clone(), x]), 1usize, Monoid::Add);
     // One fold consumed by two different parents — written once with the
     // node shared, once with the fold rebuilt from scratch.
     let combine = |e1: NodeRef, e2: NodeRef| {
@@ -190,7 +195,7 @@ fn partition_computes_a_structural_duplicate_once() {
         .into_iter()
         .collect();
     let executed = duplicated_schedule.execute(&env);
-    let reference = eval(&duplicated, &env).permuted_to(&executed.axes);
+    let reference = eval(&duplicated, &env);
     assert_eq!(executed.shape, reference.shape);
     for (got, want) in executed.data.iter().zip(&reference.data) {
         assert!(

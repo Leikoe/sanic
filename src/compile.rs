@@ -1,8 +1,8 @@
 //! Root-based compilation and execution.
 //!
-//! The public graph is positional. Compilation lowers it into the existing
-//! algebraic kernel IR using axes minted inside this one compilation, then
-//! verifies, derives, partitions, and prepares a backend executable.
+//! The graph stays positional throughout compilation. Analysis resolves each
+//! dimension occurrence lazily as `(node pointer, dimension index)` metadata;
+//! there is no second graph representation or graph-rewriting lowering step.
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -12,8 +12,7 @@ use std::rc::Rc;
 
 use crate::cost;
 use crate::interp::{Env, Value};
-use crate::ir::{Axis, Dtype, Extent, Node, NodeRef};
-use crate::kernel_ir as kir;
+use crate::ir::{self, Axis, AxisRef, Dtype, Extent, Node, NodeRef};
 use crate::partition::{Schedule, partition_many};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +126,7 @@ pub struct InputSpec {
     name: String,
     lowered_name: &'static str,
     shape: Vec<Axis>,
-    axes: Vec<kir::Axis>,
+    axes: Vec<AxisRef>,
     dtype: Dtype,
 }
 
@@ -325,38 +324,22 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         return Err(CompileError::DynamicShapesNotYetSupported);
     }
 
-    // Canonicalize BEFORE lowering: lowering mints fresh scoped axes per
-    // node, so two structurally identical public subtrees (a RoPE frequency
-    // table built once for the query path and once for the key path) become
-    // axis-distinct — and unmergeable — the moment they lower. Merged here,
-    // they lower ONCE through the pointer-keyed memo.
+    // One canonical table spans every output so independently constructed,
+    // structurally identical subtrees become one immutable DAG node.
     let roots = crate::ir::canonicalize_many(&roots);
-
-    let mut lowerer = Lowerer::default();
-    let lowered = roots
-        .iter()
-        .map(|root| lowerer.lower(root))
-        .collect::<Result<Vec<_>, _>>()?;
-    let lowered_roots = lowered
-        .into_iter()
-        .map(|lowered| ensure_order(lowered.node, &lowered.axes))
-        .collect::<Vec<_>>();
+    let inputs = collect_inputs(&roots)?;
     let output_shapes = roots
         .iter()
         .map(|root| root.shape().into_iter().map(Axis::extent).collect())
         .collect::<Vec<Vec<usize>>>();
 
-    crate::verify::verify_many(&lowered_roots)
+    crate::verify::verify_many(&roots)
         .map_err(|error| CompileError::InvalidGraph(error.to_string()))?;
 
     let output_names = (0..roots.len())
         .map(|index| leak(format!("Out{index}")))
         .collect::<Vec<_>>();
-    let named_roots = lowered_roots
-        .iter()
-        .cloned()
-        .zip(output_names)
-        .collect::<Vec<_>>();
+    let named_roots = roots.iter().cloned().zip(output_names).collect::<Vec<_>>();
     let schedule = partition_many(&named_roots, &backend.profile());
     let executable = backend.prepare(&schedule, &output_shapes)?;
 
@@ -364,7 +347,7 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         backend: backend.clone(),
         schedule,
         executable,
-        inputs: lowerer.inputs,
+        inputs,
         output_shapes,
     })
 }
@@ -400,287 +383,71 @@ fn contains_dynamic(roots: &[NodeRef]) -> bool {
     roots.iter().any(|root| visit(root, &mut seen))
 }
 
-#[derive(Default)]
-struct Lowerer {
-    next_axis: usize,
-    memo: HashMap<*const Node, Lowered>,
-    inputs: Vec<InputSpec>,
-}
-
-#[derive(Clone)]
-struct Lowered {
-    node: kir::NodeRef,
-    /// Kernel axes corresponding to the public node's positional dimensions.
-    /// `None` is a source-free singleton inserted only for broadcasting.
-    axes: Vec<Option<kir::Axis>>,
-}
-
-impl Lowerer {
-    fn fresh_axis(&mut self, axis: Axis) -> kir::Axis {
-        let id = self.next_axis;
-        self.next_axis += 1;
-        kir::scoped_axis(id, axis.name, axis.extent)
-    }
-
-    fn lower(&mut self, node: &NodeRef) -> Result<Lowered, CompileError> {
-        let pointer = Rc::as_ptr(node);
-        if let Some(lowered) = self.memo.get(&pointer) {
-            return Ok(lowered.clone());
+fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
+    fn visit(
+        node: &NodeRef,
+        seen: &mut HashSet<*const Node>,
+        inputs: &mut Vec<InputSpec>,
+    ) -> Result<(), CompileError> {
+        if !seen.insert(Rc::as_ptr(node)) {
+            return Ok(());
         }
-
-        let lowered = match node.as_ref() {
+        match node.as_ref() {
             Node::Input { name, shape, dtype } => {
                 if name.is_empty() {
                     return Err(CompileError::InvalidInput(
                         "input names cannot be empty".into(),
                     ));
                 }
-                if let Some(previous) = self.inputs.iter().find(|input| input.name == *name) {
-                    let previous_extents: Vec<Extent> =
-                        previous.shape.iter().map(|axis| axis.extent).collect();
-                    let extents: Vec<Extent> = shape.iter().map(|axis| axis.extent).collect();
+                if let Some(previous) = inputs.iter().find(|input| input.name == *name) {
+                    let previous_extents = previous
+                        .shape
+                        .iter()
+                        .map(|axis| axis.extent)
+                        .collect::<Vec<_>>();
+                    let extents = shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
                     if previous_extents != extents || previous.dtype != *dtype {
                         return Err(CompileError::InvalidInput(format!(
                             "`{name}` was declared incompatibly"
                         )));
                     }
-                }
-                let axes = shape
-                    .iter()
-                    .copied()
-                    .map(|axis| self.fresh_axis(axis))
-                    .collect::<Vec<_>>();
-                let lowered_name = self
-                    .inputs
-                    .iter()
-                    .find(|input| input.name == *name)
-                    .map(|input| input.lowered_name)
-                    .unwrap_or_else(|| leak(name.clone()));
-                if !self.inputs.iter().any(|input| input.name == *name) {
-                    self.inputs.push(InputSpec {
-                        name: name.clone(),
-                        lowered_name,
+                } else {
+                    inputs.push(InputSpec {
+                        name: (*name).to_string(),
+                        lowered_name: name,
                         shape: shape.clone(),
-                        axes: axes.clone(),
+                        axes: ir::axis_refs(node),
                         dtype: *dtype,
                     });
                 }
-                Lowered {
-                    node: kir::input(lowered_name, &axes, *dtype),
-                    axes: axes.into_iter().map(Some).collect(),
-                }
             }
-            Node::Const { v } => Lowered {
-                node: kir::konst(*v),
-                axes: Vec::new(),
-            },
-            Node::Iota { axis } => {
-                let axis = self.fresh_axis(*axis);
-                Lowered {
-                    node: kir::iota(axis),
-                    axes: vec![Some(axis)],
-                }
-            }
-            Node::Coordinate { src, dim } => {
-                let lowered = self.lower(src)?;
-                let node = lowered.axes[*dim]
-                    .map(kir::iota)
-                    .unwrap_or_else(|| kir::konst(0.0));
-                Lowered {
-                    node,
-                    axes: lowered.axes,
-                }
-            }
-            Node::Map { op, inputs } => {
-                let output_shape = node.shape();
-                let lowered_inputs = inputs
-                    .iter()
-                    .map(|input| self.lower(input))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let input_shapes = inputs.iter().map(|input| input.shape()).collect::<Vec<_>>();
-                let rank = output_shape.len();
-                let output_axes = (0..rank)
-                    .map(|output_dim| {
-                        let mut fallback = None;
-                        for (shape, lowered) in input_shapes.iter().zip(&lowered_inputs) {
-                            let Some(source_dim) =
-                                output_dim.checked_sub(rank.saturating_sub(shape.len()))
-                            else {
-                                continue;
-                            };
-                            let candidate = lowered.axes[source_dim];
-                            fallback = fallback.or(candidate);
-                            if shape[source_dim].extent != Extent::Static(1) {
-                                return candidate;
-                            }
-                        }
-                        fallback
-                    })
-                    .collect::<Vec<_>>();
-                let aligned = lowered_inputs
-                    .into_iter()
-                    .zip(&input_shapes)
-                    .map(|(lowered, shape)| align(lowered, shape, &output_shape, &output_axes))
-                    .collect();
-                let mapped = kir::map(*op, aligned);
-                Lowered {
-                    node: ensure_order(mapped, &output_axes),
-                    axes: output_axes,
-                }
-            }
-            Node::Reduce { src, dim, op } => {
-                let mut lowered = self.lower(src)?;
-                if let Some(axis) = lowered.axes.remove(*dim) {
-                    lowered.node = kir::reduce(lowered.node, axis, *op);
-                }
-                lowered
-            }
-            Node::Scan { src, dim, op } => {
-                let mut lowered = self.lower(src)?;
-                if let Some(axis) = lowered.axes[*dim] {
-                    lowered.node = kir::scan(lowered.node, axis, *op);
-                }
-                lowered
-            }
-            Node::Gather { src, index, dim } => {
-                let mut lowered_src = self.lower(src)?;
-                let lowered_index = self.lower(index)?;
-                let axis = lowered_src.axes.remove(*dim).ok_or_else(|| {
-                    CompileError::InvalidGraph(
-                        "cannot gather a source-free singleton dimension".into(),
-                    )
-                })?;
-                let mut axes = lowered_src.axes;
-                axes.splice(*dim..*dim, lowered_index.axes);
-                let gathered = kir::gather(lowered_src.node, lowered_index.node, axis);
-                Lowered {
-                    node: ensure_order(gathered, &axes),
-                    axes,
-                }
-            }
-            Node::View { src, dims } => {
-                let lowered = self.lower(src)?;
-                let mut groups = Vec::new();
-                let mut output_axes = Vec::with_capacity(dims.len());
-                for dim in dims {
-                    let members = dim
-                        .sources
-                        .iter()
-                        .filter_map(|&source| lowered.axes[source])
-                        .collect::<Vec<_>>();
-                    let output = match members.as_slice() {
-                        [] => None,
-                        [axis] => Some(*axis),
-                        _ => {
-                            let output = self.fresh_axis(dim.axis);
-                            groups.push((members, output));
-                            Some(output)
-                        }
-                    };
-                    output_axes.push(output);
-                }
-                let viewed = if groups.is_empty() {
-                    lowered.node
-                } else {
-                    kir::view(lowered.node, groups)
-                };
-                Lowered {
-                    node: viewed,
-                    axes: output_axes,
-                }
-            }
-            Node::Reindex {
-                src,
-                shape,
-                map,
-                padded,
+            Node::Const { .. } | Node::Iota { .. } => {}
+            Node::Coordinate { src, .. }
+            | Node::Reduce { src, .. }
+            | Node::Scan { src, .. }
+            | Node::View { src, .. }
+            | Node::Reindex { src, .. } => visit(src, seen, inputs)?,
+            Node::Map {
+                inputs: children, ..
             } => {
-                let lowered = self.lower(src)?;
-                let output_axes = shape
-                    .iter()
-                    .copied()
-                    .map(|axis| self.fresh_axis(axis))
-                    .collect::<Vec<_>>();
-                let map = map
-                    .iter()
-                    .filter_map(|(source, terms, offset)| {
-                        lowered.axes[*source].map(|source_axis| {
-                            (
-                                source_axis,
-                                terms
-                                    .iter()
-                                    .map(|(coefficient, output)| {
-                                        (*coefficient, output_axes[*output])
-                                    })
-                                    .collect(),
-                                *offset,
-                            )
-                        })
-                    })
-                    .collect();
-                let reindexed = kir::reindex(lowered.node, map, *padded);
-                let axes = output_axes.into_iter().map(Some).collect::<Vec<_>>();
-                Lowered {
-                    node: ensure_order(reindexed, &axes),
-                    axes,
+                for child in children {
+                    visit(child, seen, inputs)?;
                 }
             }
-        };
-
-        self.memo.insert(pointer, lowered.clone());
-        Ok(lowered)
-    }
-}
-
-fn align(
-    lowered: Lowered,
-    source: &[Axis],
-    target: &[Axis],
-    target_axes: &[Option<kir::Axis>],
-) -> kir::NodeRef {
-    let mut node = lowered.node;
-    let offset = target.len() - source.len();
-    for (source_dim, source_axis) in source.iter().enumerate() {
-        let Some(lowered_axis) = lowered.axes[source_dim] else {
-            continue;
-        };
-        let target_dim = offset + source_dim;
-        let target_axis = target[target_dim];
-        match (
-            source_axis.extent,
-            target_axis.extent,
-            target_axes[target_dim],
-        ) {
-            (Extent::Static(1), right, _) if right != Extent::Static(1) => {
-                node = kir::reindex(node, vec![(lowered_axis, Vec::new(), 0)], false);
+            Node::Gather { src, index, .. } => {
+                visit(src, seen, inputs)?;
+                visit(index, seen, inputs)?;
             }
-            (left, right, Some(target_axis)) if left == right => {
-                if lowered_axis != target_axis {
-                    node = kir::rename(node, lowered_axis, target_axis);
-                }
-            }
-            _ => unreachable!("public map shape validation accepted incompatible dimensions"),
         }
+        Ok(())
     }
-    node
-}
 
-fn ensure_order(node: kir::NodeRef, axes: &[Option<kir::Axis>]) -> kir::NodeRef {
-    let axes = axes.iter().flatten().copied().collect::<Vec<_>>();
-    if node.shape() == axes {
-        return node;
+    let mut inputs = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        visit(root, &mut seen, &mut inputs)?;
     }
-    let mut zero = kir::konst(0.0);
-    for axis in axes {
-        zero = kir::map(
-            kir::MapOp::Add,
-            vec![
-                zero,
-                kir::map(kir::MapOp::Mul, vec![kir::iota(axis), kir::konst(0.0)]),
-            ],
-        );
-    }
-    kir::map(kir::MapOp::Add, vec![zero, node])
+    Ok(inputs)
 }
 
 // ── CPU backend ─────────────────────────────────────────────────────────────
@@ -773,6 +540,7 @@ impl Backend for CpuDevice {
                     axes: input.axes.clone(),
                     shape: buffer.shape.clone(),
                     data: buffer.data.clone(),
+                    keepalive: Vec::new(),
                 },
             );
         }
@@ -1147,7 +915,7 @@ mod metal_backend {
                 Stage::Fused { spec, .. } => ("fold", Some(spec.cost)),
                 Stage::Elementwise { .. } => ("map", None),
                 Stage::Gather { .. } => ("gather", None),
-                Stage::Sequential { .. } => ("seq", None),
+                Stage::Fallback { .. } => ("fallback", None),
                 Stage::Infeasible { .. } => ("infeasible", None),
             };
             stage_info.insert(crate::partition::stage_output(stage), (kind, planned));

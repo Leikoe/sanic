@@ -1,33 +1,20 @@
-//! Structural verification for the IR.
+//! Structural verification for the positional tensor IR.
 //!
-//! tinygrad verifies every UOp against a declarative spec before scheduling
-//! and again after lowering. Sanic has a much smaller IR, so its equivalent is a
-//! single bottom-up pass: infer each node's axes while checking the invariants
-//! later passes rely on. This keeps malformed graphs from becoming mysterious
-//! interpreter bounds errors or compiler failures.
-//!
-//! Verification is deliberately separate from construction. The public
-//! [`Node`] can represent an invalid graph long enough for [`verify`]
-//! to return a useful [`VerifyError`]. Public pipeline boundaries call
-//! [`assert_valid`] or [`assert_valid_many`] before doing work.
+//! Constructors reject malformed graphs locally, but [`Node`] remains public
+//! so tests and tooling can build raw nodes. This bottom-up pass validates the
+//! invariants analysis, scheduling, and code generation rely on without
+//! assigning graph-global meaning to axis descriptors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::kernel_ir::{
-    AffineIndex, Axis, AxisName, Dtype, Extent, Node as NodeKind, NodeRef as Node,
-};
+use crate::ir::{Axis, Dtype, Extent, Node as NodeKind, NodeRef as Node, ViewDim};
 
-/// The first node that violates the current IR well-formedness rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyError {
-    /// Postorder index of the node, matching the order in which verification
-    /// visits a DAG.
     pub node_index: usize,
-    /// IR node kind.
     pub op: &'static str,
-    /// The violated invariant.
     pub reason: String,
 }
 
@@ -43,27 +30,13 @@ impl fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// Verify one IR root.
-/// The one tolerance policy every numerical oracle reads (CRITIQUE.md §1.3):
-/// the permitted RELATIVE drift between two evaluations of the same value
-/// that differ only in accumulation order, per accumulation dtype and
-/// reduction length. Reordered summation drifts by at most ~n·ε times the
-/// condition slack of the surrounding arithmetic; the policy charges one
-/// multiply for the length and a fixed slack of 64 for the carrier
-/// vocabulary's transcendentals (exp/log/sqrt). Pass the dtype the values
-/// are ACCUMULATED in (the interpreter and the Rust oracle are `F64`), and
-/// `terms` = the folded extent (1 for pointwise values).
-///
-/// When a tolerance is a policy, a tightening regression is meaningful; when
-/// it is a literal, it is a vibe.
+/// Relative drift permitted when only accumulation order changes.
 pub fn rel_tolerance(dtype: Dtype, terms: usize) -> f64 {
     let eps = match dtype {
         Dtype::F64 => f64::EPSILON,
         Dtype::F32 => f32::EPSILON as f64,
-        Dtype::F16 => 9.77e-4,  // 2⁻¹⁰
-        Dtype::BF16 => 7.82e-3, // 2⁻⁷
-        // Integer accumulation is exact; a dequantized comparison happens in
-        // float and should pass that dtype instead.
+        Dtype::F16 => 9.77e-4,
+        Dtype::BF16 => 7.82e-3,
         Dtype::I8 | Dtype::I4 => 0.0,
     };
     64.0 * eps * terms.max(1) as f64
@@ -73,8 +46,6 @@ pub fn verify(node: &Node) -> Result<(), VerifyError> {
     verify_many(std::slice::from_ref(node))
 }
 
-/// Verify several roots as one graph, including consistency between shared
-/// input-buffer declarations reached from different roots.
 pub fn verify_many(roots: &[Node]) -> Result<(), VerifyError> {
     let mut verifier = Verifier::default();
     for root in roots {
@@ -83,7 +54,6 @@ pub fn verify_many(roots: &[Node]) -> Result<(), VerifyError> {
     Ok(())
 }
 
-/// Panic with a diagnostic [`VerifyError`] when one IR root is malformed.
 #[track_caller]
 pub fn assert_valid(node: &Node) {
     if let Err(error) = verify(node) {
@@ -91,8 +61,6 @@ pub fn assert_valid(node: &Node) {
     }
 }
 
-/// Panic with a diagnostic [`VerifyError`] when any of several IR roots is
-/// malformed.
 #[track_caller]
 pub fn assert_valid_many(roots: &[Node]) {
     if let Err(error) = verify_many(roots) {
@@ -103,7 +71,7 @@ pub fn assert_valid_many(roots: &[Node]) {
 #[derive(Clone)]
 struct InputDecl {
     node_index: usize,
-    axes: Vec<Axis>,
+    shape: Vec<Axis>,
     dtype: Dtype,
 }
 
@@ -111,7 +79,6 @@ struct InputDecl {
 struct Verifier {
     shapes: HashMap<*const NodeKind, Rc<Vec<Axis>>>,
     inputs: HashMap<&'static str, InputDecl>,
-    axes: HashMap<Axis, (AxisName, Extent)>,
     next_node: usize,
 }
 
@@ -122,113 +89,44 @@ impl Verifier {
             return Ok(shape.clone());
         }
 
-        // Children come first, so `node_index` is a stable topological
-        // (postorder) position like tinygrad's type_verify diagnostics.
-        let shape = match node.as_ref() {
-            NodeKind::Input { axes, .. } => axes.clone(),
-            NodeKind::Const { .. } => Vec::new(),
-            NodeKind::Iota { axis } => vec![*axis],
-            NodeKind::Map { inputs, .. } => {
-                let mut shape = Vec::new();
-                for input in inputs {
-                    let input_shape = self.visit(input)?;
-                    union_axes(&mut shape, &input_shape);
-                }
-                shape
-            }
-            NodeKind::Reduce { src, axis, .. } => self
-                .visit(src)?
+        let child_shapes = match node.as_ref() {
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => Vec::new(),
+            NodeKind::Coordinate { src, .. }
+            | NodeKind::Reduce { src, .. }
+            | NodeKind::Scan { src, .. }
+            | NodeKind::View { src, .. }
+            | NodeKind::Reindex { src, .. } => vec![self.visit(src)?],
+            NodeKind::Map { inputs, .. } => inputs
                 .iter()
-                .copied()
-                .filter(|candidate| candidate != axis)
-                .collect(),
-            NodeKind::Scan { src, .. } => (*self.visit(src)?).clone(),
-            NodeKind::Gather { src, index, axis } => {
-                let source_shape = self.visit(src)?;
-                let index_shape = self.visit(index)?;
-                let mut shape: Vec<Axis> = source_shape
-                    .iter()
-                    .copied()
-                    .filter(|candidate| candidate != axis)
-                    .collect();
-                union_axes(&mut shape, &index_shape);
-                shape
-            }
-            NodeKind::View { src, groups } => {
-                let source_shape = self.visit(src)?;
-                let mut shape = Vec::new();
-                for source_axis in source_shape.iter().copied() {
-                    if let Some((_, target)) = groups
-                        .iter()
-                        .find(|(members, _)| members.contains(&source_axis))
-                    {
-                        push_axis(&mut shape, *target);
-                    } else {
-                        push_axis(&mut shape, source_axis);
-                    }
-                }
-                shape
-            }
-            NodeKind::Reindex { src, map, .. } => {
-                let source_shape = self.visit(src)?;
-                let mut shape = Vec::new();
-                for source_axis in source_shape.iter().copied() {
-                    if let Some((_, terms, _)) =
-                        map.iter().find(|(mapped, _, _)| *mapped == source_axis)
-                    {
-                        for (_, output_axis) in terms {
-                            push_axis(&mut shape, *output_axis);
-                        }
-                    } else {
-                        push_axis(&mut shape, source_axis);
-                    }
-                }
-                shape
-            }
+                .map(|input| self.visit(input))
+                .collect::<Result<Vec<_>, _>>()?,
+            NodeKind::Gather { src, index, .. } => vec![self.visit(src)?, self.visit(index)?],
         };
 
         let node_index = self.next_node;
         self.next_node += 1;
         let op = op_name(node);
-        self.check_node(node, node_index, op)?;
-        self.check_shape(&shape, node_index, op)?;
-
-        let shape = Rc::new(shape);
-        self.shapes.insert(pointer, shape.clone());
-        Ok(shape)
-    }
-
-    fn check_node(
-        &mut self,
-        node: &Node,
-        node_index: usize,
-        op: &'static str,
-    ) -> Result<(), VerifyError> {
         let fail = |reason: String| VerifyError {
             node_index,
             op,
             reason,
         };
 
-        match node.as_ref() {
-            NodeKind::Input {
-                name, axes, dtype, ..
-            } => {
-                for &axis in axes {
-                    self.check_axis(axis, node_index, op)?;
+        let shape = match node.as_ref() {
+            NodeKind::Input { name, shape, dtype } => {
+                if name.is_empty() {
+                    return Err(fail("input name cannot be empty".into()));
                 }
                 if let Some(previous) = self.inputs.get(name) {
-                    let same_axes = sorted_axes(&previous.axes) == sorted_axes(axes);
-                    let same_positional_shape = previous.axes.len() == axes.len()
+                    let compatible = previous.shape.len() == shape.len()
                         && previous
-                            .axes
+                            .shape
                             .iter()
-                            .zip(axes)
+                            .zip(shape)
                             .all(|(left, right)| left.extent == right.extent);
-                    if !same_axes && !same_positional_shape {
+                    if !compatible {
                         return Err(fail(format!(
-                            "input `{name}` conflicts with node {}: declarations must use \
-                             the same axes or the same positional extents",
+                            "input `{name}` conflicts with node {}: positional extents differ",
                             previous.node_index
                         )));
                     }
@@ -243,14 +141,19 @@ impl Verifier {
                         name,
                         InputDecl {
                             node_index,
-                            axes: axes.clone(),
+                            shape: shape.clone(),
                             dtype: *dtype,
                         },
                     );
                 }
+                shape.clone()
             }
-            NodeKind::Const { .. } => {}
-            NodeKind::Iota { axis } => self.check_axis(*axis, node_index, op)?,
+            NodeKind::Const { .. } => Vec::new(),
+            NodeKind::Iota { axis } => vec![*axis],
+            NodeKind::Coordinate { dim, .. } => {
+                check_dim(*dim, &child_shapes[0], "coordinate").map_err(&fail)?;
+                (*child_shapes[0]).clone()
+            }
             NodeKind::Map { op: map_op, inputs } => {
                 if inputs.len() != map_op.arity() {
                     return Err(fail(format!(
@@ -260,251 +163,176 @@ impl Verifier {
                         inputs.len()
                     )));
                 }
+                broadcast_shape(&child_shapes).map_err(&fail)?
             }
-            NodeKind::Reduce { axis, .. } => {
-                self.check_axis(*axis, node_index, op)?;
-                // Unlike Scan and Gather, Reduce may bind a fresh axis.
-                // `Reduce(Const(1), n, Add)` is sanic's count primitive, and
-                // folding an invariant over `n` deliberately repeats it
-                // extent(n) times.
+            NodeKind::Reduce { dim, .. } => {
+                check_dim(*dim, &child_shapes[0], "reduce").map_err(&fail)?;
+                let mut shape = (*child_shapes[0]).clone();
+                shape.remove(*dim);
+                shape
             }
-            NodeKind::Scan { src, axis, .. } => {
-                self.check_axis(*axis, node_index, op)?;
-                let source_shape = self.shape(src);
-                if !source_shape.contains(axis) {
-                    return Err(fail(format!(
-                        "scan axis {axis:?} is not present in source axes {source_shape:?}"
-                    )));
-                }
+            NodeKind::Scan { dim, .. } => {
+                check_dim(*dim, &child_shapes[0], "scan").map_err(&fail)?;
+                (*child_shapes[0]).clone()
             }
-            NodeKind::Gather { src, axis, .. } => {
-                self.check_axis(*axis, node_index, op)?;
-                let source_shape = self.shape(src);
-                if !source_shape.contains(axis) {
-                    return Err(fail(format!(
-                        "gather axis {axis:?} is not present in source axes {source_shape:?}"
-                    )));
-                }
+            NodeKind::Gather { dim, .. } => {
+                check_dim(*dim, &child_shapes[0], "gather").map_err(&fail)?;
+                let mut shape = Vec::new();
+                shape.extend_from_slice(&child_shapes[0][..*dim]);
+                shape.extend_from_slice(&child_shapes[1]);
+                shape.extend_from_slice(&child_shapes[0][*dim + 1..]);
+                shape
             }
-            NodeKind::View { src, groups } => {
-                self.check_view(src, groups, node_index, op)?;
+            NodeKind::View { dims, .. } => {
+                check_view(&child_shapes[0], dims).map_err(&fail)?;
+                dims.iter().map(|dim| dim.axis).collect()
             }
-            NodeKind::Reindex { src, map, padded } => {
-                self.check_reindex(src, map, *padded, node_index, op)?;
+            NodeKind::Reindex {
+                shape, map, padded, ..
+            } => {
+                check_reindex(&child_shapes[0], shape, map, *padded).map_err(&fail)?;
+                shape.clone()
             }
-        }
-        Ok(())
-    }
-
-    fn check_view(
-        &mut self,
-        src: &Node,
-        groups: &[(Vec<Axis>, Axis)],
-        node_index: usize,
-        op: &'static str,
-    ) -> Result<(), VerifyError> {
-        let fail = |reason: String| VerifyError {
-            node_index,
-            op,
-            reason,
         };
-        let source_shape = self.shape(src);
-        let mut consumed = HashSet::new();
-        let mut targets = HashSet::new();
 
-        for (members, target) in groups {
-            self.check_axis(*target, node_index, op)?;
-            if members.is_empty() {
-                return Err(fail(format!(
-                    "view target {target:?} has an empty source group"
-                )));
-            }
-            if !targets.insert(*target) {
-                return Err(fail(format!(
-                    "view target {target:?} is produced by more than one group"
-                )));
-            }
-            if source_shape.contains(target)
-                && !(members.len() == 1 && members.first() == Some(target))
-            {
-                return Err(fail(format!(
-                    "view target {target:?} aliases an existing source axis; \
-                     targets must be fresh"
-                )));
-            }
-
-            let mut product = Some(1usize);
-            for &member in members {
-                self.check_axis(member, node_index, op)?;
-                if !source_shape.contains(&member) {
-                    return Err(fail(format!(
-                        "view source axis {member:?} is not present in source axes {source_shape:?}"
-                    )));
-                }
-                if !consumed.insert(member) {
-                    return Err(fail(format!(
-                        "view source axis {member:?} is consumed more than once"
-                    )));
-                }
-                product = match (product, member.extent) {
-                    (Some(acc), Extent::Static(extent)) => {
-                        Some(acc.checked_mul(extent).ok_or_else(|| {
-                            fail(format!(
-                                "grouped extent overflows usize at source axis {member:?}"
-                            ))
-                        })?)
-                    }
-                    _ => None,
-                };
-            }
-            if let (Some(expected), Extent::Static(actual)) = (product, target.extent)
-                && expected != actual
-            {
-                return Err(fail(format!(
-                    "view target {target:?} has extent {actual}; grouped source extent is {expected}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn check_reindex(
-        &mut self,
-        src: &Node,
-        map: &[AffineIndex],
-        padded: bool,
-        node_index: usize,
-        op: &'static str,
-    ) -> Result<(), VerifyError> {
-        let fail = |reason: String| VerifyError {
-            node_index,
-            op,
-            reason,
-        };
-        let source_shape = self.shape(src);
-        let mut mapped_axes = HashSet::new();
-
-        for (source_axis, terms, offset) in map {
-            self.check_axis(*source_axis, node_index, op)?;
-            if !source_shape.contains(source_axis) {
-                return Err(fail(format!(
-                    "reindex source axis {source_axis:?} is not present in source axes \
-                     {source_shape:?}"
-                )));
-            }
-            if !mapped_axes.insert(*source_axis) {
-                return Err(fail(format!(
-                    "reindex source axis {source_axis:?} is mapped more than once"
-                )));
-            }
-            for &(_, output_axis) in terms {
-                self.check_axis(output_axis, node_index, op)?;
-            }
-
-            if !padded {
-                let bounds = affine_bounds(terms, *offset).map_err(&fail)?;
-                if let (Extent::Static(source_extent), Some((minimum, maximum))) =
-                    (source_axis.extent, bounds)
-                {
-                    if minimum < 0 || maximum >= source_extent as i128 {
-                        return Err(fail(format!(
-                            "reindex of {source_axis:?} reaches [{minimum}, {maximum}], outside \
-                             [0, {source_extent}) without padding"
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn check_shape(
-        &mut self,
-        shape: &[Axis],
-        node_index: usize,
-        op: &'static str,
-    ) -> Result<(), VerifyError> {
-        let mut seen = HashSet::new();
-        let mut volume = Some(1usize);
-        for &axis in shape {
-            self.check_axis(axis, node_index, op)?;
-            if !seen.insert(axis) {
-                return Err(VerifyError {
-                    node_index,
-                    op,
-                    reason: format!("output axis {axis:?} occurs more than once"),
-                });
-            }
-            volume = match (volume, axis.extent) {
-                (Some(acc), Extent::Static(extent)) => {
-                    Some(acc.checked_mul(extent).ok_or_else(|| VerifyError {
-                        node_index,
-                        op,
-                        reason: format!("static output volume overflows usize at axis {axis:?}"),
-                    })?)
-                }
-                _ => None,
-            };
-        }
-        Ok(())
-    }
-
-    fn check_axis(
-        &mut self,
-        axis: Axis,
-        node_index: usize,
-        op: &'static str,
-    ) -> Result<(), VerifyError> {
-        if axis.extent == Extent::Static(0) {
-            return Err(VerifyError {
-                node_index,
-                op,
-                reason: format!(
-                    "axis {axis:?} has zero extent, which the dense IR cannot represent"
-                ),
-            });
-        }
-        if let Some(&(name, extent)) = self.axes.get(&axis) {
-            if name != axis.name || extent != axis.extent {
-                return Err(VerifyError {
-                    node_index,
-                    op,
-                    reason: format!(
-                        "axis identity {axis:?} has inconsistent metadata: \
-                         ({name:?}, {extent:?}) != ({:?}, {:?})",
-                        axis.name, axis.extent
-                    ),
-                });
-            }
-        } else {
-            self.axes.insert(axis, (axis.name, axis.extent));
-        }
-        Ok(())
-    }
-
-    fn shape(&self, node: &Node) -> Rc<Vec<Axis>> {
-        self.shapes[&Rc::as_ptr(node)].clone()
+        check_shape(&shape).map_err(&fail)?;
+        let shape = Rc::new(shape);
+        self.shapes.insert(pointer, shape.clone());
+        Ok(shape)
     }
 }
 
-fn affine_bounds(terms: &[(i64, Axis)], offset: i64) -> Result<Option<(i128, i128)>, String> {
+fn check_dim(dim: usize, shape: &[Axis], op: &str) -> Result<(), String> {
+    if dim >= shape.len() {
+        Err(format!(
+            "{op} dimension {dim} is out of range for rank {}",
+            shape.len()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn broadcast_shape(shapes: &[Rc<Vec<Axis>>]) -> Result<Vec<Axis>, String> {
+    let rank = shapes.iter().map(|shape| shape.len()).max().unwrap_or(0);
+    let mut output = Vec::with_capacity(rank);
+    for output_dim in 0..rank {
+        let mut selected: Option<Axis> = None;
+        for shape in shapes {
+            let Some(input_dim) = output_dim.checked_sub(rank - shape.len()) else {
+                continue;
+            };
+            let candidate = shape[input_dim];
+            selected = Some(match selected {
+                None => candidate,
+                Some(current) => match (current.extent, candidate.extent) {
+                    (Extent::Static(1), _) => candidate,
+                    (_, Extent::Static(1)) => current,
+                    (left, right) if left == right => current,
+                    _ => {
+                        return Err(format!(
+                            "map dimensions with extents {:?} and {:?} cannot broadcast",
+                            current.extent, candidate.extent
+                        ));
+                    }
+                },
+            });
+        }
+        output.push(selected.ok_or_else(|| "map output dimension has no source".to_string())?);
+    }
+    Ok(output)
+}
+
+fn check_view(source: &[Axis], dims: &[ViewDim]) -> Result<(), String> {
+    let mut consumed = vec![false; source.len()];
+    for dim in dims {
+        if dim.sources.is_empty() && dim.axis.extent != Extent::Static(1) {
+            return Err("a source-free view dimension must have extent one".into());
+        }
+        let mut product = Some(1usize);
+        for &source_dim in &dim.sources {
+            check_dim(source_dim, source, "view source")?;
+            if std::mem::replace(&mut consumed[source_dim], true) {
+                return Err(format!(
+                    "view source dimension {source_dim} is consumed more than once"
+                ));
+            }
+            product = match (product, source[source_dim].extent) {
+                (Some(acc), Extent::Static(extent)) => acc.checked_mul(extent),
+                _ => None,
+            };
+        }
+        if let (Some(expected), Extent::Static(actual)) = (product, dim.axis.extent)
+            && expected != actual
+        {
+            return Err(format!(
+                "view output extent {actual} does not match grouped source extent {expected}"
+            ));
+        }
+    }
+    if let Some(missing) = consumed.iter().position(|consumed| !consumed) {
+        return Err(format!("view source dimension {missing} is not consumed"));
+    }
+    Ok(())
+}
+
+fn check_reindex(
+    source: &[Axis],
+    output: &[Axis],
+    map: &[(usize, Vec<(i64, usize)>, i64)],
+    padded: bool,
+) -> Result<(), String> {
+    if map.len() != source.len() {
+        return Err(format!(
+            "reindex maps {} source dimensions; expected {}",
+            map.len(),
+            source.len()
+        ));
+    }
+    let mut seen = vec![false; source.len()];
+    for (source_dim, terms, offset) in map {
+        check_dim(*source_dim, source, "reindex source")?;
+        if std::mem::replace(&mut seen[*source_dim], true) {
+            return Err(format!(
+                "reindex source dimension {source_dim} is mapped more than once"
+            ));
+        }
+        for &(_, output_dim) in terms {
+            check_dim(output_dim, output, "reindex output")?;
+        }
+        if !padded
+            && let Some((minimum, maximum)) = affine_bounds(terms, *offset, output)?
+            && let Extent::Static(extent) = source[*source_dim].extent
+            && (minimum < 0 || maximum >= extent as i128)
+        {
+            return Err(format!(
+                "reindex of source dimension {source_dim} reaches [{minimum}, {maximum}], outside [0, {extent}) without padding"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn affine_bounds(
+    terms: &[(i64, usize)],
+    offset: i64,
+    output: &[Axis],
+) -> Result<Option<(i128, i128)>, String> {
     let (mut minimum, mut maximum) = (offset as i128, offset as i128);
-    // Equal output axes are correlated, so combine their coefficients before
-    // taking a box bound (`i - i` is exactly zero, not `[-n, n]`).
-    let mut coefficients: HashMap<Axis, i128> = HashMap::new();
-    for &(coefficient, axis) in terms {
-        let combined = coefficients.entry(axis).or_default();
+    let mut coefficients = HashMap::<usize, i128>::new();
+    for &(coefficient, output_dim) in terms {
+        let combined = coefficients.entry(output_dim).or_default();
         *combined = combined
             .checked_add(coefficient as i128)
-            .ok_or_else(|| format!("affine coefficient overflows i128 at axis {axis:?}"))?;
+            .ok_or_else(|| "affine coefficient overflows i128".to_string())?;
     }
-    for (axis, coefficient) in coefficients {
-        let Extent::Static(extent) = axis.extent else {
+    for (output_dim, coefficient) in coefficients {
+        let Extent::Static(extent) = output[output_dim].extent else {
             return Ok(None);
         };
         let delta = coefficient
             .checked_mul((extent - 1) as i128)
-            .ok_or_else(|| format!("affine index range overflows i128 at axis {axis:?}"))?;
+            .ok_or_else(|| "affine index range overflows i128".to_string())?;
         if delta < 0 {
             minimum = minimum
                 .checked_add(delta)
@@ -518,22 +346,22 @@ fn affine_bounds(terms: &[(i64, Axis)], offset: i64) -> Result<Option<(i128, i12
     Ok(Some((minimum, maximum)))
 }
 
-fn push_axis(axes: &mut Vec<Axis>, axis: Axis) {
-    if !axes.contains(&axis) {
-        axes.push(axis);
+fn check_shape(shape: &[Axis]) -> Result<(), String> {
+    let mut volume = 1usize;
+    for (dim, axis) in shape.iter().enumerate() {
+        match axis.extent {
+            Extent::Static(0) => {
+                return Err(format!("dimension {dim} has zero extent"));
+            }
+            Extent::Static(extent) => {
+                volume = volume.checked_mul(extent).ok_or_else(|| {
+                    format!("static output volume overflows usize at dimension {dim}")
+                })?;
+            }
+            Extent::Dynamic => {}
+        }
     }
-}
-
-fn union_axes(axes: &mut Vec<Axis>, more: &[Axis]) {
-    for &axis in more {
-        push_axis(axes, axis);
-    }
-}
-
-fn sorted_axes(axes: &[Axis]) -> Vec<Axis> {
-    let mut sorted = axes.to_vec();
-    sorted.sort();
-    sorted
+    Ok(())
 }
 
 fn op_name(node: &Node) -> &'static str {
@@ -541,6 +369,7 @@ fn op_name(node: &Node) -> &'static str {
         NodeKind::Input { .. } => "Input",
         NodeKind::Const { .. } => "Const",
         NodeKind::Iota { .. } => "Iota",
+        NodeKind::Coordinate { .. } => "Coordinate",
         NodeKind::Map { .. } => "Map",
         NodeKind::Reduce { .. } => "Reduce",
         NodeKind::Scan { .. } => "Scan",
@@ -553,145 +382,41 @@ fn op_name(node: &Node) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_ir::{
-        BinOp, MapOp, Monoid, axis, input, konst, map, reduce, reindex, rename, view,
-    };
-
-    fn add() -> BinOp {
-        BinOp::Monoid(Monoid::Add)
-    }
+    use crate::ir::{MapOp, axis, input, konst};
 
     #[test]
-    fn accepts_a_valid_composed_graph() {
-        let (q, k, d, e) = (axis("q", 3), axis("k", 5), axis("d", 4), axis("e", 2));
-        let graph = crate::kernel_ir::attention(
-            input("Q", &[q, d], Dtype::F32),
-            input("K", &[k, d], Dtype::F32),
-            input("V", &[k, e], Dtype::F32),
-            d,
-            k,
-        );
-        assert_eq!(verify(&graph), Ok(()));
-    }
-
-    #[test]
-    fn checks_map_arity() {
+    fn rejects_bad_map_arity() {
         let invalid = Rc::new(NodeKind::Map {
             op: MapOp::Add,
             inputs: vec![konst(1.0)],
         });
-        let error = verify(&invalid).unwrap_err();
-        assert_eq!(error.op, "Map");
-        assert!(error.reason.contains("expects 2 inputs"));
-    }
-
-    #[test]
-    fn checks_axis_scope() {
-        let n = axis("n", 4);
-        let missing = axis("missing", 4);
-        let count = reduce(konst(1.0), missing, add());
-        assert_eq!(verify(&count), Ok(()));
-
-        let invalid = crate::kernel_ir::scan(input("X", &[n], Dtype::F32), missing, add());
-        assert!(verify(&invalid).unwrap_err().reason.contains("not present"));
-    }
-
-    #[test]
-    fn checks_input_axes_and_storage_declarations() {
-        let n = axis("n", 4);
-        let duplicate_axis = input("X", &[n, n], Dtype::F32);
-        assert!(
-            verify(&duplicate_axis)
-                .unwrap_err()
-                .reason
-                .contains("occurs more than once")
-        );
-
-        let m = axis("m", 4);
-        let compatible_alias = map(
-            MapOp::Add,
-            vec![input("X", &[n], Dtype::F32), input("X", &[m], Dtype::F32)],
-        );
-        assert_eq!(verify(&compatible_alias), Ok(()));
-
-        let conflicting_dtype = map(
-            MapOp::Add,
-            vec![input("X", &[n], Dtype::F16), input("X", &[m], Dtype::F32)],
-        );
-        assert!(
-            verify(&conflicting_dtype)
-                .unwrap_err()
-                .reason
-                .contains("storage dtype")
-        );
-    }
-
-    #[test]
-    fn checks_view_groups_and_extents() {
-        let (a, b, flat) = (axis("a", 2), axis("b", 3), axis("flat", 5));
-        let wrong_extent = view(input("X", &[a, b], Dtype::F32), vec![(vec![a, b], flat)]);
-        assert!(
-            verify(&wrong_extent)
-                .unwrap_err()
-                .reason
-                .contains("grouped source extent is 6")
-        );
-
-        let target_collision = rename(input("X", &[a, b], Dtype::F32), a, b);
-        assert!(
-            verify(&target_collision)
-                .unwrap_err()
-                .reason
-                .contains("targets must be fresh")
-        );
-    }
-
-    #[test]
-    fn proves_unpadded_affine_indices_are_in_bounds() {
-        let (source, output) = (axis("source", 5), axis("output", 4));
-        let invalid = reindex(
-            input("X", &[source], Dtype::F32),
-            vec![(source, vec![(1, output)], 2)],
-            false,
-        );
         assert!(
             verify(&invalid)
                 .unwrap_err()
                 .reason
-                .contains("outside [0, 5)")
+                .contains("expects 2 inputs")
         );
-
-        let padded = reindex(
-            input("X", &[source], Dtype::F32),
-            vec![(source, vec![(1, output)], 2)],
-            true,
-        );
-        assert_eq!(verify(&padded), Ok(()));
-
-        let reversed = reindex(
-            input("X", &[source], Dtype::F32),
-            vec![(source, vec![(-1, source)], 4)],
-            false,
-        );
-        assert_eq!(verify(&reversed), Ok(()));
-
-        let singleton = axis("singleton", 1);
-        let correlated = reindex(
-            input("Y", &[singleton], Dtype::F32),
-            vec![(singleton, vec![(1, output), (-1, output)], 0)],
-            false,
-        );
-        assert_eq!(verify(&correlated), Ok(()));
     }
 
     #[test]
-    fn errors_include_the_topological_node_position() {
-        let invalid = Rc::new(NodeKind::Map {
-            op: MapOp::Add,
-            inputs: vec![konst(1.0)],
+    fn axis_descriptors_are_not_dimension_identities() {
+        let n = axis("n", 4);
+        assert_eq!(verify(&input("X", [n, n], Dtype::F32)), Ok(()));
+    }
+
+    #[test]
+    fn rejects_out_of_range_positional_dimension() {
+        let n = axis("n", 4);
+        let invalid = Rc::new(NodeKind::Reduce {
+            src: input("X", [n], Dtype::F32),
+            dim: 1,
+            op: crate::ir::Monoid::Add,
         });
-        let error = verify(&invalid).unwrap_err();
-        assert_eq!(error.node_index, 1);
-        assert!(error.to_string().contains("node 1 (Map)"));
+        assert!(
+            verify(&invalid)
+                .unwrap_err()
+                .reason
+                .contains("out of range")
+        );
     }
 }

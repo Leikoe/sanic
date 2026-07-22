@@ -9,16 +9,21 @@
 
 use sanic::analyze::{Parallelism, analyze, analyze_all, streamable, structure};
 use sanic::derive::{Carrier, Expr, derive};
-use sanic::kernel_ir::*;
+use sanic::ir::*;
+use sanic::nn::scaled_dot_product_attention;
 
-fn add_r() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn attention(query: NodeRef, key: NodeRef, value: NodeRef) -> NodeRef {
+    scaled_dot_product_attention(query, key, value, None, 0.0, false, Some(1.0), false)
 }
-fn max_r() -> BinOp {
-    BinOp::Monoid(Monoid::Max)
+
+fn add_r() -> Monoid {
+    Monoid::Add
 }
-fn lse_r() -> BinOp {
-    BinOp::Monoid(Monoid::LogSumExp)
+fn max_r() -> Monoid {
+    Monoid::Max
+}
+fn lse_r() -> Monoid {
+    Monoid::LogSumExp
 }
 
 // ── a tiny deterministic PRNG so tests need no external crates ──────────────
@@ -67,15 +72,17 @@ fn matmul_axis_tags() {
     let (i, j, k) = (axis("i", 5), axis("j", 6), axis("k", 8));
     let a = input("A", &[i, k], Dtype::F32);
     let b = input("B", &[k, j], Dtype::F32);
-    let mm = matmul(a, b, k);
+    let [i_axis, k_axis] = axis_refs(&a).try_into().unwrap();
+    let j_axis = axis_refs(&b)[1];
+    let mm = matmul(a, b);
 
-    assert_eq!(structure(&mm, i).level, Parallelism::Free);
-    assert_eq!(structure(&mm, j).level, Parallelism::Free);
+    assert_eq!(structure(&mm, i_axis).level, Parallelism::Free);
+    assert_eq!(structure(&mm, j_axis).level, Parallelism::Free);
 
-    let sk = structure(&mm, k);
+    let sk = structure(&mm, k_axis);
     assert_eq!(sk.level, Parallelism::Monoidal);
     assert!(sk.linear, "contraction is a linear (+) reduction");
-    assert!(streamable(&mm, k));
+    assert!(streamable(&mm, k_axis));
 }
 
 // ── the dot-product carrier reproduces a contraction ─────────────────────────
@@ -84,9 +91,10 @@ fn dot_product_carrier() {
     let k = axis("k", 17);
     let a = input("A", &[k], Dtype::F32);
     let b = input("B", &[k], Dtype::F32);
-    let mm = matmul(a, b, k);
+    let stream = axis_refs(&a)[0];
+    let mm = reduce(map(MapOp::Mul, vec![a, b]), 0usize, Monoid::Add);
 
-    let car = derive(&mm, k).expect("matmul k is derivable");
+    let car = derive(&mm, stream).expect("dot-product dimension is derivable");
     assert_eq!(car.slots, 1);
 
     let mut rng = Lcg::new(1);
@@ -107,7 +115,8 @@ fn renders_derived_flash_attention() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let car = derive(&attention(q, kk, v, d, k), k).unwrap();
+    let stream = axis_refs(&kk)[0];
+    let car = derive(&attention(q, kk, v), stream).unwrap();
     let r = car.render();
     assert!(r.contains("into:    s0 = x0;  s1 = 1;  s2 = x1"));
     assert!(r.contains("s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))"));
@@ -123,7 +132,9 @@ fn structure_map_for_attention() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let report = analyze(&attention(q, kk, v, d, k), &[sq, k]);
+    let query_axis = axis_refs(&q)[0];
+    let key_axis = axis_refs(&kk)[0];
+    let report = analyze(&attention(q, kk, v), &[query_axis, key_axis]);
 
     let rs = &report.axes[0];
     assert_eq!(rs.structure.level, Parallelism::Free);
@@ -147,21 +158,35 @@ fn structure_map_auto_discovers_axes() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let attn = attention(q, kk, v, d, k);
+    let query_axis = axis_refs(&q)[0];
+    let contract_axis = axis_refs(&q)[1];
+    let key_axis = axis_refs(&kk)[0];
+    let value_axis = axis_refs(&v)[1];
+    let attn = attention(q, kk, v);
 
-    let discovered: std::collections::BTreeSet<_> = all_axes(&attn).into_iter().collect();
-    assert_eq!(discovered, [d, e, k, sq].into_iter().collect());
+    let discovered = all_axis_refs(&attn);
+    assert!(
+        [query_axis, contract_axis, key_axis, value_axis]
+            .iter()
+            .all(|axis| discovered.contains(axis))
+    );
 
     let report = analyze_all(&attn);
-    let by = |a: Axis| report.axes.iter().find(|r| r.axis == a).unwrap();
-    assert_eq!(by(k).carrier.as_ref().unwrap().slots, 3); // the fusion axis
-    assert_eq!(by(d).structure.level, Parallelism::Monoidal);
+    let by = |axis: AxisRef| {
+        report
+            .axes
+            .iter()
+            .find(|report| report.axis == axis)
+            .unwrap()
+    };
+    assert_eq!(by(key_axis).carrier.as_ref().unwrap().slots, 3); // the fusion axis
+    assert_eq!(by(contract_axis).structure.level, Parallelism::Monoidal);
     assert!(
-        by(d).carrier.is_none(),
+        by(contract_axis).carrier.is_none(),
         "the contraction folds deeper, not here"
     );
-    assert_eq!(by(sq).structure.level, Parallelism::Free);
-    assert_eq!(by(e).structure.level, Parallelism::Free);
+    assert_eq!(by(query_axis).structure.level, Parallelism::Free);
+    assert_eq!(by(value_axis).structure.level, Parallelism::Free);
 
     let r = report.render();
     assert!(r.contains("project: s2 / s1"));
@@ -180,24 +205,41 @@ fn carrier_knows_its_accumulator_size() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let attn = attention(q, kk, v, d, k);
+    let stream = axis_refs(&kk)[0];
+    let value_axis = axis_refs(&v)[1];
+    let attn = attention(q, kk, v);
 
     // output-shape inference: attention is indexed by query and value-feature.
     let out: BTreeSet<Axis> = attn.shape().into_iter().collect();
     assert_eq!(out, [sq, e].into_iter().collect());
 
-    let car = derive(&attn, k).unwrap();
-    let span = |i: usize| car.spans[i].iter().copied().collect::<BTreeSet<Axis>>();
-    assert_eq!(span(0), [sq].into_iter().collect(), "m is per-query");
-    assert_eq!(span(1), [sq].into_iter().collect(), "ℓ is per-query");
+    let car = derive(&attn, stream).unwrap();
+    let span = |i: usize| {
+        car.spans[i]
+            .iter()
+            .map(|axis| (axis.name, axis.extent))
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        span(0),
+        [(sq.name, sq.extent)].into_iter().collect(),
+        "m is per-query"
+    );
+    assert_eq!(
+        span(1),
+        [(sq.name, sq.extent)].into_iter().collect(),
+        "ℓ is per-query"
+    );
     assert_eq!(
         span(2),
-        [sq, e].into_iter().collect(),
+        [(sq.name, sq.extent), (e.name, e.extent)]
+            .into_iter()
+            .collect(),
         "o spans query × value-feature"
     );
 
     // exact |Acc| per query (sq → 1) with value-feature extent e = 64.
-    let acc = car.acc_scalars(|ax| if ax == e { 64.0 } else { 1.0 });
+    let acc = car.acc_scalars(|axis| if axis == value_axis { 64.0 } else { 1.0 });
     assert_eq!(acc, 2.0 + 64.0);
 }
 
@@ -215,22 +257,22 @@ fn multi_head_attention_derives_identically_to_single_head() {
         axis("d", 64),
         axis("e", 64),
     );
-    let mha = attention(
-        input("Q", &[b, h, sq, d], Dtype::F32),
-        input("K", &[b, h, k, d], Dtype::F32),
-        input("V", &[b, h, k, e], Dtype::F32),
-        d,
-        k,
-    );
+    let mq = input("Q", &[b, h, sq, d], Dtype::F32);
+    let mk = input("K", &[b, h, k, d], Dtype::F32);
+    let mv = input("V", &[b, h, k, e], Dtype::F32);
+    let [batch_axis, head_axis, _, _] = axis_refs(&mq).try_into().unwrap();
+    let multi_stream = axis_refs(&mk)[2];
+    let value_axis = axis_refs(&mv)[3];
+    let mha = attention(mq, mk, mv);
+    let sk = input("K", &[k, d], Dtype::F32);
+    let single_stream = axis_refs(&sk)[0];
     let sha = attention(
         input("Q", &[sq, d], Dtype::F32),
-        input("K", &[k, d], Dtype::F32),
+        sk,
         input("V", &[k, e], Dtype::F32),
-        d,
-        k,
     );
-    let cm = derive(&mha, k).unwrap();
-    let cs = derive(&sha, k).unwrap();
+    let cm = derive(&mha, multi_stream).unwrap();
+    let cs = derive(&sha, single_stream).unwrap();
 
     // the derived kernel is the same — no MHA special-casing
     assert_eq!(format!("{:?}", cm.into), format!("{:?}", cs.into));
@@ -239,8 +281,12 @@ fn multi_head_attention_derives_identically_to_single_head() {
     assert_eq!(cm.slots, 3);
 
     // only the spans differ: MHA's output slot carries the batch & head axes
-    let o_span: std::collections::BTreeSet<_> = cm.spans[2].iter().copied().collect();
-    assert!(o_span.contains(&b) && o_span.contains(&h) && o_span.contains(&e));
+    let o_span: std::collections::HashSet<_> = cm.spans[2].iter().copied().collect();
+    assert!(
+        [batch_axis, head_axis, value_axis]
+            .iter()
+            .all(|axis| o_span.contains(axis))
+    );
 }
 
 // ── attention: sq FREE, k MONOIDAL, derives Acc = (m, ℓ, o), proj = o/ℓ ──────
@@ -250,15 +296,17 @@ fn attention_axis_tags_and_carrier() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let attn = attention(q, kk, v, d, k);
+    let query_axis = axis_refs(&q)[0];
+    let key_axis = axis_refs(&kk)[0];
+    let attn = attention(q, kk, v);
 
-    assert_eq!(structure(&attn, sq).level, Parallelism::Free);
-    assert_eq!(structure(&attn, k).level, Parallelism::Monoidal);
-    assert!(streamable(&attn, k));
+    assert_eq!(structure(&attn, query_axis).level, Parallelism::Free);
+    assert_eq!(structure(&attn, key_axis).level, Parallelism::Monoidal);
+    assert!(streamable(&attn, key_axis));
 
     // The headline: derive the (m, ℓ, o) accumulator from the rules, by the
     // generic compositional fold — no FlashAttention-shaped template.
-    let car = derive(&attn, k).expect("attention k is derivable");
+    let car = derive(&attn, key_axis).expect("attention key dimension is derivable");
     assert_eq!(car.slots, 3, "Acc = (m, ℓ, o)");
     // `rescale` = the online-softmax coupling; `defer-div` = the ÷ℓ
     // normalizer applied once at the end.
@@ -282,11 +330,12 @@ fn mean_carrier() {
     // mean = (Σ x) / (Σ 1) — the count is a fold over a literal 1.
     let a = axis("a", 31);
     let x = input("X", &[a], Dtype::F32);
-    let sum = reduce(x.clone(), a, add_r());
-    let count = reduce(konst(1.0), a, add_r());
+    let stream = axis_refs(&x)[0];
+    let sum = reduce(x.clone(), 0usize, add_r());
+    let count = reduce(ones_like(x.clone()), 0usize, add_r());
     let mean = map(MapOp::Div, vec![sum, count]);
 
-    let car = derive(&mean, a).expect("mean is derivable");
+    let car = derive(&mean, stream).expect("mean is derivable");
     assert_eq!(car.slots, 2, "Acc = (sum, count)");
     assert!(car.rules.contains(&"tuple")); // more than one slot needed
 
@@ -303,14 +352,15 @@ fn variance_carrier() {
     // var = E[x²] − E[x]²  =  Σx²/n − (Σx/n)²
     let a = axis("a", 40);
     let x = input("X", &[a], Dtype::F32);
-    let sumx2 = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), a, add_r());
-    let sumx = reduce(x.clone(), a, add_r());
-    let count = reduce(konst(1.0), a, add_r());
+    let stream = axis_refs(&x)[0];
+    let sumx2 = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 0usize, add_r());
+    let sumx = reduce(x.clone(), 0usize, add_r());
+    let count = reduce(ones_like(x.clone()), 0usize, add_r());
     let ex2 = map(MapOp::Div, vec![sumx2, count.clone()]);
     let ex = map(MapOp::Div, vec![sumx, count]);
     let var = map(MapOp::Sub, vec![ex2, map(MapOp::Mul, vec![ex.clone(), ex])]);
 
-    let car = derive(&var, a).expect("variance is derivable");
+    let car = derive(&var, stream).expect("variance is derivable");
     assert_eq!(car.slots, 3, "Acc = (Σx², Σx, count)");
 
     let mut rng = Lcg::new(99);
@@ -328,15 +378,16 @@ fn logsumexp_carrier() {
     // lse(x) = log(Σ exp(x − m)) + m,   m = max x
     let a = axis("a", 29);
     let x = input("X", &[a], Dtype::F32);
-    let m = reduce(x.clone(), a, max_r());
+    let stream = axis_refs(&x)[0];
+    let m = reduce(x.clone(), 0usize, max_r());
     let e = map(
         MapOp::Exp,
         vec![map(MapOp::Sub, vec![x.clone(), m.clone()])],
     );
-    let s = reduce(e, a, add_r());
+    let s = reduce(e, 0usize, add_r());
     let lse = map(MapOp::Add, vec![map(MapOp::Log, vec![s]), m]);
 
-    let car = derive(&lse, a).expect("logsumexp is derivable");
+    let car = derive(&lse, stream).expect("logsumexp is derivable");
     assert_eq!(car.slots, 2, "Acc = (max, Σexp)");
     assert!(car.rules.contains(&"rescale")); // the max/exp coupling
 
@@ -345,6 +396,56 @@ fn logsumexp_carrier() {
     let items: Vec<Vec<f64>> = xs.iter().map(|&x| vec![x]).collect();
     let reference = xs.iter().map(|x| x.exp()).sum::<f64>().ln();
     check(&car, &items, &[reference]);
+}
+
+// ── payloads filtered to an extremal key form a generic product monoid ──────
+#[test]
+fn payloads_at_an_extremal_key_derive_generically() {
+    let n = axis("n", 7);
+    let key = input("K", &[n], Dtype::F32);
+    let payload = input("P", &[n], Dtype::F32);
+    let stream = axis_refs(&key)[0];
+    let maximum = reduce(key.clone(), 0usize, max_r());
+    let at_maximum = map(
+        MapOp::Where,
+        vec![
+            map(MapOp::Lt, vec![key, maximum]),
+            konst(Monoid::Add.identity()),
+            payload,
+        ],
+    );
+    let sum_at_maximum = reduce(at_maximum, 0usize, add_r());
+
+    let carrier = derive(&sum_at_maximum, stream).expect("extremal payloads are derivable");
+    assert_eq!(carrier.slots, 2, "Acc = (maximum key, tied payload sum)");
+    assert!(carrier.rules.contains(&"extremum-filter"));
+
+    let keys = [-1.0, 4.0, 2.0, 4.0, -1.0, 4.0, 3.0];
+    let payloads = [10.0, 2.0, 20.0, 3.0, 30.0, 5.0, 40.0];
+    let items: Vec<Vec<f64>> = keys
+        .into_iter()
+        .zip(payloads)
+        .map(|(key, payload)| vec![key, payload])
+        .collect();
+    check(&carrier, &items, &[10.0]);
+
+    let key = input("K", &[n], Dtype::F32);
+    let payload = input("P", &[n], Dtype::F32);
+    let stream = axis_refs(&key)[0];
+    let minimum = reduce(key.clone(), 0usize, Monoid::Min);
+    let at_minimum = map(
+        MapOp::Where,
+        vec![
+            map(MapOp::Lt, vec![minimum, key]),
+            konst(Monoid::Max.identity()),
+            payload,
+        ],
+    );
+    let max_at_minimum = reduce(at_minimum, 0usize, max_r());
+    let carrier = derive(&max_at_minimum, stream).expect("minimum-key payloads are derivable");
+    assert_eq!(carrier.slots, 2, "Acc = (minimum key, tied payload max)");
+    assert!(carrier.rules.contains(&"extremum-filter"));
+    check(&carrier, &items, &[30.0]);
 }
 
 // ── magnitude tiers: the rescale coupling exercised for its numerical purpose ─
@@ -374,7 +475,8 @@ fn attention_rescale_survives_overflow_magnitudes() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let car = derive(&attention(q, kk, v, d, k), k).unwrap();
+    let stream = axis_refs(&kk)[0];
+    let car = derive(&attention(q, kk, v), stream).unwrap();
 
     let n = 23;
     for &center in &[50.0, 88.0, 300.0, 710.0, -710.0] {
@@ -405,14 +507,15 @@ fn attention_rescale_survives_overflow_magnitudes() {
 fn logsumexp_rescale_survives_overflow_magnitudes() {
     let a = axis("a", 23);
     let x = input("X", &[a], Dtype::F32);
-    let m = reduce(x.clone(), a, max_r());
+    let stream = axis_refs(&x)[0];
+    let m = reduce(x.clone(), 0usize, max_r());
     let e = map(
         MapOp::Exp,
         vec![map(MapOp::Sub, vec![x.clone(), m.clone()])],
     );
-    let s = reduce(e, a, add_r());
+    let s = reduce(e, 0usize, add_r());
     let lse = map(MapOp::Add, vec![map(MapOp::Log, vec![s]), m]);
-    let car = derive(&lse, a).unwrap();
+    let car = derive(&lse, stream).unwrap();
 
     let n = 23;
     for &center in &[50.0, 88.0, 300.0, 710.0, -710.0] {
@@ -443,14 +546,15 @@ fn logsumexp_rescale_survives_overflow_magnitudes() {
 fn masked_scaled_attention_derives() {
     let (s, k, e) = (axis("s", 8), axis("k", 21), axis("e", 64));
     let scores = input("S", &[s, k], Dtype::F32);
+    let stream = axis_refs(&scores)[1];
     let scale = input("scale", &[], Dtype::F32);
     let mask = input("M", &[s, k], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
 
     let sc = map(MapOp::Add, vec![map(MapOp::Mul, vec![scores, scale]), mask]);
-    let out = matmul(softmax(sc, k), v, k);
+    let out = matmul(softmax(sc, 1usize), v);
 
-    let car = derive(&out, k).expect("masked scaled attention derivable");
+    let car = derive(&out, stream).expect("masked scaled attention derivable");
     assert_eq!(car.slots, 3, "still (m, ℓ, o)");
     assert!(
         car.rules.contains(&"fused-map"),
@@ -479,11 +583,15 @@ fn masked_scaled_attention_derives() {
 fn computed_causal_mask_derives() {
     let (s, t, e) = (axis("s", 8), axis("t", 12), axis("e", 64));
     let scores = input("S", &[s, t], Dtype::F32);
+    let stream = axis_refs(&scores)[1];
     let v = input("V", &[t, e], Dtype::F32);
-    let masked = map(MapOp::Add, vec![scores, causal_mask(s, t)]);
-    let out = matmul(softmax(masked, t), v, t);
+    let masked = map(
+        MapOp::Add,
+        vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
+    );
+    let out = matmul(softmax(masked, 1usize), v);
 
-    let car = derive(&out, t).expect("causally masked attention derivable");
+    let car = derive(&out, stream).expect("causally masked attention derivable");
     assert_eq!(car.slots, 3);
     assert!(car.rules.contains(&"fused-map"));
 
@@ -502,18 +610,40 @@ fn computed_causal_mask_derives() {
     check(&car, &items, &[num / den]);
 }
 
+// ── every unary MapOp in the closed basis can ride a reduction lift ─────────
+#[test]
+fn tanh_fuses_into_a_reduction() {
+    let n = axis("n", 17);
+    let x = input("X", &[n], Dtype::F32);
+    let stream = axis_refs(&x)[0];
+    let sum = reduce(map(MapOp::Tanh, vec![x]), 0usize, Monoid::Add);
+    let carrier = derive(&sum, stream).expect("tanh should ride the additive lift");
+    assert_eq!(carrier.slots, 1);
+    assert!(carrier.rules.contains(&"fused-map"));
+
+    let mut rng = Lcg::new(0x7A4);
+    let values: Vec<f64> = (0..17).map(|_| rng.next_f64()).collect();
+    let items: Vec<Vec<f64>> = values.iter().map(|&value| vec![value]).collect();
+    check(
+        &carrier,
+        &items,
+        &[values.iter().map(|value| value.tanh()).sum()],
+    );
+}
+
 // ── real-workload MLP: silu (a composition!) fuses into the down-proj lift ──
 // Σ_f silu(gate_f)·up_f·w_f — an activation-fused GEMM, derived not matched.
 #[test]
 fn silu_fuses_into_a_contraction() {
     let f = axis("f", 27);
     let gate = input("G", &[f], Dtype::F32);
+    let stream = axis_refs(&gate)[0];
     let up = input("U", &[f], Dtype::F32);
     let w = input("Wd", &[f], Dtype::F32);
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let down = reduce(map(MapOp::Mul, vec![act, w]), f, add_r());
+    let down = reduce(map(MapOp::Mul, vec![act, w]), 0usize, add_r());
 
-    let car = derive(&down, f).expect("silu contraction derivable");
+    let car = derive(&down, stream).expect("silu contraction derivable");
     assert_eq!(
         car.slots, 1,
         "one running sum — the activation is in the lift"
@@ -535,16 +665,17 @@ fn silu_fuses_into_a_contraction() {
 fn rmsnorm_fused_projection_carrier() {
     let d = axis("d", 16);
     let x = input("X", &[d], Dtype::F32);
+    let stream = axis_refs(&x)[0];
     let g = input("G", &[d], Dtype::F32);
     let w = input("W", &[d], Dtype::F32);
     let n = 16.0;
-    let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), d, add_r());
+    let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 0usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
     let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom]);
-    let proj = matmul(norm, w, d);
+    let proj = reduce(map(MapOp::Mul, vec![norm, w]), 0usize, Monoid::Add);
 
-    let car = derive(&proj, d).expect("norm-fused projection derivable");
+    let car = derive(&proj, stream).expect("norm-fused projection derivable");
     assert_eq!(car.slots, 2, "Acc = (Σ x·g·w, Σx²)");
     assert!(car.rules.contains(&"defer-div"));
 
@@ -570,11 +701,13 @@ fn view_scoping_rules() {
         axis("sf", 24),
     );
     let x = input("X", &[s, dm], Dtype::F32);
-    let xt = rename(x.clone(), s, t);
+    let [source_s, _] = axis_refs(&x).try_into().unwrap();
+    let xt = rename(x.clone(), 0usize, t);
+    let renamed_t = axis_refs(&xt)[0];
     assert_eq!(xt.shape(), vec![t, dm]);
-    assert_eq!(structure(&xt, t).level, Parallelism::Free);
+    assert_eq!(structure(&xt, renamed_t).level, Parallelism::Free);
     assert_eq!(
-        structure(&xt, s).level,
+        structure(&xt, source_s).level,
         Parallelism::Free,
         "the consumed name is out of scope above the view"
     );
@@ -582,12 +715,15 @@ fn view_scoping_rules() {
     // a grouped output joins its members' structures; the members go out of
     // scope — asking about them above the view is asking about variables
     // that no longer exist.
-    let mm = matmul(x, input("W", &[f, dm], Dtype::F32), dm); // [s, f]
-    let grouped = flatten(mm, &[s, f], sf);
+    let weight = input("W", &[f, dm], Dtype::F32);
+    let output_f = axis_refs(&weight)[0];
+    let mm = matmul(x, transpose(weight, 0usize, 1usize)); // [s, f]
+    let grouped = flatten(mm, &[0, 1][..], sf);
+    let grouped_axis = axis_refs(&grouped)[0];
     assert_eq!(grouped.shape(), vec![sf]);
-    assert_eq!(structure(&grouped, sf).level, Parallelism::Free);
-    assert_eq!(structure(&grouped, s).level, Parallelism::Free);
-    assert_eq!(structure(&grouped, f).level, Parallelism::Free);
+    assert_eq!(structure(&grouped, grouped_axis).level, Parallelism::Free);
+    assert_eq!(structure(&grouped, source_s).level, Parallelism::Free);
+    assert_eq!(structure(&grouped, output_f).level, Parallelism::Free);
 }
 
 // ── a fold whose leaf is a flattened view — the MHA output projection ────────
@@ -598,11 +734,12 @@ fn fold_through_a_flattened_view() {
     let a = input("A", &[h, dv], Dtype::F32);
     let b = input("B", &[h, dv], Dtype::F32);
     let prod = map(MapOp::Mul, vec![a, b]); // computed, not a raw input
-    let flat = flatten(prod, &[h, dv], dmv);
+    let flat = flatten(prod, &[0, 1][..], dmv);
+    let stream = axis_refs(&flat)[0];
     let w = input("W", &[dmv], Dtype::F32);
-    let out = reduce(map(MapOp::Mul, vec![flat, w]), dmv, add_r());
+    let out = reduce(map(MapOp::Mul, vec![flat, w]), 0usize, add_r());
 
-    let car = derive(&out, dmv).expect("folds over the flattened axis");
+    let car = derive(&out, stream).expect("folds over the flattened axis");
     assert_eq!(car.slots, 1, "a plain contraction against the view");
 
     // element = (flattened value, weight) per flattened index
@@ -614,55 +751,38 @@ fn fold_through_a_flattened_view() {
     check(&car, &items, &[reference]);
 }
 
-// ── tanh-RNN time axis SEQUENTIAL, no accumulator ────────────────────────────
-#[test]
-fn tanh_rnn_is_sequential() {
-    let (t, h) = (axis("t", 8), axis("h", 16));
-    let x = input("X", &[t, h], Dtype::F32);
-    let rnn = tanh_rnn(x, t);
-    assert_eq!(structure(&rnn, t).level, Parallelism::Sequential);
-    assert!(!streamable(&rnn, t));
-    assert!(
-        derive(&rnn, t).is_err(),
-        "refuses to emit an accumulator for a non-associative recurrence"
-    );
-}
-
-// ── linear/SSM scan time axis MONOIDAL, affine-map carrier ───────────────────
-#[test]
-fn ssm_scan_is_monoidal() {
-    let t = axis("t", 19);
-    let params = input("AB", &[t], Dtype::F32); // each step carries its (A_t, b_t)
-    let ssm = ssm_scan(params, t);
-    assert_eq!(structure(&ssm, t).level, Parallelism::Monoidal);
-    assert!(streamable(&ssm, t));
-
-    let car = derive(&ssm, t).expect("affine scan is derivable");
-    assert_eq!(car.slots, 2, "carrier is the affine map (A, b)");
-
-    // reference: iterate h_t = A_t·h_{t-1} + b_t from h_0 = 0
-    let mut rng = Lcg::new(555);
-    let steps: Vec<(f64, f64)> = (0..19)
-        .map(|_| (rng.next_f64() * 0.3, rng.next_f64()))
-        .collect();
-    let mut h = 0.0;
-    for &(a, b) in &steps {
-        h = a * h + b;
-    }
-    let items: Vec<Vec<f64>> = steps.iter().map(|&(a, b)| vec![a, b]).collect();
-    check(&car, &items, &[h]);
-}
-
 // ── embedding / gather axis OPAQUE ───────────────────────────────────────────
 #[test]
 fn embedding_is_opaque() {
     let (vocab, d, seq) = (axis("vocab", 32), axis("d", 16), axis("seq", 8));
     let table = input("E", &[vocab, d], Dtype::F32);
+    let selected = axis_refs(&table)[0];
     let ids = input("ids", &[seq], Dtype::F32);
-    let emb = embedding(table, ids, vocab);
-    assert_eq!(structure(&emb, vocab).level, Parallelism::Opaque);
-    assert!(!streamable(&emb, vocab));
-    assert!(derive(&emb, vocab).is_err());
+    let emb = embedding(table, ids, 0usize);
+    assert_eq!(structure(&emb, selected).level, Parallelism::Opaque);
+    assert!(!streamable(&emb, selected));
+    assert!(derive(&emb, selected).is_err());
+}
+
+// ── Scan has complete scalar-monoid semantics and an honest fallback stage ─
+#[test]
+fn scalar_prefix_scan_executes_through_the_fallback() {
+    use sanic::cost::DeviceProfile;
+    use sanic::interp::{Env, Value, eval};
+    use sanic::partition::{Stage, partition};
+
+    let n = axis("n", 5);
+    let values = Value::from_shape_fn(&[5], |coordinate| [2.0, -1.0, 3.0, 0.5, 4.0][coordinate[0]]);
+    let env: Env = [("X", values)].into_iter().collect();
+    let prefix = scan(input("X", &[n], Dtype::F32), 0usize, Monoid::Add);
+
+    assert_eq!(eval(&prefix, &env).data, vec![2.0, 1.0, 4.0, 4.5, 8.5]);
+    let schedule = partition(&prefix, &DeviceProfile::toy());
+    assert!(matches!(
+        schedule.stages.as_slice(),
+        [Stage::Fallback { .. }]
+    ));
+    assert_eq!(schedule.execute(&env).data, vec![2.0, 1.0, 4.0, 4.5, 8.5]);
 }
 
 // ── per-(node, axis): the middle axis of a double-GEMM is reduced in one
@@ -676,14 +796,15 @@ fn per_node_axis_double_gemm() {
     let (i, a, m, j) = (axis("i", 4), axis("a", 5), axis("m", 6), axis("j", 7));
     let x = input("X", &[i, a], Dtype::F32);
     let y = input("Y", &[a, m], Dtype::F32);
-    let g1 = matmul(x, y, a); // contracts a → output [i, m]
+    let middle = axis_refs(&y)[1];
+    let g1 = matmul(x, y); // contracts a → output [i, m]
     let z = input("Z", &[m, j], Dtype::F32);
-    let g2 = matmul(g1.clone(), z, m); // contracts m → output [i, j]
+    let g2 = matmul(g1.clone(), z); // contracts m → output [i, j]
 
     // `m` is a free output index of GEMM-1 ...
-    assert_eq!(structure(&g1, m).level, Parallelism::Free);
+    assert_eq!(structure(&g1, middle).level, Parallelism::Free);
     // ... but the contraction of GEMM-2, at that node.
-    assert_eq!(structure(&g2, m).level, Parallelism::Monoidal);
+    assert_eq!(structure(&g2, middle).level, Parallelism::Monoidal);
 }
 
 // associativity must hold for *every* split point, exercised at the
@@ -694,8 +815,9 @@ fn flash_attention_associative_all_splits() {
     let q = input("Q", &[sq, d], Dtype::F32);
     let kk = input("K", &[k, d], Dtype::F32);
     let v = input("V", &[k, e], Dtype::F32);
-    let attn = attention(q, kk, v, d, k);
-    let car = derive(&attn, k).unwrap();
+    let stream = axis_refs(&kk)[0];
+    let attn = attention(q, kk, v);
+    let car = derive(&attn, stream).unwrap();
     let mut rng = Lcg::new(2024);
     let items: Vec<Vec<f64>> = (0..12)
         .map(|_| vec![rng.next_f64(), rng.next_f64()])
@@ -719,14 +841,15 @@ fn multi_value_attention_generalizes() {
     // with two deferred linear reductions sharing one (m, s).
     let k = axis("k", 15);
     let scores = input("S", &[k], Dtype::F32);
+    let stream = axis_refs(&scores)[0];
     let v1 = input("V1", &[k], Dtype::F32);
     let v2 = input("V2", &[k], Dtype::F32);
-    let w = softmax(scores, k);
-    let o1 = reduce(map(MapOp::Mul, vec![w.clone(), v1]), k, add_r());
-    let o2 = reduce(map(MapOp::Mul, vec![w, v2]), k, add_r());
+    let w = softmax(scores, 0usize);
+    let o1 = reduce(map(MapOp::Mul, vec![w.clone(), v1]), 0usize, add_r());
+    let o2 = reduce(map(MapOp::Mul, vec![w, v2]), 0usize, add_r());
     let total = map(MapOp::Add, vec![o1, o2]);
 
-    let car = derive(&total, k).expect("multi-value attention derivable");
+    let car = derive(&total, stream).expect("multi-value attention derivable");
     assert_eq!(car.slots, 4, "Acc = (m, s, o1, o2) — one shared softmax");
 
     let mut rng = Lcg::new(2027);
@@ -740,17 +863,13 @@ fn multi_value_attention_generalizes() {
     check(&car, &items, &[n1 / denom + n2 / denom]);
 }
 
-// ── battle-test: the CTC forward DP, which hits every axis kind at once ──────
+// ── CTC's inner transition and final loss use the same derived carrier ───────
 //
 //   α_t[s] = logsumexp(α_{t-1}[s], α_{t-1}[s-1], α_{t-1}[s-2]) + logp_t[ℓ(s)]
 //   loss   = −logsumexp_s α_T[s]
 //
-// The single most important pass/fail: tag `t` SEQUENTIAL while tagging BOTH
-// logsumexps MONOIDAL-with-a-derived-(m,s)-carrier — stream *inside* a
-// timestep, but serialize *across* time. An engine that conflates
-// "reduction-shaped" with "foldable" would illegally parallelize time.
 #[test]
-fn ctc_forward_battle_test() {
+fn ctc_logsumexp_carriers_match() {
     // The (max, Σexp) carrier must be DERIVED, not stored: 2 slots, the
     // rescaling combine (telescoping exp — not a naive Add), and the
     // log-space projection `log(s) + m`.
@@ -788,27 +907,33 @@ fn ctc_forward_battle_test() {
         axis("v", 32),
     );
     let logp = input("logp", &[b, t, v], Dtype::F32);
+    let batch_axis = axis_refs(&logp)[0];
+    let vocab_axis = axis_refs(&logp)[2];
     let labels = input("labels", &[s], Dtype::F32);
-    let emit = gather(logp, labels, v); // logp_t[ℓ(s)] — index vocab by label
+    let emit = gather(logp, labels, 2usize); // logp_t[ℓ(s)] — index vocab by label
 
     let prev = input("alpha_prev", &[b, pred, s], Dtype::F32); // α_{t-1} at predecessors
-    let trans = reduce(prev, pred, lse_r()); // logsumexp over predecessors
-    let step = map(MapOp::Add, vec![trans.clone(), emit.clone()]); // + emission
-    let alpha = scan(step.clone(), t, BinOp::NonAssoc("ctc_forward")); // recurrence
-
+    let pred_axis = axis_refs(&prev)[1];
+    let state_axis = axis_refs(&prev)[2];
+    let trans = reduce(prev, 1usize, lse_r()); // logsumexp over predecessors
+    let step = map(
+        MapOp::Add,
+        vec![unsqueeze(trans.clone(), 1usize), emit.clone()],
+    ); // + emission
     let alpha_t = input("alpha_T", &[b, s], Dtype::F32);
-    let loss = reduce(alpha_t, s, lse_r()); // final logsumexp over states
+    let final_state_axis = axis_refs(&alpha_t)[1];
+    let loss = reduce(alpha_t, 1usize, lse_r()); // final logsumexp over states
 
     // ── b (batch) → FREE → grid ──────────────────────────────────────────────
-    assert_eq!(structure(&alpha, b).level, Parallelism::Free);
+    assert_eq!(structure(&step, batch_axis).level, Parallelism::Free);
 
     // ── s within a timestep → FREE → parallel across states ─────────────────
-    assert_eq!(structure(&step, s).level, Parallelism::Free);
+    assert_eq!(structure(&step, state_axis).level, Parallelism::Free);
 
     // ── pred → MONOIDAL, derive (max, Σexp), fuse, no intermediate ──────────
-    assert_eq!(structure(&trans, pred).level, Parallelism::Monoidal);
-    assert!(structure(&trans, pred).linear, "log-semiring additive");
-    let tc = derive(&trans, pred).expect("transition logsumexp derivable");
+    assert_eq!(structure(&trans, pred_axis).level, Parallelism::Monoidal);
+    assert!(structure(&trans, pred_axis).linear, "log-semiring additive");
+    let tc = derive(&trans, pred_axis).expect("transition logsumexp derivable");
     assert!(
         is_logsumexp_carrier(&tc),
         "derived (m, s) carrier, project = log(s) + m"
@@ -823,29 +948,22 @@ fn ctc_forward_battle_test() {
     }
 
     // ── v (vocab, via label gather) → OPAQUE → not foldable ─────────────────
-    assert_eq!(structure(&emit, v).level, Parallelism::Opaque);
-    assert!(!streamable(&emit, v));
-    assert!(derive(&emit, v).is_err());
-
-    // ── t (time) → SEQUENTIAL → must REFUSE to fold ─────────────────────────
-    assert_eq!(structure(&alpha, t).level, Parallelism::Sequential);
-    assert!(!streamable(&alpha, t));
-    assert!(
-        derive(&alpha, t).is_err(),
-        "must refuse to emit a fold for the non-associative time recurrence"
-    );
+    assert_eq!(structure(&emit, vocab_axis).level, Parallelism::Opaque);
+    assert!(!streamable(&emit, vocab_axis));
+    assert!(derive(&emit, vocab_axis).is_err());
 
     // ── final s reduction → MONOIDAL, (max, Σexp), log(s)+m ─────────────────
-    assert_eq!(structure(&loss, s).level, Parallelism::Monoidal);
-    let lc = derive(&loss, s).expect("final logsumexp derivable");
+    assert_eq!(
+        structure(&loss, final_state_axis).level,
+        Parallelism::Monoidal
+    );
+    let lc = derive(&loss, final_state_axis).expect("final logsumexp derivable");
     assert!(is_logsumexp_carrier(&lc));
     assert!(lc.rules.contains(&"rescale"));
 
-    // ── the headline guarantee: in ONE model, t is serial while BOTH
-    //    logsumexps fold; and the two carriers are derived *uniformly* (the
-    //    same (m, s) accumulator), proving there is no stored template — they
-    //    live on different axes, one buried inside the scan body. ─────────────
-    assert!(!streamable(&alpha, t) && streamable(&trans, pred) && streamable(&loss, s));
+    // Both logsumexps derive uniformly to the same (m, s) accumulator; there
+    // is no stored CTC or loss template.
+    assert!(streamable(&trans, pred_axis) && streamable(&loss, final_state_axis));
     assert_eq!(format!("{:?}", tc.combine), format!("{:?}", lc.combine));
     assert_eq!(format!("{:?}", tc.into), format!("{:?}", lc.into));
     assert_eq!(format!("{:?}", tc.project), format!("{:?}", lc.project));
@@ -853,8 +971,8 @@ fn ctc_forward_battle_test() {
 
 // ── the harder composite: a soft-attention readout over a streamed log-space
 //    DP. ONE graph that forces the rescaling coupling, the deferred
-//    normalizer, OPAQUE, the SEQUENTIAL atom, AND the same-axis-merge vs
-//    cross-axis-tiling distinction at once.
+//    normalizer, OPAQUE, and the same-axis-merge vs cross-axis-tiling
+//    distinction at once.
 #[test]
 fn soft_attention_over_logspace_dp() {
     // gather-indexed score: K is selected from a table by a runtime label.
@@ -867,30 +985,42 @@ fn soft_attention_over_logspace_dp() {
         axis("t", 6),
     );
     let q = input("Q", &[b, d], Dtype::F32);
+    let batch_axis = axis_refs(&q)[0];
+    let contract_axis = axis_refs(&q)[1];
     let ktable = input("Ktable", &[idx, k, d], Dtype::F32);
+    let index_axis = axis_refs(&ktable)[0];
+    let key_axis = axis_refs(&ktable)[1];
     let labels = input("labels", &[b], Dtype::F32);
-    let kgath = gather(ktable, labels, idx); // K[b,k,d] via runtime index → OPAQUE on idx
-    let score = reduce(map(MapOp::Mul, vec![q, kgath.clone()]), d, add_r()); // linear contraction on d
-    let weight = softmax(score.clone(), k); // (m, s) coupling
+    let kgath = gather(ktable, labels, 0usize); // K[b,k,d] via runtime index → OPAQUE on idx
+    let score = reduce(
+        map(MapOp::Mul, vec![unsqueeze(q, 1usize), kgath.clone()]),
+        2usize,
+        add_r(),
+    ); // linear contraction on d
+    let weight = softmax(score.clone(), 1usize); // (m, s) coupling
 
     // VALUES are themselves a streamed reduction: a logsumexp-matmul over h.
-    let wv = input("Wv", &[d, h], Dtype::F32);
+    let wv = input("Wv", &[k, h], Dtype::F32);
+    let value_key_axis = axis_refs(&wv)[0];
+    let hidden_axis = axis_refs(&wv)[1];
     let hmat = input("H", &[b, t, k, h], Dtype::F32);
-    let value = reduce(map(MapOp::Add, vec![wv, hmat]), h, lse_r()); // LogMatMul contract=h
+    let value = reduce(map(MapOp::Add, vec![wv, hmat]), 3usize, lse_r()); // LogMatMul contract=h
 
-    let out = reduce(map(MapOp::Mul, vec![weight, value.clone()]), k, add_r()); // linear consumer on k
-    let recur = scan(out.clone(), t, BinOp::NonAssoc("recurrent_readout")); // serial in time
-
+    let out = reduce(
+        map(MapOp::Mul, vec![unsqueeze(weight, 1usize), value.clone()]),
+        2usize,
+        add_r(),
+    ); // linear consumer on k
     // ── d: the score contraction is MONOIDAL and linear ─────────────────────
-    let sd = structure(&score, d);
+    let sd = structure(&score, contract_axis);
     assert_eq!(sd.level, Parallelism::Monoidal);
     assert!(sd.linear);
 
     // ── same-axis MERGE on k: derive the (m, s, o) carrier — coupling plus
     //    deferred normalizer. The values are atomic per-k inputs, so exactly
     //    3 slots — h is NOT swallowed into the k-fold. ─────────────────────────
-    assert_eq!(structure(&out, k).level, Parallelism::Monoidal);
-    let oc = derive(&out, k).expect("k readout derivable");
+    assert_eq!(structure(&out, key_axis).level, Parallelism::Monoidal);
+    let oc = derive(&out, key_axis).expect("k readout derivable");
     assert_eq!(
         oc.slots, 3,
         "Acc = (m, s, o) — softmax merged, h not fused in"
@@ -911,8 +1041,8 @@ fn soft_attention_over_logspace_dp() {
 
     // ── cross-axis PRODUCER on h: value's own (max, Σexp) carrier, with the
     //    log-space product (Wv + H) fused into `into`, plus the coupling. ─────
-    assert_eq!(structure(&value, h).level, Parallelism::Monoidal);
-    let vc = derive(&value, h).expect("logsumexp-matmul derivable");
+    assert_eq!(structure(&value, hidden_axis).level, Parallelism::Monoidal);
+    let vc = derive(&value, hidden_axis).expect("logsumexp-matmul derivable");
     assert_eq!(vc.slots, 2, "(max, Σexp)");
     assert!(
         vc.rules.contains(&"fused-map"),
@@ -936,20 +1066,16 @@ fn soft_attention_over_logspace_dp() {
     //    `value` is FREE along k (→ cross-axis tiling, a leaf in the k-fold),
     //    while h is still MONOIDAL at the `out` node (the producer reduction
     //    lives one level down). ─────────────────────────────────────────────
-    assert_eq!(structure(&value, k).level, Parallelism::Free);
-    assert_eq!(structure(&out, h).level, Parallelism::Monoidal);
-    assert_eq!(structure(&out, k).level, Parallelism::Monoidal);
+    assert_eq!(structure(&value, value_key_axis).level, Parallelism::Free);
+    assert_eq!(structure(&out, hidden_axis).level, Parallelism::Monoidal);
+    assert_eq!(structure(&out, key_axis).level, Parallelism::Monoidal);
 
     // ── OPAQUE: the gather-indexed score input is runtime-determined ────────
-    assert_eq!(structure(&kgath, idx).level, Parallelism::Opaque);
-    assert!(derive(&kgath, idx).is_err());
-
-    // ── SEQUENTIAL atom: the recurrent readout serializes across time ───────
-    assert_eq!(structure(&recur, t).level, Parallelism::Sequential);
-    assert!(derive(&recur, t).is_err());
+    assert_eq!(structure(&kgath, index_axis).level, Parallelism::Opaque);
+    assert!(derive(&kgath, index_axis).is_err());
 
     // ── batch stays FREE through the whole composite ─────────────────────────
-    assert_eq!(structure(&recur, b).level, Parallelism::Free);
+    assert_eq!(structure(&out, batch_axis).level, Parallelism::Free);
 }
 
 /// The distributive laws the completeness probe forced into the algebra
@@ -961,11 +1087,15 @@ fn soft_attention_over_logspace_dp() {
 fn probe_discovered_laws_are_sound() {
     use sanic::interp::{Env, Value, eval, run_carrier};
 
-    fn x(n: Axis) -> NodeRef {
-        input("X", &[n], Dtype::F32)
+    fn coll(x: &NodeRef, op: Monoid) -> NodeRef {
+        reduce(x.clone(), 0usize, op)
     }
-    fn coll(n: Axis, op: BinOp) -> NodeRef {
-        reduce(x(n), n, op)
+    fn fold_broadcast(x: &NodeRef, value: NodeRef, op: Monoid) -> NodeRef {
+        reduce(
+            map(MapOp::Mul, vec![ones_like(x.clone()), value]),
+            0usize,
+            op,
+        )
     }
     fn mul(a: NodeRef, b: NodeRef) -> NodeRef {
         map(MapOp::Mul, vec![a, b])
@@ -985,54 +1115,68 @@ fn probe_discovered_laws_are_sound() {
 
     // Each program is a builder: the axis carries its extent, so every trial
     // length below mints its own `n` and rebuilds the graph around it.
-    type Program = fn(Axis) -> NodeRef;
+    type Program = fn(NodeRef) -> NodeRef;
     let programs: Vec<(&str, Program)> = vec![
         // invariant reductions: Σ/max/min/lse over a same-axis collapsed value
-        ("sum_of_sum", |n| reduce(coll(n, add_r()), n, add_r())),
-        ("max_of_sum", |n| reduce(coll(n, add_r()), n, max_r())),
-        ("lse_of_max", |n| reduce(coll(n, max_r()), n, lse_r())),
-        ("sum_of_scaled_max", |n| {
-            reduce(mul(coll(n, max_r()), konst(-1.5)), n, add_r())
+        ("sum_of_sum", |x| {
+            fold_broadcast(&x, coll(&x, add_r()), add_r())
+        }),
+        ("max_of_sum", |x| {
+            fold_broadcast(&x, coll(&x, add_r()), max_r())
+        }),
+        ("lse_of_max", |x| {
+            fold_broadcast(&x, coll(&x, max_r()), lse_r())
+        }),
+        ("sum_of_scaled_max", |x| {
+            fold_broadcast(&x, mul(coll(&x, max_r()), konst(-1.5)), add_r())
         }),
         // lattice coupling: reduce_m(max/min(pe, coll)) for m ∈ {Max, Min}
-        ("min_of_max_pe_coll", |n| {
+        ("min_of_max_pe_coll", |x| {
+            let coordinate = coordinate(x.clone(), 0usize);
             reduce(
-                mx(subn(iota(n), x(n)), coll(n, add_r())),
-                n,
-                BinOp::Monoid(Monoid::Min),
+                mx(subn(coordinate, x.clone()), coll(&x, add_r())),
+                0usize,
+                Monoid::Min,
             )
         }),
-        ("max_of_max_coll_pe", |n| {
-            reduce(mx(coll(n, add_r()), x(n)), n, max_r())
+        ("max_of_max_coll_pe", |x| {
+            reduce(mx(coll(&x, add_r()), x), 0usize, max_r())
         }),
-        ("max_of_min_pe_coll", |n| {
-            reduce(mn(x(n), coll(n, add_r())), n, max_r())
+        ("max_of_min_pe_coll", |x| {
+            reduce(mn(x.clone(), coll(&x, add_r())), 0usize, max_r())
         }),
-        ("min_of_min_coll_pe", |n| {
-            reduce(mn(coll(n, max_r()), x(n)), n, BinOp::Monoid(Monoid::Min))
+        ("min_of_min_coll_pe", |x| {
+            reduce(mn(coll(&x, max_r()), x), 0usize, Monoid::Min)
         }),
         // additive deferral: pe ± coll under Max/Min/Add
-        ("max_of_pe_plus_coll", |n| {
-            reduce(add(iota(n), coll(n, max_r())), n, max_r())
-        }),
-        ("min_of_coll_minus_pe", |n| {
-            reduce(subn(coll(n, max_r()), x(n)), n, BinOp::Monoid(Monoid::Min))
-        }),
-        ("sum_of_pe_plus_coll", |n| {
-            reduce(add(x(n), coll(n, max_r())), n, add_r())
-        }),
-        // signed defer-scale: extremum of coll·pe dispatches on the sign
-        ("min_of_scaled_pe", |n| {
+        ("max_of_pe_plus_coll", |x| {
             reduce(
-                mul(add(x(n), konst(0.5)), coll(n, max_r())),
-                n,
-                BinOp::Monoid(Monoid::Min),
+                add(coordinate(x.clone(), 0usize), coll(&x, max_r())),
+                0usize,
+                max_r(),
             )
         }),
-        ("max_of_scaled_iota", |n| {
+        ("min_of_coll_minus_pe", |x| {
+            reduce(subn(coll(&x, max_r()), x), 0usize, Monoid::Min)
+        }),
+        ("sum_of_pe_plus_coll", |x| {
+            reduce(add(x.clone(), coll(&x, max_r())), 0usize, add_r())
+        }),
+        // signed defer-scale: extremum of coll·pe dispatches on the sign
+        ("min_of_scaled_pe", |x| {
             reduce(
-                mul(mul(iota(n), coll(n, max_r())), coll(n, add_r())),
-                n,
+                mul(add(x.clone(), konst(0.5)), coll(&x, max_r())),
+                0usize,
+                Monoid::Min,
+            )
+        }),
+        ("max_of_scaled_iota", |x| {
+            reduce(
+                mul(
+                    mul(coordinate(x.clone(), 0usize), coll(&x, max_r())),
+                    coll(&x, add_r()),
+                ),
+                0usize,
                 max_r(),
             )
         }),
@@ -1043,8 +1187,10 @@ fn probe_discovered_laws_are_sound() {
         for trial in 0..6 {
             let len = 3 + trial;
             let n = axis("n", len);
-            let g = build(n);
-            let c = derive(&g, n).unwrap_or_else(|d| panic!("{name}: must derive, got {d}"));
+            let x = input("X", &[n], Dtype::F32);
+            let stream = axis_refs(&x)[0];
+            let g = build(x);
+            let c = derive(&g, stream).unwrap_or_else(|d| panic!("{name}: must derive, got {d}"));
             // mixed signs, planted ties: the adversarial cases for these laws
             let vals: Vec<f64> = (0..len)
                 .map(|i| {
@@ -1052,11 +1198,14 @@ fn probe_discovered_laws_are_sound() {
                     (v.round() / 4.0) * if i % 3 == 2 { -1.0 } else { 1.0 }
                 })
                 .collect();
-            let env: Env = [("X", Value::from_fn(&[n], |c| vals[c[&n]]))]
-                .into_iter()
-                .collect();
+            let env: Env = [(
+                "X",
+                Value::from_shape_fn(&[len], |coordinate| vals[coordinate[0]]),
+            )]
+            .into_iter()
+            .collect();
             let want = eval(&g, &env).data[0];
-            let got = run_carrier(&g, n, &c, &env).data[0];
+            let got = run_carrier(&g, stream, &c, &env).data[0];
             assert!(
                 (want - got).abs() <= 1e-9 * (1.0 + want.abs()),
                 "{name} (len {len}): eval={want} run_carrier={got}\nvals={vals:?}"

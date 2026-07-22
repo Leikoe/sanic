@@ -1,10 +1,13 @@
+use sanic::cost::DeviceProfile;
+use sanic::derive::{SlotKind, derive};
+use sanic::partition::{Stage, partition, partition_many};
 use sanic::{
-    BinOp, Buffer, Compile, CompileError, CpuDevice, Dtype, Extent, MapOp, Monoid, ViewDim, axis,
-    input, map, matmul, positional_view, reduce,
+    Buffer, Compile, CompileError, CpuDevice, Dtype, Extent, MapOp, Monoid, ViewDim, argmax, axis,
+    axis_refs, input, map, matmul, positional_view, reduce, topk,
 };
 
-fn add() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add() -> Monoid {
+    Monoid::Add
 }
 
 #[test]
@@ -142,6 +145,81 @@ fn matmul_contracts_by_position_even_when_axis_metadata_repeats() {
 
     assert_eq!(outputs[0].shape(), &[2, 2]);
     assert_eq!(outputs[0].data(), &[19.0, 22.0, 43.0, 50.0]);
+}
+
+#[test]
+fn positional_argmax_is_one_generic_key_payload_fold() {
+    let item = axis("item", 8);
+    let x = input("x", [item], Dtype::F32);
+    let stream = axis_refs(&x)[0];
+    let index = argmax(x, -1isize);
+
+    let carrier = derive(&index, stream).expect("argmax composition should derive");
+    assert!(matches!(
+        carrier.kinds.as_slice(),
+        [
+            SlotKind::Plain(Monoid::Max),
+            SlotKind::AtExtremum {
+                key_slot: 0,
+                key: Monoid::Max,
+                ties: Monoid::Min,
+            }
+        ]
+    ));
+    let schedule = partition(&index, &DeviceProfile::toy());
+    assert!(matches!(
+        schedule.stages.as_slice(),
+        [Stage::Fused { spec, .. }] if spec.carrier.slots == 2
+    ));
+
+    let cpu = CpuDevice::new();
+    let program = index.compile(&cpu).unwrap();
+    let x = cpu
+        .buffer([8], Dtype::F32, [2.0, 5.0, 5.0, 1.0, 5.0, 2.0, 0.0, 5.0])
+        .unwrap();
+    let outputs = program.run([("x", x)]);
+    assert_eq!(outputs[0].shape(), &[]);
+    assert_eq!(outputs[0].data(), &[1.0]);
+}
+
+#[test]
+fn positional_topk_composition_returns_descending_values_and_indices() {
+    let item = axis("item", 8);
+    let pairs = topk(input("x", [item], Dtype::F32), 0usize, 3);
+    let roots = pairs
+        .iter()
+        .flat_map(|(value, index)| [value.clone(), index.clone()])
+        .collect::<Vec<_>>();
+
+    let schedule = partition_many(
+        &[
+            (pairs[0].0.clone(), "v0"),
+            (pairs[0].1.clone(), "i0"),
+            (pairs[1].0.clone(), "v1"),
+            (pairs[1].1.clone(), "i1"),
+            (pairs[2].0.clone(), "v2"),
+            (pairs[2].1.clone(), "i2"),
+        ],
+        &DeviceProfile::toy(),
+    );
+    assert!(
+        schedule
+            .stages
+            .iter()
+            .all(|stage| !matches!(stage, Stage::Infeasible { .. })),
+        "the generic repeated-selection graph must remain schedulable"
+    );
+    let cpu = CpuDevice::new();
+    let program = roots.compile(&cpu).unwrap();
+    let x = cpu
+        .buffer([8], Dtype::F32, [2.0, 9.0, 5.0, 7.0, 3.0, 6.0, 1.0, 4.0])
+        .unwrap();
+    let outputs = program.run([("x", x)]);
+    let got = outputs
+        .iter()
+        .map(|output| output.data()[0])
+        .collect::<Vec<_>>();
+    assert_eq!(got, [9.0, 1.0, 7.0, 3.0, 6.0, 5.0]);
 }
 
 #[cfg(target_os = "macos")]

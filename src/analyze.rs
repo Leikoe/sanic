@@ -1,14 +1,13 @@
 //! Classification: how does the computation depend on each axis?
 //!
-//! One recursive pass assigns every (node, axis) a rung on a four-value
-//! ladder, ordered from most to least parallel. The verdict is simple:
-//! FREE and MONOIDAL axes stream and parallelize; OPAQUE and SEQUENTIAL do
-//! not. `analyze_all` packages the verdicts for a whole graph — every axis
-//! classified, with the derived accumulator attached wherever one exists.
+//! One recursive pass assigns every (node, axis) a rung on a three-value
+//! ladder, ordered from most to least parallel. FREE and MONOIDAL axes stream
+//! and parallelize; OPAQUE axes require runtime indexing. `analyze_all`
+//! packages the verdicts for a whole graph — every axis classified, with the
+//! derived accumulator attached wherever one exists.
 
 use crate::derive::{self, Carrier};
-use crate::kernel_ir as ir;
-use crate::kernel_ir::{Axis, Node as NodeKind, NodeRef as Node};
+use crate::ir::{self, AxisRef, AxisSelector, Node as NodeKind, NodeRef as Node};
 
 /// How parallel an axis is, best to worst. `Ord` follows that order, so the
 /// join of two structures is `max` — the least parallel input wins.
@@ -20,8 +19,6 @@ pub enum Parallelism {
     Monoidal,
     /// Data-dependent access (gather) → decided at runtime.
     Opaque,
-    /// Non-associative dependence → strictly serial.
-    Sequential,
 }
 
 /// The classification of one (node, axis). `linear` is a refinement of
@@ -66,14 +63,17 @@ fn join_all(it: impl Iterator<Item = Structure>) -> Structure {
 /// shares its whole prefix), so an unmemoized walk re-derives shared
 /// subtrees once per path to them — the dominant cost of partitioning a
 /// deep model. A fresh cache per call keeps it pure and stale-pointer-free.
-pub fn structure(node: &Node, axis: Axis) -> Structure {
+pub fn structure(node: &Node, axis: impl AxisSelector) -> Structure {
+    let Some(axis) = axis.resolve_axis(node, "structure") else {
+        return Structure::FREE;
+    };
     structure_memo(node, axis, &mut std::collections::HashMap::new())
 }
 
 fn structure_memo(
     node: &Node,
-    axis: Axis,
-    cache: &mut std::collections::HashMap<(*const NodeKind, Axis), Structure>,
+    axis: AxisRef,
+    cache: &mut std::collections::HashMap<(*const NodeKind, AxisRef), Structure>,
 ) -> Structure {
     let key = (std::rc::Rc::as_ptr(node), axis);
     if let Some(s) = cache.get(&key) {
@@ -86,51 +86,56 @@ fn structure_memo(
 
 fn structure_uncached(
     node: &Node,
-    axis: Axis,
-    cache: &mut std::collections::HashMap<(*const NodeKind, Axis), Structure>,
+    axis: AxisRef,
+    cache: &mut std::collections::HashMap<(*const NodeKind, AxisRef), Structure>,
 ) -> Structure {
     match node.as_ref() {
         // Raw data, literals and index values depend on no axis (an Iota
         // varies *with* its axis, but elementwise — no cross-element
         // dependence, which is what FREE means).
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => Structure::FREE,
+        NodeKind::Input { .. }
+        | NodeKind::Const { .. }
+        | NodeKind::Iota { .. }
+        | NodeKind::Coordinate { .. } => Structure::FREE,
 
         // Elementwise: pass the joined input structure through. Linearity
         // survives only if the op itself preserves it.
         NodeKind::Map { op, inputs } => {
-            let up = join_all(inputs.iter().map(|n| structure_memo(n, axis, cache)));
+            let up =
+                join_all(inputs.iter().map(|input| {
+                    structure_memo(input, ir::map_input_axis(node, input, axis), cache)
+                }));
             Structure::at(up.level, up.linear && op.preserves_linear())
         }
 
-        NodeKind::Reduce { src, axis: red, op } => {
+        NodeKind::Reduce { src, dim, op } => {
+            let red = ir::source_axis(src, *dim);
             let up = structure_memo(src, axis, cache);
-            if *red != axis {
+            if red != axis {
                 // Reducing a different axis says nothing about this one.
                 up
-            } else if matches!(up.level, Parallelism::Sequential | Parallelism::Opaque) {
+            } else if matches!(up.level, Parallelism::Opaque) {
                 // Poisoned upstream: propagate.
                 up
-            } else if op.is_monoid() {
-                Structure::at(Parallelism::Monoidal, op.is_additive() && up.linear)
             } else {
-                Structure::at(Parallelism::Sequential, false)
+                Structure::at(Parallelism::Monoidal, op.is_additive() && up.linear)
             }
         }
 
-        NodeKind::Scan { src, axis: sc, op } => {
-            if *sc != axis {
+        NodeKind::Scan { src, dim, op } => {
+            let scanned = ir::source_axis(src, *dim);
+            if scanned != axis {
                 structure_memo(src, axis, cache)
-            } else if op.is_monoid() {
+            } else {
                 let up = structure_memo(src, axis, cache);
                 Structure::at(Parallelism::Monoidal, op.is_additive() && up.linear)
-            } else {
-                Structure::at(Parallelism::Sequential, false)
             }
         }
 
-        NodeKind::Gather { src, axis: g, .. } => {
+        NodeKind::Gather { src, dim, .. } => {
+            let gathered = ir::source_axis(src, *dim);
             let up = structure_memo(src, axis, cache);
-            if *g == axis {
+            if gathered == axis {
                 up.join(Structure::at(Parallelism::Opaque, false))
             } else {
                 up
@@ -142,7 +147,8 @@ fn structure_uncached(
         // scope above the view (asking about it is asking about a variable
         // that no longer exists — FREE, like any absent axis); everything
         // else passes through.
-        NodeKind::View { src, groups } => {
+        NodeKind::View { src, .. } => {
+            let groups = ir::view_groups(node);
             if let Some((members, _)) = groups.iter().find(|(_, to)| *to == axis) {
                 return join_all(members.iter().map(|m| structure_memo(src, *m, cache)));
             }
@@ -157,8 +163,9 @@ fn structure_uncached(
         // still elementwise — shifting indices adds no cross-element
         // dependence, and a padded 0.0 is a constant); a mapped source axis
         // is out of scope above the node; the rest passes through.
-        NodeKind::Reindex { src, map, .. } => {
-            let driving: Vec<Axis> = map
+        NodeKind::Reindex { src, .. } => {
+            let map = ir::resolved_reindex(node);
+            let driving: Vec<AxisRef> = map
                 .iter()
                 .filter(|(_, terms, _)| terms.iter().any(|(_, a)| *a == axis))
                 .map(|(m, _, _)| *m)
@@ -175,7 +182,7 @@ fn structure_uncached(
 }
 
 /// Can this axis be folded in one pass? Yes iff FREE or MONOIDAL.
-pub fn streamable(node: &Node, axis: Axis) -> bool {
+pub fn streamable(node: &Node, axis: impl AxisSelector) -> bool {
     matches!(
         structure(node, axis).level,
         Parallelism::Free | Parallelism::Monoidal
@@ -186,11 +193,11 @@ pub fn streamable(node: &Node, axis: Axis) -> bool {
 
 /// The verdict for one axis of a graph.
 pub struct AxisReport {
-    pub axis: Axis,
+    pub axis: AxisRef,
     pub structure: Structure,
     /// The streaming accumulator — present iff the axis folds *at this node*.
-    /// FREE axes are grid dimensions; OPAQUE / SEQUENTIAL have no one-pass
-    /// form; a MONOIDAL axis without a carrier folds in a sub-expression.
+    /// FREE axes are grid dimensions; OPAQUE axes have no one-pass form; a
+    /// MONOIDAL axis without a carrier folds in a sub-expression.
     pub carrier: Option<Carrier>,
     /// Why a MONOIDAL axis nonetheless has no carrier at this node — the
     /// deriver's claim, kept so the report can say it and a census can
@@ -204,10 +211,13 @@ pub struct Report {
 }
 
 /// Classify the given axes and derive an accumulator wherever one folds.
-pub fn analyze(node: &Node, axes: &[Axis]) -> Report {
+pub fn analyze<A: AxisSelector>(node: &Node, axes: &[A]) -> Report {
     let axes = axes
         .iter()
-        .map(|&a| {
+        .map(|&selector| {
+            let a = selector
+                .resolve_axis(node, "analyze")
+                .expect("analyze axis is absent from the selected node");
             let structure = structure(node, a);
             let (carrier, decline) = match structure.level {
                 Parallelism::Monoidal => match derive::derive(node, a) {
@@ -229,7 +239,7 @@ pub fn analyze(node: &Node, axes: &[Axis]) -> Report {
 
 /// Same, but the engine discovers the axes itself — the zero-config front door.
 pub fn analyze_all(node: &Node) -> Report {
-    analyze(node, &ir::all_axes(node))
+    analyze(node, &ir::all_axis_refs(node))
 }
 
 impl Report {
@@ -243,14 +253,12 @@ impl Report {
                 Parallelism::Monoidal if a.structure.linear => "MONOIDAL (linear)",
                 Parallelism::Monoidal => "MONOIDAL",
                 Parallelism::Opaque => "OPAQUE",
-                Parallelism::Sequential => "SEQUENTIAL",
             };
             let action = match a.structure.level {
                 Parallelism::Free => "grid (DOALL)",
                 Parallelism::Monoidal if a.carrier.is_some() => "fold",
                 Parallelism::Monoidal => "fold (in a sub-expression)",
                 Parallelism::Opaque => "runtime gather",
-                Parallelism::Sequential => "serial — no fold",
             };
             out += &format!("  {:<4} {:<18} → {}\n", a.axis.name, tag, action);
             if let Some(c) = &a.carrier {

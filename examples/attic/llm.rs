@@ -28,8 +28,8 @@ use sanic::cost::DeviceProfile;
 use sanic::ir::*;
 use sanic::partition::partition;
 
-fn add_r() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add_r() -> Monoid {
+    Monoid::Add
 }
 
 /// RMSNorm: x · g / √(mean(x²) + ε), with ε and 1/n as literals.

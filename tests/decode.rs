@@ -14,13 +14,12 @@
 //! compiled Rust, where the caches are `Vec`s living across a real host
 //! loop and `run` returns the (ck, cv, logits) triple each step.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
 use sanic::cost::DeviceProfile;
 use sanic::interp::{Env, Value, eval};
-use sanic::kernel_ir::*;
+use sanic::ir::*;
 use sanic::partition::{Schedule, partition_many};
 use sanic::runtime::Session;
 use sanic::rustgen::emit_schedule;
@@ -42,7 +41,12 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_fn(axes, |_| rng.f())
+    let shape = axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>();
+    Value::from_shape_fn(&shape, |_| rng.f())
+}
+
+fn linear_vector(x: NodeRef, weight: NodeRef) -> NodeRef {
+    reduce(map(MapOp::Mul, vec![weight, x]), 1usize, Monoid::Add)
 }
 
 /// The single-head attention LM decode step: cache updates + logits.
@@ -51,31 +55,39 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
     let x = input("x", &[dm], Dtype::F32); // current token's embedding
     let pos = input("pos", &[], Dtype::F32); // current position, as data
 
-    let new_k = matmul(x.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [dk]
-    let new_v = matmul(x.clone(), input("Wv", &[dv, dm], Dtype::F32), dm); // [dv]
-    let q = matmul(x, input("Wq", &[dk, dm], Dtype::F32), dm); // [dk]
+    let new_k = linear_vector(x.clone(), input("Wk", &[dk, dm], Dtype::F32)); // [dk]
+    let new_v = linear_vector(x.clone(), input("Wv", &[dv, dm], Dtype::F32)); // [dv]
+    let q = linear_vector(x, input("Wq", &[dk, dm], Dtype::F32)); // [dk]
 
     // cache row writes: updated[t,·] = where(t == pos, new, cache[t,·])
+    let cache_k = input("cache_k", &[t, dk], Dtype::F32);
     let ck = map(
         MapOp::Where,
         vec![
-            one_hot(t, pos.clone()),
+            one_hot_like(cache_k.clone(), 0usize, pos.clone()),
             new_k,
-            input("cache_k", &[t, dk], Dtype::F32),
+            cache_k,
         ],
     ); // [t, dk]
+    let cache_v = input("cache_v", &[t, dv], Dtype::F32);
     let cv = map(
         MapOp::Where,
         vec![
-            one_hot(t, pos.clone()),
+            one_hot_like(cache_v.clone(), 0usize, pos.clone()),
             new_v,
-            input("cache_v", &[t, dv], Dtype::F32),
+            cache_v,
         ],
     ); // [t, dv]
 
     // attention over the updated cache; positions beyond `pos` masked out
     let scale = konst(1.0 / (dk.extent() as f64).sqrt());
-    let scores = map(MapOp::Mul, vec![matmul(q, ck.clone(), dk), scale]); // [t]
+    let scores = map(
+        MapOp::Mul,
+        vec![
+            reduce(map(MapOp::Mul, vec![ck.clone(), q]), 1usize, Monoid::Add),
+            scale,
+        ],
+    ); // [t]
     let future = map(MapOp::Lt, vec![pos, iota(t)]); // t > pos
     let masked = map(
         MapOp::Add,
@@ -84,9 +96,13 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
             map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)]),
         ],
     );
-    let att = softmax(masked, t);
-    let out = matmul(att, cv.clone(), t); // [dv]
-    let logits = matmul(out, input("Wl", &[v, dv], Dtype::F32), dv); // [v]
+    let att = softmax(masked, 0usize);
+    let out = reduce(
+        map(MapOp::Mul, vec![unsqueeze(att, 1usize), cv.clone()]),
+        0usize,
+        Monoid::Add,
+    ); // [dv]
+    let logits = linear_vector(out, input("Wl", &[v, dv], Dtype::F32)); // [v]
 
     partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
@@ -99,16 +115,34 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
 /// must produce.
 fn prefill_logits(s: Axis, t2: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis, env: &Env) -> Value {
     let x = input("X", &[s, dm], Dtype::F32);
-    let xt = rename(x.clone(), s, t2);
-    let q = matmul(x, input("Wq", &[dk, dm], Dtype::F32), dm); // [s, dk]
-    let k = matmul(xt.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [t2, dk]
-    let vv = matmul(xt, input("Wv", &[dv, dm], Dtype::F32), dm); // [t2, dv]
+    let xt = rename(x.clone(), 0usize, t2);
+    let q = matmul(
+        x,
+        transpose(input("Wq", &[dk, dm], Dtype::F32), 0usize, 1usize),
+    ); // [s, dk]
+    let k = matmul(
+        xt.clone(),
+        transpose(input("Wk", &[dk, dm], Dtype::F32), 0usize, 1usize),
+    ); // [t2, dk]
+    let vv = matmul(
+        xt,
+        transpose(input("Wv", &[dv, dm], Dtype::F32), 0usize, 1usize),
+    ); // [t2, dv]
     let scale = konst(1.0 / (dk.extent() as f64).sqrt());
-    let scores = map(MapOp::Mul, vec![matmul(q, k, dk), scale]);
-    let masked = map(MapOp::Add, vec![scores, causal_mask(s, t2)]);
-    let att = softmax(masked, t2);
-    let out = matmul(att, vv, t2); // [s, dv]
-    let logits = matmul(out, input("Wl", &[v, dv], Dtype::F32), dv); // [s, v]
+    let scores = map(
+        MapOp::Mul,
+        vec![matmul(q, transpose(k, 0usize, 1usize)), scale],
+    );
+    let masked = map(
+        MapOp::Add,
+        vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
+    );
+    let att = softmax(masked, 1usize);
+    let out = matmul(att, vv); // [s, dv]
+    let logits = matmul(
+        out,
+        transpose(input("Wl", &[v, dv], Dtype::F32), 0usize, 1usize),
+    ); // [s, v]
     eval(&logits, env)
 }
 
@@ -157,22 +191,25 @@ fn incremental_decode_equals_prefill() {
     sess.bind("Wk", wk);
     sess.bind("Wv", wv);
     sess.bind("Wl", wl);
-    sess.bind("cache_k", Value::from_fn(&[t, dk], |_| 0.0));
-    sess.bind("cache_v", Value::from_fn(&[t, dv], |_| 0.0));
+    sess.bind(
+        "cache_k",
+        Value::from_shape_fn(&[t.extent(), dk.extent()], |_| 0.0),
+    );
+    sess.bind(
+        "cache_v",
+        Value::from_shape_fn(&[t.extent(), dv.extent()], |_| 0.0),
+    );
 
     for p in 0..steps {
-        let row = Value::from_fn(&[dm], |c| {
-            let coord: HashMap<Axis, usize> = [(s, p), (dm, c[&dm])].into_iter().collect();
-            xs.at(&coord)
-        });
+        let row = Value::from_shape_fn(&[dm.extent()], |c| xs.at_index(&[p, c[0]]));
         sess.bind("x", row);
         sess.bind_scalar("pos", p as f64);
         sess.step(&sched, &[("ck_new", "cache_k"), ("cv_new", "cache_v")]);
 
         let logits = sess.get("logits");
         for vi in 0..v.extent() {
-            let got = logits.at(&[(v, vi)].into_iter().collect());
-            let want = reference.at(&[(s, p), (v, vi)].into_iter().collect());
+            let got = logits.at_index(&[vi]);
+            let want = reference.at_index(&[p, vi]);
             let tol = sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS)
                 * (1.0 + got.abs().max(want.abs()));
             assert!(
@@ -185,17 +222,15 @@ fn incremental_decode_equals_prefill() {
     // and the caches now hold exactly the prefill K/V
     let k_ref = eval(
         &matmul(
-            rename(input("X", &[s, dm], Dtype::F32), s, t),
-            input("Wk", &[dk, dm], Dtype::F32),
-            dm,
+            rename(input("X", &[s, dm], Dtype::F32), 0usize, t),
+            transpose(input("Wk", &[dk, dm], Dtype::F32), 0usize, 1usize),
         ),
         &prefill_env,
     );
     let ck = sess.get("cache_k");
     for ti in 0..steps {
         for ki in 0..dk.extent() {
-            let c: HashMap<Axis, usize> = [(t, ti), (dk, ki)].into_iter().collect();
-            let (a, b) = (ck.at(&c), k_ref.at(&c));
+            let (a, b) = (ck.at_index(&[ti, ki]), k_ref.at_index(&[ti, ki]));
             assert!(
                 (a - b).abs()
                     <= sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + a.abs()),
@@ -238,7 +273,7 @@ fn incremental_decode_compiles_and_equals_prefill() {
     let expected: Vec<f64> = (0..steps)
         .flat_map(|p| {
             (0..v.extent())
-                .map(|vi| reference.at(&[(s, p), (v, vi)].into_iter().collect()))
+                .map(|vi| reference.at_index(&[p, vi]))
                 .collect::<Vec<f64>>()
         })
         .collect();
@@ -264,16 +299,20 @@ fn incremental_decode_compiles_and_equals_prefill() {
     };
     let mut main = String::from("\nfn main() {\n");
     for (name, tensor) in [("Wq", &wq), ("Wk", &wk), ("Wv", &wv), ("Wl", &wl)] {
-        let axes: Vec<Axis> = program
+        let axes: Vec<AxisRef> = program
             .inputs
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, a)| a.clone())
             .unwrap_or_else(|| tensor.axes.clone());
-        main.push_str(&format!(
-            "    let b_{name}: Vec<f64> = vec![{}];\n",
-            bake(&tensor.permuted_to(&axes).data)
-        ));
+        main.push_str(&format!("    let b_{name}: Vec<f64> = vec![{}];\n", {
+            assert_eq!(
+                tensor.shape,
+                axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
+                "input {name} shape"
+            );
+            bake(&tensor.data)
+        }));
     }
     main.push_str(&format!(
         "    let xs: Vec<f64> = vec![{}];\n",

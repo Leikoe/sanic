@@ -8,11 +8,11 @@
 //! always addresses shape index `1`.
 //!
 //! ```
-//! use sanic::{BinOp, Compile, CpuDevice, Dtype, Monoid, axis, input, reduce};
+//! use sanic::{Compile, CpuDevice, Dtype, Monoid, axis, input, reduce};
 //!
 //! let d = axis("d", 2);
 //! let x = input("x", [d, d], Dtype::F32);
-//! let rows = reduce(x, 1usize, BinOp::Monoid(Monoid::Add));
+//! let rows = reduce(x, 1usize, Monoid::Add);
 //!
 //! let cpu = CpuDevice::new();
 //! let program = rows.compile(&cpu)?;
@@ -66,7 +66,6 @@ pub mod grad;
 pub mod interp;
 pub mod ir;
 #[doc(hidden)]
-pub mod kernel_ir;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod nn;
@@ -78,6 +77,7 @@ pub mod plan;
 pub mod runtime;
 #[doc(hidden)]
 pub mod rustgen;
+mod scalar;
 #[doc(hidden)]
 pub mod simplify;
 #[doc(hidden)]

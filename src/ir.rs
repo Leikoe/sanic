@@ -2,13 +2,15 @@
 //!
 //! A dimension is identified only by its position in a node's ordered shape.
 //! [`Axis`] carries display metadata and an extent; it is never a graph-wide
-//! variable or an equality key. Compiler passes lower these nodes into their
-//! own scoped loop representation.
+//! variable or an equality key. Compiler passes annotate these same nodes
+//! with ephemeral `(node, dimension)` loop metadata; there is no second graph
+//! IR.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-pub use crate::kernel_ir::{BinOp, Dtype, Extent, MapOp, Monoid};
+pub use crate::scalar::{Dtype, Extent, MapOp, Monoid};
 
 /// A shared reference to an immutable graph node.
 pub type NodeRef = Rc<Node>;
@@ -65,7 +67,7 @@ pub struct ViewDim {
 #[derive(Debug)]
 pub enum Node {
     Input {
-        name: String,
+        name: &'static str,
         shape: Vec<Axis>,
         dtype: Dtype,
     },
@@ -88,12 +90,12 @@ pub enum Node {
     Reduce {
         src: NodeRef,
         dim: usize,
-        op: BinOp,
+        op: Monoid,
     },
     Scan {
         src: NodeRef,
         dim: usize,
-        op: BinOp,
+        op: Monoid,
     },
     Gather {
         src: NodeRef,
@@ -110,6 +112,90 @@ pub enum Node {
         map: Vec<AffineIndex>,
         padded: bool,
     },
+}
+
+/// One logical tensor dimension, identified by an output position of a
+/// particular immutable node. It is compiler metadata, never stored in a
+/// graph node.
+///
+/// Elementwise maps and descriptor-preserving views reuse an input occurrence
+/// where possible. A relabel, flatten, or affine reindex introduces an
+/// occurrence owned by that structural node. Equality is pointer identity
+/// plus position; `name` and `extent` are diagnostics only.
+#[derive(Clone, Copy)]
+pub struct AxisRef {
+    owner: *const Node,
+    pub dim: usize,
+    pub name: &'static str,
+    pub extent: Extent,
+}
+
+impl AxisRef {
+    pub fn extent(self) -> usize {
+        match self.extent {
+            Extent::Static(value) => value,
+            Extent::Dynamic => panic!("axis `{}` has a dynamic extent", self.name),
+        }
+    }
+}
+
+impl PartialEq for AxisRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.dim == other.dim
+    }
+}
+
+impl Eq for AxisRef {}
+
+impl Hash for AxisRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
+        self.dim.hash(state);
+    }
+}
+
+impl fmt::Display for AxisRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+impl fmt::Debug for AxisRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AxisRef")
+            .field("node", &(self.owner as usize))
+            .field("dim", &self.dim)
+            .field("name", &self.name)
+            .field("extent", &self.extent)
+            .finish()
+    }
+}
+
+/// A dimension selector accepted at compiler-analysis boundaries. Public code
+/// normally passes `usize`/`isize`; compiler passes may pass an already
+/// resolved [`AxisRef`] when they need to follow one occurrence through the
+/// graph. A selector is always relative to the specific node supplied at the
+/// call site; display descriptors never participate in resolution.
+pub trait AxisSelector: Copy {
+    fn resolve_axis(self, node: &NodeRef, op: &str) -> Option<AxisRef>;
+}
+
+impl AxisSelector for AxisRef {
+    fn resolve_axis(self, _node: &NodeRef, _op: &str) -> Option<AxisRef> {
+        Some(self)
+    }
+}
+
+impl AxisSelector for usize {
+    fn resolve_axis(self, node: &NodeRef, op: &str) -> Option<AxisRef> {
+        Some(axis_refs(node)[self.resolve(&node.shape(), op)])
+    }
+}
+
+impl AxisSelector for isize {
+    fn resolve_axis(self, node: &NodeRef, op: &str) -> Option<AxisRef> {
+        Some(axis_refs(node)[self.resolve(&node.shape(), op)])
+    }
 }
 
 impl Node {
@@ -179,6 +265,215 @@ fn shape_rc(
     shape
 }
 
+/// Resolved logical dimensions of `node`, in output-shape order.
+///
+/// This is the compiler's axis-resolution pass in lazy form. It annotates the
+/// existing positional DAG; it does not rebuild it into another IR.
+pub fn axis_refs(node: &NodeRef) -> Vec<AxisRef> {
+    (*axis_refs_rc(node, &mut std::collections::HashMap::new())).clone()
+}
+
+fn own_axis(node: &NodeRef, dim: usize, descriptor: Axis) -> AxisRef {
+    AxisRef {
+        owner: Rc::as_ptr(node),
+        dim,
+        name: descriptor.name,
+        extent: descriptor.extent,
+    }
+}
+
+fn axis_refs_rc(
+    node: &NodeRef,
+    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<AxisRef>>>,
+) -> Rc<Vec<AxisRef>> {
+    let key = Rc::as_ptr(node);
+    if let Some(axes) = cache.get(&key) {
+        return axes.clone();
+    }
+
+    let descriptors = node.shape();
+    let axes = match node.as_ref() {
+        Node::Input { shape, .. } => shape
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(dim, axis)| own_axis(node, dim, axis))
+            .collect(),
+        Node::Const { .. } => Vec::new(),
+        Node::Iota { axis } => vec![own_axis(node, 0, *axis)],
+        Node::Coordinate { src, .. } => (*axis_refs_rc(src, cache)).clone(),
+        Node::Map { inputs, .. } => {
+            let rank = descriptors.len();
+            (0..rank)
+                .map(|output_dim| {
+                    let mut fallback = None;
+                    for input in inputs {
+                        let input_shape = input.shape();
+                        let Some(input_dim) =
+                            output_dim.checked_sub(rank.saturating_sub(input_shape.len()))
+                        else {
+                            continue;
+                        };
+                        let candidate = axis_refs_rc(input, cache)[input_dim];
+                        fallback = fallback.or(Some(candidate));
+                        if input_shape[input_dim].extent != Extent::Static(1) {
+                            return candidate;
+                        }
+                    }
+                    fallback.unwrap_or_else(|| own_axis(node, output_dim, descriptors[output_dim]))
+                })
+                .collect()
+        }
+        Node::Reduce { src, dim, .. } => {
+            let mut axes = (*axis_refs_rc(src, cache)).clone();
+            axes.remove(*dim);
+            axes
+        }
+        Node::Scan { src, .. } => (*axis_refs_rc(src, cache)).clone(),
+        Node::Gather { src, index, dim } => {
+            let mut axes = (*axis_refs_rc(src, cache)).clone();
+            axes.splice(*dim..=*dim, axis_refs_rc(index, cache).iter().copied());
+            axes
+        }
+        Node::View { src, dims } => {
+            let source_axes = axis_refs_rc(src, cache);
+            let source_shape = src.shape();
+            dims.iter()
+                .enumerate()
+                .map(|(output_dim, view_dim)| match view_dim.sources.as_slice() {
+                    [source_dim] if view_dim.axis == source_shape[*source_dim] => {
+                        source_axes[*source_dim]
+                    }
+                    _ => own_axis(node, output_dim, view_dim.axis),
+                })
+                .collect()
+        }
+        Node::Reindex { shape, .. } => shape
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(dim, axis)| own_axis(node, dim, axis))
+            .collect(),
+    };
+    let axes = Rc::new(axes);
+    cache.insert(key, axes.clone());
+    axes
+}
+
+/// Axis consumed by a reduction, scan, or gather.
+pub fn source_axis(src: &NodeRef, dim: usize) -> AxisRef {
+    axis_refs(src)[dim]
+}
+
+/// Translate one map-output axis to the corresponding occurrence in `input`.
+/// An axis consumed inside an input is not an output dimension of the map; in
+/// that case it passes through unchanged so recursive analysis can find it.
+pub fn map_input_axis(map_node: &NodeRef, input: &NodeRef, axis: AxisRef) -> AxisRef {
+    let output_axes = axis_refs(map_node);
+    let Some(output_dim) = output_axes.iter().position(|candidate| *candidate == axis) else {
+        return axis;
+    };
+    let output_shape = map_node.shape();
+    let input_shape = input.shape();
+    let Some(input_dim) = output_dim.checked_sub(output_shape.len() - input_shape.len()) else {
+        return axis;
+    };
+    if input_shape[input_dim].extent == Extent::Static(1)
+        && output_shape[output_dim].extent != Extent::Static(1)
+    {
+        axis
+    } else {
+        axis_refs(input)[input_dim]
+    }
+}
+
+/// Flatten/view relations in resolved axis coordinates.
+pub fn view_groups(node: &NodeRef) -> Vec<(Vec<AxisRef>, AxisRef)> {
+    let Node::View { src, dims } = node.as_ref() else {
+        return Vec::new();
+    };
+    let source = axis_refs(src);
+    let output = axis_refs(node);
+    dims.iter()
+        .enumerate()
+        .filter(|(output_dim, dim)| {
+            !dim.sources.is_empty()
+                && !matches!(dim.sources.as_slice(), [source_dim]
+                    if source[*source_dim] == output[*output_dim])
+        })
+        .map(|(output_dim, dim)| {
+            (
+                dim.sources
+                    .iter()
+                    .map(|&source_dim| source[source_dim])
+                    .collect(),
+                output[output_dim],
+            )
+        })
+        .collect()
+}
+
+/// Positional affine reindexing expressed in resolved axis coordinates.
+pub fn resolved_reindex(node: &NodeRef) -> Vec<(AxisRef, Vec<(i64, AxisRef)>, i64)> {
+    let Node::Reindex { src, map, .. } = node.as_ref() else {
+        return Vec::new();
+    };
+    let source = axis_refs(src);
+    let output = axis_refs(node);
+    map.iter()
+        .map(|(source_dim, terms, offset)| {
+            (
+                source[*source_dim],
+                terms
+                    .iter()
+                    .map(|(coefficient, output_dim)| (*coefficient, output[*output_dim]))
+                    .collect(),
+                *offset,
+            )
+        })
+        .collect()
+}
+
+/// Every logical dimension occurrence reachable from `node`, in first-seen
+/// order. Ordinary elementwise/pass-through axes deduplicate naturally;
+/// flatten and reindex boundaries introduce new occurrences.
+pub fn all_axis_refs(node: &NodeRef) -> Vec<AxisRef> {
+    fn walk(
+        node: &NodeRef,
+        out: &mut Vec<AxisRef>,
+        seen: &mut std::collections::HashSet<*const Node>,
+    ) {
+        if !seen.insert(Rc::as_ptr(node)) {
+            return;
+        }
+        for axis in axis_refs(node) {
+            if !out.contains(&axis) {
+                out.push(axis);
+            }
+        }
+        match node.as_ref() {
+            Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => {}
+            Node::Coordinate { src, .. }
+            | Node::Reduce { src, .. }
+            | Node::Scan { src, .. }
+            | Node::View { src, .. }
+            | Node::Reindex { src, .. } => walk(src, out, seen),
+            Node::Map { inputs, .. } => {
+                for input in inputs {
+                    walk(input, out, seen);
+                }
+            }
+            Node::Gather { src, index, .. } => {
+                walk(src, out, seen);
+                walk(index, out, seen);
+            }
+        }
+    }
+    let mut axes = Vec::new();
+    walk(node, &mut axes, &mut std::collections::HashSet::new());
+    axes
+}
+
 fn assert_dim(shape: &[Axis], dim: usize, op: &str) {
     assert!(
         dim < shape.len(),
@@ -243,8 +538,9 @@ impl Dimension for isize {
 }
 
 pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> NodeRef {
+    let name = Box::leak(name.into().into_boxed_str());
     Rc::new(Node::Input {
-        name: name.into(),
+        name,
         shape: shape.as_ref().to_vec(),
         dtype,
     })
@@ -252,6 +548,15 @@ pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -
 
 pub fn konst(v: f64) -> NodeRef {
     Rc::new(Node::Const { v })
+}
+
+/// A tensor of ones with the same positional shape as `source`, expressed
+/// from scalar maps so it preserves the source dimension occurrences.
+pub fn ones_like(source: NodeRef) -> NodeRef {
+    map(
+        MapOp::Add,
+        vec![map(MapOp::Mul, vec![source, konst(0.0)]), konst(1.0)],
+    )
 }
 
 pub fn iota(axis: Axis) -> NodeRef {
@@ -274,9 +579,14 @@ pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
     Rc::new(Node::Map { op, inputs })
 }
 
-pub fn reduce(src: NodeRef, dim: impl Dimension, op: BinOp) -> NodeRef {
+pub fn reduce(src: NodeRef, dim: impl Dimension, op: Monoid) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "reduce");
     Rc::new(Node::Reduce { src, dim, op })
+}
+
+pub fn scan(src: NodeRef, dim: impl Dimension, op: Monoid) -> NodeRef {
+    let dim = dim.resolve(&src.shape(), "scan");
+    Rc::new(Node::Scan { src, dim, op })
 }
 
 pub fn gather(src: NodeRef, index: NodeRef, dim: impl Dimension) -> NodeRef {
@@ -310,7 +620,7 @@ pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
         if let (Some(expected), Extent::Static(actual)) = (product, dim.axis.extent) {
             assert_eq!(
                 actual, expected,
-                "view: output extent {actual} does not match source product {expected}"
+                "view: output extent {actual} does not match source product {expected}; source={source:?}, dim={dim:?}"
             );
         }
     }
@@ -436,20 +746,33 @@ pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> No
 }
 
 /// Rebuild `roots` with maximal sharing: separately constructed but
-/// structurally identical subtrees collapse into ONE node. This runs BEFORE
-/// lowering (see [`crate::compile`]), which mints fresh scoped axes per node
-/// — after that, two copies of the same public subtree are axis-distinct and
-/// can never merge again. One table spans all roots. A subtree that is
-/// already canonical keeps its original `Rc`.
+/// structurally identical subtrees collapse into ONE node. One table spans
+/// all roots, and a subtree that is already canonical keeps its original
+/// `Rc`.
 pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
-    let mut canonical: std::collections::HashMap<String, NodeRef> =
-        std::collections::HashMap::new();
-    let mut memo: std::collections::HashMap<*const Node, NodeRef> =
-        std::collections::HashMap::new();
-    roots
-        .iter()
-        .map(|root| canonicalize_node(root, &mut canonical, &mut memo))
-        .collect()
+    let mut canonicalizer = Canonicalizer::default();
+    roots.iter().map(|root| canonicalizer.tree(root)).collect()
+}
+
+/// Canonical table retained by passes that rebuild nodes after entry.
+#[derive(Default)]
+pub struct Canonicalizer {
+    canonical: std::collections::HashMap<String, NodeRef>,
+    memo: std::collections::HashMap<*const Node, NodeRef>,
+}
+
+impl Canonicalizer {
+    pub fn tree(&mut self, node: &NodeRef) -> NodeRef {
+        canonicalize_node(node, &mut self.canonical, &mut self.memo)
+    }
+
+    /// Canonicalize one node whose children are already canonical.
+    pub fn shallow(&mut self, node: NodeRef) -> NodeRef {
+        self.canonical
+            .entry(shallow_key(&node))
+            .or_insert(node)
+            .clone()
+    }
 }
 
 fn canonicalize_node(
@@ -562,7 +885,7 @@ fn canonicalize_node(
 
 /// One node's structure with children identified by POINTER — valid as an
 /// identity key exactly when the children are already canonical.
-fn shallow_key(n: &NodeRef) -> String {
+pub(crate) fn shallow_key(n: &NodeRef) -> String {
     let p = |c: &NodeRef| Rc::as_ptr(c) as usize;
     match n.as_ref() {
         Node::Input { name, shape, dtype } => format!("I{name}{shape:?}{dtype:?}"),
@@ -583,6 +906,89 @@ fn shallow_key(n: &NodeRef) -> String {
             padded,
         } => format!("X{shape:?}{map:?}{padded}.{}", p(src)),
     }
+}
+
+/// Number of elements in a materialized output (`1` for a scalar).
+pub fn volume(node: &NodeRef) -> usize {
+    node.shape()
+        .iter()
+        .map(|axis| axis.extent())
+        .product::<usize>()
+        .max(1)
+}
+
+/// Input declarations and their resolved storage dimensions.
+pub fn input_axes(node: &NodeRef) -> Vec<(&'static str, Vec<AxisRef>)> {
+    fn walk(
+        node: &NodeRef,
+        output: &mut Vec<(&'static str, Vec<AxisRef>)>,
+        seen: &mut std::collections::HashSet<*const Node>,
+    ) {
+        if !seen.insert(Rc::as_ptr(node)) {
+            return;
+        }
+        match node.as_ref() {
+            Node::Input { name, .. } => output.push((*name, axis_refs(node))),
+            Node::Const { .. } | Node::Iota { .. } => {}
+            Node::Coordinate { src, .. }
+            | Node::Reduce { src, .. }
+            | Node::Scan { src, .. }
+            | Node::View { src, .. }
+            | Node::Reindex { src, .. } => walk(src, output, seen),
+            Node::Map { inputs, .. } => {
+                for input in inputs {
+                    walk(input, output, seen);
+                }
+            }
+            Node::Gather { src, index, .. } => {
+                walk(src, output, seen);
+                walk(index, output, seen);
+            }
+        }
+    }
+    let mut output = Vec::new();
+    walk(node, &mut output, &mut std::collections::HashSet::new());
+    output
+}
+
+pub fn input_dtypes(node: &NodeRef) -> Vec<(&'static str, Dtype)> {
+    let mut output = Vec::new();
+    for (name, _) in input_axes(node) {
+        if output.iter().any(|(existing, _)| *existing == name) {
+            continue;
+        }
+        fn find(node: &NodeRef, wanted: &str) -> Option<Dtype> {
+            match node.as_ref() {
+                Node::Input { name, dtype, .. } if *name == wanted => Some(*dtype),
+                Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => None,
+                Node::Coordinate { src, .. }
+                | Node::Reduce { src, .. }
+                | Node::Scan { src, .. }
+                | Node::View { src, .. }
+                | Node::Reindex { src, .. } => find(src, wanted),
+                Node::Map { inputs, .. } => inputs.iter().find_map(|input| find(input, wanted)),
+                Node::Gather { src, index, .. } => {
+                    find(src, wanted).or_else(|| find(index, wanted))
+                }
+            }
+        }
+        output.push((
+            name,
+            find(node, name).expect("input disappeared during traversal"),
+        ));
+    }
+    output
+}
+
+/// Input names in first-seen order.
+pub fn leaf_names(node: &NodeRef) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for (name, _) in input_axes(node) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 // ── derived compositions ────────────────────────────────────────────────────
@@ -640,12 +1046,15 @@ pub fn matmul(a: NodeRef, b: NodeRef) -> NodeRef {
     );
     let product = map(MapOp::Mul, vec![left, right]);
     let contract = product.shape().len() - 2;
-    reduce(product, contract, BinOp::Monoid(Monoid::Add))
+    reduce(product, contract, Monoid::Add)
 }
 
-fn unsqueeze_at(src: NodeRef, dim: usize) -> NodeRef {
+pub fn unsqueeze(src: NodeRef, dim: impl Dimension) -> NodeRef {
     let source = src.shape();
-    assert!(dim <= source.len(), "unsqueeze dimension out of range");
+    let rank = source.len() as isize + 1;
+    // Resolve against the output rank so `-1` appends.
+    let synthetic = vec![axis("unsqueeze", 1); rank as usize];
+    let dim = dim.resolve(&synthetic, "unsqueeze");
     let singleton = axis("singleton", 1);
     let mut dims = Vec::with_capacity(source.len() + 1);
     for output_dim in 0..=source.len() {
@@ -669,13 +1078,286 @@ fn unsqueeze_at(src: NodeRef, dim: usize) -> NodeRef {
     positional_view(src, dims)
 }
 
+/// Remove a static singleton dimension without aggregation.
+pub fn squeeze(src: NodeRef, dim: impl Dimension) -> NodeRef {
+    let source = src.shape();
+    let dim = dim.resolve(&source, "squeeze");
+    assert_eq!(
+        source[dim].extent,
+        Extent::Static(1),
+        "squeeze requires a static singleton dimension"
+    );
+    let mut shape = source.clone();
+    shape.remove(dim);
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            let terms = if source_dim == dim {
+                Vec::new()
+            } else {
+                let output_dim = source_dim - usize::from(source_dim > dim);
+                vec![(1, output_dim)]
+            };
+            (source_dim, terms, 0)
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
 pub fn softmax(x: NodeRef, dim: impl Dimension) -> NodeRef {
     let dim = dim.resolve(&x.shape(), "softmax");
-    let maximum = reduce(x.clone(), dim, BinOp::Monoid(Monoid::Max));
-    let maximum = unsqueeze_at(maximum, dim);
+    let maximum = reduce(x.clone(), dim, Monoid::Max);
+    let maximum = unsqueeze(maximum, dim);
     let exponent = map(MapOp::Exp, vec![map(MapOp::Sub, vec![x, maximum])]);
-    let normalizer = reduce(exponent.clone(), dim, BinOp::Monoid(Monoid::Add));
-    map(MapOp::Div, vec![exponent, unsqueeze_at(normalizer, dim)])
+    let normalizer = reduce(exponent.clone(), dim, Monoid::Add);
+    map(MapOp::Div, vec![exponent, unsqueeze(normalizer, dim)])
+}
+
+/// Change one dimension's display descriptor without changing storage.
+pub fn rename(src: NodeRef, dim: impl Dimension, to: Axis) -> NodeRef {
+    let source = src.shape();
+    let dim = dim.resolve(&source, "rename");
+    positional_view(
+        src,
+        source
+            .iter()
+            .enumerate()
+            .map(|(source_dim, &axis)| ViewDim {
+                sources: vec![source_dim],
+                axis: if source_dim == dim { to } else { axis },
+            })
+            .collect(),
+    )
+}
+
+/// A contiguous slice along one dimension.
+pub fn slice(src: NodeRef, dim: impl Dimension, to: Axis, start: usize) -> NodeRef {
+    let source = src.shape();
+    let dim = dim.resolve(&source, "slice");
+    let mut shape = source.clone();
+    shape[dim] = to;
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            (
+                source_dim,
+                vec![(1, source_dim)],
+                if source_dim == dim { start as i64 } else { 0 },
+            )
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
+/// Zero-pad one dimension; `to` declares the resulting extent.
+pub fn pad(src: NodeRef, dim: impl Dimension, to: Axis, low: usize) -> NodeRef {
+    let source = src.shape();
+    let dim = dim.resolve(&source, "pad");
+    let mut shape = source.clone();
+    shape[dim] = to;
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            (
+                source_dim,
+                vec![(1, source_dim)],
+                if source_dim == dim { -(low as i64) } else { 0 },
+            )
+        })
+        .collect();
+    positional_reindex(src, shape, map, true)
+}
+
+/// Sliding windows along one dimension. The selected source dimension is
+/// replaced by `(out, kernel)`.
+pub fn window(
+    src: NodeRef,
+    dim: impl Dimension,
+    out: Axis,
+    kernel: Axis,
+    stride: usize,
+    dilation: usize,
+) -> NodeRef {
+    let source = src.shape();
+    let dim = dim.resolve(&source, "window");
+    let mut shape = source.clone();
+    shape.splice(dim..=dim, [out, kernel]);
+    let map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            if source_dim == dim {
+                (
+                    source_dim,
+                    vec![(stride as i64, dim), (dilation as i64, dim + 1)],
+                    0,
+                )
+            } else {
+                let output_dim = source_dim + usize::from(source_dim > dim);
+                (source_dim, vec![(1, output_dim)], 0)
+            }
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
+/// Embedding lookup is a gather along the table's vocabulary dimension.
+pub fn embedding(table: NodeRef, ids: NodeRef, dim: impl Dimension) -> NodeRef {
+    gather(table, ids, dim)
+}
+
+/// Add-combine rows according to a one-dimensional index tensor. This is the
+/// positional adjoint of gathering along `dim`, expressed from reindexing,
+/// coordinates, maps, and one reduction.
+pub fn scatter_add(
+    src: NodeRef,
+    index: NodeRef,
+    dim: impl Dimension,
+    output_axis: Axis,
+) -> NodeRef {
+    let source = src.shape();
+    let dim = dim.resolve(&source, "scatter_add");
+    let index_shape = index.shape();
+    assert_eq!(index_shape.len(), 1, "scatter_add index must be rank one");
+    assert_eq!(
+        index_shape[0].extent, source[dim].extent,
+        "scatter_add index extent must match the selected source dimension"
+    );
+
+    let mut iteration = source.clone();
+    iteration.insert(dim + 1, output_axis);
+    let source_map = source
+        .iter()
+        .enumerate()
+        .map(|(source_dim, _)| {
+            let output_dim = source_dim + usize::from(source_dim > dim);
+            (source_dim, vec![(1, output_dim)], 0)
+        })
+        .collect();
+    let lifted_source = positional_reindex(src, iteration.clone(), source_map, false);
+    let lifted_index = positional_reindex(index, iteration, vec![(0, vec![(1, dim)], 0)], false);
+    let selected = one_hot_like(lifted_source.clone(), dim + 1, lifted_index);
+    reduce(
+        map(MapOp::Mul, vec![selected, lifted_source]),
+        dim,
+        Monoid::Add,
+    )
+}
+
+/// `1` where the coordinate of `template` along `dim` equals `value`.
+pub fn one_hot_like(template: NodeRef, dim: impl Dimension, value: NodeRef) -> NodeRef {
+    let dim = dim.resolve(&template.shape(), "one_hot");
+    let coordinate = coordinate(template, dim);
+    map(
+        MapOp::Sub,
+        vec![
+            map(
+                MapOp::Sub,
+                vec![
+                    konst(1.0),
+                    map(MapOp::Lt, vec![coordinate.clone(), value.clone()]),
+                ],
+            ),
+            map(MapOp::Lt, vec![value, coordinate]),
+        ],
+    )
+}
+
+fn first_index_of_maximum(x: NodeRef, maximum: NodeRef, dim: usize) -> NodeRef {
+    let maximum = unsqueeze(maximum, dim);
+    let candidate = map(
+        MapOp::Where,
+        vec![
+            map(MapOp::Lt, vec![x.clone(), maximum]),
+            konst(f64::INFINITY),
+            coordinate(x, dim),
+        ],
+    );
+    reduce(candidate, dim, Monoid::Min)
+}
+
+/// Index of the first maximum along a positional dimension.
+pub fn argmax(x: NodeRef, dim: impl Dimension) -> NodeRef {
+    let dim = dim.resolve(&x.shape(), "argmax");
+    let maximum = reduce(x.clone(), dim, Monoid::Max);
+    first_index_of_maximum(x, maximum, dim)
+}
+
+/// Top-k as frontend composition: repeated generic max reductions, equality
+/// masks, and index reductions. The core has no top-k node or matcher.
+pub fn topk(x: NodeRef, dim: impl Dimension, k: usize) -> Vec<(NodeRef, NodeRef)> {
+    let dim = dim.resolve(&x.shape(), "topk");
+    let extent = x.shape()[dim].extent();
+    assert!(k > 0, "topk requires k >= 1");
+    assert!(k <= extent, "topk requires k <= dimension extent {extent}");
+
+    let mut remaining = x;
+    let mut selected = Vec::with_capacity(k);
+    for _ in 0..k {
+        let value = reduce(remaining.clone(), dim, Monoid::Max);
+        let index = first_index_of_maximum(remaining.clone(), value.clone(), dim);
+        let selected_position = one_hot_like(remaining.clone(), dim, unsqueeze(index.clone(), dim));
+        remaining = map(
+            MapOp::Where,
+            vec![selected_position, konst(f64::NEG_INFINITY), remaining],
+        );
+        selected.push((value, index));
+    }
+    selected
+}
+
+/// Stack every selected rank in a new trailing dimension.
+pub fn topk_all(
+    x: NodeRef,
+    dim: impl Dimension,
+    k: usize,
+    rank: Axis,
+    return_indices: bool,
+) -> NodeRef {
+    assert_eq!(rank.extent(), k, "topk_all rank axis extent must equal k");
+    let mut sum = None;
+    for (rank_index, (value, index)) in topk(x, dim, k).into_iter().enumerate() {
+        let selected = if return_indices { index } else { value };
+        let source = selected.shape();
+        let mut shape = source.clone();
+        shape.push(rank);
+        let selected = positional_reindex(
+            selected,
+            shape,
+            source
+                .iter()
+                .enumerate()
+                .map(|(source_dim, _)| (source_dim, vec![(1, source_dim)], 0))
+                .collect(),
+            false,
+        );
+        let rank_coordinate = coordinate(selected.clone(), -1isize);
+        let at_rank = map(
+            MapOp::Sub,
+            vec![
+                map(
+                    MapOp::Sub,
+                    vec![
+                        konst(1.0),
+                        map(
+                            MapOp::Lt,
+                            vec![rank_coordinate.clone(), konst(rank_index as f64)],
+                        ),
+                    ],
+                ),
+                map(MapOp::Lt, vec![konst(rank_index as f64), rank_coordinate]),
+            ],
+        );
+        let term = map(MapOp::Mul, vec![at_rank, selected]);
+        sum = Some(match sum {
+            None => term,
+            Some(previous) => map(MapOp::Add, vec![previous, term]),
+        });
+    }
+    sum.expect("topk requires k >= 1")
 }
 
 pub fn silu(x: NodeRef) -> NodeRef {
@@ -692,7 +1374,7 @@ pub fn silu(x: NodeRef) -> NodeRef {
     map(MapOp::Mul, vec![x, sigmoid])
 }
 
-pub(crate) fn causal_mask_like(
+pub fn causal_mask_like(
     scores: NodeRef,
     query_dim: impl Dimension,
     key_dim: impl Dimension,

@@ -1,6 +1,7 @@
 # Framework Review
 
-Reviewed against the vendored Tinygrad source and specification on July 18, 2026.
+Reviewed against the vendored Tinygrad source and specification on July 18,
+2026; repository-contract findings refreshed after the July 20 core audit.
 
 ## Verdict
 
@@ -23,7 +24,7 @@ However, Sanic currently has important gaps between:
 | Scheduling | Prototype; partially disconnected from code generation |
 | Lowering and memory | Substantially behind Tinygrad |
 | Frontend and runtime | Useful fixture, not yet framework-quality |
-| Correctness evidence | Good focused tests, broken full-suite contract |
+| Correctness evidence | Good focused and full-suite coverage; no CI enforcement |
 | Documentation | Overstates current capabilities |
 
 ## Most serious problems
@@ -46,20 +47,18 @@ Relevant code:
 - [`src/emit_metal.rs`](src/emit_metal.rs)
 - [`src/partition.rs`](src/partition.rs)
 
-### 2. The algebraic contract is stronger than the implemented semantics
+### 2. The numerical contract must remain explicit
 
-The IR calls addition, multiplication, maximum, minimum, log-sum-exp, top-k, and affine composition monoidal. These do not share one uniform correctness contract:
+The IR now admits only scalar monoids with complete interpreter and backend
+semantics. Their numerical contracts still differ:
 
 - Floating-point addition and multiplication are not exactly associative.
 - Maximum and minimum behavior depends on NaNs and signed zero.
-- Top-k uses singleton insertion rather than a general associative merge. The guarded execution path knows this, but public `Carrier::tree_fold` can still tree-merge arbitrary top-k carriers.
-- `AffineCompose` has no explicit pair or product value type, and the interpreter cannot execute it.
 
 The implementation needs separate concepts for:
 
 - algebraically associative operations over ideal values;
 - numerically reorderable operations within a stated tolerance;
-- sequential-only carrier updates; and
 - executable operations supported by a backend.
 
 At present, the word "monoid" hides these distinctions.
@@ -97,9 +96,10 @@ Relevant Tinygrad references:
 
 Several choices will become painful as models get larger:
 
-- Axis order is forced by injecting `0 * Iota(axis)` into value computation.
 - Input names are leaked into `'static` storage.
-- The immutable `Rc` DAG has no stable node IDs, hash-consing, or persistent metadata cache.
+- Compilation hash-conses the immutable `Rc` DAG and analyses use scoped
+  pointer-keyed caches, but shape metadata is still recomputed across passes.
+  Any longer-lived cache needs explicit graph ownership, not stable node IDs.
 - Dynamic dimensions are narrowly supported; many shape paths require static extents.
 - Most failures panic instead of returning structured diagnostics.
 
@@ -107,16 +107,15 @@ The current Llama example only constructs a graph. It does not load weights, com
 
 Relevant code:
 
-- [`src/tensor.rs`](src/tensor.rs)
+- [`src/ir.rs`](src/ir.rs)
 - [`examples/llama3_2.rs`](examples/llama3_2.rs)
 
-### 5. Repository claims exceed current evidence
+### 5. The repository contract is not enforced continuously
 
-The healthy part is real: 43 library tests and 80 selected integration tests passed during this review.
-
-However, `cargo test --all-targets --no-run` fails because several integration and GPU tests still use removed APIs. The README also advertises attic examples, gives the wrong current example name, and describes `cargo test` as a complete working suite. There is no CI configuration enforcing the stated contract.
-
-This does not invalidate the compiler work, but it makes results harder to trust than they should be.
+The stale removed-API call sites have been fixed. On July 20, `cargo test`
+passed 157 tests plus the doctest (one diagnostic-only test ignored), and
+`cargo clippy --all-targets -- -D warnings` passed. The remaining process gap
+is that no CI configuration continuously enforces that contract.
 
 ## What Sanic does better than Tinygrad
 
@@ -128,7 +127,10 @@ The most valuable difference is semantic rather than ergonomic:
 - The pure graph plus commit-after-success session model is a good foundation for stateful decoding.
 - The closed high-level IR is easier to reason about than Tinygrad's large multiphase `UOp` dialect.
 
-There are semantic special cases in Sanic—affine roots, argmax, top-k, matrix multiplication recognition, and masked maxima—so "no patterns" is too strong. The fair claim is that Sanic uses reusable algebraic patterns rather than workload-specific kernel templates.
+There are structural patterns in Sanic—contraction recognition, extremal-key
+payloads, and masked maxima—so "no patterns" is too strong. The fair claim is
+that Sanic uses reusable algebraic patterns rather than workload-specific
+kernel templates.
 
 Tinygrad's own test suite documents the current fusion boundary:
 
@@ -142,13 +144,13 @@ The most useful ideas are:
 
 1. Stable graph nodes with cached derived properties, like Tinygrad's hash-consed UOps.
 2. Executable verification at every phase boundary.
-3. A typed lower IR for ranges, loads, stores, barriers, dependencies, and hardware operations.
+3. A typed command/effect plan for ranges, loads, stores, barriers, dependencies, and hardware operations.
 4. Semantic dtype, device, address-space, and symbolic-index information.
 5. Lifetime-based buffer reuse.
 6. Measured tuning of the exact schedule that will be emitted.
 7. A large, continuously running backend test matrix.
 
-Sanic should not copy Tinygrad's enormous single union dialect, pervasive heuristic matching, or global Python state. Rust provides an opportunity to use separate typed IRs for different compiler phases.
+Sanic should not copy Tinygrad's enormous single union dialect, pervasive heuristic matching, or global Python state. Keep one immutable positional tensor IR; attach typed analysis and scheduling data to it, and introduce a command/effect plan only where backend side effects actually begin.
 
 ## Recommended architecture
 
@@ -162,26 +164,26 @@ structural and numerical contract verification
 carrier derivation and fusion partitioning
         |
         v
-executable schedule/range IR
+executable schedule/range plan
         |
         v
-typed command/effect IR
+typed command/effect plan
         |
         v
 memory planning and target rendering
 ```
 
-The schedule IR must be the sole source of tiling and placement decisions consumed by every backend.
+The schedule plan must be the sole source of tiling and placement decisions consumed by every backend.
 
 ## Priority order
 
-1. Make every current test compile and run in CI; correct README claims.
-2. Fix the top-k/tree-fold correctness hole and stop classifying unsupported affine values as executable monoids.
+1. Add CI that continuously runs the current full-suite and clippy contract.
+2. ~~Fix the top-k/tree-fold correctness hole and stop classifying unsupported affine values as executable monoids.~~ Resolved: both shortcuts were removed; Argmax fusion was recovered generically.
 3. State the floating-point reordering contract explicitly.
 4. Unify `KernelSpec` and `FoldSched` into one schedule representation that Metal actually consumes.
-5. Introduce per-graph stable node IDs and cached shape/dependence metadata.
+5. Keep node-relative occurrence metadata pass-local, with explicit ownership and scoped caches; do not add persistent node IDs.
 6. Separate semantic axes, layout order, and hardware iteration ranges.
-7. Add typed scalar, index, and product values plus a proper lower command IR.
+7. Add typed scalar, index, and product values plus a proper command/effect plan.
 8. Add memory planning, and only then broaden backend coverage.
 
 Sanic does not need a formal LaTeX specification at this stage. It needs small executable phase contracts and tests that make invalid states impossible to pass downstream.

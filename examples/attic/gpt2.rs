@@ -183,7 +183,7 @@ fn layer_norm(x: Node, g: &'static str, b: &'static str, dm: Axis) -> Node {
     let mean = map(
         MapOp::Mul,
         vec![
-            reduce(x.clone(), dm, BinOp::Monoid(Monoid::Add)),
+            reduce(x.clone(), dm, Monoid::Add),
             inv_n.clone(),
         ],
     );
@@ -194,7 +194,7 @@ fn layer_norm(x: Node, g: &'static str, b: &'static str, dm: Axis) -> Node {
             reduce(
                 map(MapOp::Mul, vec![xc.clone(), xc.clone()]),
                 dm,
-                BinOp::Monoid(Monoid::Add),
+                Monoid::Add,
             ),
             inv_n,
         ],

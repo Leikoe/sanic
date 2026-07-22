@@ -102,6 +102,10 @@ name in isolation:
 - A **sequential** axis carries a non-associative recurrence and cannot be
   reassociated.
 
+The executable core currently represents only free, monoidal, and opaque
+axes. Sequential remains a model-level category until a recurrence node can
+carry an executable step body; a name-only scheduling label is not semantics.
+
 The same semantic axis may be free at one subcomputation and monoidal at a
 consumer. For example, the middle axis of `(X·Y)·Z` is an output axis of the
 first matrix multiplication and the reduction axis of the second. Parallelism

@@ -69,7 +69,9 @@ reserved for carriers that are not compositions of known ones.
 | 2B. Carrier synthesis | spec + budget → (Acc, ⊗, e, project) | SMT search modulo associativity | Open; bounded/partial |
 
 Stage 1 is a prerequisite and pruner for Stage 2: it identifies *which* axes are
-worth deriving a carrier for, and refuses the sequential/opaque ones.
+worth deriving a carrier for and refuses opaque ones. Sequential dependence is
+reserved for a future recurrence node with an executable step body; the current
+semantic IR does not fabricate it from an operator label.
 
 ---
 
@@ -86,15 +88,15 @@ touches) and whether it writes. The basis:
   identity (or a projection for broadcast); introduces no dependence on any axis.
 - **`Reduce(src, axis, ⊕)`** — folds `axis` with binary operator `⊕`; the write
   access projects `axis` out.
-- **`Scan(src, axis, ⊕)`** — prefix recurrence over `axis`; foldable iff `⊕` is
-  associative, else a sequential chain.
+- **`Scan(src, axis, ⊕)`** — inclusive prefix fold over `axis`; the current IR
+  accepts scalar monoids only.
 - **`Gather(src, index, axis)`** — `src[index[...]]`; access function is
   **data-dependent** (the index is a tensor, not an affine function).
 
 The first three generate the dense affine core. `MatMul`, `Softmax`,
-`LogMatMul`, `LayerNorm`, attention, and the linear-attention/SSM family are
-**derived** as compositions of `Map` and `Reduce`, so the analysis handles them
-with no special cases:
+`LogMatMul`, `LayerNorm`, and attention are **derived** as compositions of
+`Map` and `Reduce`, so the semantic IR needs no workload-specific operators.
+Product-valued linear-attention/SSM recurrences remain future work:
 
 ```
 MatMul(A, B; contract=k)  ≜  Reduce( Map(×, A, B), k, ADD )
@@ -125,12 +127,13 @@ Operator {
 is_monoid := associative ∧ identity.is_some()
 ```
 
-`+`, `×`, `max`, `min`, `logsumexp` are monoids. A nonlinear recurrence step
-(e.g. `tanh(W·h + x)`) is a magma (no associativity) and must be declared as
-such. **Soundness obligation:** the declared laws are trusted by the whole
-engine; mis-declaring associativity yields incorrect fusions. The operator
-library should ship with machine-checked proofs (or property-tested evidence) of
-each declared law.
+`+`, `×`, `max`, `min`, `logsumexp` are the scalar monoids admitted today. A
+future nonlinear recurrence step (e.g. `tanh(W·h + x)`) would not be admitted
+through this interface: it needs an explicit executable step and an honest
+sequential execution contract. **Soundness obligation:** the declared laws are
+trusted by the whole engine; mis-declaring associativity yields incorrect
+fusions. The operator library should ship with machine-checked proofs (or
+property-tested evidence) of each declared law.
 
 ---
 
@@ -149,6 +152,11 @@ LINEAR      a MONOIDAL fold that is additionally  → permits normalizer deferra
 OPAQUE      data-dependent access (gather)        → runtime-determined
 SEQUENTIAL  dependence with non-associative ⊕     → strict serial, depth = N
 ```
+
+The executable core currently admits the `FREE`, `MONOIDAL`, and `OPAQUE`
+subset. `Reduce` and `Scan` accept scalar monoids only. `SEQUENTIAL` remains a
+model-level category for a future recurrence node with an explicit step body;
+it is not represented by a name-only operator tag.
 
 `LINEAR` refines `MONOIDAL`: every linear reduction is monoidal, but the engine
 records linearity separately because Stage 2A needs it to decide normalizer
@@ -176,12 +184,12 @@ Computed by structural recursion; `up` is the join of the input structures.
   `gelu` do not — but note these sit *between* reductions, see §5.3).
 - **`Reduce(_, axis, ⊕)`**:
   - if `axis ≠ a` → `up` (reducing a different axis is per-`a` independent).
-  - if `up` is `SEQUENTIAL` or `OPAQUE` → propagate it (poisoned upstream).
-  - else → `MONOIDAL` if `⊕.is_monoid` else `SEQUENTIAL`; set `is_linear` iff
-    `⊕` is `+` (or another semiring-additive operator) **and** the summand is
-    linear in the reduced quantity.
+  - if `up` is `OPAQUE` → propagate it (poisoned upstream).
+  - else → `MONOIDAL`; set `is_linear` iff `⊕` is `+` (or another
+    semiring-additive operator) **and** the summand is linear in the reduced
+    quantity.
 - **`Scan(_, axis, ⊕)`**:
-  - if `axis = a` → `MONOIDAL` if `⊕.is_monoid` else `SEQUENTIAL`.
+  - if `axis = a` → `MONOIDAL` (only scalar monoids are admitted).
   - else → `up`.
 - **`Gather(_, index, axis)`**:
   - if `axis = a` → `OPAQUE` (join with `up`).
@@ -314,9 +322,9 @@ pointwise, which (R2) absorbs.
   log-score tensor; the rule collapses it to O(1) state over the contracted axis.
 - **layernorm/rmsnorm** → mean/variance carriers fused with the elementwise
   affine epilogue in `project`.
-- **linear attention / SSM scan** `h_t = A_t·h_{t−1} + b_t` → affine-map
-  composition is associative, so `Scan` over `t` is `MONOIDAL`; carrier is the
-  affine map `(A, b)` under composition.
+- **linear attention / SSM scan** `h_t = A_t·h_{t−1} + b_t` would use affine-map
+  composition and the carrier `(A, b)`, once product values give that statement
+  executable IR semantics.
 
 ---
 
@@ -437,8 +445,9 @@ The engine is correct on the core if, with no hand-written accumulators, it:
   the online rescaling combine and `project = o/s`;
 - derives `(sum,count)` for mean, `(count,mean,M2)` for variance,
   `(max,Σexp)` for logsumexp;
-- tags the `tanh`-RNN time axis SEQUENTIAL and refuses to emit an accumulator;
-- tags the linear/SSM scan time axis MONOIDAL and derives the affine-map carrier;
+- evaluates and emits scalar-monoid prefix scans, with Add-scan autodiff;
+- refuses to represent product-valued or non-associative recurrences until
+  their value and step semantics exist;
 - tags embedding/sampling/MoE-dispatch axes OPAQUE.
 
 Reproducing the FlashAttention accumulator from the composition rules — not from

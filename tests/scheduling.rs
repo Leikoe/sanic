@@ -7,24 +7,34 @@
 //! a wrong one.
 
 use sanic::cost::*;
-use sanic::kernel_ir::*;
+use sanic::ir::*;
+use sanic::nn::scaled_dot_product_attention;
 
 const KT: f64 = 64.0; // K/V block streamed per step
 
 /// The engine-supplied accumulator size: derive the attention carrier and
 /// read off its per-query scalar count (m, ℓ, plus o over the value dim).
 fn acc_per_lane(d: f64) -> f64 {
-    let (sq, k, dd, e) = (axis("sq", 1), axis("k", 1), axis("d", 1), axis("e", 1));
-    let attn = attention(
+    // Distinct non-singleton toy extents keep positional broadcasting honest;
+    // the real symbolic sizes are supplied to `acc_scalars` below.
+    let (sq, k, dd, e) = (axis("sq", 2), axis("k", 3), axis("d", 4), axis("e", 5));
+    let key = input("K", &[k, dd], Dtype::F32);
+    let stream = axis_refs(&key)[0];
+    let value = input("V", &[k, e], Dtype::F32);
+    let value_axis = axis_refs(&value)[1];
+    let attn = scaled_dot_product_attention(
         input("Q", &[sq, dd], Dtype::F32),
-        input("K", &[k, dd], Dtype::F32),
-        input("V", &[k, e], Dtype::F32),
-        dd,
-        k,
+        key,
+        value,
+        None,
+        0.0,
+        false,
+        Some(1.0),
+        false,
     );
-    sanic::derive::derive(&attn, k)
+    sanic::derive::derive(&attn, stream)
         .unwrap()
-        .acc_scalars(|ax| if ax == e { d } else { 1.0 })
+        .acc_scalars(|axis| if axis == value_axis { d } else { 1.0 })
 }
 
 /// The fused flash kernel and its query tile: the inner search over

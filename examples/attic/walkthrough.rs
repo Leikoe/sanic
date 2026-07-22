@@ -124,15 +124,15 @@ fn main() {
     println!("   attn   : {:?}   (the (kv_heads, group) pair is q_heads)", shape(&attn));
 
     // ── STEP 1: analyze — classify every (node, axis) ────────────────────────
-    // The four-value ladder decides what streams: FREE and MONOIDAL axes fold
-    // and parallelize; OPAQUE / SEQUENTIAL do not. `batch`, the head axes and
+    // The three-value ladder decides what streams: FREE and MONOIDAL axes fold
+    // and parallelize; OPAQUE axes do not. `batch`, the head axes and
     // `seq_len` all land FREE — grid dimensions. `group` being FREE and absent
     // from k/v is exactly GQA's KV sharing.
     step(
         1,
         "analyze — classify how the graph depends on each axis",
         "the graph",
-        "a structure map (FREE / MONOIDAL / OPAQUE / SEQUENTIAL per axis)",
+        "a structure map (FREE / MONOIDAL / OPAQUE per axis)",
     );
     print!("{}", analyze_all(&attn).render());
     println!(
@@ -247,8 +247,8 @@ fn main() {
                 inputs.join(", "),
                 output,
             ),
-            Stage::Sequential { op, axis, inputs, output, .. } => println!(
-                "     [{i}] SCAN    `{op}`/`{}`  reads [{}] → {}",
+            Stage::Fallback { axis, inputs, output, .. } => println!(
+                "     [{i}] FALLBACK `{}`  reads [{}] → {}",
                 axis,
                 inputs.join(", "),
                 output,

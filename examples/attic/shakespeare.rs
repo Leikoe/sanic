@@ -58,8 +58,8 @@ fn gelu(h: Node) -> Node {
     )
 }
 
-fn add_r() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add_r() -> Monoid {
+    Monoid::Add
 }
 
 /// The trainable weights of the model, in the order they are built: `(name, axes)`.
@@ -186,7 +186,7 @@ fn main() {
     let logits = matmul(xf, input("wte", &[vv, dm], Dtype::F32), dm); // [s, v]  (weight-tied)
 
     // ── next-token cross-entropy, mean over positions (composed logsumexp) ──
-    let mmax = reduce(logits.clone(), vv, BinOp::Monoid(Monoid::Max));
+    let mmax = reduce(logits.clone(), vv, Monoid::Max);
     let sh = map(MapOp::Exp, vec![map(MapOp::Sub, vec![logits.clone(), mmax.clone()])]);
     let lse = map(MapOp::Add, vec![mmax, map(MapOp::Log, vec![reduce(sh, vv, add_r())])]); // [s]
     let picked = reduce(map(MapOp::Mul, vec![logits.clone(), one_hot(vv, input("tgt", &[bb, s], Dtype::F32))]), vv, add_r());

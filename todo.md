@@ -20,8 +20,8 @@ page is substrate we need so the moat is usable on real workloads.
 **Works, end to end, correct:**
 
 - **`derive`** — the core. Reconstructs online-softmax (rescale), deferred
-  normalizers (defer-div), fused elementwise, multi-slot tuples, affine/SSM
-  scans. Associative carrier families are checked with
+  normalizers (defer-div), fused elementwise, and multi-slot tuples.
+  Associative carrier families are checked with
   `tree_fold == fold == reference`.
 - **`analyze` / `plan` / `cost` / `partition`** — classify axes, pick tiles by
   analytical roofline, split a whole graph at the derive frontier. A full
@@ -57,7 +57,7 @@ page is substrate we need so the moat is usable on real workloads.
   SwiGLU-fused down-GEMM, embedding gather, the whole transformer block,
   **quantized matmul** (int-weight dequant fused into the GEMM lift, no
   materialized dequantized weight), and **RoPE'd flash attention** (computed
-  rotation matmul fused into flash — no movement ops, via named-axis pairing).
+  rotation matmul fused into flash from positional pair dimensions).
 - **`emit_rust`** — the derived kernel as compilable Rust (scalar + tiled), for
   a single carrier (superseded by `rustgen` for whole schedules).
 
@@ -66,7 +66,7 @@ page is substrate we need so the moat is usable on real workloads.
   (`axis("s", 512)`) — so every shape is derivable from any graph and the
   `Extents` side-tables are GONE from the whole pipeline. `eval(node, env)`,
   `partition(node, dev)`, `plan(node, dev)`, `grad(loss, wrt)`,
-  `Schedule::execute(env)`, `Session::new()`, `Value::from_fn(axes, f)`,
+  `Schedule::execute(env)`, `Session::new()`, `Value::from_shape_fn(shape, f)`,
   `volume(node)` — every extents/f64-map parameter deleted crate-wide (the
   dual usize/f64 map wart with it). Axis labels do not participate in
   equality, hashing, broadcasting, or shape resolution. `Extent::Dynamic` considered and
@@ -186,15 +186,12 @@ page is substrate we need so the moat is usable on real workloads.
 
 **Exists but narrow / unproven:**
 
-- **SSM/`Scan`** — narrowed (2026-07-13), each edge now a rule or a stated
-  decline: MONOIDAL prefix scans evaluate, EMIT (each point folds its own
+- **`Scan`** — narrowed: scalar-monoid prefix scans evaluate and EMIT (each point folds its own
   prefix — Rust and GPU, oracle-checked, `monoidal_prefix_scans_run_on_gpu`)
   and Add-scans DIFFERENTIATE (cumsum ⟵ reversed cumsum, held to finite
-  differences). Declined, precisely: the affine scan's TENSOR convention
-  (how a step's (A_t, b_t) pair rides an axis — the carrier itself is
-  proven at the algebra level in `tests/laws.rs`, but picking an IR
-  convention without an SSM consumer would be a guess), Max/Min scan
-  backward (per-prefix winner masks), and the affine adjoint recurrence.
+  differences). Product-valued and non-associative recurrences are absent
+  until the IR can represent their inputs and step semantics honestly.
+  Max/Min scan backward still needs per-prefix contribution masks.
 
 **Absent (the honest remainder):** two-pass row-resident kernels
 (softmax-as-OUTPUT: the derivation's Pe forms already carry the recipe —
@@ -255,9 +252,9 @@ Additive to the IR, no algebra changes:
 - **Transcendentals `Sin`/`Cos`** — [done]. Threaded through every layer
   (`ir`, `derive` incl. `Expr`, `codegen`, `emit_rust`) — ~2 lines each,
   confirming the closed basis stays cheap to extend and total.
-- **RoPE** — [done, without new IR]. Named axes make the pair/half split a
-  matter of *axis structure*, not a reshape: express the head dim as a pair
-  axis and apply a **computed 2×2 rotation matmul** (memory-free, from
+- **RoPE** — [done, without new IR]. Explicit positional pair/half dimensions
+  make the split part of the graph structure rather than a special operation:
+  apply a **computed 2×2 rotation matmul** (memory-free, from
   `iota`/`cos`/`sin`/`exp`). Because the rotations are free along the key axis,
   RoPE'd attention derives to **one fused flash kernel** — verified vs a
   hand-written RoPE reference, vs the interpreter, and **on the GPU**
@@ -303,11 +300,11 @@ MTLBuffers, buffer-swap commits, 7 kernels/step × 6 steps). The same
 mechanism runs optimizer state (see M8's SGD loop).
 
 ### M7 — Irregular frontend compositions · [partial, sort declined]
-- **argmax** — `BinOp::ArgMax`, an index-carrying maximum: a (max, idx)
-  tuple monoid (first-max-wins ties), derived like any fold via a two-slot
-  carrier — the running max plus an `ArgIdx` slot streaming `iota` — so
-  argmax is **one kernel**. Replaced the original `Σ i·[x == max]`
-  composition (two kernels, and unsound to fuse: it differs on ties).
+- **argmax** — a frontend composition of max, comparison/where, `iota`, and
+  min, with first-max-wins ties. The core has no Argmax operation or
+  Argmax-specific carrier slot. The generic `extremum-filter` law derives its
+  (maximum, minimum tied index) product carrier, so the composition is one
+  kernel without teaching the compiler about Argmax.
 - **top-k** — a frontend composition of repeated max/argmax and one-hot
   masking, with first-max-wins ties. The core has no Top-k operation or
   K-best carrier. Deriving the bounded ordered-pair carrier from this graph is
@@ -387,10 +384,8 @@ device profile (`Device::m1_pro`) with two honesty fixes the measurements
 forced: leaves priced in ISSUE ops (`count_issue_ops` — loads, div/mod
 index chains, gather arithmetic, not one flop per element; underpricing
 recompute is what made one-thread-per-output look fine), and hardware
-constants grounded in this machine's own kernels. Order-sensitive carriers
-(first-max-wins `ArgIdx`, `AffineStep`) decline
-to scalar — the same rule `emit_split_metal` enforces, tested on planted
-ties. MLX's sdpa-vector and qmv shapes fall out as priced instances; so
+constants grounded in this machine's own kernels. Every current carrier merge
+is symmetric and may use the split schedules. MLX's sdpa-vector and qmv shapes fall out as priced instances; so
 does the *non*-change (the 200k-row lm_head stays scalar — it was already
 at bandwidth). **Measured: Trinity 211.7 → 26.0 ms/step GPU (196 → 26
 ms/tok wall, 38.1 tok/s), GPT-2 29 → 8 ms/tok (128 tok/s); numerics pinned
@@ -532,12 +527,14 @@ compressed-tensors checkpoint **stays packed on device end to end**:
   views/reindexes/gathers with the AXIS TRANSLATED at each boundary
   (below a flatten the entanglement lives on the members), placing retry
   cuts as deep as the algebra allows. The count ladder then continued on
-  theory, not tuning: `BinOp::ArgMax` replaced the old
-  `Σ i·[x == max]` spelling, which is tie-unsound to fuse. A later Top-k
-  shortcut reduced routing kernels but was removed on 2026-07-20 because it
-  encoded a frontend operation in the core; sharing stopped being a fusion
-  barrier where recompute is cheap (a residual add per consumer is nothing
-  next to a launch + round trip); transcendentals inline when their
+  theory, not tuning: an Argmax shortcut replaced the old
+  `Σ i·[x == max]` spelling, which is tie-unsound to fuse. That shortcut and
+  a later Top-k shortcut reduced routing kernels but were removed on
+  2026-07-20 because they encoded frontend operations in the core. Argmax's
+  one-fold behavior was recovered through the generic extremal-key/payload
+  law; sharing stopped being a fusion barrier where recompute is cheap (a
+  residual add per consumer is nothing next to a launch + round trip);
+  transcendentals inline when their
   subtree is stream-INVARIANT (a norm's rsqrt hoists out of the loop — so
   normalized activations fuse into every consumer GEMM with no norm map
   stage at all); and gathers joined elementwise cones as in-body indexed
@@ -668,21 +665,18 @@ chunked lane streams (2026-07-13) — `FoldSched.chunk` folds contiguous
 8-element runs per lane when a packed leaf makes contiguity pay; MoE
 gate/up 2.2×, down 4.4 → 3.75 ms, GPU-bit-checked
 (`coop_chunked_w4_matvec`), numerics pinned (same Δ, SEQUENCE MATCH).
-CLIMBED: one-fold-per-layer top-k (2026-07-13) — the `project-leaf`
-derive rule (a projection may read stream-invariant leaves; k-best slots
-dedup across rank queries) makes `ir::topk_all` ONE 16-slot fold whose
-projection is rank-indexed by the grid coordinate: 432 rank kernels → 54,
+HISTORICAL: one-fold-per-layer top-k (2026-07-13) — the former
+operation-specific selection machinery produced 432 rank kernels → 54 and
 Trinity 1,968 → 1,590 kernels, 20.3 → **19.4 ms/step (~22 ms/token
-wall)**, numerics bit-identical (SEQUENCE MATCH holds). Narrowed on
-measurement: Mul-only, order-sensitive carriers only — the general form
-absorbed attention gates into projections, declined the cooperative
-schedule, and cost 8×.
-REMOVED (2026-07-20): the one-fold Top-k result above depended on a
-`BinOp::TopK` semantic shortcut and K-best-specific carrier machinery in the
-core. Top-k is now a frontend composition of max/argmax, one-hot, and where;
-the completeness ledger names bounded ordered-selection carrier inference as
-an open compiler problem. The old kernel-count and latency figures remain as
-historical measurements, not claims about the current tree.
+wall)**. This is retained as a measurement record, not a claim about the
+current generic frontend composition.
+REMOVED (2026-07-20): the one-fold Argmax and Top-k results above depended on
+semantic shortcuts and operation-specific carrier machinery in the core.
+Argmax and Top-k are now frontend compositions of generic maps and folds.
+Generic extremal-key/payload inference recovers Argmax's product carrier;
+the completeness ledger keeps bounded ordered-selection inference for Top-k
+open. The old Top-k kernel-count and latency figures remain historical
+measurements, not claims about the current tree.
 CLIMBED: f16 attention weights (2026-07-13) — the five projections upload bf16→f16
 through the existing typed-load path, −413 MB, 23.3 → **20.3 ms/step
 (~21 ms/token)**, and the 0.010 near-tie flips the other way: Trinity now
@@ -782,7 +776,8 @@ between steps (the M6 discipline, on optimizer state instead of a KV cache).
 
 ## The completeness oracle (`tests/completeness.rs`)
 
-The argmax and top-k fusions were found by counting kernels against MLX.
+The Argmax and Top-k product-state fusions were found by counting kernels
+against MLX. Argmax is now derived generically; bounded Top-k remains open.
 That was a process failure, named precisely: soundness always had an oracle
 (everything derived runs against `eval`), completeness never did — nothing
 ever checked that a DECLINE was correct. Now it is a checkable claim:

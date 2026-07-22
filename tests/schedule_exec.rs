@@ -13,7 +13,8 @@
 
 use sanic::cost::DeviceProfile;
 use sanic::interp::{Env, Value, eval};
-use sanic::kernel_ir::*;
+use sanic::ir::*;
+use sanic::nn::scaled_dot_product_attention;
 use sanic::partition::partition;
 
 struct Lcg(u64);
@@ -29,11 +30,11 @@ impl Lcg {
 }
 
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_fn(axes, |_| rng.f())
+    let shape = axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>();
+    Value::from_shape_fn(&shape, |_| rng.f())
 }
 
 fn assert_close(x: &Value, y: &Value) {
-    let y = y.permuted_to(&x.axes);
     assert_eq!(x.shape, y.shape, "shape: {:?} vs {:?}", x.axes, y.axes);
     let mut worst = 0.0f64;
     for (a, b) in x.data.iter().zip(&y.data) {
@@ -46,15 +47,24 @@ fn assert_close(x: &Value, y: &Value) {
     );
 }
 
-fn add_r() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add_r() -> Monoid {
+    Monoid::Add
 }
 
-fn rmsnorm(x: NodeRef, g: NodeRef, n: f64, ax: Axis) -> NodeRef {
-    let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), ax, add_r());
+fn rmsnorm(x: NodeRef, g: NodeRef, n: f64) -> NodeRef {
+    let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-    map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), denom])
+    map(
+        MapOp::Div,
+        vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
+    )
+}
+
+fn head_projection(x: NodeRef, weight: NodeRef) -> NodeRef {
+    let x = unsqueeze(unsqueeze(x, 0usize), 2usize);
+    let weight = unsqueeze(weight, 1usize);
+    reduce(map(MapOp::Mul, vec![x, weight]), 3usize, add_r())
 }
 
 // ── a focused case: flash attention + residual epilogue + output GEMM ────────
@@ -79,12 +89,24 @@ fn attention_block_schedule_executes_to_reference() {
     .collect();
 
     let x = input("X", &[s, dm], Dtype::F32);
-    let xk = rename(x.clone(), s, t);
-    let q = matmul(x.clone(), input("Wq", &[dk, dm], Dtype::F32), dm); // [s, dk]
-    let k = matmul(xk.clone(), input("Wk", &[dk, dm], Dtype::F32), dm); // [t, dk]
-    let v = matmul(xk, input("Wv", &[dv, dm], Dtype::F32), dm); // [t, dv]
-    let attn = attention(q, k, v, dk, t); // [s, dv]
-    let o = matmul(attn, input("Wo", &[dm, dv], Dtype::F32), dv); // [s, dm]
+    let xk = rename(x.clone(), 0usize, t);
+    let q = matmul(
+        x.clone(),
+        transpose(input("Wq", &[dk, dm], Dtype::F32), 0usize, 1usize),
+    ); // [s, dk]
+    let k = matmul(
+        xk.clone(),
+        transpose(input("Wk", &[dk, dm], Dtype::F32), 0usize, 1usize),
+    ); // [t, dk]
+    let v = matmul(
+        xk,
+        transpose(input("Wv", &[dv, dm], Dtype::F32), 0usize, 1usize),
+    ); // [t, dv]
+    let attn = scaled_dot_product_attention(q, k, v, None, 0.0, false, Some(1.0), false);
+    let o = matmul(
+        attn,
+        transpose(input("Wo", &[dm, dv], Dtype::F32), 0usize, 1usize),
+    ); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
     let sched = partition(&y, &DeviceProfile::toy());
@@ -130,37 +152,45 @@ fn full_transformer_block_schedule_executes_to_reference() {
     .collect();
 
     let x = input("X", &[s, dm], Dtype::F32);
-    let xn = rmsnorm(x.clone(), input("g1", &[dm], Dtype::F32), n, dm);
-    let xn_kv = rename(xn.clone(), s, t);
+    let xn = rmsnorm(x.clone(), input("g1", &[dm], Dtype::F32), n);
+    let xn_kv = rename(xn.clone(), 0usize, t);
 
-    let q = matmul(xn, input("Wq", &[h, dk, dm], Dtype::F32), dm); // [s, h, dk]
-    let k = matmul(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32), dm); // [t, h, dk]
-    let vv = matmul(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32), dm); // [t, h, dv]
+    let q = head_projection(xn, input("Wq", &[h, dk, dm], Dtype::F32)); // [h, s, dk]
+    let k = head_projection(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32)); // [h, t, dk]
+    let vv = head_projection(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32)); // [h, t, dv]
 
-    let scores = matmul(q, k, dk); // [s, h, t]
-    let scaled = map(
-        MapOp::Mul,
-        vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())],
-    );
-    let masked = map(MapOp::Add, vec![scaled, causal_mask(s, t)]);
-    let attn = matmul(softmax(masked, t), vv, t); // [s, h, dv]
+    let attn = scaled_dot_product_attention(
+        q,
+        k,
+        vv,
+        None,
+        0.0,
+        true,
+        Some(1.0 / (dk.extent() as f64).sqrt()),
+        false,
+    ); // [h, s, dv]
 
-    let flat = flatten(attn, &[h, dv], dmv); // [s, dmv]
-    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32), dmv); // [s, dm]
+    let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv); // [s, dmv]
+    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32)); // [s, dm]
     let res1 = map(MapOp::Add, vec![o, x]);
 
-    let hn = rmsnorm(res1.clone(), input("g2", &[dm], Dtype::F32), n, dm);
-    let gate = matmul(hn.clone(), input("Wg", &[f, dm], Dtype::F32), dm); // [s, f]
-    let up = matmul(hn, input("Wu", &[f, dm], Dtype::F32), dm); // [s, f]
+    let hn = rmsnorm(res1.clone(), input("g2", &[dm], Dtype::F32), n);
+    let gate = matmul(
+        hn.clone(),
+        transpose(input("Wg", &[f, dm], Dtype::F32), 0usize, 1usize),
+    ); // [s, f]
+    let up = matmul(
+        hn,
+        transpose(input("Wu", &[f, dm], Dtype::F32), 0usize, 1usize),
+    ); // [s, f]
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let mlp = reduce(
-        map(MapOp::Mul, vec![act, input("Wd", &[f, dm], Dtype::F32)]),
-        f,
-        add_r(),
-    );
+    let mlp = matmul(act, input("Wd", &[f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
 
-    let logits = matmul(yb, input("W_lm", &[v, dm], Dtype::F32), dm); // [s, v]
+    let logits = matmul(
+        yb,
+        transpose(input("W_lm", &[v, dm], Dtype::F32), 0usize, 1usize),
+    ); // [s, v]
 
     let sched = partition(&logits, &DeviceProfile::toy());
     assert!(
@@ -183,13 +213,7 @@ fn full_transformer_block_schedule_executes_to_reference() {
     }
     assert_eq!(
         buckets,
-        [
-            ("binop-of-coupled", 1),
-            ("not-streamed", 32),
-            ("still-per-element", 2),
-        ]
-        .into_iter()
-        .collect(),
+        [("not-streamed", 25)].into_iter().collect(),
         "a transformer decline bucket changed; inspect the census above"
     );
 }

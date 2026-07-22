@@ -37,7 +37,8 @@ share loop ranges*: a single-consumer producer inherits its consumer's
 ranges and fuses (`indexing.py:211-213`); boundaries appear where ranges
 can't flow. In sanic, *everything one `derive` call swallows is one kernel*,
 and cuts land at the carrier's leaves. Both replaced op-category fusion
-rules with a structural criterion. Neither has a pattern library.
+rules with a structural criterion. Sanic still has reusable algebraic patterns;
+it avoids workload-named kernel templates.
 
 **The same multi-consumer logic — theirs is finer.** When a DAG-shared node
 is indexed identically by all consumers, tinygrad recomputes/fuses it
@@ -85,7 +86,7 @@ arbitrary index arithmetic, and never needs operator laws. Sanic's needs the
 laws (`Monoid`, linearity) declared per op — and pays back with derived
 streaming kernels no syntactic fusion can reach.
 
-## Axis identity: positional vs named-and-scoped
+## Axis identity: positional vs occurrence-scoped
 
 tinygrad has **no axis names**: REDUCE's arg is a *count* of leading axes,
 RANGE ids are counters tagged with a hardware role (`AxisType`:
@@ -96,12 +97,12 @@ permute/reshape/reduce (`mixin/movement.py:365-405`,
 entirely — and make a question like "is this axis foldable at this node"
 unaskable, which is fine for tinygrad because it never asks it.
 
-Sanic bets the other way: named axes carry semantic identity across the
-graph, which is what the per-(node, axis) classification and the carrier's
-slot spans are built on — and which is why sanic needed scoping semantics
-(`Reduce` binds, `View` re-binds). The two decisions are coupled: **the
-algebra needs axis identity; syntactic fusion doesn't.** Any "derive-first"
-compiler will have to make sanic's choice.
+Sanic's graph is positional too. During analysis it resolves each logical
+dimension to an ephemeral occurrence identified by `(node, dimension)` and
+propagates that occurrence through shape-preserving structure. Carrier spans
+and per-dimension classification use those occurrences; axis labels remain
+diagnostic. The algebra needs dimension provenance, but it does not need names
+or identifiers stored in graph nodes.
 
 ## What `tinyspec` teaches us about our IR
 
@@ -125,8 +126,8 @@ literally:
 | concern | tinygrad | sanic today | design verdict |
 |---|---|---|---|
 | semantic unit | one UOp union across phases | nine pure `NodeKind`s, then `Carrier`, `Stage`, and `KernelSpec` | Sanic's phase separation is clearer; shared scalar/index sublanguages should stop being duplicated |
-| axes | positional shapes; schedule `RANGE`s get `AxisType` | opaque semantic axis identities with scoped `View`/`Reindex` binders | Sanic's identity is required for per-(node, axis) algebra; preserve it, but give split loops separate schedule identities |
-| reductions | `ADD/MAX/MUL` over leading positional axes | named-axis scalar monoids plus argmax, top-k, affine and non-associative declarations | Sanic is algebraically stronger, but `BinOp` currently conflates scalar result semantics, tuple carrier state, and recurrence classification |
+| axes | positional shapes; schedule `RANGE`s get `AxisType` | positional shapes; analysis derives ephemeral `(node, dimension)` occurrences | Sanic needs provenance for per-dimension algebra, not names stored in the graph; split loops still need schedule identities |
+| reductions | `ADD/MAX/MUL` over leading positional axes | positional scalar monoids plus structurally derived coupled carriers | Sanic's core admits only operations with complete scalar semantics; product recurrences wait for product values |
 | movement | explicit tensor movement ops lowered to symbolic range indices and validity masks | `View` plus affine `Reindex`, with `Gather` for data-dependent access | The convergence is good; Sanic still needs a general symbolic integer/validity language, not more movement constructors |
 | effects | `LOAD/STORE/AFTER/GROUP/SINK` in the dialect | tensor DAG stays pure; ordered stages and runtime commits carry effects | Purity is a strength worth keeping; a typed lower command IR should replace implicit vector order and string-named buffers |
 | derived facts | dtype, shape, device, address space, value interval, sharding axis | output axes, structure, carrier spans, storage-byte dtype, roofline | Sanic's algebraic facts are unique; dtype, symbolic extent, device and bounds facts are far too weak |
@@ -143,11 +144,11 @@ symbolic merge, projection, and leaves. That is why online softmax and weighted
 online softmax can be *derived* from ordinary graphs instead of introduced as
 opaque calls.
 
-**Axis identity makes the algebra local and compositional.** Named identity is
-not frontend decoration: it lets the same axis be free at one node, reduced at
-another, rebound by a view, and classified independently everywhere. Tinygrad's
-positional ranges are excellent scheduling objects; they cannot express this
-semantic question without reconstructing provenance.
+**Dimension occurrences make the algebra local and compositional.** The
+analysis pass can classify the nth output dimension of a particular node as
+free, reduced, or rebound without placing IDs in the semantic graph. Tinygrad's
+positional ranges are excellent scheduling objects; Sanic additionally
+reconstructs provenance because carrier derivation asks this semantic question.
 
 **The semantic graph is pure.** A KV-cache update remains a pure expression,
 and the runtime commits it only after the schedule finishes. This keeps alias
@@ -165,22 +166,18 @@ is attempting.
 
 1. **One closed basis is currently restated too many times.** `MapOp`,
    carrier `Expr`, dense evaluation, reverse mode, Rust rendering, and Metal
-   rendering each encode scalar semantics. They can drift: `Tanh` is a legal
-   `MapOp` and exists in both emitters and autodiff, but carrier `Expr` has no
-   `Tanh` and derivation declines it. The right lesson from UOps is to share a
-   typed scalar expression language and make phase capability explicit, not to
-   keep six exhaustive matches synchronized by convention.
-2. **`BinOp` is doing three jobs, and one claimed law is currently false.**
-   Scalar monoids have complete dense semantics. `ArgMax`/`TopK` secretly
-   introduce tuple state and project back to one scalar. The implemented
-   k-best merge inserts a singleton into the left state; it is not the
-   advertised two-list merge, and split reduction explicitly refuses it.
-   Therefore that carrier is a valid sequential streaming algorithm but not
-   yet an associative/tree certificate. `AffineCompose` expects a two-field
-   item that the tensor value system cannot represent, while `NonAssoc` is a
-   scheduling verdict rather than an operator. Before adding reducers, Sanic
-   needs either product values or a closed reducer interface whose input,
-   state, result, identity, combine, and reference semantics agree.
+   rendering each encode scalar semantics. They can drift: the audit found
+   `Tanh` missing from carrier `Expr`; that gap is now closed and regression
+   tested, but the duplication remains. The right lesson from UOps is to share
+   a typed scalar expression language and make phase capability explicit, not
+   to keep six exhaustive matches synchronized by convention.
+2. **Product values remain the next type-system boundary.** Reductions and
+   scans now admit only scalar `Monoid`s with complete dense semantics; the old
+   Argmax, Top-k, affine-compose, and non-associative semantic shortcuts are
+   gone. The compiler derives Argmax's extremal-key/payload product while
+   bounded Top-k and genuine product-valued recurrences wait for either product
+   values or a closed reducer interface whose input, state, result, identity,
+   combine, and reference semantics agree.
 3. **Dynamic shape is a marker, not symbolic shape.** A dynamic extent can be
    copied from a bound input, but it cannot express products, quotients,
    inequalities, or validity. Tinygrad uses the same symbolic integer UOps for
@@ -199,11 +196,12 @@ is attempting.
    loops that are not new tensor dimensions. Tinygrad's `AxisType` table makes
    this separation explicit. Sanic should preserve semantic-axis provenance
    while lowering to independently splittable loop ranges.
-6. **The pure/effect boundary needs a real lower IR.** Keeping `Store` out of
+6. **The pure/effect boundary needs a typed command/effect plan.** Keeping `Store` out of
    `NodeKind` is correct, but `Vec<Stage>` execution order plus string buffer
    names will not support memory reuse, barriers, async copies, atomics, or
    multi-device dependencies cleanly. Add a typed command/buffer graph after
-   partitioning; do not contaminate the algebraic tensor IR to get it.
+   partitioning; it is an execution plan, not a second tensor IR. Do not
+   contaminate the algebraic tensor IR to get it.
 7. **Dtype must become semantics before serious codegen.** Sanic's `Dtype`
    currently prices storage bytes while the oracle computes `f64`. That was a
    useful bootstrap, but casts, accumulation dtype, integer ops, overflow,
@@ -230,7 +228,7 @@ node in every phase.
 Sanic's `src/verify.rs` is an internal graph-boundary verifier, not a formal
 language document and not a stability promise. A bottom-up DAG walk rejects
 wrong `Map` arity, inconsistent declarations of one input buffer, duplicate or
-zero-sized axes, invalid `TopK` parameters, ill-scoped `View` groups, wrong
+zero-sized axes, ill-scoped `View` groups, wrong
 flatten extents, and statically out-of-bounds unpadded affine reindexes.
 Dynamic affine bounds are rechecked after graph inputs are concretized.
 

@@ -1,7 +1,9 @@
-//! M7 — the irregular tail: top-k and scatter, as compositions of the
+//! M7 — the irregular tail: argmax, top-k and scatter, as compositions of the
 //! existing basis (no new node kinds), verified against hand references and
 //! through the partitioned pipeline.
 //!
+//! * `argmax` — min payload among indices tied at the maximum key. The generic
+//!   extremal-key/payload law derives its two-slot carrier from composition.
 //! * `topk` — repeated max/argmax and one-hot masking, built by the frontend
 //!   from ordinary graph operations. Carrier discovery for the whole
 //!   composition remains compiler work rather than Top-k semantics.
@@ -13,12 +15,11 @@
 //! fold — outside the algebra this compiler trusts, and unneeded for
 //! inference.
 
-use std::collections::HashMap;
-
 use sanic::cost::DeviceProfile;
+use sanic::derive::{SlotKind, derive};
 use sanic::interp::{Env, Value, eval};
-use sanic::kernel_ir::*;
-use sanic::partition::{partition, partition_many};
+use sanic::ir::*;
+use sanic::partition::{Stage, partition, partition_many};
 
 struct Lcg(u64);
 impl Lcg {
@@ -32,7 +33,51 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_fn(axes, |_| rng.f())
+    Value::from_shape_fn(
+        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
+        |_| rng.f(),
+    )
+}
+
+// ── argmax: a generic extremal-key/payload product fold ─────────────────────
+
+#[test]
+fn argmax_is_one_generic_product_fold() {
+    let n = axis("n", 8);
+    let data = [2.0, 5.0, 5.0, 1.0, 5.0, 2.0, 0.0, 5.0];
+    let values = Value::from_shape_fn(&[8], |coordinate| data[coordinate[0]]);
+    let env: Env = [("X", values)].into_iter().collect();
+    let x = input("X", &[n], Dtype::F32);
+    let stream = axis_refs(&x)[0];
+    let node = argmax(x, 0usize);
+
+    let carrier = derive(&node, stream).expect("argmax composition should derive");
+    assert_eq!(
+        carrier.slots, 2,
+        "Acc = (maximum value, minimum tied index)"
+    );
+    assert!(carrier.rules.contains(&"extremum-filter"));
+    assert!(matches!(
+        carrier.kinds.as_slice(),
+        [
+            SlotKind::Plain(Monoid::Max),
+            SlotKind::AtExtremum {
+                key_slot: 0,
+                key: Monoid::Max,
+                ties: Monoid::Min,
+            }
+        ]
+    ));
+
+    let schedule = partition(&node, &DeviceProfile::toy());
+    assert_eq!(
+        schedule.stages.len(),
+        1,
+        "argmax composition should be one product fold:\n{}",
+        schedule.render()
+    );
+    assert!(matches!(&schedule.stages[0], Stage::Fused { spec, .. } if spec.carrier.slots == 2));
+    assert_eq!(schedule.execute(&env).data, vec![1.0]);
 }
 
 // ── top-k: values and indices, largest first ─────────────────────────────────
@@ -45,7 +90,7 @@ fn topk_matches_a_hand_sort() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
+    let pairs = topk(input("X", &[n], Dtype::F32), 0usize, k);
 
     // hand reference: sort (value, index) descending by value
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
@@ -70,7 +115,7 @@ fn topk_partitions_and_executes() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
+    let pairs = topk(input("X", &[n], Dtype::F32), 0usize, k);
     let names: Vec<(NodeRef, &'static str)> = pairs
         .iter()
         .enumerate()
@@ -107,22 +152,21 @@ fn topk_all_composition_matches_and_schedules() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let scores = input("X", &[n], Dtype::F32);
-    let all_indices = topk_all(scores.clone(), n, k, rk, true);
-    let all_values = topk_all(scores, n, k, rk, false);
+    let all_indices = topk_all(scores.clone(), 0usize, k, rk, true);
+    let all_values = topk_all(scores, 0usize, k, rk, false);
 
     let expected_indices = eval(&all_indices, &env);
     let expected_values = eval(&all_values, &env);
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
     for (r, &(expected_value, expected_index)) in order.iter().take(k).enumerate() {
-        let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
         assert_eq!(
-            expected_indices.at(&coord),
+            expected_indices.at_index(&[r]),
             expected_index as f64,
             "index at rank {r}"
         );
         assert_eq!(
-            expected_values.at(&coord),
+            expected_values.at_index(&[r]),
             expected_value,
             "value at rank {r}"
         );
@@ -138,18 +182,17 @@ fn topk_all_composition_matches_and_schedules() {
     let values = &run_env["values"];
     let indices = &run_env["indices"];
     for (r, &(expected_value, expected_index)) in order.iter().take(k).enumerate() {
-        let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(values.at(&coord), expected_value, "scheduled value {r}");
+        assert_eq!(values.at_index(&[r]), expected_value, "scheduled value {r}");
         assert_eq!(
-            indices.at(&coord),
+            indices.at_index(&[r]),
             expected_index as f64,
             "scheduled index {r}"
         );
     }
 }
 
-// Planted exact ties: the shared-slot fold keeps first-max-wins across the
-// WHOLE selection, exactly like the per-rank folds it replaces.
+// Planted exact ties: the all-ranks frontend composition preserves the same
+// first-max-wins behavior as its constituent per-rank folds.
 #[test]
 fn topk_all_ties_match_per_rank_folds() {
     let k = 3usize;
@@ -157,22 +200,22 @@ fn topk_all_ties_match_per_rank_folds() {
     // ties everywhere: [2, 5, 5, 1, 5, 2, 0, 5] — ranks 0..3 are all the 5s,
     // first-seen order 1, 2, 4
     let data = [2.0, 5.0, 5.0, 1.0, 5.0, 2.0, 0.0, 5.0];
-    let x = Value::from_fn(&[n], |c| data[c[&n]]);
+    let x = Value::from_shape_fn(&[8], |coordinate| data[coordinate[0]]);
     let env: Env = [("X", x)].into_iter().collect();
 
-    let all = topk_all(input("X", &[n], Dtype::F32), n, k, rk, true);
+    let all = topk_all(input("X", &[n], Dtype::F32), 0usize, k, rk, true);
     let got = eval(&all, &env);
-    let pairs = topk(input("X", &[n], Dtype::F32), n, k);
+    let pairs = topk(input("X", &[n], Dtype::F32), 0usize, k);
     for (r, (_, i)) in pairs.iter().enumerate() {
-        let coord: HashMap<Axis, usize> = [(rk, r)].into_iter().collect();
-        assert_eq!(got.at(&coord), eval(i, &env).data[0], "rank {r} under ties");
+        assert_eq!(
+            got.at_index(&[r]),
+            eval(i, &env).data[0],
+            "rank {r} under ties"
+        );
     }
-    let coord0: HashMap<Axis, usize> = [(rk, 0)].into_iter().collect();
-    let coord1: HashMap<Axis, usize> = [(rk, 1)].into_iter().collect();
-    let coord2: HashMap<Axis, usize> = [(rk, 2)].into_iter().collect();
-    assert_eq!(got.at(&coord0), 1.0);
-    assert_eq!(got.at(&coord1), 2.0);
-    assert_eq!(got.at(&coord2), 4.0);
+    assert_eq!(got.at_index(&[0]), 1.0);
+    assert_eq!(got.at_index(&[1]), 2.0);
+    assert_eq!(got.at_index(&[2]), 4.0);
 }
 
 // Batched top-1 (the MoE router shape): argmax per row.
@@ -183,20 +226,17 @@ fn batched_top1_routes_rows() {
     let gates = rand_tensor(&[b, e], &mut rng);
     let env: Env = [("G", gates.clone())].into_iter().collect();
 
-    let pairs = topk(input("G", &[b, e], Dtype::F32), e, 1);
+    let pairs = topk(input("G", &[b, e], Dtype::F32), 1usize, 1);
     let idx = eval(&pairs[0].1, &env);
     for bi in 0..5 {
         let mut best = 0usize;
         for ei in 1..8 {
-            let c = |e_i| {
-                let m: HashMap<Axis, usize> = [(b, bi), (e, e_i)].into_iter().collect();
-                gates.at(&m)
-            };
+            let c = |e_i| gates.at_index(&[bi, e_i]);
             if c(ei) > c(best) {
                 best = ei;
             }
         }
-        let got = idx.at(&[(b, bi)].into_iter().collect());
+        let got = idx.at_index(&[bi]);
         assert_eq!(got, best as f64, "row {bi}");
     }
 }
@@ -205,7 +245,7 @@ fn batched_top1_routes_rows() {
 #[should_panic(expected = "topk requires k >= 1")]
 fn topk_rejects_an_empty_selection() {
     let n = axis("n", 4);
-    let _ = topk(input("X", &[n], Dtype::F32), n, 0);
+    let _ = topk(input("X", &[n], Dtype::F32), 0usize, 0);
 }
 
 #[test]
@@ -213,7 +253,7 @@ fn topk_rejects_an_empty_selection() {
 fn topk_all_requires_one_rank_axis_position_per_result() {
     let n = axis("n", 4);
     let ranks = axis("ranks", 3);
-    let _ = topk_all(input("X", &[n], Dtype::F32), n, 2, ranks, true);
+    let _ = topk_all(input("X", &[n], Dtype::F32), 0usize, 2, ranks, true);
 }
 
 // ── scatter-add: the inverse of gather, collisions summed ────────────────────
@@ -225,31 +265,27 @@ fn scatter_add_matches_hand_with_collisions() {
     let src = rand_tensor(&[i, d], &mut rng);
     // indices with deliberate collisions and a hole (nothing maps to 2)
     let idx_vals = [0usize, 1, 1, 3, 0, 1, 3];
-    let idx = Value::from_fn(&[i], |c| idx_vals[c[&i]] as f64);
+    let idx = Value::from_shape_fn(&[7], |coordinate| idx_vals[coordinate[0]] as f64);
     let env: Env = [("S", src.clone()), ("idx", idx)].into_iter().collect();
 
     let sc = scatter_add(
         input("S", &[i, d], Dtype::F32),
         input("idx", &[i], Dtype::F32),
-        i,
+        0usize,
         j,
     );
     let got = eval(&sc, &env);
 
-    let hand = Value::from_fn(&[j, d], |c| {
+    let hand = Value::from_shape_fn(&[4, 3], |coordinate| {
         idx_vals
             .iter()
             .enumerate()
-            .filter(|&(_, &jj)| jj == c[&j])
-            .map(|(ii, _)| {
-                let m: HashMap<Axis, usize> = [(i, ii), (d, c[&d])].into_iter().collect();
-                src.at(&m)
-            })
+            .filter(|&(_, &jj)| jj == coordinate[0])
+            .map(|(ii, _)| src.at_index(&[ii, coordinate[1]]))
             .sum()
     });
-    let hand_p = hand.permuted_to(&got.axes);
-    assert_eq!(got.shape, hand_p.shape);
-    for (a, b) in got.data.iter().zip(&hand_p.data) {
+    assert_eq!(got.shape, hand.shape);
+    for (a, b) in got.data.iter().zip(&hand.data) {
         assert!((a - b).abs() < 1e-12, "{a} vs {b}");
     }
 
@@ -276,21 +312,19 @@ fn scatter_add_inverts_a_permutation_gather() {
     let mut rng = Lcg(0x1D);
     let table = rand_tensor(&[v, d], &mut rng);
     let perm = [3usize, 0, 4, 1, 2];
-    let ids = Value::from_fn(&[s], |c| perm[c[&s]] as f64);
+    let ids = Value::from_shape_fn(&[5], |coordinate| perm[coordinate[0]] as f64);
     let env: Env = [("T", table.clone()), ("ids", ids)].into_iter().collect();
 
     let gathered = gather(
         input("T", &[v, d], Dtype::F32),
         input("ids", &[s], Dtype::F32),
-        v,
-    ); // [d, s]
-    let back = scatter_add(gathered, input("ids", &[s], Dtype::F32), s, v2); // [d, v2]
+        0usize,
+    ); // [s, d]
+    let back = scatter_add(gathered, input("ids", &[s], Dtype::F32), 0usize, v2); // [v2, d]
     let got = eval(&back, &env);
     for vi in 0..5 {
         for di in 0..3 {
-            let g: HashMap<Axis, usize> = [(v2, vi), (d, di)].into_iter().collect();
-            let t: HashMap<Axis, usize> = [(v, vi), (d, di)].into_iter().collect();
-            assert!((got.at(&g) - table.at(&t)).abs() < 1e-12);
+            assert!((got.at_index(&[vi, di]) - table.at_index(&[vi, di])).abs() < 1e-12);
         }
     }
 }

@@ -71,7 +71,7 @@ fn rms(x: Node, w: &'static str, dm: Axis, n: usize) -> Node {
             reduce(
                 map(MapOp::Mul, vec![x.clone(), x.clone()]),
                 dm,
-                BinOp::Monoid(Monoid::Add),
+                Monoid::Add,
             ),
             konst(1.0 / n as f64),
         ],
@@ -96,7 +96,7 @@ fn rms_head(x: Node, w: &'static str, j2: Axis, rr: Axis, hd: Axis) -> Node {
             reduce(
                 flatten(map(MapOp::Mul, vec![x.clone(), x.clone()]), &[j2, rr], hd),
                 hd,
-                BinOp::Monoid(Monoid::Add),
+                Monoid::Add,
             ),
             konst(1.0 / HD as f64),
         ],
@@ -175,7 +175,7 @@ fn w4_matvec(
             input(s, &s_axes, Dtype::F32),
         ],
     );
-    reduce(flatten(prod, &[gi, ri], flat), flat, BinOp::Monoid(Monoid::Add))
+    reduce(flatten(prod, &[gi, ri], flat), flat, Monoid::Add)
 }
 
 struct Model {
@@ -315,12 +315,9 @@ fn build() -> Model {
             let score = sigmoid(matmul(xn2.clone(), router_in, dm));
             roots.push((score, nm("score")));
             let score_in = input(nm("score"), &[nr], Dtype::F32);
-            // Selection is on bias-corrected scores; ALL EIGHT ranks are ONE
-            // fold (`topk_all`): the k-best slots are shared across the rank
-            // queries and the rank one-hot is read at project time, so the
-            // eight index kernels this layer used to launch are one kernel
-            // over the rank-axis grid. The route WEIGHTS re-gather the raw
-            // sigmoid scores below.
+            // Selection is on bias-corrected scores. `topk_all` is the
+            // frontend composition that stacks all eight ranks; the route
+            // weights re-gather the raw sigmoid scores below.
             let biased = map(
                 MapOp::Add,
                 vec![score_in.clone(), input(nm("ebias"), &[nr], Dtype::F32)],
@@ -400,7 +397,7 @@ fn build() -> Model {
                 );
                 let ssel = gather(input(s, &[ne, out_ax, gx], Dtype::F32), idx_in.clone(), ne);
                 let prod = map(MapOp::Mul, vec![map(MapOp::Mul, vec![wsel, x]), ssel]);
-                reduce(flatten(prod, &[gx, rx], fl), fl, BinOp::Monoid(Monoid::Add))
+                reduce(flatten(prod, &[gx, rx], fl), fl, Monoid::Add)
             };
             let gate_y = grouped(nm("weg"), nm("seg"), fe, gi, ri, xs.clone(), e1); // [sl, fe]
             let up_y = grouped(nm("weu"), nm("seu"), fe, gi, ri, xs.clone(), e2); // [sl, fe]
@@ -411,7 +408,7 @@ fn build() -> Model {
             reduce(
                 map(MapOp::Mul, vec![down_y, coef_in]),
                 sl,
-                BinOp::Monoid(Monoid::Add),
+                Monoid::Add,
             )
         };
 
@@ -680,8 +677,8 @@ fn main() {
                     inputs.iter().map(|n| norm(n)).collect::<Vec<_>>(),
                     norm(output),
                 ),
-                Stage::Sequential { op, inputs, output, .. } => println!(
-                    "S op={op} in={:?} out={}",
+                Stage::Fallback { inputs, output, .. } => println!(
+                    "F in={:?} out={}",
                     inputs.iter().map(|n| norm(n)).collect::<Vec<_>>(),
                     norm(output),
                 ),
@@ -695,7 +692,7 @@ fn main() {
         let mut folds = 0usize;
         let mut maps = 0usize;
         let mut gathers = 0usize;
-        let mut seqs = 0usize;
+        let mut fallbacks = 0usize;
         let mut gather_elems = 0usize;
         let mut by_tag: HashMap<&'static str, usize> = HashMap::new();
         let tag = |out: &str, by: &mut HashMap<&'static str, usize>| {
@@ -728,15 +725,15 @@ fn main() {
                         .product::<usize>();
                     tag(output, &mut by_tag);
                 }
-                Stage::Sequential { output, .. } => {
-                    seqs += 1;
+                Stage::Fallback { output, .. } => {
+                    fallbacks += 1;
                     tag(output, &mut by_tag);
                 }
                 Stage::Infeasible { .. } => {}
             }
         }
         println!(
-            "stages: {} total = {folds} folds + {maps} elementwise + {gathers} gathers + {seqs} sequential",
+            "stages: {} total = {folds} folds + {maps} elementwise + {gathers} gathers + {fallbacks} fallback",
             model.sched.stages.len()
         );
         println!("gathered/materialized elements across gather stages: {gather_elems}");
@@ -751,7 +748,7 @@ fn main() {
                 Stage::Fused { spec, .. } => spec.output_name.clone(),
                 Stage::Elementwise { output, .. }
                 | Stage::Gather { output, .. }
-                | Stage::Sequential { output, .. } => output.clone(),
+                | Stage::Fallback { output, .. } => output.clone(),
                 Stage::Infeasible { output, .. } => output.clone(),
             };
             if out == "xd10" {
@@ -767,7 +764,7 @@ fn main() {
                     Stage::Fused { .. } => "fold",
                     Stage::Elementwise { .. } => "map",
                     Stage::Gather { .. } => "gather",
-                    Stage::Sequential { .. } => "seq",
+                    Stage::Fallback { .. } => "fallback",
                     Stage::Infeasible { .. } => "infeasible",
                 };
                 layer_stages.push(format!("{kind}:{out}"));

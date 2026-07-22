@@ -199,9 +199,7 @@ roofline on a measured device profile (`Device::m1_pro`) plus one honesty
 fix the investigation forced: leaves are priced in ISSUE ops (loads, div/mod
 index chains, gathers — what the emitter actually emits), not one flop per
 element, which is exactly what had made one-thread-per-output look cheap.
-Order-sensitive carriers (first-max-wins ArgIdx, k-best's singleton insert,
-AffineStep) decline to scalar — the same rule the GROUP split already
-enforced, now tested on planted ties. No kernel names any operation: the
+Every current carrier merge is symmetric and may use the GROUP split. No kernel names any operation: the
 sdpa-vector shape, the qmv shape, and the lm_head *non*-change all fall out
 of pricing.
 
@@ -308,21 +306,13 @@ per simdgroup (x-vector reuse), and the compressed-tensors −8·Σx
 zero-point hoist. Step: ~19.5 ms replayed, ~21 ms/token — the step is
 now overlap-bound, so per-class wins land smaller than they measure.
 
-**One fold per layer for all top-k ranks (2026-07-13): 20.3 → 19.4
-ms/step, 1,968 → 1,590 kernels.** A new derivation rule, not stage
-plumbing: a fold's projection may read leaves that are CONSTANT along the
-streamed axis (`project-leaf`), and the per-rank k-best reduces of one
-score vector share their slots. So `Σ_r onehot(rk=r)·rank_r`
-(`ir::topk_all`) derives as ONE 16-slot carrier whose projection is
-rank-indexed by the grid coordinate — 432 grid-1 rank kernels become 54
-grid-8 kernels, first-max-wins ties preserved (GPU-tested on planted
-ties). The rule is deliberately narrow: Mul only (an additive form would
-swallow residual epilogues into projections), and only when the collapsed
-side reads order-sensitive slots — those carriers decline the cooperative
-schedule anyway, so the absorption is free; an attention gate over a
-rescale carrier stays an epilogue (the first, general version of the rule
-absorbed it, dropped the flash folds to scalar, and cost 8× — measured,
-then narrowed).
+**Historical one-fold Top-k result (2026-07-13): 20.3 → 19.4 ms/step,
+1,968 → 1,590 kernels.** The former implementation combined all rank
+queries into an operation-specific 16-slot selection carrier. That machinery
+was removed on 2026-07-20: `topk` and `topk_all` are now only frontend
+compositions of generic maps and reductions, and bounded ordered-selection
+inference remains compiler work. These numbers are retained as a performance
+target, not a claim about the current tree.
 
 **f16 attention weights (2026-07-13): 23.3 → 20.3 ms/step, ~21 ms/token
 wall (~46 tok/s).** The self-inflicted f32 doubling undone: the five

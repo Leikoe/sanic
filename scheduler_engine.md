@@ -32,7 +32,7 @@ the space of parameterizations of a fixed correct skeleton."
 From the algebraic engine, per region of the graph:
 
 - **Structure map**: for each (node, axis), a tag in
-  `{FREE, MONOIDAL, LINEAR, OPAQUE, SEQUENTIAL}`. `LINEAR` is a `MONOIDAL`
+  `{FREE, MONOIDAL, LINEAR, OPAQUE}`. `LINEAR` is a `MONOIDAL`
   refinement (the fold is also a semimodule homomorphism). Tracked
   per-(node, axis), not collapsed to outputs — an axis may be contracted in one
   node and free in another.
@@ -50,7 +50,8 @@ families of §3. It is feasible (satisfies all hardware constraints) and ranked
 best under the cost model. Concretely, per kernel: its node set (the fusion
 partition), grid axes, the streamed axis, stream-vs-tree per monoidal axis, tile
 sizes per axis, and buffer placement for any materialized intermediates and
-OPAQUE/SEQUENTIAL state.
+OPAQUE state. A future explicit recurrence IR would add SEQUENTIAL state here;
+the current core does not fabricate it from an operator label.
 
 ### 1.3 Target description
 
@@ -91,7 +92,7 @@ Exactly five families. The structure map dictates which apply where.
 | 2 | **Loop assignment** | which FREE axes are grid; which MONOIDAL axis is the streamed inner loop | per kernel |
 | 3 | **Stream-vs-tree** | per MONOIDAL axis: sequential O(1) fold, or parallel tree-reduction | axis length + critical path |
 | 4 | **Tile sizes** | block size per axis; register-vs-SRAM residency of `Acc` | hard-bounded by capacity |
-| 5 | **Memory placement** | buffers at fusion cuts; KV-cache/recurrence state; gather index layout | OPAQUE + SEQUENTIAL regions |
+| 5 | **Memory placement** | buffers at fusion cuts; KV-cache/session state; gather index layout | OPAQUE regions + runtime state |
 
 Notes per family:
 
@@ -116,7 +117,7 @@ Notes per family:
   size enters the SRAM constraint directly.
 
 - **(5) Memory placement.** The structure map flags *where* materialization is
-  forced (fusion cuts, OPAQUE gathers, SEQUENTIAL recurrence state). The
+  forced (fusion cuts and OPAQUE gathers). The runtime separately owns session state. The
   scheduler sizes and places these buffers. For OPAQUE, use the gather index
   refinement (permutation / sorted / arbitrary) to choose coalesced vs.
   scattered handling.
@@ -212,14 +213,13 @@ and modest in size.
 Each candidate partition is costed by invoking the inner search (§6.1) on each
 resulting kernel and summing, plus launch overhead.
 
-### 6.3 OPAQUE / SEQUENTIAL memory planning
+### 6.3 OPAQUE and runtime-state memory planning
 
 A parallel track, driven by the structure map's flags rather than the
 fuse/tile search:
 
 - buffer allocation and lifetime for intermediates at fusion cuts;
-- KV-cache and recurrence-state layout for SEQUENTIAL regions (the
-  autoregressive loop, scans);
+- KV-cache and session-state layout for host-controlled autoregressive loops;
 - gather/scatter index layout for OPAQUE regions, using the index-structure
   refinement to choose coalesced vs. scattered access paths.
 
@@ -239,7 +239,7 @@ fuse/tile search:
    enumeration, ranked by the cost model.
 4. **Outer fusion-partition search.** DP over the graph (ILP for small exact
    cases, greedy/beam for large), costing each candidate via the inner search.
-5. **OPAQUE/SEQUENTIAL memory planning.** Buffer allocation at cuts, KV-cache and
+5. **OPAQUE/runtime-state memory planning.** Buffer allocation at cuts, KV-cache and
    gather layout, as a parallel track.
 
 The order is dependency-driven: the partition search (4) needs the inner search
@@ -262,9 +262,9 @@ The scheduler is correct when, **without any hand-written schedules**, it:
 - **Reproduces fused-MLP / fused-MoE-expert** scheduling: up-proj → in-register
   activation → down-proj, hidden tensor never materialized, with a tiling that
   fits the wider intermediate.
-- **Plans the autoregressive/decode and KV-cache regions** as SEQUENTIAL +
-  OPAQUE with correct buffer placement, rather than attempting to fuse across
-  the decode loop.
+- **Plans autoregressive/decode and KV-cache regions** with host-controlled
+  session state plus OPAQUE indexed access, rather than pretending the whole
+  decode loop is a tensor recurrence.
 - **Scales to a full forward graph**: produces a feasible, fully-parameterized
   schedule for an entire model in acceptable compiler time, with the partition
   search bounded by the pre-identified fusable groups.

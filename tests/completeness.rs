@@ -1,10 +1,10 @@
 //! The completeness oracle: DECLINES become checkable claims.
 //!
 //! Soundness has always had an oracle — everything `derive` produces is run
-//! against `eval`. This file is the missing direction. The argmax and top-k
-//! fusions were not found by the theory; they were found by counting kernels
-//! against another framework. That could happen because "fusable" was only
-//! ever checked one way: nothing ever asked whether a *decline* was correct.
+//! against `eval`. This file is the missing direction. Product-state
+//! selection fusions were first found by counting kernels against another
+//! framework. That could happen because "fusable" was only ever checked one
+//! way: nothing ever asked whether a *decline* was correct.
 //!
 //! "Fusable" has a semantic definition that does not mention the deriver:
 //!
@@ -33,12 +33,11 @@
 //! proof. The pool, the alphabet, and the collision budget bound what the
 //! probe can see, and those bounds are printed rather than hidden.
 //!
-//! Two historical misses remain in the ledger in their original graph form.
-//! Argmax is covered by its product monoid; bounded ordered selection remains
-//! an explicit compiler gap after removing the former Top-K IR shortcut. The
-//! probe finds both carriers mechanically, which is exactly the alarm that
-//! should fire before a kernel-count comparison does. Run with `--nocapture`
-//! to read the ledger.
+//! Argmax's generic extremal-key/payload carrier is derived from composition.
+//! Bounded ordered selection remains an explicit compiler gap after removing
+//! its semantic IR shortcut. The probe finds that carrier mechanically, which
+//! is exactly the alarm that should fire before a kernel-count comparison
+//! does. Run with `--nocapture` to read the ledger.
 //!
 //! The probe's admitted blind spot is its pool. The SECOND oracle at the
 //! bottom of this file — the Hankel rank test of the theory doc's §5.7 —
@@ -49,7 +48,7 @@ use std::collections::HashMap;
 
 use sanic::derive::derive;
 use sanic::interp::{Env, Value, eval};
-use sanic::kernel_ir::*;
+use sanic::ir::*;
 
 // ── streams over a quantized alphabet ────────────────────────────────────────
 
@@ -118,16 +117,19 @@ fn suffixes(rng: &mut Lcg, count: usize) -> Vec<Vec<f64>> {
 
 /// A syllabus program: a scalar function of one streamed input, given as an
 /// IR graph builder so `derive` can be asked about the exact same object.
-type Build = fn(NodeRef, Axis) -> NodeRef;
+type Build = fn(NodeRef, usize) -> NodeRef;
 type Sketch = fn(&[f64]) -> f64;
 
 fn run_h(build: Build, xs: &[f64]) -> f64 {
     let n = axis("n", xs.len());
-    let g = build(input("X", &[n], Dtype::F32), n);
+    let g = build(input("X", &[n], Dtype::F32), 0);
     let x = xs.to_vec();
-    let env: Env = [("X", Value::from_fn(&[n], |c| x[c[&n]]))]
-        .into_iter()
-        .collect();
+    let env: Env = [(
+        "X",
+        Value::from_shape_fn(&[xs.len()], |coordinate| x[coordinate[0]]),
+    )]
+    .into_iter()
+    .collect();
     eval(&g, &env).data[0]
 }
 
@@ -180,9 +182,9 @@ const MIN_PAIRS: usize = 30;
 enum Verdict {
     /// A determining sketch was found. The count is the sketch's COMPONENT
     /// COUNT — an upper bound on carrier dimension, not the dimension
-    /// itself (argmax's passing σ has three components; its carrier has two
-    /// slots). The rank oracle at the bottom of this file measures the real
-    /// number.
+    /// itself (argmax's passing σ has three components; the known product
+    /// carrier has two slots). The rank oracle at the bottom of this file
+    /// measures the real number.
     Carrier(usize, Vec<&'static str>),
     /// Every conclusive candidate was separated; one witness kept, shrunk
     /// to the shortest (p, q, suffix) that still collides and splits.
@@ -364,9 +366,6 @@ fn shrink_witness(
 enum Expect {
     /// `derive` succeeds AND the probe confirms a small carrier.
     Derived,
-    /// `derive` declines this GRAPH; the probe finds the carrier; the algebra
-    /// covers the function through the op named here. Pinned history.
-    CoveredElsewhere(&'static str),
     /// `derive` declines and the probe exhibits a carrier. This is accepted
     /// only as named compiler debt, never hidden behind a semantic IR op.
     KnownFusionGap(&'static str),
@@ -381,63 +380,23 @@ fn indicator_lt(a: NodeRef, b: NodeRef) -> NodeRef {
 fn syllabus() -> Vec<(&'static str, Build, Expect)> {
     use Expect::*;
     vec![
-        (
-            "sum",
-            (|x, n| reduce(x, n, BinOp::Monoid(Monoid::Add))) as Build,
-            Derived,
-        ),
-        (
-            "max",
-            |x, n| reduce(x, n, BinOp::Monoid(Monoid::Max)),
-            Derived,
-        ),
+        ("sum", (|x, n| reduce(x, n, Monoid::Add)) as Build, Derived),
+        ("max", |x, n| reduce(x, n, Monoid::Max), Derived),
         (
             "sumsq",
-            |x, n| {
-                reduce(
-                    map(MapOp::Mul, vec![x.clone(), x]),
-                    n,
-                    BinOp::Monoid(Monoid::Add),
-                )
-            },
+            |x, n| reduce(map(MapOp::Mul, vec![x.clone(), x]), n, Monoid::Add),
             Derived,
         ),
-        (
-            "lse",
-            |x, n| reduce(x, n, BinOp::Monoid(Monoid::LogSumExp)),
-            Derived,
-        ),
+        ("lse", |x, n| reduce(x, n, Monoid::LogSumExp), Derived),
         (
             "dot_iota",
             |x, n| {
-                reduce(
-                    map(MapOp::Mul, vec![iota(n), x]),
-                    n,
-                    BinOp::Monoid(Monoid::Add),
-                )
+                let coordinate = coordinate(x.clone(), n);
+                reduce(map(MapOp::Mul, vec![coordinate, x]), n, Monoid::Add)
             },
             Derived,
         ),
-        ("argmax_op", |x, n| argmax(x, n), Derived),
-        // ── the two historical misses, pinned in their original graph form ──
-        (
-            "argmax_graph",
-            |x, n| {
-                // Σ i·[x == max x] — how argmax was spelled before the op
-                // existed: two kernels, and unsound to fuse (ties sum).
-                let m = reduce(x.clone(), n, BinOp::Monoid(Monoid::Max));
-                let ge = map(
-                    MapOp::Sub,
-                    vec![konst(1.0), indicator_lt(x.clone(), m)], // x ≥ max ⇔ ¬(x < max)
-                );
-                reduce(
-                    map(MapOp::Mul, vec![iota(n), ge]),
-                    n,
-                    BinOp::Monoid(Monoid::Add),
-                )
-            },
-            CoveredElsewhere("BinOp::ArgMax — the (max, idx) tuple monoid"),
-        ),
+        ("argmax_frontend", |x, n| argmax(x, n), Derived),
         (
             "top2_idx_frontend",
             |x, n| topk(x, n, 2)[1].1.clone(),
@@ -451,9 +410,9 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
                 // Σ [x_i > max/2]: the threshold is only known at the END —
                 // any future element can move it, so the count needs the
                 // whole histogram, not constant state.
-                let m = reduce(x.clone(), n, BinOp::Monoid(Monoid::Max));
+                let m = reduce(x.clone(), n, Monoid::Max);
                 let half = map(MapOp::Mul, vec![m, konst(0.5)]);
-                reduce(indicator_lt(half, x), n, BinOp::Monoid(Monoid::Add))
+                reduce(indicator_lt(half, x), n, Monoid::Add)
             },
             JustifiedDecline,
         ),
@@ -463,21 +422,17 @@ fn syllabus() -> Vec<(&'static str, Build, Expect)> {
 /// Lower median, tie-safe: the element with at most ⌊(len−1)/2⌋ strictly
 /// smaller and at most ⌈(len−1)/2⌉ strictly greater values. Rank counting
 /// needs the whole stream per element — the shape of a true non-fold.
-fn median_graph(x: NodeRef, n: Axis) -> NodeRef {
-    let j = axis("mj", n.extent());
-    let xj = view(x.clone(), vec![(vec![n], j)]);
+fn median_graph(x: NodeRef, n: usize) -> NodeRef {
+    // The comparison traverses the same data under two independent logical
+    // occurrences. A clone is still the same occurrence; the explicit view
+    // creates the second one without relying on its display descriptor.
+    let comparison = rename(x.clone(), n, axis("comparison", x.shape()[n].extent()));
+    let xi = unsqueeze(x.clone(), 1usize);
+    let xj = unsqueeze(comparison, 0usize);
     let ones = map(MapOp::Mul, vec![xj.clone(), konst(0.0)]);
-    let len = reduce(
-        map(MapOp::Add, vec![ones, konst(1.0)]),
-        j,
-        BinOp::Monoid(Monoid::Add),
-    );
-    let n_less = reduce(
-        indicator_lt(xj.clone(), x.clone()),
-        j,
-        BinOp::Monoid(Monoid::Add),
-    );
-    let n_greater = reduce(indicator_lt(x.clone(), xj), j, BinOp::Monoid(Monoid::Add));
+    let len = reduce(map(MapOp::Add, vec![ones, konst(1.0)]), 1usize, Monoid::Add);
+    let n_less = reduce(indicator_lt(xj.clone(), xi.clone()), 1usize, Monoid::Add);
+    let n_greater = reduce(indicator_lt(xi, xj), 1usize, Monoid::Add);
     // integer ranks vs half-integer thresholds: rank ≤ t ⇔ rank < t + 0.5
     let m_lo = map(
         MapOp::Mul,
@@ -490,12 +445,8 @@ fn median_graph(x: NodeRef, n: Axis) -> NodeRef {
     let ok_lo = indicator_lt(n_less, map(MapOp::Add, vec![m_lo, konst(0.5)]));
     let ok_hi = indicator_lt(n_greater, map(MapOp::Add, vec![hi_bound, konst(0.5)]));
     let hit = map(MapOp::Mul, vec![ok_lo, ok_hi]);
-    let picked = reduce(
-        map(MapOp::Mul, vec![x, hit.clone()]),
-        n,
-        BinOp::Monoid(Monoid::Add),
-    );
-    let count = reduce(hit, n, BinOp::Monoid(Monoid::Add));
+    let picked = reduce(map(MapOp::Mul, vec![x, hit.clone()]), n, Monoid::Add);
+    let count = reduce(hit, n, Monoid::Add);
     map(MapOp::Div, vec![picked, count])
 }
 
@@ -541,7 +492,9 @@ fn every_decline_is_justified_or_pinned() {
         // hides a producer fold. (`derive` alone answers a weaker question —
         // "does the root stream over its leaves" — median's rank reduces,
         // say, are legal leaves but each is its own kernel.)
-        let derived = derive(&build(input("X", &[n], Dtype::F32), n), n)
+        let x = input("X", &[n], Dtype::F32);
+        let stream = axis_refs(&x)[0];
+        let derived = derive(&build(x, 0), stream)
             .ok()
             .filter(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         let verdict = probe(build);
@@ -551,13 +504,6 @@ fn every_decline_is_justified_or_pinned() {
                 format!(
                     "  DERIVED     {name:22} {} slot(s); probe agrees (3 seeds): σ = ({}), {comps} sketch slot(s)\n",
                     c.slots,
-                    sigma.join(", ")
-                )
-            }
-            (None, Verdict::Carrier(comps, sigma), Expect::CoveredElsewhere(op)) => {
-                confirm_carrier_across_seeds(name, build, &mut failures);
-                format!(
-                    "  GRAPH-FORM  {name:22} graph declines; carrier exists (3 seeds: σ = ({}), ≤ {comps} slots) — covered by {op}\n",
                     sigma.join(", ")
                 )
             }
@@ -647,8 +593,10 @@ fn random_declines_survive_the_probe() {
     for seed in 0..24u64 {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
-        let g = build(input("X", &[n], Dtype::F32), n);
-        let one_pass = derive(&g, n).is_ok_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
+        let x = input("X", &[n], Dtype::F32);
+        let stream = axis_refs(&x)[0];
+        let g = build(x, 0);
+        let one_pass = derive(&g, stream).is_ok_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         if one_pass {
             continue; // sound by the existing oracle; nothing to check
         }
@@ -684,21 +632,17 @@ thread_local! {
 
 /// Small expression over (x, iota, consts, one nested same-axis fold),
 /// reduced at the top — the shape real workloads decline in.
-fn random_program(x: NodeRef, n: Axis, seed: u64) -> NodeRef {
+fn random_program(x: NodeRef, n: usize, seed: u64) -> NodeRef {
     let mut s = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     let leaf = |s: &mut Lcg, x: &NodeRef| -> NodeRef {
         match (s.next() >> 30) % 4 {
             0 => x.clone(),
-            1 => iota(n),
+            1 => coordinate(x.clone(), n),
             2 => konst(((s.next() >> 32) % 5) as f64 * 0.5 - 1.0),
             _ => match (s.next() >> 31) % 3 {
-                0 => reduce(x.clone(), n, BinOp::Monoid(Monoid::Add)),
-                1 => reduce(x.clone(), n, BinOp::Monoid(Monoid::Max)),
-                _ => reduce(
-                    map(MapOp::Mul, vec![x.clone(), x.clone()]),
-                    n,
-                    BinOp::Monoid(Monoid::Add),
-                ),
+                0 => reduce(x.clone(), n, Monoid::Add),
+                1 => reduce(x.clone(), n, Monoid::Max),
+                _ => reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), n, Monoid::Add),
             },
         }
     };
@@ -715,18 +659,26 @@ fn random_program(x: NodeRef, n: Axis, seed: u64) -> NodeRef {
     let o1 = op(&mut s);
     let o2 = op(&mut s);
     let e = map(o2, vec![map(o1, vec![a, b]), c]);
-    let top = match (s.next() >> 28) % 3 {
-        0 => BinOp::Monoid(Monoid::Add),
-        1 => BinOp::Monoid(Monoid::Max),
-        _ => BinOp::Monoid(Monoid::Min),
+    // All three random leaves may happen to be scalar nested folds/constants.
+    // Only that case needs an explicit iteration space for the top reduction.
+    let e = if e.shape().is_empty() {
+        map(MapOp::Mul, vec![ones_like(x), e])
+    } else {
+        e
     };
-    reduce(e, n, top)
+    let top = match (s.next() >> 28) % 3 {
+        0 => Monoid::Add,
+        1 => Monoid::Max,
+        _ => Monoid::Min,
+    };
+    reduce(e, 0usize, top)
 }
 
 fn contains_fold(node: &NodeRef) -> bool {
     match node.as_ref() {
         Node::Reduce { .. } | Node::Scan { .. } => true,
         Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => false,
+        Node::Coordinate { src, .. } => contains_fold(src),
         Node::Map { inputs, .. } => inputs.iter().any(contains_fold),
         Node::View { src, .. } | Node::Reindex { src, .. } => contains_fold(src),
         Node::Gather { src, index, .. } => contains_fold(src) || contains_fold(index),
@@ -741,8 +693,14 @@ fn inspect_flagged_seeds() {
     for seed in [7u64, 13, 23] {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
-        let g = build(input("X", &[n], Dtype::F32), n);
-        println!("seed {seed}: derives={} {:?}\n", derive(&g, n).is_ok(), g);
+        let x = input("X", &[n], Dtype::F32);
+        let stream = axis_refs(&x)[0];
+        let g = build(x, 0);
+        println!(
+            "seed {seed}: derives={} {:?}\n",
+            derive(&g, stream).is_ok(),
+            g
+        );
     }
 }
 
@@ -818,9 +776,9 @@ fn fooling_families_grow_only_at_true_walls() {
     // The walls: the same-answer family grows with prefix length — the
     // refutation is a loop, and each k prints as state ≥ log₂ k bits.
     let cahm: Build = |x, n| {
-        let m = reduce(x.clone(), n, BinOp::Monoid(Monoid::Max));
+        let m = reduce(x.clone(), n, Monoid::Max);
         let half = map(MapOp::Mul, vec![m, konst(0.5)]);
-        reduce(indicator_lt(half, x), n, BinOp::Monoid(Monoid::Add))
+        reduce(indicator_lt(half, x), n, Monoid::Add)
     };
     // The two walls grow at different rates — median's classes are multisets
     // (polynomial in length), count-above-half-max's are counts against a
@@ -853,9 +811,9 @@ fn fooling_families_grow_only_at_true_walls() {
     // same-answer separation — the family machinery finds exactly one
     // member, at every length. A false separation here would be the policy
     // tolerance misfiring.
-    let sum: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::Add));
-    let mx: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::Max));
-    let lse: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::LogSumExp));
+    let sum: Build = |x, n| reduce(x, n, Monoid::Add);
+    let mx: Build = |x, n| reduce(x, n, Monoid::Max);
+    let lse: Build = |x, n| reduce(x, n, Monoid::LogSumExp);
     for (name, build) in [("sum", sum), ("max", mx), ("lse", lse)] {
         for plen in [5usize, 9] {
             let k = same_answer_family(build, plen);
@@ -1004,18 +962,12 @@ fn rank_with_gap(spectrum: &[f64], tol: f64) -> Option<usize> {
 #[test]
 fn rank_oracle_measures_small_carriers() {
     // Σx — one slot; centering pays the affine unit, the rank is the carrier.
-    let sum: Build = |x, n| reduce(x, n, BinOp::Monoid(Monoid::Add));
+    let sum: Build = |x, n| reduce(x, n, Monoid::Add);
     let spec = relative_spectrum(futures_matrix(&[sum], 6, 40, 12, false, 0xA11CE));
     assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σ spectrum: {spec:?}");
 
     // Σx², same shape, different lift — still one measured slot.
-    let sumsq: Build = |x, n| {
-        reduce(
-            map(MapOp::Mul, vec![x.clone(), x]),
-            n,
-            BinOp::Monoid(Monoid::Add),
-        )
-    };
+    let sumsq: Build = |x, n| reduce(map(MapOp::Mul, vec![x.clone(), x]), n, Monoid::Add);
     let spec = relative_spectrum(futures_matrix(&[sumsq], 6, 40, 12, false, 0xB0B));
     assert_eq!(
         rank_with_gap(&spec, 1e-8),
@@ -1036,12 +988,8 @@ fn rank_oracle_reports_attention_ambiguous_raw_and_small_deferred() {
     let raw: Build = |x, n| {
         let e = map(MapOp::Exp, vec![x.clone()]);
         let v = map(MapOp::Mul, vec![x.clone(), x]);
-        let num = reduce(
-            map(MapOp::Mul, vec![e.clone(), v]),
-            n,
-            BinOp::Monoid(Monoid::Add),
-        );
-        let den = reduce(e, n, BinOp::Monoid(Monoid::Add));
+        let num = reduce(map(MapOp::Mul, vec![e.clone(), v]), n, Monoid::Add);
+        let den = reduce(e, n, Monoid::Add);
         map(MapOp::Div, vec![num, den])
     };
     let spec = relative_spectrum(futures_matrix(&[raw], 6, 40, 12, false, 0xF1A5));
@@ -1060,11 +1008,11 @@ fn rank_oracle_reports_attention_ambiguous_raw_and_small_deferred() {
     // exactly 2 — the carrier as a number, not a design. The running max
     // contributes nothing here: it is numerical stabilization, not semantic
     // state (Appendix A).
-    let ell: Build = |x, n| reduce(map(MapOp::Exp, vec![x]), n, BinOp::Monoid(Monoid::Add));
+    let ell: Build = |x, n| reduce(map(MapOp::Exp, vec![x]), n, Monoid::Add);
     let o: Build = |x, n| {
         let e = map(MapOp::Exp, vec![x.clone()]);
         let v = map(MapOp::Mul, vec![x.clone(), x]);
-        reduce(map(MapOp::Mul, vec![e, v]), n, BinOp::Monoid(Monoid::Add))
+        reduce(map(MapOp::Mul, vec![e, v]), n, Monoid::Add)
     };
     let spec = relative_spectrum(futures_matrix(&[ell, o], 6, 40, 12, false, 0xF1A5));
     assert_eq!(

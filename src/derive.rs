@@ -23,8 +23,6 @@
 //! * `defer-div` — a normalizer (a value folded over the same axis) was
 //!   pulled out of a linear reduction by distributivity and is applied once,
 //!   at the end.
-//! * `argmax` — an index-carrying maximum becomes the `(max, index)` product
-//!   monoid with first-maximum tie semantics.
 //! * `invariant` — a reduction over an axis its operand does not vary along:
 //!   `Σ = n·value` (the count is itself a slot), `max/min/lse = value (+ln n)`.
 //! * `lattice` — `reduce_m(max/min(z, c))` for m ∈ {Max, Min} and `c`
@@ -34,6 +32,10 @@
 //!   reductions and leave a sum through a count slot (`Σ(z+c) = Σz + n·c`).
 //! * `defer-scale` — an extremum of `c·z`: the sign of `c` decides which
 //!   extremum survives, so BOTH are carried and project dispatches on sign.
+//! * `extremum-filter` — reducing payloads only where a key equals its own
+//!   max/min becomes a product carrier: the extremal key plus the payload
+//!   monoid over ties. Argmax is one instance (maximum key, minimum index),
+//!   but neither the IR nor this rule names that frontend operation.
 //!
 //! Soundness and completeness are guarded separately. Soundness: every
 //! carrier is executable data, run against the interpreter (`tests/laws.rs`
@@ -81,7 +83,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::analyze::{Parallelism, structure};
-use crate::kernel_ir::{Axis, BinOp, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
+use crate::ir::{self, AxisRef, AxisSelector, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── symbolic expressions over carrier slots ──────────────────────────────────
 
@@ -108,6 +110,7 @@ pub enum Expr {
     Exp(Box<Expr>),
     Log(Box<Expr>),
     Sqrt(Box<Expr>),
+    Tanh(Box<Expr>),
     Sin(Box<Expr>),
     Cos(Box<Expr>),
     /// `cond != 0 ? a : b`.
@@ -138,6 +141,9 @@ fn log(a: Expr) -> Expr {
 }
 fn esqrt(a: Expr) -> Expr {
     Expr::Sqrt(Box::new(a))
+}
+fn etanh(a: Expr) -> Expr {
+    Expr::Tanh(Box::new(a))
 }
 fn esin(a: Expr) -> Expr {
     Expr::Sin(Box::new(a))
@@ -226,6 +232,7 @@ fn eval(e: &Expr, env: &Env) -> f64 {
         Expr::Exp(a) => eval(a, env).exp(),
         Expr::Log(a) => eval(a, env).ln(),
         Expr::Sqrt(a) => eval(a, env).sqrt(),
+        Expr::Tanh(a) => eval(a, env).tanh(),
         Expr::Sin(a) => eval(a, env).sin(),
         Expr::Cos(a) => eval(a, env).cos(),
         Expr::Where(c, a, b) => {
@@ -259,13 +266,17 @@ pub struct Carrier {
     pub project: Vec<Expr>,
     /// The free axes each slot spans (streamed axis excluded). The exact
     /// accumulator size for a tile is `Σ_slots Π extents[span]` — `acc_scalars`.
-    pub spans: Vec<Vec<Axis>>,
+    pub spans: Vec<Vec<AxisRef>>,
     /// Which of the five derivation moves fired, in plain words (see the
     /// module doc): `fold`, `fused-map`, `tuple`, `rescale`, `defer-div`.
     pub rules: Vec<&'static str>,
     /// What kind of reduction each slot is. The emitters read this to pick the
     /// intra-tile operation without pattern-matching the computation.
     pub kinds: Vec<SlotKind>,
+    pub(crate) aliases: HashMap<AxisRef, AxisRef>,
+    // `AxisRef` is intentionally just `(node pointer, dimension)`. Retain the
+    // graph that owns every such pointer for as long as the carrier exists.
+    _keepalive: Node,
 }
 
 impl Carrier {
@@ -293,7 +304,7 @@ impl Carrier {
         }
     }
 
-    /// Sequential fold into the raw accumulator, without projecting.
+    /// Left fold into the raw accumulator, without projecting.
     pub fn fold_acc(&self, items: &[Vec<f64>]) -> Vec<f64> {
         let mut acc = self.identity.clone();
         for it in items {
@@ -340,7 +351,7 @@ impl Carrier {
     /// number the scheduler feeds into its SRAM constraint. A slot spanning no
     /// free axes is one scalar; a slot spanning `{sq, e}` is
     /// `extent(sq)·extent(e)`.
-    pub fn acc_scalars(&self, extent: impl Fn(Axis) -> f64) -> f64 {
+    pub fn acc_scalars(&self, extent: impl Fn(AxisRef) -> f64) -> f64 {
         self.spans
             .iter()
             .map(|span| span.iter().map(|&a| extent(a)).product::<f64>())
@@ -415,6 +426,7 @@ fn render_expr(e: &Expr, parent: u8) -> String {
         Expr::Exp(a) => format!("exp({})", render_expr(a, 0)),
         Expr::Log(a) => format!("log({})", render_expr(a, 0)),
         Expr::Sqrt(a) => format!("sqrt({})", render_expr(a, 0)),
+        Expr::Tanh(a) => format!("tanh({})", render_expr(a, 0)),
         Expr::Sin(a) => format!("sin({})", render_expr(a, 0)),
         Expr::Cos(a) => format!("cos({})", render_expr(a, 0)),
         Expr::Where(c, a, b) => format!(
@@ -436,7 +448,7 @@ fn render_expr(e: &Expr, parent: u8) -> String {
 /// streaming state composition had gotten to when it stopped.
 #[derive(Debug, Clone)]
 pub struct Decline {
-    pub axis: Axis,
+    pub axis: AxisRef,
     /// The sub-expression whose composition rule had no case.
     pub at: Node,
     /// The missing case, e.g. `"sum-of-coupled"`, `"two-exp-domains"`.
@@ -458,7 +470,7 @@ impl std::fmt::Display for Decline {
     }
 }
 
-fn decline(at: &Node, axis: Axis, rule: &'static str, reached: impl Into<String>) -> Decline {
+fn decline(at: &Node, axis: AxisRef, rule: &'static str, reached: impl Into<String>) -> Decline {
     Decline {
         axis,
         at: at.clone(),
@@ -473,9 +485,14 @@ fn node_head(n: &Node) -> String {
         NodeKind::Input { name, .. } => format!("input {name}"),
         NodeKind::Const { v } => format!("const {v}"),
         NodeKind::Iota { axis } => format!("iota {}", axis.name),
+        NodeKind::Coordinate { dim, .. } => format!("coordinate {dim}"),
         NodeKind::Map { op, .. } => format!("map {op:?}"),
-        NodeKind::Reduce { op, axis, .. } => format!("reduce {op:?} over {}", axis.name),
-        NodeKind::Scan { op, axis, .. } => format!("scan {op:?} over {}", axis.name),
+        NodeKind::Reduce { src, dim, op } => {
+            format!("reduce {op:?} over {}", ir::source_axis(src, *dim).name)
+        }
+        NodeKind::Scan { src, dim, op } => {
+            format!("scan {op:?} over {}", ir::source_axis(src, *dim).name)
+        }
         NodeKind::Gather { .. } => "gather".to_string(),
         NodeKind::View { .. } => "view".to_string(),
         NodeKind::Reindex { .. } => "reindex".to_string(),
@@ -487,8 +504,8 @@ fn node_head(n: &Node) -> String {
 /// One accumulator slot under construction.
 struct Slot {
     kind: SlotKind,
-    into: Expr,      // per-element contribution, over `Item`
-    span: Vec<Axis>, // free axes this slot ranges over (streamed axis excluded)
+    into: Expr,         // per-element contribution, over `Item`
+    span: Vec<AxisRef>, // free axes this slot ranges over (streamed axis excluded)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -499,12 +516,14 @@ pub enum SlotKind {
     /// `Σ exp(score − running_max)·raw`, where the running max is slot
     /// `max_slot`. On merge it telescopes — rescale by `exp(m − M_new)`.
     ExpShifted { max_slot: usize },
-    /// Affine-map composition (the SSM carrier). Not a scalar monoid slot;
-    /// emitters must handle it separately or decline.
-    AffineStep,
-    /// The index half of an index-carrying maximum: merged as
-    /// `a₀ < b₀ ? b_i : a_i` against max slot `max_slot` — first max wins.
-    ArgIdx { max_slot: usize },
+    /// A payload accumulated only among elements tied at an extremal key.
+    /// The pair forms a product monoid: `key` chooses the winning group and
+    /// `ties` combines payloads when both groups have the same key.
+    AtExtremum {
+        key_slot: usize,
+        key: Monoid,
+        ties: Monoid,
+    },
 }
 
 /// What streaming a sub-expression over the axis produced so far.
@@ -616,24 +635,70 @@ struct Ctx {
     /// Leaves are the fold's per-element inputs — and therefore the fusion
     /// boundary: anything here that is not a raw `Input` must either be
     /// computed in-body or materialized by another kernel.
-    leaves: Vec<(Node, Vec<Axis>)>,
+    leaves: Vec<(Node, Vec<AxisRef>)>,
     /// Memoizes `go` per node so DAG-shared sub-expressions map to the same
     /// slots instead of registering duplicates (and so the walk stays linear
     /// on backward graphs). `memo_log` records insertion order so a failed
     /// map decomposition can roll its entries back.
-    memo: HashMap<ByAddr, S>,
-    memo_log: Vec<ByAddr>,
+    memo: HashMap<(ByAddr, AxisRef), S>,
+    memo_log: Vec<(ByAddr, AxisRef)>,
     rules: BTreeSet<&'static str>,
     /// Memoizes `other_axis_folds` per node — the free-map-vs-contraction check.
-    other_folds: HashMap<ByAddr, (bool, bool)>,
+    other_folds: HashMap<(ByAddr, AxisRef), (bool, bool)>,
+    /// Local dimension occurrences translated into the root kernel's loop
+    /// coordinates. This is compiler metadata only; the graph stays
+    /// positional and immutable.
+    aliases: HashMap<AxisRef, AxisRef>,
+    stream: AxisRef,
 }
 
 impl Ctx {
-    fn leaf(&mut self, node: &Node, free: Vec<Axis>) -> usize {
+    /// Resolve the kernel's canonical loop coordinate to an occurrence in
+    /// `node`'s output. An axis already below the node passes through as-is;
+    /// maps and reductions know how to recurse with such a hidden occurrence.
+    fn local_axis(&self, node: &Node, axis: AxisRef) -> AxisRef {
+        let target = self.aliases.get(&axis).copied().unwrap_or(axis);
+        let output = ir::axis_refs(node);
+        if output.contains(&axis) {
+            return axis;
+        }
+        if let Some(local) = output
+            .into_iter()
+            .find(|local| self.aliases.get(local).copied().unwrap_or(*local) == target)
+        {
+            return local;
+        }
+        axis
+    }
+
+    /// A singleton view can reconnect a canonical output loop to a reduction
+    /// occurrence hidden anywhere in its source expression. This search is
+    /// deliberately confined to that structural boundary; doing a subtree
+    /// search at every scalar node turns derivation quadratic and makes the
+    /// completeness probe unusably slow.
+    fn descendant_axis(&self, node: &Node, axis: AxisRef) -> AxisRef {
+        let target = self.aliases.get(&axis).copied().unwrap_or(axis);
+        ir::all_axis_refs(node)
+            .into_iter()
+            .find(|local| self.aliases.get(local).copied().unwrap_or(*local) == target)
+            .unwrap_or(axis)
+    }
+
+    fn leaf(&mut self, node: &Node, free: Vec<AxisRef>) -> usize {
+        let mut canonical = Vec::new();
+        for axis in free {
+            if axis.extent == crate::ir::Extent::Static(1) {
+                continue;
+            }
+            let axis = self.aliases.get(&axis).copied().unwrap_or(axis);
+            if axis != self.stream && !canonical.contains(&axis) {
+                canonical.push(axis);
+            }
+        }
         if let Some(i) = self.leaves.iter().position(|(n, _)| Rc::ptr_eq(n, node)) {
             i
         } else {
-            self.leaves.push((node.clone(), free));
+            self.leaves.push((node.clone(), canonical));
             self.leaves.len() - 1
         }
     }
@@ -647,7 +712,7 @@ impl Ctx {
         self.rules.insert("fold");
         // A slot spans the free axes of every leaf it reads, plus — for an
         // exp-shifted slot — the axes of the max slot it rides.
-        let mut span: Vec<Axis> = Vec::new();
+        let mut span: Vec<AxisRef> = Vec::new();
         for i in items_of(&into) {
             for &a in &self.leaves[i].1 {
                 if !span.contains(&a) {
@@ -655,8 +720,13 @@ impl Ctx {
                 }
             }
         }
-        if let SlotKind::ExpShifted { max_slot } = kind {
-            for &a in &self.slots[max_slot].span {
+        let dependency = match kind {
+            SlotKind::ExpShifted { max_slot } => Some(max_slot),
+            SlotKind::AtExtremum { key_slot, .. } => Some(key_slot),
+            _ => None,
+        };
+        if let Some(dependency) = dependency {
+            for &a in &self.slots[dependency].span {
                 if !span.contains(&a) {
                     span.push(a);
                 }
@@ -686,9 +756,12 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
                 walk(a, out);
                 walk(b, out);
             }
-            Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Sin(a) | Expr::Cos(a) => {
-                walk(a, out)
-            }
+            Expr::Exp(a)
+            | Expr::Log(a)
+            | Expr::Sqrt(a)
+            | Expr::Tanh(a)
+            | Expr::Sin(a)
+            | Expr::Cos(a) => walk(a, out),
             Expr::Where(c, a, b) => {
                 walk(c, out);
                 walk(a, out);
@@ -701,24 +774,197 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     out
 }
 
+fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
+    fn alias_collapsed(
+        node: &Node,
+        insertion: usize,
+        target: AxisRef,
+        aliases: &mut HashMap<AxisRef, AxisRef>,
+    ) {
+        match node.as_ref() {
+            NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
+                aliases.insert(ir::source_axis(src, *dim), target);
+            }
+            NodeKind::Map { inputs, .. } => {
+                let output_rank = node.shape().len();
+                for input in inputs {
+                    let input_rank = input.shape().len();
+                    let lead = output_rank - input_rank;
+                    if insertion >= lead && insertion - lead <= input_rank {
+                        alias_collapsed(input, insertion - lead, target, aliases);
+                    }
+                }
+            }
+            NodeKind::View { src, dims } => {
+                let source_insertion = dims
+                    .iter()
+                    .take(insertion)
+                    .map(|dim| dim.sources.len())
+                    .sum();
+                alias_collapsed(src, source_insertion, target, aliases);
+            }
+            _ => {}
+        }
+    }
+
+    fn walk(
+        node: &Node,
+        canonical: Vec<Option<AxisRef>>,
+        stream: AxisRef,
+        aliases: &mut HashMap<AxisRef, AxisRef>,
+        seen: &mut std::collections::HashSet<*const NodeKind>,
+    ) {
+        let axes = ir::axis_refs(node);
+        for (&local, target) in axes.iter().zip(&canonical) {
+            if let Some(target) = target {
+                aliases.entry(local).or_insert(*target);
+            }
+        }
+        if !seen.insert(Rc::as_ptr(node)) {
+            return;
+        }
+
+        match node.as_ref() {
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
+            NodeKind::Coordinate { src, .. } => {
+                walk(src, canonical, stream, aliases, seen);
+            }
+            NodeKind::Map { inputs, .. } => {
+                let output_shape = node.shape();
+                for input in inputs {
+                    let input_shape = input.shape();
+                    let lead = output_shape.len() - input_shape.len();
+                    let child = input_shape
+                        .iter()
+                        .enumerate()
+                        .map(|(input_dim, descriptor)| {
+                            let output_dim = lead + input_dim;
+                            if descriptor.extent == crate::ir::Extent::Static(1)
+                                && output_shape[output_dim].extent != crate::ir::Extent::Static(1)
+                            {
+                                None
+                            } else {
+                                canonical[output_dim]
+                            }
+                        })
+                        .collect();
+                    walk(input, child, stream, aliases, seen);
+                }
+            }
+            NodeKind::Reduce { src, dim, .. } => {
+                let source_axes = ir::axis_refs(src);
+                let child = source_axes
+                    .iter()
+                    .enumerate()
+                    .map(|(source_dim, source_axis)| {
+                        if source_dim < *dim {
+                            canonical[source_dim]
+                        } else if source_dim == *dim {
+                            Some(aliases.get(source_axis).copied().unwrap_or(
+                                if *source_axis == stream {
+                                    stream
+                                } else {
+                                    *source_axis
+                                },
+                            ))
+                        } else {
+                            canonical[source_dim - 1]
+                        }
+                    })
+                    .collect();
+                walk(src, child, stream, aliases, seen);
+            }
+            NodeKind::Scan { src, .. } => {
+                walk(src, canonical, stream, aliases, seen);
+            }
+            NodeKind::Gather { src, index, dim } => {
+                let source_axes = ir::axis_refs(src);
+                let index_rank = ir::axis_refs(index).len();
+                let source = source_axes
+                    .iter()
+                    .enumerate()
+                    .map(|(source_dim, source_axis)| {
+                        if source_dim < *dim {
+                            canonical[source_dim]
+                        } else if source_dim == *dim {
+                            Some(aliases.get(source_axis).copied().unwrap_or(
+                                if *source_axis == stream {
+                                    stream
+                                } else {
+                                    *source_axis
+                                },
+                            ))
+                        } else {
+                            canonical[source_dim - 1 + index_rank]
+                        }
+                    })
+                    .collect();
+                walk(src, source, stream, aliases, seen);
+                walk(
+                    index,
+                    canonical[*dim..*dim + index_rank].to_vec(),
+                    stream,
+                    aliases,
+                    seen,
+                );
+            }
+            NodeKind::View { src, dims } => {
+                let mut source = vec![None; ir::axis_refs(src).len()];
+                for (output_dim, dim) in dims.iter().enumerate() {
+                    if let [source_dim] = dim.sources.as_slice() {
+                        source[*source_dim] = canonical[output_dim];
+                    }
+                }
+                // Re-inserting a singleton at a reduction's old position is
+                // how a frontend broadcasts that collapsed value back over
+                // the dimension it summarizes. Preserve that positional
+                // provenance so a consuming fold can recognize both
+                // reductions as carrying the same loop occurrence.
+                for (inserted, dim) in dims.iter().enumerate() {
+                    if dim.sources.is_empty()
+                        && let Some(target) = canonical[inserted]
+                    {
+                        alias_collapsed(src, inserted, target, aliases);
+                    }
+                }
+                walk(src, source, stream, aliases, seen);
+            }
+            NodeKind::Reindex { src, map, .. } => {
+                let mut source = vec![None; ir::axis_refs(src).len()];
+                for (source_dim, terms, offset) in map {
+                    if *offset == 0
+                        && let [(1, output_dim)] = terms.as_slice()
+                    {
+                        source[*source_dim] = canonical[*output_dim];
+                    }
+                }
+                walk(src, source, stream, aliases, seen);
+            }
+        }
+    }
+
+    let root_axes = ir::axis_refs(root);
+    let canonical = root_axes.iter().copied().map(Some).collect();
+    let mut aliases = HashMap::new();
+    walk(
+        root,
+        canonical,
+        stream,
+        &mut aliases,
+        &mut std::collections::HashSet::new(),
+    );
+    aliases.insert(stream, stream);
+    aliases
+}
+
 /// Derive the streaming carrier for folding `node` over `axis`. The `Err` is
 /// a [`Decline`] naming the first composition rule that had no case — a
 /// serial or data-dependent axis, an expression outside the supported
 /// fragment, or a target that never collapses the axis.
-pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
-    // An affine / SSM scan folds under a known monoid (affine-map
-    // composition), not under the compositional rules. It is the one extra
-    // carrier the library ships.
-    if let NodeKind::Scan {
-        axis: sc,
-        op: BinOp::AffineCompose,
-        ..
-    } = node.as_ref()
-        && *sc == axis
-    {
-        return Ok(affine_scan_carrier());
-    }
-
+pub fn derive(node: &Node, axis: impl AxisSelector) -> Result<Carrier, Decline> {
+    let axis = axis
+        .resolve_axis(node, "derive")
+        .expect("derive axis is absent from the selected node");
     let mut ctx = Ctx {
         slots: Vec::new(),
         leaves: Vec::new(),
@@ -726,6 +972,8 @@ pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
         memo_log: Vec::new(),
         rules: BTreeSet::new(),
         other_folds: HashMap::new(),
+        aliases: axis_aliases(node, axis),
+        stream: axis,
     };
     let s = go(node, axis, &mut ctx)?;
 
@@ -751,6 +999,7 @@ pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
     let spans = ctx.slots.iter().map(|s| s.span.clone()).collect();
     let kinds = ctx.slots.iter().map(|s| s.kind).collect();
     let leaves = ctx.leaves.iter().map(|(n, _)| n.clone()).collect();
+    let aliases = ctx.aliases.clone();
     Ok(Carrier {
         slots: ctx.slots.len(),
         leaves,
@@ -761,6 +1010,8 @@ pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
         spans,
         rules: ctx.rules.into_iter().collect(),
         kinds,
+        aliases,
+        _keepalive: node.clone(),
     })
 }
 
@@ -783,35 +1034,40 @@ pub fn derive(node: &Node, axis: Axis) -> Result<Carrier, Decline> {
 /// units are folded away before graphs reach here.
 fn other_axis_folds(
     node: &Node,
-    axis: Axis,
-    cache: &mut HashMap<ByAddr, (bool, bool)>,
+    axis: AxisRef,
+    cache: &mut HashMap<(ByAddr, AxisRef), (bool, bool)>,
 ) -> (bool, bool) {
     // Memoized per node (the streamed axis is fixed for a whole derivation):
     // a DAG-shared subtree is classified once. Unmemoized, this re-walks shared
     // subtrees and is exponential on backward graphs.
-    let key = ByAddr(node.clone());
+    let key = (ByAddr(node.clone()), axis);
     if let Some(&r) = cache.get(&key) {
         return r;
     }
     let is_contraction = matches!(node.as_ref(),
-        NodeKind::Reduce { src, op: BinOp::Monoid(Monoid::Add), axis: a }
-            if *a != axis
+        NodeKind::Reduce { src, op: Monoid::Add, dim }
+            if ir::source_axis(src, *dim) != axis
             && matches!(src.as_ref(),
                 NodeKind::Map { op: MapOp::Mul, inputs } if inputs.len() == 2));
     let result = match node.as_ref() {
-        NodeKind::Reduce { src, axis: a, .. } | NodeKind::Scan { src, axis: a, .. } => {
+        NodeKind::Reduce { src, dim, .. } | NodeKind::Scan { src, dim, .. } => {
+            let folded = ir::source_axis(src, *dim);
             let (plain, contr) = other_axis_folds(src, axis, cache);
-            match (*a != axis, is_contraction) {
+            match (folded != axis, is_contraction) {
                 (true, true) => (plain, true),
                 (true, false) => (true, contr),
                 (false, _) => (plain, contr),
             }
         }
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => (false, false),
+        NodeKind::Input { .. }
+        | NodeKind::Const { .. }
+        | NodeKind::Iota { .. }
+        | NodeKind::Coordinate { .. } => (false, false),
         NodeKind::Map { inputs, .. } => {
             let (mut p, mut c) = (false, false);
-            for i in inputs {
-                let (p2, c2) = other_axis_folds(i, axis, cache);
+            for input in inputs {
+                let input_axis = ir::map_input_axis(node, input, axis);
+                let (p2, c2) = other_axis_folds(input, input_axis, cache);
                 p |= p2;
                 c |= c2;
             }
@@ -832,8 +1088,9 @@ fn other_axis_folds(
 
 /// Stream `node` over `axis`, registering reductions-over-axis as slots.
 /// Memoized per node, so DAG-shared sub-expressions register once.
-fn go(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
-    let key = ByAddr(node.clone());
+fn go(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> {
+    let axis = ctx.local_axis(node, axis);
+    let key = (ByAddr(node.clone()), axis);
     if let Some(s) = ctx.memo.get(&key) {
         return Ok(s.clone());
     }
@@ -843,7 +1100,7 @@ fn go(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
     Ok(s)
 }
 
-fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
+fn go_uncached(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> {
     // A literal lifts to a constant expression, never a leaf.
     if let NodeKind::Const { v } = node.as_ref() {
         return Ok(S::Pe {
@@ -851,6 +1108,18 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
             shift: None,
             post: cst(1.0),
         });
+    }
+
+    // Shape-only views are transparent to scalar carrier algebra, including
+    // when their source is otherwise FREE. Handle them before the free-leaf
+    // shortcut so a broadcast literal remains a literal rather than becoming
+    // an artificial buffer input, and a broadcast reduction remains coupled
+    // to the fold that produced it.
+    if let NodeKind::View { src, dims } = node.as_ref()
+        && dims.iter().all(|dim| dim.sources.len() <= 1)
+    {
+        let source_axis = ctx.descendant_axis(src, axis);
+        return go(src, source_axis, ctx);
     }
 
     // A maximal sub-expression that is FREE along the axis is, from the
@@ -875,7 +1144,10 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
     };
     if is_free && (!is_map || keep_map_whole) {
         // The leaf's free axes are its output shape minus the streamed axis.
-        let free = node.shape().into_iter().filter(|a| *a != axis).collect();
+        let free = ir::axis_refs(node)
+            .into_iter()
+            .filter(|a| *a != axis)
+            .collect();
         return Ok(S::Pe {
             raw: Expr::Item(ctx.leaf(node, free)),
             shift: None,
@@ -907,7 +1179,10 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
                     ctx.memo.remove(&key);
                 }
                 ctx.rules = save.3;
-                let free = node.shape().into_iter().filter(|a| *a != axis).collect();
+                let free = ir::axis_refs(node)
+                    .into_iter()
+                    .filter(|a| *a != axis)
+                    .collect();
                 return Ok(S::Pe {
                     raw: Expr::Item(ctx.leaf(node, free)),
                     shift: None,
@@ -917,7 +1192,7 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
             Err(declined)
         }
 
-        NodeKind::Reduce { src, axis: red, op } if *red == axis => {
+        NodeKind::Reduce { src, dim, op } if ir::source_axis(src, *dim) == axis => {
             reduce_op(node, src, *op, axis, ctx)
         }
 
@@ -926,9 +1201,6 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
         // outside the carrier algebra. Name the classification for the census.
         _ => {
             let (rule, why) = match structure(node, axis).level {
-                Parallelism::Sequential => {
-                    ("sequential", "a non-associative recurrence along the axis")
-                }
                 Parallelism::Opaque => ("opaque", "data-dependent access along the axis"),
                 _ => (
                     "not-streamed",
@@ -942,31 +1214,54 @@ fn go_uncached(node: &Node, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
 
 /// Reduce `src` over `axis` with monoid `op`, allocating slot(s). `node` is
 /// the reduction itself — the site a decline reports.
-fn reduce_op(node: &Node, src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> Result<S, Decline> {
-    // Index-carrying maximum: two slots — the running max of the streamed
-    // values, and the index (an iota leaf) that first achieved it.
-    if let BinOp::ArgMax = op {
-        let s = go(src, axis, ctx)?;
-        let Some(raw) = plain_pe(&s) else {
-            return Err(decline(node, axis, "argmax-of-coupled", reached(&s)));
+fn reduce_op(
+    node: &Node,
+    src: &Node,
+    m: Monoid,
+    axis: AxisRef,
+    ctx: &mut Ctx,
+) -> Result<S, Decline> {
+    // Generic extremal-key filtering:
+    //
+    //   reduce_ties(where(key < max(key), identity_ties, payload))
+    //   reduce_ties(where(min(key) < key, identity_ties, payload))
+    //
+    // Only payloads tied at the winning key survive. The one-pass carrier is
+    // therefore `(extremal key, ties-reduced payload)`. This is an algebraic
+    // property of the composition; no frontend operation is named here.
+    if let Some((key, key_monoid, payload)) = extremum_filtered_payload(src, m, axis) {
+        let key_state = go(&key, axis, ctx)?;
+        let Some(key_into) = plain_pe(&key_state) else {
+            return Err(decline(
+                node,
+                axis,
+                "coupled-extremum-key",
+                reached(&key_state),
+            ));
         };
-        let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
-        let iota_leaf = ctx.leaf(&crate::kernel_ir::iota(axis), Vec::new());
-        let idx_slot = ctx.push_slot(SlotKind::ArgIdx { max_slot }, Expr::Item(iota_leaf));
-        // The index ranges over whatever grid rows the max does — its `into`
-        // (an iota) says nothing about that, so inherit the span.
-        ctx.slots[idx_slot].span = ctx.slots[max_slot].span.clone();
-        return Ok(S::Coll(Expr::F(idx_slot)));
+        let key_slot = ctx.push_slot(SlotKind::Plain(key_monoid), key_into);
+
+        let payload_state = go(&payload, axis, ctx)?;
+        let Some(payload_into) = plain_pe(&payload_state) else {
+            return Err(decline(
+                node,
+                axis,
+                "coupled-extremum-payload",
+                reached(&payload_state),
+            ));
+        };
+        ctx.rules.insert("extremum-filter");
+        let payload_slot = ctx.push_slot(
+            SlotKind::AtExtremum {
+                key_slot,
+                key: key_monoid,
+                ties: m,
+            },
+            payload_into,
+        );
+        return Ok(S::Coll(Expr::F(payload_slot)));
     }
-    let BinOp::Monoid(m) = op else {
-        // non-associative / affine handled elsewhere
-        return Err(decline(
-            node,
-            axis,
-            "non-monoid-reduce",
-            "the reduction operator has no declared monoid",
-        ));
-    };
+
     let s = go(src, axis, ctx)?;
 
     match m {
@@ -1112,6 +1407,83 @@ fn reduce_op(node: &Node, src: &Node, op: BinOp, axis: Axis, ctx: &mut Ctx) -> R
     }
 }
 
+/// Recognize a payload monoid filtered to the elements at a key's own
+/// extremum. The shape is deliberately expressed only in terms of ordinary
+/// maps and folds. LogSumExp is excluded because its stable binary combine is
+/// itself a product carrier; the other scalar monoids combine directly.
+fn extremum_filtered_payload(
+    src: &Node,
+    ties: Monoid,
+    axis: AxisRef,
+) -> Option<(Node, Monoid, Node)> {
+    if matches!(ties, Monoid::LogSumExp) {
+        return None;
+    }
+    let NodeKind::Map {
+        op: MapOp::Where,
+        inputs,
+    } = src.as_ref()
+    else {
+        return None;
+    };
+    let [condition, rejected, payload] = inputs.as_slice() else {
+        return None;
+    };
+    let NodeKind::Const { v } = through_shape_views(rejected).as_ref() else {
+        return None;
+    };
+    if *v != ties.identity() {
+        return None;
+    }
+    let NodeKind::Map {
+        op: MapOp::Lt,
+        inputs: comparison,
+    } = through_shape_views(condition).as_ref()
+    else {
+        return None;
+    };
+    let [left, right] = comparison.as_slice() else {
+        return None;
+    };
+
+    let reduced = |node: &Node, monoid: Monoid| -> Option<Node> {
+        // Shape-only views do not change the scalar expression being
+        // matched. Frontend compositions use them to broadcast a reduction
+        // back over its source, so recognize the algebra through that shell.
+        let node = through_shape_views(node);
+        let NodeKind::Reduce {
+            src,
+            dim,
+            op: reduced_monoid,
+        } = node.as_ref()
+        else {
+            return None;
+        };
+        (ir::source_axis(src, *dim) == axis && *reduced_monoid == monoid).then(|| src.clone())
+    };
+
+    if let Some(key) = reduced(right, Monoid::Max)
+        && Rc::ptr_eq(through_shape_views(left), &key)
+    {
+        return Some((key, Monoid::Max, payload.clone()));
+    }
+    if let Some(key) = reduced(left, Monoid::Min)
+        && Rc::ptr_eq(through_shape_views(right), &key)
+    {
+        return Some((key, Monoid::Min, payload.clone()));
+    }
+    None
+}
+
+fn through_shape_views(mut node: &Node) -> &Node {
+    while let NodeKind::View { src, dims } = node.as_ref()
+        && dims.iter().all(|dim| dim.sources.len() <= 1)
+    {
+        node = src;
+    }
+    node
+}
+
 /// Combine the streamed inputs of an elementwise map. Total over the closed
 /// basis (an op the fold genuinely can't stream through declines, and the
 /// caller falls back to a whole-map leaf when legal). `node` is the map
@@ -1120,24 +1492,32 @@ fn map_op(
     node: &Node,
     op: MapOp,
     inputs: &[Node],
-    axis: Axis,
+    axis: AxisRef,
     ctx: &mut Ctx,
 ) -> Result<S, Decline> {
+    let input_axes: Vec<AxisRef> = inputs
+        .iter()
+        .map(|input| ir::map_input_axis(node, input, axis))
+        .collect();
     match op {
-        MapOp::Add => binop(node, Bin::Add, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Sub => binop(node, Bin::Sub, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Mul => binop(node, Bin::Mul, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Div => binop(node, Bin::Div, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Max => binop(node, Bin::Max, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Min => binop(node, Bin::Min, &inputs[0], &inputs[1], axis, ctx),
-        MapOp::Lt => binop(node, Bin::Lt, &inputs[0], &inputs[1], axis, ctx),
+        MapOp::Add => binop(node, Bin::Add, inputs, &input_axes, axis, ctx),
+        MapOp::Sub => binop(node, Bin::Sub, inputs, &input_axes, axis, ctx),
+        MapOp::Mul => binop(node, Bin::Mul, inputs, &input_axes, axis, ctx),
+        MapOp::Div => binop(node, Bin::Div, inputs, &input_axes, axis, ctx),
+        MapOp::Max => binop(node, Bin::Max, inputs, &input_axes, axis, ctx),
+        MapOp::Min => binop(node, Bin::Min, inputs, &input_axes, axis, ctx),
+        MapOp::Lt => binop(node, Bin::Lt, inputs, &input_axes, axis, ctx),
 
-        MapOp::Neg => unary(node, &inputs[0], axis, ctx, |e| sub(cst(0.0), e)),
-        MapOp::Recip => unary(node, &inputs[0], axis, ctx, |e| pdiv(cst(1.0), e)),
-        MapOp::Log => unary(node, &inputs[0], axis, ctx, log),
-        MapOp::Sqrt => unary(node, &inputs[0], axis, ctx, esqrt),
-        MapOp::Sin => unary(node, &inputs[0], axis, ctx, esin),
-        MapOp::Cos => unary(node, &inputs[0], axis, ctx, ecos),
+        MapOp::Neg => unary(node, &inputs[0], input_axes[0], axis, ctx, |e| {
+            sub(cst(0.0), e)
+        }),
+        MapOp::Recip => unary(node, &inputs[0], input_axes[0], axis, ctx, |e| {
+            pdiv(cst(1.0), e)
+        }),
+        MapOp::Log => unary(node, &inputs[0], input_axes[0], axis, ctx, log),
+        MapOp::Sqrt => unary(node, &inputs[0], input_axes[0], axis, ctx, esqrt),
+        MapOp::Sin => unary(node, &inputs[0], input_axes[0], axis, ctx, esin),
+        MapOp::Cos => unary(node, &inputs[0], input_axes[0], axis, ctx, ecos),
 
         // exp is where the online-softmax coupling is discovered: exp of
         // `x − m` (a per-element value minus its own running max) rides the
@@ -1145,7 +1525,7 @@ fn map_op(
         // max, so when the shifted value IS the max's contribution the unit
         // lift is exp(x − x) = 1.
         MapOp::Exp => {
-            let s = go(&inputs[0], axis, ctx)?;
+            let s = go(&inputs[0], input_axes[0], ctx)?;
             if let Some(e) = as_coll(&s) {
                 return Ok(S::Coll(exp(e)));
             }
@@ -1171,14 +1551,12 @@ fn map_op(
             }
         }
 
-        // The fold has no closed form for tanh; the whole-map-leaf fallback
-        // in `go_uncached` covers the free-along-axis case.
-        MapOp::Tanh => Err(decline(node, axis, "tanh", "no closed fold form for tanh")),
+        MapOp::Tanh => unary(node, &inputs[0], input_axes[0], axis, ctx, etanh),
 
         MapOp::Where => {
-            let c = go(&inputs[0], axis, ctx)?;
-            let a = go(&inputs[1], axis, ctx)?;
-            let b = go(&inputs[2], axis, ctx)?;
+            let c = go(&inputs[0], input_axes[0], ctx)?;
+            let a = go(&inputs[1], input_axes[1], ctx)?;
+            let b = go(&inputs[2], input_axes[2], ctx)?;
             if let (Some(c), Some(a), Some(b)) = (as_coll(&c), as_coll(&a), as_coll(&b)) {
                 return Ok(S::Coll(ewhere(c, a, b)));
             }
@@ -1209,16 +1587,17 @@ fn map_op(
 fn unary(
     node: &Node,
     x: &Node,
-    axis: Axis,
+    input_axis: AxisRef,
+    decline_axis: AxisRef,
     ctx: &mut Ctx,
     f: impl Fn(Expr) -> Expr,
 ) -> Result<S, Decline> {
-    let s = go(x, axis, ctx)?;
+    let s = go(x, input_axis, ctx)?;
     if let Some(e) = as_coll(&s) {
         return Ok(S::Coll(f(e)));
     }
     let Some(raw) = plain_pe(&s) else {
-        return Err(decline(node, axis, "unary-of-coupled", reached(&s)));
+        return Err(decline(node, decline_axis, "unary-of-coupled", reached(&s)));
     };
     Ok(S::Pe {
         raw: f(raw),
@@ -1241,13 +1620,13 @@ enum Bin {
 fn binop(
     node: &Node,
     op: Bin,
-    x: &Node,
-    y: &Node,
-    axis: Axis,
+    inputs: &[Node],
+    input_axes: &[AxisRef],
+    decline_axis: AxisRef,
     ctx: &mut Ctx,
 ) -> Result<S, Decline> {
-    let a = go(x, axis, ctx)?;
-    let b = go(y, axis, ctx)?;
+    let a = go(&inputs[0], input_axes[0], ctx)?;
+    let b = go(&inputs[1], input_axes[1], ctx)?;
 
     // Both collapsed (or promotable constants) → a scalar combination of
     // reduced values.
@@ -1366,7 +1745,7 @@ fn binop(
             let Some(shift) = merge_shift(s1, s2) else {
                 return Err(decline(
                     node,
-                    axis,
+                    decline_axis,
                     "two-exp-domains",
                     "the factors ride two distinct running maxes",
                 ));
@@ -1381,7 +1760,7 @@ fn binop(
             let (Some(r1), Some(r2)) = (plain_pe(&a), plain_pe(&b)) else {
                 return Err(decline(
                     node,
-                    axis,
+                    decline_axis,
                     "binop-of-coupled",
                     format!("lhs {}; rhs {}", reached(&a), reached(&b)),
                 ));
@@ -1432,11 +1811,32 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
                 let rb = exp(sub(Expr::B(mx), big));
                 padd(pmul(Expr::A(i), ra), pmul(Expr::B(i), rb))
             }
-            SlotKind::ArgIdx { max_slot: mx } => {
-                // first max wins: switch to B only on a STRICT improvement
-                ewhere(elt(Expr::A(mx), Expr::B(mx)), Expr::B(i), Expr::A(i))
+            SlotKind::AtExtremum {
+                key_slot,
+                key,
+                ties,
+            } => {
+                let tied = match ties {
+                    Monoid::Add => padd(Expr::A(i), Expr::B(i)),
+                    Monoid::Mul => Expr::Mul(Box::new(Expr::A(i)), Box::new(Expr::B(i))),
+                    Monoid::Max => emax(Expr::A(i), Expr::B(i)),
+                    Monoid::Min => emin(Expr::A(i), Expr::B(i)),
+                    Monoid::LogSumExp => unreachable!("excluded by extremum_filtered_payload"),
+                };
+                match key {
+                    Monoid::Max => ewhere(
+                        elt(Expr::A(key_slot), Expr::B(key_slot)),
+                        Expr::B(i),
+                        ewhere(elt(Expr::B(key_slot), Expr::A(key_slot)), Expr::A(i), tied),
+                    ),
+                    Monoid::Min => ewhere(
+                        elt(Expr::A(key_slot), Expr::B(key_slot)),
+                        Expr::A(i),
+                        ewhere(elt(Expr::B(key_slot), Expr::A(key_slot)), Expr::B(i), tied),
+                    ),
+                    _ => unreachable!("an extremal key is max or min"),
+                }
             }
-            SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
         })
         .collect();
     let identity = slots
@@ -1444,33 +1844,8 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
         .map(|s| match s.kind {
             SlotKind::Plain(m) => m.identity(),
             SlotKind::ExpShifted { .. } => 0.0,
-            SlotKind::ArgIdx { .. } => 0.0,
-            SlotKind::AffineStep => unreachable!("AffineStep slots are built directly"),
+            SlotKind::AtExtremum { ties, .. } => ties.identity(),
         })
         .collect();
     (into, combine, identity)
-}
-
-/// The SSM / linear-recurrence carrier: the affine map `(A, b)` under
-/// composition. `combine(L, R) = R ∘ L`, `identity` = the identity map,
-/// `project` applies the composite to `h₀ = 0` (returns `b`).
-fn affine_scan_carrier() -> Carrier {
-    Carrier {
-        slots: 2,
-        leaves: Vec::new(), // the special-cased carrier has no derived leaves
-        into: vec![Expr::Item(0), Expr::Item(1)], // (A_t, b_t)
-        // (A', b') for R∘L with L first:  x ↦ A_R(A_L x + b_L) + b_R
-        combine: vec![
-            Expr::Mul(Box::new(Expr::B(0)), Box::new(Expr::A(0))),
-            padd(
-                Expr::Mul(Box::new(Expr::B(0)), Box::new(Expr::A(1))),
-                Expr::B(1),
-            ),
-        ],
-        identity: vec![1.0, 0.0],
-        project: vec![Expr::F(1)],
-        spans: vec![vec![], vec![]], // scalar affine state, no free axes
-        rules: vec!["affine"],
-        kinds: vec![SlotKind::AffineStep, SlotKind::AffineStep],
-    }
 }

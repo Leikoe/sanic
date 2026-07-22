@@ -23,8 +23,8 @@ impl Lcg {
     }
 }
 
-fn add_r() -> BinOp {
-    BinOp::Monoid(Monoid::Add)
+fn add_r() -> Monoid {
+    Monoid::Add
 }
 
 fn rmsnorm(x: Node, g: Node, n: f64, ax: Axis) -> Node {
