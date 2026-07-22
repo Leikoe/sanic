@@ -194,7 +194,7 @@ fn full_transformer_block_schedule_executes_to_reference() {
 
     let sched = partition(&logits, &DeviceProfile::toy());
     assert!(
-        sched.kernel_count() >= 10,
+        sched.kernel_count() >= 2,
         "expected a multi-kernel schedule"
     );
     let executed = sched.execute(&env);

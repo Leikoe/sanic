@@ -1006,12 +1006,8 @@ impl Partitioner<'_> {
     /// here — derivation, pricing and emission all stay on the original
     /// node, so every surviving choice is unchanged.)
     fn best_fold(&mut self, node: &Node) -> Option<(AxisRef, Carrier)> {
-        let live = all_axis_refs(&self.splice(node, true));
         let mut best: Option<(AxisRef, Carrier, f64)> = None;
-        for axis in nearest_fold_axes(node) {
-            if !live.contains(&axis) {
-                continue; // collapsed inside a done producer — read it instead
-            }
+        for axis in nearest_fold_axes(node, &self.done) {
             if self.structures.classify(node, axis).level != Parallelism::Monoidal {
                 continue;
             }
@@ -1490,16 +1486,19 @@ fn expensive_map_below_views(node: &Node) -> Option<Node> {
 /// A fold behind another fold cannot be the producer fused into this stage;
 /// it is considered when recursive partitioning reaches that producer.
 /// Sibling folds at the same depth are all retained so generic product
-/// carriers can still combine them.
-fn nearest_fold_axes(node: &Node) -> Vec<AxisRef> {
+/// carriers can still combine them. A node in `done` is a materialized
+/// buffer this stage READS — the frontier stops there, whatever lies below.
+fn nearest_fold_axes(node: &Node, done: &HashMap<*const NodeKind, &'static str>) -> Vec<AxisRef> {
     fn walk(
         node: &Node,
         depth: usize,
         nearest: &mut usize,
         axes: &mut Vec<AxisRef>,
         seen: &mut HashMap<*const NodeKind, usize>,
+        done: &HashMap<*const NodeKind, &'static str>,
     ) {
         if depth > *nearest
+            || (depth > 0 && done.contains_key(&Rc::as_ptr(node)))
             || seen
                 .get(&Rc::as_ptr(node))
                 .is_some_and(|previous| *previous <= depth)
@@ -1520,11 +1519,11 @@ fn nearest_fold_axes(node: &Node) -> Vec<AxisRef> {
             }
             NodeKind::Map { inputs, .. } => {
                 for input in inputs {
-                    walk(input, depth + 1, nearest, axes, seen);
+                    walk(input, depth + 1, nearest, axes, seen, done);
                 }
             }
             NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-                walk(src, depth + 1, nearest, axes, seen)
+                walk(src, depth + 1, nearest, axes, seen, done)
             }
             NodeKind::Input { .. }
             | NodeKind::Const { .. }
@@ -1536,7 +1535,7 @@ fn nearest_fold_axes(node: &Node) -> Vec<AxisRef> {
 
     let mut nearest = usize::MAX;
     let mut axes = Vec::new();
-    walk(node, 0, &mut nearest, &mut axes, &mut HashMap::new());
+    walk(node, 0, &mut nearest, &mut axes, &mut HashMap::new(), done);
     axes
 }
 
@@ -2173,6 +2172,9 @@ impl Schedule {
                 }
             }
         }
+        if !self.declines.is_empty() {
+            eprintln!("{}", self.decline_census().trim_end());
+        }
     }
 }
 
@@ -2281,7 +2283,7 @@ mod tests {
         let current = reduce(new, 0usize, Monoid::Add);
         let root = map(MapOp::Add, vec![history, current]);
 
-        assert_eq!(nearest_fold_axes(&root), vec![new_stream]);
+        assert_eq!(nearest_fold_axes(&root, &HashMap::new()), vec![new_stream]);
         assert_ne!(old_stream, new_stream);
     }
 
