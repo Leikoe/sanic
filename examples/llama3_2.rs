@@ -166,7 +166,7 @@ fn rms_norm(x: NodeRef, weight: NodeRef, hidden_dim: usize) -> NodeRef {
 fn llama3_inv_freq(frequency: Axis) -> NodeRef {
     let exponent = mul(
         iota(frequency),
-        konst(-ROPE_THETA.ln() / (frequency.extent() * 2) as f64),
+        konst(-ROPE_THETA.ln() / frequency.extent() as f64),
     );
     let inv_freq = unary(MapOp::Exp, exponent);
     let wave_length = div(konst(2.0 * std::f64::consts::PI), inv_freq.clone());
@@ -734,9 +734,8 @@ fn run_metal() -> Result<(), String> {
         started.elapsed().as_secs_f32()
     );
 
-    // Freeze the bindings and capture the whole schedule as replayable
-    // graphs: each cache output is the NEXT step's cache input, so a step is
-    // one `executeCommandsInBuffer` instead of re-encoding every kernel.
+    // Freeze both cache-binding parities for repeated execution: each cache
+    // output is the NEXT step's cache input.
     let feedback = graph
         .cache_names
         .iter()
@@ -758,7 +757,7 @@ fn run_metal() -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     eprintln!(
-        "captured {} dispatches into two replay graphs in {:.2}s",
+        "prepared {} dispatches for two replay bindings in {:.2}s",
         program.kernel_count(),
         started.elapsed().as_secs_f32()
     );
@@ -846,6 +845,20 @@ fn run_metal() -> Result<(), String> {
 mod tests {
     use super::*;
     use sanic::CpuDevice;
+    use sanic::interp::{Env, eval};
+
+    #[test]
+    fn rope_frequencies_use_even_head_coordinates() {
+        let frequencies = axis("frequency", 32);
+        let resolved = eval(&llama3_inv_freq(frequencies), &Env::new());
+
+        // Llama's arange(0, head_dim, 2) / head_dim is equivalent to
+        // frequency_index / (head_dim / 2). The first nonzero frequency is
+        // still above the scaling transition, so it is unchanged by llama3
+        // long-context scaling.
+        let expected = (-ROPE_THETA.ln() / 32.0).exp();
+        assert!((resolved.data[1] - expected).abs() < 1e-12);
+    }
 
     #[test]
     fn compact_decode_builds_caches_and_compiles_through_functional_sdpa() {

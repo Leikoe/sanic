@@ -671,12 +671,10 @@ mod metal_backend {
         }
     }
 
-    /// A program frozen over one binding set and captured as replayable
-    /// Metal graphs — the production decode path. [`Program::capture`]
-    /// encodes every dispatch ONCE into an indirect command buffer
-    /// ([`crate::metal::MetalGraph`]); [`MetalReplay::step`] then replays
-    /// the whole schedule as one encoder and one `executeCommandsInBuffer`
-    /// instead of re-allocating buffers and re-encoding N kernels per step.
+    /// A program frozen over one binding set for repeated Metal execution.
+    /// Small schedules use an indirect command buffer; large schedules use
+    /// ordered encoders in one command buffer. Both paths retain allocations
+    /// and bindings across steps.
     ///
     /// `feedback` wires an output to an input of the NEXT step (a KV cache
     /// flowing through a decode loop). Bindings are frozen at capture, so a
@@ -686,7 +684,7 @@ mod metal_backend {
     /// token id — is the same buffer in both parities.
     pub struct MetalReplay<'p> {
         program: &'p Program<MetalDevice>,
-        /// One captured graph, or two when feedback swaps bindings.
+        /// One frozen graph, or two when feedback swaps bindings.
         graphs: Vec<MetalGraph>,
         /// Per-parity dispatch lists — the `SANIC_DEBUG=2` fallback.
         dispatches: Vec<Vec<Dispatch>>,
@@ -696,7 +694,7 @@ mod metal_backend {
     }
 
     impl Program<MetalDevice> {
-        /// Freeze this program over `bindings` and capture it for replay —
+        /// Freeze this program over `bindings` for replay —
         /// see [`MetalReplay`]. Binding validation matches
         /// [`Program::try_run`]; every `feedback` pair `(output index,
         /// input name)` must name a real output and a real input of equal
@@ -833,7 +831,7 @@ mod metal_backend {
         /// write CPU-driven inputs (a token id) into their bound buffers
         /// before calling. Under `SANIC_DEBUG=2` the step runs through the
         /// per-dispatch timed path and prints the launch dump instead of
-        /// replaying the captured graph.
+        /// replaying the frozen graph.
         ///
         /// Errs on any command buffer error — the step's writes are
         /// untrustworthy and a decode loop must not continue on them.

@@ -166,6 +166,57 @@ fn rmsnorm_fused_projection_matches_naive() {
     assert_kernel_matches_reference(&q, stream, &env);
 }
 
+#[test]
+fn standalone_broadcast_denominator_keeps_the_stream_axis() {
+    let (sequence, singleton, hidden) = (
+        axis("sequence", 1),
+        axis("singleton", 1),
+        axis("hidden", 16),
+    );
+    let mut rng = Lcg(0x51A6_1E70);
+    let env: Env = [
+        ("a", rand_tensor(&[sequence, hidden], &mut rng)),
+        ("b", rand_tensor(&[singleton, hidden], &mut rng)),
+        ("c", rand_tensor(&[singleton, hidden], &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+    let residual = map(
+        MapOp::Add,
+        vec![
+            map(
+                MapOp::Add,
+                vec![
+                    input("a", [sequence, hidden], Dtype::F32),
+                    input("b", [singleton, hidden], Dtype::F32),
+                ],
+            ),
+            input("c", [singleton, hidden], Dtype::F32),
+        ],
+    );
+    let stream = axis_refs(&residual)[1];
+    let sum_square = reduce(
+        map(MapOp::Mul, vec![residual.clone(), residual]),
+        1usize,
+        Monoid::Add,
+    );
+    let denominator = unsqueeze(
+        map(
+            MapOp::Sqrt,
+            vec![map(
+                MapOp::Add,
+                vec![
+                    map(MapOp::Mul, vec![sum_square, konst(1.0 / 16.0)]),
+                    konst(1e-5),
+                ],
+            )],
+        ),
+        1usize,
+    );
+
+    assert_kernel_matches_reference(&denominator, stream, &env);
+}
+
 // ── logsumexp: the max/Σexp pair projected by log(s)+m ───────────────────────
 #[test]
 fn logsumexp_matches_naive() {

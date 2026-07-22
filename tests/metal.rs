@@ -170,6 +170,205 @@ fn flash_attention_runs_on_gpu() {
     eprintln!("flash on GPU: {}", out.trim());
 }
 
+#[test]
+fn masked_gqa_decode_attention_matches_oracle_on_gpu() {
+    let (query_heads, kv_heads, cache, features) = (
+        axis("query_heads", 32),
+        axis("kv_heads", 8),
+        axis("cache", 7),
+        axis("features", 64),
+    );
+    let query_sequence = axis("query_sequence", 1);
+    let mut rng = Lcg(0x6A7A);
+    let mut key = rand_tensor(&[kv_heads, cache, features], &mut rng);
+    let mut value = rand_tensor(&[kv_heads, cache, features], &mut rng);
+    for head in 0..kv_heads.extent() {
+        for position in 1..cache.extent() {
+            for feature in 0..features.extent() {
+                let offset = (head * cache.extent() + position) * features.extent() + feature;
+                key.data[offset] = 0.0;
+                value.data[offset] = 0.0;
+            }
+        }
+    }
+    let env: Env = [
+        (
+            "Q",
+            rand_tensor(&[query_heads, query_sequence, features], &mut rng),
+        ),
+        ("K", key),
+        ("V", value),
+        (
+            "mask",
+            Value::from_shape_fn(&[cache.extent()], |position| {
+                if position[0] == 0 {
+                    0.0
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let attention = sanic::nn::functional::scaled_dot_product_attention(
+        input("Q", [query_heads, query_sequence, features], Dtype::F32),
+        input("K", [kv_heads, cache, features], Dtype::F32),
+        input("V", [kv_heads, cache, features], Dtype::F32),
+        Some(input("mask", [cache], Dtype::F32)),
+        0.0,
+        false,
+        None,
+        true,
+    );
+    let reference = eval(&attention, &env);
+    let schedule = partition(&attention, &DeviceProfile::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+
+    let Some(result) = run_schedule_on_gpu("masked-gqa-decode", &program, &env, &reference) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("masked GQA decode attention: {}", result.trim());
+}
+
+#[test]
+fn rmsnorm_of_a_shared_residual_matches_oracle_on_gpu() {
+    let (token, hidden) = (axis("token", 1), axis("hidden", 2048));
+    let mut rng = Lcg(0xA11CE);
+    let env: Env = [
+        ("a", rand_tensor(&[token, hidden], &mut rng)),
+        ("b", rand_tensor(&[token, hidden], &mut rng)),
+        ("c", rand_tensor(&[token, hidden], &mut rng)),
+        ("gain", rand_tensor(&[hidden], &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+    let residual = map(
+        MapOp::Add,
+        vec![
+            map(
+                MapOp::Add,
+                vec![
+                    input("a", [token, hidden], Dtype::F32),
+                    input("b", [token, hidden], Dtype::F32),
+                ],
+            ),
+            input("c", [token, hidden], Dtype::F32),
+        ],
+    );
+    let mean_square = map(
+        MapOp::Mul,
+        vec![
+            reduce(
+                map(MapOp::Mul, vec![residual.clone(), residual.clone()]),
+                1usize,
+                Monoid::Add,
+            ),
+            konst(1.0 / hidden.extent() as f64),
+        ],
+    );
+    let norm = map(
+        MapOp::Div,
+        vec![
+            map(
+                MapOp::Mul,
+                vec![residual, input("gain", [hidden], Dtype::F32)],
+            ),
+            unsqueeze(
+                map(
+                    MapOp::Sqrt,
+                    vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])],
+                ),
+                1usize,
+            ),
+        ],
+    );
+    let reference = eval(&norm, &env);
+    let schedule = partition(&norm, &DeviceProfile::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+
+    let Some(result) = run_schedule_on_gpu("residual-rmsnorm", &program, &env, &reference) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("shared-residual RMSNorm: {}", result.trim());
+}
+
+#[test]
+fn residual_rmsnorm_fused_projection_matches_oracle_on_gpu() {
+    let (token, hidden, output) = (axis("token", 1), axis("hidden", 2048), axis("output", 64));
+    let mut rng = Lcg(0xF053D);
+    let env: Env = [
+        ("a", rand_tensor(&[token, hidden], &mut rng)),
+        ("b", rand_tensor(&[token, hidden], &mut rng)),
+        ("c", rand_tensor(&[token, hidden], &mut rng)),
+        ("gain", rand_tensor(&[hidden], &mut rng)),
+        ("weight", rand_tensor(&[output, hidden], &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+    let residual = map(
+        MapOp::Add,
+        vec![
+            map(
+                MapOp::Add,
+                vec![
+                    input("a", [token, hidden], Dtype::F32),
+                    input("b", [token, hidden], Dtype::F32),
+                ],
+            ),
+            input("c", [token, hidden], Dtype::F32),
+        ],
+    );
+    let mean_square = map(
+        MapOp::Mul,
+        vec![
+            reduce(
+                map(MapOp::Mul, vec![residual.clone(), residual.clone()]),
+                1usize,
+                Monoid::Add,
+            ),
+            konst(1.0 / hidden.extent() as f64),
+        ],
+    );
+    let norm = map(
+        MapOp::Div,
+        vec![
+            map(
+                MapOp::Mul,
+                vec![residual, input("gain", [hidden], Dtype::F32)],
+            ),
+            unsqueeze(
+                map(
+                    MapOp::Sqrt,
+                    vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])],
+                ),
+                1usize,
+            ),
+        ],
+    );
+    let projection = matmul(
+        norm,
+        transpose(
+            input("weight", [output, hidden], Dtype::F32),
+            0usize,
+            1usize,
+        ),
+    );
+    let reference = eval(&projection, &env);
+    let schedule = partition(&projection, &DeviceProfile::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+
+    let Some(result) =
+        run_schedule_on_gpu("residual-rmsnorm-projection", &program, &env, &reference)
+    else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("residual RMSNorm projection: {}", result.trim());
+}
+
 // ── causal-masked + scaled flash (computed mask), on the GPU ─────────────────
 #[test]
 fn causal_flash_runs_on_gpu() {
@@ -1401,6 +1600,57 @@ fn graph_replay_matches_oracle() {
         "graph replay on GPU: {} kernels in one indirect command buffer, two replays match",
         program.stages.len()
     );
+}
+
+#[test]
+fn bindless_graph_replay_declares_indirect_resources() {
+    use sanic::metal::MetalGraph;
+
+    let elements = axis("elements", 257);
+    let mut env = Env::new();
+    let mut sum = konst(0.0);
+    for input_index in 0..40 {
+        let name: &'static str = Box::leak(format!("wide_input_{input_index}").into_boxed_str());
+        env.insert(
+            name,
+            Value::from_shape_fn(&[elements.extent()], |index| {
+                input_index as f64 * 0.01 + index[0] as f64 * 0.001
+            }),
+        );
+        sum = map(MapOp::Add, vec![sum, input(name, [elements], Dtype::F32)]);
+    }
+
+    let schedule = partition(&sum, &DeviceProfile::toy());
+    let program = emit_schedule_metal(&schedule);
+    assert!(
+        program.stages.iter().any(|stage| stage.argbuf.is_some()),
+        "the regression must exercise an argument-buffer dispatch"
+    );
+    let reference = eval(&sum, &env);
+
+    let Some(device) = MetalDevice::open() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let pipelines = device.compile(&program.msl);
+    let mut buffers = HashMap::new();
+    for (name, _) in &program.inputs {
+        buffers.insert(name.to_string(), device.from_f64(&env[name].data));
+    }
+    for (name, size) in &program.buffers {
+        buffers.insert(name.clone(), device.alloc_f32(*size));
+    }
+    let graph: MetalGraph = device.capture(&program_dispatches(&program, &buffers, &pipelines));
+    let output = &program.stages.last().unwrap().output;
+    for replay in 0..2 {
+        device.run_graph_timed(&graph).unwrap();
+        let got = device.read_f32(&buffers[output], reference.data.len());
+        let maxrel = max_rel_err(&got, &reference.data);
+        assert!(
+            maxrel < 3e-3,
+            "bindless graph mismatch on replay {replay}: {maxrel:e}"
+        );
+    }
 }
 
 // ── cooperative fold schedules, each emitter path against the oracle ────────

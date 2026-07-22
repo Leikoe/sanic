@@ -785,7 +785,10 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
     ) {
         match node.as_ref() {
             NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
-                aliases.insert(ir::source_axis(src, *dim), target);
+                let collapsed = ir::source_axis(src, *dim);
+                if collapsed.extent == target.extent {
+                    aliases.insert(collapsed, target);
+                }
             }
             NodeKind::Map { inputs, .. } => {
                 let output_rank = node.shape().len();
