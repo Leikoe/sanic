@@ -6,6 +6,7 @@
 //! inputs carry the streamed axis; the cost model ranks the candidates.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
@@ -39,11 +40,62 @@ pub fn plan_axis(
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> Option<KernelSpec> {
+    plan_axis_with_groups(
+        node,
+        streaming_axis,
+        carrier,
+        dev,
+        &mut GroupCache::default(),
+    )
+}
+
+/// Flatten-group membership across a retained DAG, collected once per node:
+/// member axis → (grouped axis, member's share of the group). A GQA key
+/// cache's `kv_heads` is a member of the group that forms `query_heads`, so a
+/// block covering a tile of the group touches only the proportional share of
+/// the member. The cache lives for one compile, like the structure cache.
+#[derive(Default)]
+pub struct GroupCache {
+    members: HashMap<AxisRef, (AxisRef, f64)>,
+    visited: HashSet<*const NodeKind>,
+    keepalive: Vec<Node>,
+}
+
+impl GroupCache {
+    fn collect(&mut self, node: &Node) {
+        let mut stack = vec![node.clone()];
+        while let Some(current) = stack.pop() {
+            if !self.visited.insert(Rc::as_ptr(&current)) {
+                continue;
+            }
+            for (group, grouped) in ir::view_groups(&current) {
+                for &member in &group {
+                    let share = member.extent() as f64 / grouped.extent() as f64;
+                    self.members.insert(member, (grouped, share));
+                }
+            }
+            stack.extend(ir::children(&current));
+            self.keepalive.push(current);
+        }
+    }
+}
+
+/// [`plan_axis`] with a compile-lifetime [`GroupCache`], so repeated planning
+/// over one retained DAG walks each node once.
+pub fn plan_axis_with_groups(
+    node: &Node,
+    streaming_axis: impl AxisSelector,
+    carrier: &Carrier,
+    dev: &DeviceProfile,
+    groups: &mut GroupCache,
+) -> Option<KernelSpec> {
     let streaming_axis = streaming_axis
         .resolve_axis(node, "plan_axis")
         .expect("planning axis is absent from the selected node");
     let b_bytes = dev.dtype_bytes;
-    let tn = TILE_N as f64;
+    // A streamed slab never exceeds the axis itself (a 7-token KV cache is
+    // not a 64-element slab).
+    let tn = (TILE_N as f64).min(streaming_axis.extent() as f64);
 
     // ── axis roles, read off the carrier and the IR ──────────────────────────
     let out_axes = ir::axis_refs(node);
@@ -77,12 +129,16 @@ pub fn plan_axis(
         .copied()
         .collect();
     let span_schedulable: Vec<AxisRef> = {
-        // A deferred divisor is intentionally kept whole: tiling an axis
-        // absent from its normalizer slot would recompute that normalization
-        // once per tile (the giant-vocabulary RMSNorm head). Let partitioning
-        // cut the divisor instead. Other partial-span slots, including the
-        // structural slot introduced by a flattened attention projection,
-        // are cheap and legal to duplicate across tiles.
+        // A deferred divisor keeps its partial-span columns unscheduled — not
+        // because tiling them is illegal (it only duplicates the normalizer
+        // slot per block), but because the EMITTER recomputes everything per
+        // output point and the cost model does not yet price that
+        // duplication: measured with it scheduled, the vocab-head RMSNorm
+        // fused at 128k outputs runs 15× worse than planned and the fused
+        // projections re-add the whole residual history per streamed element
+        // (llama decode 28.6 → 141 ms/tok). Lift this exclusion when leaf
+        // cutting prices recomputation (Prop 4.1) so the roofline can reject
+        // those fusions itself. Other partial-span slots stay schedulable.
         if carrier.rules.contains(&"defer-div") {
             span_union
                 .iter()
@@ -128,6 +184,9 @@ pub fn plan_axis(
             .copied()
             .expect("every input must declare a storage dtype")
     };
+
+    groups.collect(node);
+    let group_member = &groups.members;
 
     // An inner contraction (matmul inside the fold) keeps a scores-like
     // intermediate tile resident (tile_m × tile_c × TILE_N).
@@ -206,16 +265,30 @@ pub fn plan_axis(
                 // row/col axes their tiles, batch axes nothing, and resident
                 // axes their full extent.
                 let per_block = |axes: &[AxisRef], tm: f64, tc: f64| -> f64 {
+                    let scheduled = |ax: AxisRef| -> Option<f64> {
+                        if ax == streaming_axis {
+                            Some(tn)
+                        } else if Some(ax) == row {
+                            Some(tm)
+                        } else if Some(ax) == col {
+                            Some(tc)
+                        } else if batch.contains(&ax) {
+                            Some(1.0)
+                        } else {
+                            None
+                        }
+                    };
                     axes.iter()
                         .map(|&ax| {
-                            if ax == streaming_axis {
-                                tn
-                            } else if Some(ax) == row {
-                                tm
-                            } else if Some(ax) == col {
-                                tc
-                            } else if batch.contains(&ax) {
-                                1.0
+                            if let Some(tile) = scheduled(ax) {
+                                tile
+                            } else if let Some(&(grouped, share)) = group_member.get(&ax) {
+                                // a block covering a tile of the grouped axis
+                                // touches only that tile's share of the member
+                                match scheduled(grouped) {
+                                    Some(tile) => (tile * share).clamp(1.0, ext(ax)),
+                                    None => ext(ax),
+                                }
                             } else {
                                 ext(ax)
                             }
@@ -253,22 +326,34 @@ pub fn plan_axis(
                         // each moving its own storage width.
                         let row_blocks = row.map_or(1.0, |r| (ext(r) / tm).ceil());
                         let col_blocks = col.map_or(1.0, |c| (ext(c) / tc).ceil());
+                        // "Carries the axis" includes carrying a group member
+                        // coupled to it: each block of the grouped axis reads
+                        // its own slice of the member, not the whole tensor
+                        // again.
+                        let carries = |axes: &[AxisRef], scheduled: AxisRef| -> bool {
+                            axes.iter().any(|&ax| {
+                                ax == scheduled
+                                    || group_member
+                                        .get(&ax)
+                                        .is_some_and(|&(grouped, _)| grouped == scheduled)
+                            })
+                        };
                         let mut hbm = output_vol * b_bytes;
                         for (nm, axes) in &inputs {
                             let vol: f64 = axes.iter().map(|&ax| ext(ax)).product();
                             let mut factor = 1.0;
                             if let Some(r) = row
-                                && !axes.contains(&r)
+                                && !carries(axes, r)
                             {
                                 factor *= row_blocks;
                             }
                             if let Some(c) = col
-                                && !axes.contains(&c)
+                                && !carries(axes, c)
                             {
                                 factor *= col_blocks;
                             }
                             for &b in &batch {
-                                if !axes.contains(&b) {
+                                if !carries(axes, b) {
                                     factor *= ext(b);
                                 }
                             }

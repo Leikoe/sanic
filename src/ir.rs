@@ -973,6 +973,20 @@ pub(crate) fn shallow_key(n: &NodeRef) -> String {
     }
 }
 
+/// A node's direct graph children, in input order.
+pub fn children(node: &NodeRef) -> Vec<NodeRef> {
+    match node.as_ref() {
+        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => Vec::new(),
+        Node::Coordinate { src, .. }
+        | Node::Reduce { src, .. }
+        | Node::Scan { src, .. }
+        | Node::View { src, .. }
+        | Node::Reindex { src, .. } => vec![src.clone()],
+        Node::Map { inputs, .. } => inputs.clone(),
+        Node::Gather { src, index, .. } => vec![src.clone(), index.clone()],
+    }
+}
+
 /// Number of elements in a materialized output (`1` for a scalar).
 pub fn volume(node: &NodeRef) -> usize {
     node.shape()

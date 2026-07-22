@@ -39,7 +39,7 @@ use crate::ir::{
     self, AxisRef, Canonicalizer, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
     ResolvedAffineIndex, all_axis_refs, leaf_names,
 };
-use crate::plan::{KernelSpec, plan_axis};
+use crate::plan::{GroupCache, KernelSpec, plan_axis_with_groups};
 
 /// One kernel in the schedule.
 pub enum Stage {
@@ -159,6 +159,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         parents,
         canon,
         structures: StructureCache::default(),
+        plan_groups: GroupCache::default(),
     };
     let mut outputs = Vec::new();
     for (r, name) in &roots {
@@ -412,6 +413,9 @@ struct Partitioner<'a> {
     /// nodes and dimensions; rebuilding this memo table per query is
     /// quadratic on deep residual graphs.
     structures: StructureCache,
+    /// Flatten-group membership for the planner, walked once per node — the
+    /// same per-compile lifetime as `structures`.
+    plan_groups: GroupCache,
 }
 
 /// Count graph edges into each node (a DAG walk; every edge counts).
@@ -1020,7 +1024,8 @@ impl Partitioner<'_> {
             };
             // Rank by planned cost on the uncut graph; an unplannable axis
             // ranks last but is still a legal fold.
-            let cost = plan_axis(node, axis, &c, self.dev).map_or(f64::INFINITY, |s| s.cost);
+            let cost = plan_axis_with_groups(node, axis, &c, self.dev, &mut self.plan_groups)
+                .map_or(f64::INFINITY, |s| s.cost);
             if best.as_ref().is_none_or(|(_, _, b)| cost < *b) {
                 best = Some((axis, c, cost));
             }
@@ -1167,7 +1172,7 @@ impl Partitioner<'_> {
                 return leak(out);
             }
         };
-        match plan_axis(&cut_graph, cut_axis, &c2, self.dev) {
+        match plan_axis_with_groups(&cut_graph, cut_axis, &c2, self.dev, &mut self.plan_groups) {
             Some(mut spec) => {
                 spec.output_name = out.to_string();
                 self.stages.push(Stage::Fused {
