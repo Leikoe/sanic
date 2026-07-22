@@ -499,6 +499,11 @@ pub fn emit_fused_metal_with(
 
     let mut g = Gen::new();
     g.axis_aliases = carrier.aliases.clone();
+    if let Some((epilogue, _)) = epi {
+        for (local, canonical) in ir::axis_refs(epilogue).into_iter().zip(&grid) {
+            g.axis_aliases.insert(local, *canonical);
+        }
+    }
     g.dtypes = dtypes.clone();
     let mut body: Vec<String> = vec![format!("if (gid >= {grid_size}) return;")];
     let coord = thread_grid_decode(&METAL, &grid, &mut g, &mut body);
@@ -673,9 +678,16 @@ pub fn emit_fused_metal_sched_with(
         .leaves
         .iter()
         .map(|l| {
-            sched
-                .lane_axis
-                .is_some_and(|a| ir::axis_refs(l).contains(&a))
+            sched.lane_axis.is_some_and(|lane_axis| {
+                let lane_axis = carrier
+                    .aliases
+                    .get(&lane_axis)
+                    .copied()
+                    .unwrap_or(lane_axis);
+                ir::axis_refs(l)
+                    .into_iter()
+                    .any(|axis| carrier.aliases.get(&axis).copied().unwrap_or(axis) == lane_axis)
+            })
         })
         .collect();
     // A slot the schedule holds once per simdgroup must not read a
@@ -704,6 +716,11 @@ pub fn emit_fused_metal_sched_with(
     }
     let mut g = Gen::new();
     g.axis_aliases = carrier.aliases.clone();
+    if let Some((epilogue, _)) = epi {
+        for (local, canonical) in ir::axis_refs(epilogue).into_iter().zip(&grid) {
+            g.axis_aliases.insert(local, *canonical);
+        }
+    }
     g.dtypes = dtypes.clone();
 
     let tgt = sched.tg_threads();

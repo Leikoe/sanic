@@ -512,7 +512,10 @@ pub fn fold_sched(
         .leaves
         .iter()
         .map(|l| {
-            let axes = ir::axis_refs(l);
+            let axes = ir::axis_refs(l)
+                .into_iter()
+                .map(|axis| carrier.aliases.get(&axis).copied().unwrap_or(axis))
+                .collect::<Vec<_>>();
             let vol: f64 = axes.iter().map(|&a| ext(a)).product::<f64>().max(1.0);
             let per_eval = count_issue_ops(l) / vol;
             (per_eval, axes, has_simd_reduce(l))

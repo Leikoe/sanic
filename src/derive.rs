@@ -82,7 +82,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::analyze::{Parallelism, structure};
+use crate::analyze::{Parallelism, StructureCache};
 use crate::ir::{self, AxisRef, AxisSelector, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 // ── symbolic expressions over carrier slots ──────────────────────────────────
@@ -629,7 +629,7 @@ impl std::hash::Hash for ByAddr {
     }
 }
 
-struct Ctx {
+struct Ctx<'a> {
     slots: Vec<Slot>,
     /// Each leaf (a sub-expression free along the axis) and its free axes.
     /// Leaves are the fold's per-element inputs — and therefore the fusion
@@ -643,16 +643,18 @@ struct Ctx {
     memo: HashMap<(ByAddr, AxisRef), S>,
     memo_log: Vec<(ByAddr, AxisRef)>,
     rules: BTreeSet<&'static str>,
-    /// Memoizes `other_axis_folds` per node — the free-map-vs-contraction check.
-    other_folds: HashMap<(ByAddr, AxisRef), (bool, bool)>,
+    /// Memoizes `other_axis_fold_content` per node — the
+    /// free-map-vs-contraction check.
+    other_folds: HashMap<(ByAddr, AxisRef), FoldContent>,
     /// Local dimension occurrences translated into the root kernel's loop
     /// coordinates. This is compiler metadata only; the graph stays
     /// positional and immutable.
     aliases: HashMap<AxisRef, AxisRef>,
     stream: AxisRef,
+    structures: &'a mut StructureCache,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     /// Resolve the kernel's canonical loop coordinate to an occurrence in
     /// `node`'s output. An axis already below the node passes through as-is;
     /// maps and reductions know how to recurse with such a hidden occurrence.
@@ -962,6 +964,17 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
 /// serial or data-dependent axis, an expression outside the supported
 /// fragment, or a target that never collapses the axis.
 pub fn derive(node: &Node, axis: impl AxisSelector) -> Result<Carrier, Decline> {
+    derive_with_structure_cache(node, axis, &mut StructureCache::default())
+}
+
+/// Derive while reusing structural facts already computed for the same
+/// retained DAG. Compiler passes should use this entry point when they
+/// classify candidates before deriving them.
+pub(crate) fn derive_with_structure_cache(
+    node: &Node,
+    axis: impl AxisSelector,
+    structures: &mut StructureCache,
+) -> Result<Carrier, Decline> {
     let axis = axis
         .resolve_axis(node, "derive")
         .expect("derive axis is absent from the selected node");
@@ -974,6 +987,7 @@ pub fn derive(node: &Node, axis: impl AxisSelector) -> Result<Carrier, Decline> 
         other_folds: HashMap::new(),
         aliases: axis_aliases(node, axis),
         stream: axis,
+        structures,
     };
     let s = go(node, axis, &mut ctx)?;
 
@@ -1015,8 +1029,8 @@ pub fn derive(node: &Node, axis: impl AxisSelector) -> Result<Carrier, Decline> 
     })
 }
 
-/// Classify the folds over axes OTHER than `axis` inside a free-along-`axis`
-/// sub-expression: `(has_plain_reduction, has_contraction)`. A logsumexp's
+/// Classify folds over axes OTHER than `axis` inside a free-along-`axis`
+/// sub-expression. A logsumexp's
 /// `max`/`Σexp` are plain single-tensor reductions; an attention score or a
 /// GEMM is a two-tensor contraction the emitters compute in-body (or cut as a
 /// separate GEMM). A free map worth keeping WHOLE wraps only plain
@@ -1032,11 +1046,28 @@ pub fn derive(node: &Node, axis: impl AxisSelector) -> Result<Carrier, Decline> 
 /// directly on the multiply — an interposed no-op (`x·1`, `x + 0`) would
 /// declassify the contraction, which is `simplify`'s side of the contract:
 /// units are folded away before graphs reach here.
-fn other_axis_folds(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoldContent {
+    None,
+    Plain,
+    Contraction,
+}
+
+impl FoldContent {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Contraction, _) | (_, Self::Contraction) => Self::Contraction,
+            (Self::Plain, _) | (_, Self::Plain) => Self::Plain,
+            _ => Self::None,
+        }
+    }
+}
+
+fn other_axis_fold_content(
     node: &Node,
     axis: AxisRef,
-    cache: &mut HashMap<(ByAddr, AxisRef), (bool, bool)>,
-) -> (bool, bool) {
+    cache: &mut HashMap<(ByAddr, AxisRef), FoldContent>,
+) -> FoldContent {
     // Memoized per node (the streamed axis is fixed for a whole derivation):
     // a DAG-shared subtree is classified once. Unmemoized, this re-walks shared
     // subtrees and is exponential on backward graphs.
@@ -1049,37 +1080,47 @@ fn other_axis_folds(
             if ir::source_axis(src, *dim) != axis
             && matches!(src.as_ref(),
                 NodeKind::Map { op: MapOp::Mul, inputs } if inputs.len() == 2));
-    let result = match node.as_ref() {
-        NodeKind::Reduce { src, dim, .. } | NodeKind::Scan { src, dim, .. } => {
-            let folded = ir::source_axis(src, *dim);
-            let (plain, contr) = other_axis_folds(src, axis, cache);
-            match (folded != axis, is_contraction) {
-                (true, true) => (plain, true),
-                (true, false) => (true, contr),
-                (false, _) => (plain, contr),
+    let result = if is_contraction {
+        // A contraction makes the enclosing free map ineligible regardless
+        // of any other folds below it, so do not traverse its inputs.
+        FoldContent::Contraction
+    } else {
+        match node.as_ref() {
+            NodeKind::Reduce { src, dim, .. } | NodeKind::Scan { src, dim, .. } => {
+                let folded = ir::source_axis(src, *dim);
+                let inner = other_axis_fold_content(src, axis, cache);
+                if folded != axis {
+                    inner.merge(FoldContent::Plain)
+                } else {
+                    inner
+                }
             }
-        }
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => (false, false),
-        NodeKind::Map { inputs, .. } => {
-            let (mut p, mut c) = (false, false);
-            for input in inputs {
-                let input_axis = ir::map_input_axis(node, input, axis);
-                let (p2, c2) = other_axis_folds(input, input_axis, cache);
-                p |= p2;
-                c |= c2;
+            NodeKind::Input { .. }
+            | NodeKind::Const { .. }
+            | NodeKind::Iota { .. }
+            | NodeKind::Coordinate { .. } => FoldContent::None,
+            NodeKind::Map { inputs, .. } => {
+                let mut content = FoldContent::None;
+                for input in inputs {
+                    let input_axis = ir::map_input_axis(node, input, axis);
+                    content = content.merge(other_axis_fold_content(input, input_axis, cache));
+                    if content == FoldContent::Contraction {
+                        break;
+                    }
+                }
+                content
             }
-            (p, c)
-        }
-        NodeKind::Gather { src, index, .. } => {
-            let (p, c) = other_axis_folds(src, axis, cache);
-            let (p2, c2) = other_axis_folds(index, axis, cache);
-            (p || p2, c || c2)
-        }
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-            other_axis_folds(src, axis, cache)
+            NodeKind::Gather { src, index, .. } => {
+                let content = other_axis_fold_content(src, axis, cache);
+                if content == FoldContent::Contraction {
+                    content
+                } else {
+                    content.merge(other_axis_fold_content(index, axis, cache))
+                }
+            }
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+                other_axis_fold_content(src, axis, cache)
+            }
         }
     };
     cache.insert(key, result);
@@ -1088,7 +1129,7 @@ fn other_axis_folds(
 
 /// Stream `node` over `axis`, registering reductions-over-axis as slots.
 /// Memoized per node, so DAG-shared sub-expressions register once.
-fn go(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> {
+fn go(node: &Node, axis: AxisRef, ctx: &mut Ctx<'_>) -> Result<S, Decline> {
     let axis = ctx.local_axis(node, axis);
     let key = (ByAddr(node.clone()), axis);
     if let Some(s) = ctx.memo.get(&key) {
@@ -1100,7 +1141,7 @@ fn go(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> {
     Ok(s)
 }
 
-fn go_uncached(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> {
+fn go_uncached(node: &Node, axis: AxisRef, ctx: &mut Ctx<'_>) -> Result<S, Decline> {
     // A literal lifts to a constant expression, never a leaf.
     if let NodeKind::Const { v } = node.as_ref() {
         return Ok(S::Pe {
@@ -1133,15 +1174,14 @@ fn go_uncached(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> 
     // fold, so each becomes its own kernel and the shared inner reduction (the
     // running max) is duplicated. Kept whole, the combination cuts once and
     // re-derives as a single carrier downstream.
-    let is_free = structure(node, axis).level == Parallelism::Free;
+    let is_free = ctx.structures.classify(node, axis).level == Parallelism::Free;
     let is_map = matches!(node.as_ref(), NodeKind::Map { .. });
     // Keep a free map whole only when it wraps plain reductions and no
     // contraction — logsumexp's `m + log(Σexp)`, yes; `scale·QKᵀ + mask` or
     // `silu(gate)·up`, no (those decompose so the matmul stays in-body / cut).
-    let keep_map_whole = is_map && {
-        let (plain, contraction) = other_axis_folds(node, axis, &mut ctx.other_folds);
-        plain && !contraction
-    };
+    let keep_map_whole = is_free
+        && is_map
+        && other_axis_fold_content(node, axis, &mut ctx.other_folds) == FoldContent::Plain;
     if is_free && (!is_map || keep_map_whole) {
         // The leaf's free axes are its output shape minus the streamed axis.
         let free = ir::axis_refs(node)
@@ -1172,7 +1212,7 @@ fn go_uncached(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> 
             // An elementwise composition the fold can't stream through that
             // is nonetheless FREE along the axis is still a legal per-element
             // input: keep the whole map as a leaf instead of failing.
-            if structure(node, axis).level == Parallelism::Free {
+            if ctx.structures.classify(node, axis).level == Parallelism::Free {
                 ctx.slots.truncate(save.0);
                 ctx.leaves.truncate(save.1);
                 for key in ctx.memo_log.drain(save.2..) {
@@ -1200,7 +1240,7 @@ fn go_uncached(node: &Node, axis: AxisRef, ctx: &mut Ctx) -> Result<S, Decline> 
         // anything not FREE along our axis and not a reduction over it is
         // outside the carrier algebra. Name the classification for the census.
         _ => {
-            let (rule, why) = match structure(node, axis).level {
+            let (rule, why) = match ctx.structures.classify(node, axis).level {
                 Parallelism::Opaque => ("opaque", "data-dependent access along the axis"),
                 _ => (
                     "not-streamed",
@@ -1219,7 +1259,7 @@ fn reduce_op(
     src: &Node,
     m: Monoid,
     axis: AxisRef,
-    ctx: &mut Ctx,
+    ctx: &mut Ctx<'_>,
 ) -> Result<S, Decline> {
     // Generic extremal-key filtering:
     //
@@ -1493,7 +1533,7 @@ fn map_op(
     op: MapOp,
     inputs: &[Node],
     axis: AxisRef,
-    ctx: &mut Ctx,
+    ctx: &mut Ctx<'_>,
 ) -> Result<S, Decline> {
     let input_axes: Vec<AxisRef> = inputs
         .iter()
@@ -1589,7 +1629,7 @@ fn unary(
     x: &Node,
     input_axis: AxisRef,
     decline_axis: AxisRef,
-    ctx: &mut Ctx,
+    ctx: &mut Ctx<'_>,
     f: impl Fn(Expr) -> Expr,
 ) -> Result<S, Decline> {
     let s = go(x, input_axis, ctx)?;
@@ -1623,7 +1663,7 @@ fn binop(
     inputs: &[Node],
     input_axes: &[AxisRef],
     decline_axis: AxisRef,
-    ctx: &mut Ctx,
+    ctx: &mut Ctx<'_>,
 ) -> Result<S, Decline> {
     let a = go(&inputs[0], input_axes[0], ctx)?;
     let b = go(&inputs[1], input_axes[1], ctx)?;

@@ -31,9 +31,9 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::analyze::{Parallelism, structure};
+use crate::analyze::{Parallelism, StructureCache};
 use crate::cost::DeviceProfile;
-use crate::derive::{Carrier, Decline, SlotKind, derive, items_of};
+use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
     self, AxisRef, Canonicalizer, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
@@ -158,6 +158,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         keepalive: Vec::new(),
         parents,
         canon,
+        structures: StructureCache::default(),
     };
     let mut outputs = Vec::new();
     for (r, name) in &roots {
@@ -407,6 +408,10 @@ struct Partitioner<'a> {
     /// cut graphs) goes back through it, so a rebuilt structural twin IS the
     /// original node and `done` keeps deduplicating across consumers.
     canon: Canonicalizer,
+    /// Shared across the whole retained DAG. Partitioning asks about many
+    /// nodes and dimensions; rebuilding this memo table per query is
+    /// quadratic on deep residual graphs.
+    structures: StructureCache,
 }
 
 /// Count graph edges into each node (a DAG walk; every edge counts).
@@ -842,6 +847,11 @@ impl Partitioner<'_> {
                     self.leaf_cuts(input, &map_input_axes(node, input, axes), out);
                 }
             }
+            // An indexed read shared by multiple paths is real reusable work:
+            // materialize it once. Keeping it inline both repeats the load and
+            // makes planning price the gather's whole backing tensor as a
+            // resident input instead of the selected rows.
+            NodeKind::Gather { .. } if self.shared(node) => push(node, out),
             NodeKind::Gather { src, index, dim } => {
                 let gathered = ir::source_axis(src, *dim);
                 self.leaf_cuts(src, &stream_below_gather(axes, index, gathered), out);
@@ -930,8 +940,8 @@ impl Partitioner<'_> {
     /// arithmetic that must stay in the kernel) to place the cut as deep as
     /// possible; anything shared, already materialized, or fold-bearing is
     /// cut whole so other consumers can reuse it.
-    fn entanglers(&self, node: &Node, axis: AxisRef, out: &mut Vec<Node>) {
-        if structure(node, axis).level == Parallelism::Free {
+    fn entanglers(&mut self, node: &Node, axis: AxisRef, out: &mut Vec<Node>) {
+        if self.structures.classify(node, axis).level == Parallelism::Free {
             return;
         }
         let private = !self.shared(node) && !self.done.contains_key(&Rc::as_ptr(node));
@@ -998,14 +1008,14 @@ impl Partitioner<'_> {
     fn best_fold(&mut self, node: &Node) -> Option<(AxisRef, Carrier)> {
         let live = all_axis_refs(&self.splice(node, true));
         let mut best: Option<(AxisRef, Carrier, f64)> = None;
-        for axis in all_axis_refs(node) {
+        for axis in nearest_fold_axes(node) {
             if !live.contains(&axis) {
                 continue; // collapsed inside a done producer — read it instead
             }
-            if structure(node, axis).level != Parallelism::Monoidal {
+            if self.structures.classify(node, axis).level != Parallelism::Monoidal {
                 continue;
             }
-            let c = match derive(node, axis) {
+            let c = match derive_with_structure_cache(node, axis, &mut self.structures) {
                 Ok(c) => c,
                 Err(d) => {
                     self.declines.push(d);
@@ -1047,6 +1057,10 @@ impl Partitioner<'_> {
             .flat_map(|(i, _)| items_of(&carrier.into[i]))
             .collect();
 
+        // Carrier leaves are the fusion boundary. Resolve the stream down to
+        // those leaves once, but never descend into their producer history.
+        let stream_provenance = stream_provenance(node, &[axis], &carrier.leaves);
+
         // Collect every cut first, then substitute in ONE rebuild pass — the
         // targets are pointers into the original graph, and any rebuild
         // invalidates them for a second pass.
@@ -1057,7 +1071,10 @@ impl Partitioner<'_> {
             // A carrier's leaf list intentionally omits structural nodes, so
             // its flat alias table cannot represent a split followed by a
             // flatten. Walking the path preserves that affine provenance.
-            let local_axes = stream_axes_at(node, leaf, &[axis]);
+            let local_axes = stream_provenance
+                .get(&Rc::as_ptr(leaf))
+                .cloned()
+                .unwrap_or_default();
             let local_axes = if local_axes.is_empty() {
                 vec![axis]
             } else {
@@ -1141,7 +1158,7 @@ impl Partitioner<'_> {
         let cut_axis = relocate_axis(node, &cut_graph, axis, &carrier.aliases).unwrap_or(axis);
 
         // Re-derive and plan on the graph the kernel will actually see.
-        let c2 = match derive(&cut_graph, cut_axis) {
+        let c2 = match derive_with_structure_cache(&cut_graph, cut_axis, &mut self.structures) {
             Ok(c) => c,
             Err(why) => {
                 let reason = why.to_string();
@@ -1469,63 +1486,153 @@ fn expensive_map_below_views(node: &Node) -> Option<Node> {
     }
 }
 
+/// Reduction occurrences on the nearest fold frontier beneath `node`.
+/// A fold behind another fold cannot be the producer fused into this stage;
+/// it is considered when recursive partitioning reaches that producer.
+/// Sibling folds at the same depth are all retained so generic product
+/// carriers can still combine them.
+fn nearest_fold_axes(node: &Node) -> Vec<AxisRef> {
+    fn walk(
+        node: &Node,
+        depth: usize,
+        nearest: &mut usize,
+        axes: &mut Vec<AxisRef>,
+        seen: &mut HashMap<*const NodeKind, usize>,
+    ) {
+        if depth > *nearest
+            || seen
+                .get(&Rc::as_ptr(node))
+                .is_some_and(|previous| *previous <= depth)
+        {
+            return;
+        }
+        seen.insert(Rc::as_ptr(node), depth);
+        match node.as_ref() {
+            NodeKind::Reduce { src, dim, .. } | NodeKind::Scan { src, dim, .. } => {
+                let axis = ir::source_axis(src, *dim);
+                if depth < *nearest {
+                    *nearest = depth;
+                    axes.clear();
+                }
+                if !axes.contains(&axis) {
+                    axes.push(axis);
+                }
+            }
+            NodeKind::Map { inputs, .. } => {
+                for input in inputs {
+                    walk(input, depth + 1, nearest, axes, seen);
+                }
+            }
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+                walk(src, depth + 1, nearest, axes, seen)
+            }
+            NodeKind::Input { .. }
+            | NodeKind::Const { .. }
+            | NodeKind::Iota { .. }
+            | NodeKind::Coordinate { .. }
+            | NodeKind::Gather { .. } => {}
+        }
+    }
+
+    let mut nearest = usize::MAX;
+    let mut axes = Vec::new();
+    walk(node, 0, &mut nearest, &mut axes, &mut HashMap::new());
+    axes
+}
+
 fn map_input_axes(node: &Node, input: &Node, axes: &[AxisRef]) -> Vec<AxisRef> {
     axes.iter()
         .map(|&axis| ir::map_input_axis(node, input, axis))
         .collect()
 }
 
-/// Translate a root stream to the local occurrences at `target`, following
-/// every graph edge that reaches that exact node. This retains structural
-/// provenance that is absent from a carrier's flattened leaf list.
-fn stream_axes_at(root: &Node, target: &Node, axes: &[AxisRef]) -> Vec<AxisRef> {
-    fn walk(node: &Node, target: &Node, axes: &[AxisRef], found: &mut Vec<AxisRef>) {
-        if Rc::ptr_eq(node, target) {
-            for &axis in axes {
-                if !found.contains(&axis) {
-                    found.push(axis);
-                }
+/// Translate a root stream to local occurrences at the requested leaves. This
+/// retains structural provenance that is absent from a carrier's flattened
+/// leaf list without walking into the producer history below the fusion
+/// boundary.
+fn stream_provenance(
+    root: &Node,
+    axes: &[AxisRef],
+    leaves: &[Node],
+) -> HashMap<*const NodeKind, Vec<AxisRef>> {
+    fn walk(
+        node: &Node,
+        axes: &[AxisRef],
+        leaves: &HashSet<*const NodeKind>,
+        local_axes: &mut HashMap<*const NodeKind, Vec<AxisRef>>,
+        seen: &mut HashSet<(*const NodeKind, Vec<AxisRef>)>,
+        resolver: &mut ir::Resolver,
+    ) {
+        let state = (Rc::as_ptr(node), axes.to_vec());
+        if !seen.insert(state) {
+            return;
+        }
+        let local = local_axes.entry(Rc::as_ptr(node)).or_default();
+        for &axis in axes {
+            if !local.contains(&axis) {
+                local.push(axis);
             }
+        }
+        if leaves.contains(&Rc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
             NodeKind::Coordinate { src, .. }
             | NodeKind::Reduce { src, .. }
-            | NodeKind::Scan { src, .. } => walk(src, target, axes, found),
+            | NodeKind::Scan { src, .. } => walk(src, axes, leaves, local_axes, seen, resolver),
             NodeKind::Map { inputs, .. } => {
                 for input in inputs {
-                    walk(input, target, &map_input_axes(node, input, axes), found);
+                    let input_axes = axes
+                        .iter()
+                        .map(|&axis| resolver.map_input_axis(node, input, axis))
+                        .collect::<Vec<_>>();
+                    walk(input, &input_axes, leaves, local_axes, seen, resolver);
                 }
             }
             NodeKind::Gather { src, index, dim } => {
-                let gathered = ir::source_axis(src, *dim);
+                let gathered = resolver.source_axis(src, *dim);
                 walk(
                     src,
-                    target,
                     &stream_below_gather(axes, index, gathered),
-                    found,
+                    leaves,
+                    local_axes,
+                    seen,
+                    resolver,
                 );
-                walk(index, target, axes, found);
+                walk(index, axes, leaves, local_axes, seen, resolver);
             }
             NodeKind::View { src, .. } => walk(
                 src,
-                target,
-                &stream_below_view(axes, &ir::view_groups(node)),
-                found,
+                &stream_below_view(axes, &resolver.view_groups(node)),
+                leaves,
+                local_axes,
+                seen,
+                resolver,
             ),
             NodeKind::Reindex { src, .. } => walk(
                 src,
-                target,
-                &stream_below_reindex(axes, &ir::resolved_reindex(node)),
-                found,
+                &stream_below_reindex(axes, &resolver.resolved_reindex(node)),
+                leaves,
+                local_axes,
+                seen,
+                resolver,
             ),
         }
     }
 
-    let mut found = Vec::new();
-    walk(root, target, axes, &mut found);
-    found
+    let leaves = leaves.iter().map(Rc::as_ptr).collect();
+    let mut local_axes = HashMap::new();
+    let mut seen = HashSet::new();
+    walk(
+        root,
+        axes,
+        &leaves,
+        &mut local_axes,
+        &mut seen,
+        &mut ir::Resolver::default(),
+    );
+    local_axes
 }
 
 /// Translate a streamed axis set DOWN through one structural boundary — the
@@ -2144,6 +2251,43 @@ mod tests {
         Monoid::Add
     }
 
+    #[test]
+    fn stream_provenance_visits_a_shared_dag_once_per_axis_state() {
+        let n = axis("n", 8);
+        let source = input("X", &[n], Dtype::F32);
+        let mut diamond = source.clone();
+        for _ in 0..40 {
+            diamond = map(MapOp::Add, vec![diamond.clone(), diamond]);
+        }
+
+        let stream = source_axis(&diamond, 0);
+        assert_eq!(
+            stream_provenance(&diamond, &[stream], std::slice::from_ref(&source))
+                [&Rc::as_ptr(&source)],
+            vec![stream]
+        );
+        assert_eq!(input_dtypes(&diamond), vec![("X", Dtype::F32)]);
+    }
+
+    #[test]
+    fn fold_candidates_stop_at_the_nearest_reduction_frontier() {
+        let old_axis = axis("old", 8);
+        let new_axis = axis("new", 8);
+        let old = input("old", &[old_axis], Dtype::F32);
+        let old_stream = source_axis(&old, 0);
+        let mut history = reduce(old, 0usize, Monoid::Add);
+        for _ in 0..40 {
+            history = map(MapOp::Add, vec![history, konst(1.0)]);
+        }
+        let new = input("new", &[new_axis], Dtype::F32);
+        let new_stream = source_axis(&new, 0);
+        let current = reduce(new, 0usize, Monoid::Add);
+        let root = map(MapOp::Add, vec![history, current]);
+
+        assert_eq!(nearest_fold_axes(&root), vec![new_stream]);
+        assert_ne!(old_stream, new_stream);
+    }
+
     // Canonical form is a CONTRACT that `simplify` establishes and this test
     // holds (`derive::other_axis_folds`'s doc): the contraction matcher is
     // syntactic, so a scaled score spelled with the scale INSIDE the reduce —
@@ -2382,6 +2526,86 @@ mod tests {
         };
         assert_eq!(spec.carrier.slots, 2, "dot product + Σx²");
         assert!(spec.carrier.rules.contains(&"defer-div"));
+    }
+
+    #[test]
+    fn gathered_bf16_rmsnorm_projection_is_feasible_on_metal() {
+        let (token, vocab, hidden, projected) = (
+            axis("token", 1),
+            axis("vocab", 128_256),
+            axis("hidden", 2048),
+            axis("projected", 256),
+        );
+        let embedding = input("E", &[vocab, hidden], Dtype::BF16);
+        let tokens = input("tokens", &[token], Dtype::F32);
+        let x = gather(embedding, tokens, 0usize);
+        let sum_square = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
+        let mean_square = map(
+            MapOp::Mul,
+            vec![sum_square.clone(), konst(1.0 / hidden.extent() as f64)],
+        );
+        let denominator = map(
+            MapOp::Sqrt,
+            vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])],
+        );
+        let norm = map(
+            MapOp::Div,
+            vec![
+                map(MapOp::Mul, vec![x, input("G", &[hidden], Dtype::BF16)]),
+                unsqueeze(denominator, 1usize),
+            ],
+        );
+        let projection = matmul(
+            norm,
+            transpose(
+                input("W", &[projected, hidden], Dtype::BF16),
+                0usize,
+                1usize,
+            ),
+        );
+
+        let sum_sched = partition(&sum_square, &DeviceProfile::m1_pro());
+        assert!(
+            sum_sched
+                .stages
+                .iter()
+                .all(|stage| !matches!(stage, Stage::Infeasible { .. })),
+            "{}",
+            sum_sched.render()
+        );
+
+        let sched = partition(&projection, &DeviceProfile::m1_pro());
+        assert!(
+            sched
+                .stages
+                .iter()
+                .all(|stage| !matches!(stage, Stage::Infeasible { .. })),
+            "{}",
+            sched.render()
+        );
+    }
+
+    #[test]
+    fn gqa_attention_lowers_to_metal_with_positional_head_axes() {
+        let (query_heads, kv_heads, query_sequence, cache_sequence, head_dim) = (
+            axis("query_heads", 32),
+            axis("kv_heads", 8),
+            axis("query_sequence", 1),
+            axis("cache_sequence", 7),
+            axis("head_dim", 64),
+        );
+        let attention = scaled_dot_product_attention(
+            input("q", &[query_heads, query_sequence, head_dim], Dtype::F32),
+            input("k", &[kv_heads, cache_sequence, head_dim], Dtype::F32),
+            input("v", &[kv_heads, cache_sequence, head_dim], Dtype::F32),
+            None,
+            0.0,
+            false,
+            None,
+            true,
+        );
+        let sched = partition(&attention, &DeviceProfile::m1_pro());
+        crate::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &sched);
     }
 
     // The SAME norm-into-GEMM fusion at a 200k-vocab head is legal but

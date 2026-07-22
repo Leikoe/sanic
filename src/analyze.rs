@@ -67,28 +67,34 @@ pub fn structure(node: &Node, axis: impl AxisSelector) -> Structure {
     let Some(axis) = axis.resolve_axis(node, "structure") else {
         return Structure::FREE;
     };
-    structure_memo(node, axis, &mut std::collections::HashMap::new())
+    StructureCache::default().classify(node, axis)
 }
 
-fn structure_memo(
-    node: &Node,
-    axis: AxisRef,
-    cache: &mut std::collections::HashMap<(*const NodeKind, AxisRef), Structure>,
-) -> Structure {
+/// Reusable per-graph classification cache for compiler passes that query
+/// many `(node, dimension)` pairs from the same retained DAG.
+#[derive(Default)]
+pub(crate) struct StructureCache {
+    entries: std::collections::HashMap<(*const NodeKind, AxisRef), Structure>,
+    resolver: ir::Resolver,
+}
+
+impl StructureCache {
+    pub(crate) fn classify(&mut self, node: &Node, axis: AxisRef) -> Structure {
+        structure_memo(node, axis, self)
+    }
+}
+
+fn structure_memo(node: &Node, axis: AxisRef, cache: &mut StructureCache) -> Structure {
     let key = (std::rc::Rc::as_ptr(node), axis);
-    if let Some(s) = cache.get(&key) {
+    if let Some(s) = cache.entries.get(&key) {
         return *s;
     }
     let s = structure_uncached(node, axis, cache);
-    cache.insert(key, s);
+    cache.entries.insert(key, s);
     s
 }
 
-fn structure_uncached(
-    node: &Node,
-    axis: AxisRef,
-    cache: &mut std::collections::HashMap<(*const NodeKind, AxisRef), Structure>,
-) -> Structure {
+fn structure_uncached(node: &Node, axis: AxisRef, cache: &mut StructureCache) -> Structure {
     match node.as_ref() {
         // Raw data, literals and index values depend on no axis (an Iota
         // varies *with* its axis, but elementwise — no cross-element
@@ -101,15 +107,15 @@ fn structure_uncached(
         // Elementwise: pass the joined input structure through. Linearity
         // survives only if the op itself preserves it.
         NodeKind::Map { op, inputs } => {
-            let up =
-                join_all(inputs.iter().map(|input| {
-                    structure_memo(input, ir::map_input_axis(node, input, axis), cache)
-                }));
+            let up = join_all(inputs.iter().map(|input| {
+                let input_axis = cache.resolver.map_input_axis(node, input, axis);
+                structure_memo(input, input_axis, cache)
+            }));
             Structure::at(up.level, up.linear && op.preserves_linear())
         }
 
         NodeKind::Reduce { src, dim, op } => {
-            let red = ir::source_axis(src, *dim);
+            let red = cache.resolver.source_axis(src, *dim);
             let up = structure_memo(src, axis, cache);
             if red != axis {
                 // Reducing a different axis says nothing about this one.
@@ -123,7 +129,7 @@ fn structure_uncached(
         }
 
         NodeKind::Scan { src, dim, op } => {
-            let scanned = ir::source_axis(src, *dim);
+            let scanned = cache.resolver.source_axis(src, *dim);
             if scanned != axis {
                 structure_memo(src, axis, cache)
             } else {
@@ -133,7 +139,7 @@ fn structure_uncached(
         }
 
         NodeKind::Gather { src, dim, .. } => {
-            let gathered = ir::source_axis(src, *dim);
+            let gathered = cache.resolver.source_axis(src, *dim);
             let up = structure_memo(src, axis, cache);
             if gathered == axis {
                 up.join(Structure::at(Parallelism::Opaque, false))
@@ -148,7 +154,7 @@ fn structure_uncached(
         // that no longer exists — FREE, like any absent axis); everything
         // else passes through.
         NodeKind::View { src, .. } => {
-            let groups = ir::view_groups(node);
+            let groups = cache.resolver.view_groups(node);
             if let Some((members, _)) = groups.iter().find(|(_, to)| *to == axis) {
                 return join_all(members.iter().map(|m| structure_memo(src, *m, cache)));
             }
@@ -164,7 +170,7 @@ fn structure_uncached(
         // dependence, and a padded 0.0 is a constant); a mapped source axis
         // is out of scope above the node; the rest passes through.
         NodeKind::Reindex { src, .. } => {
-            let map = ir::resolved_reindex(node);
+            let map = cache.resolver.resolved_reindex(node);
             let driving: Vec<AxisRef> = map
                 .iter()
                 .filter(|(_, terms, _)| terms.iter().any(|(_, a)| *a == axis))
@@ -212,18 +218,21 @@ pub struct Report {
 
 /// Classify the given axes and derive an accumulator wherever one folds.
 pub fn analyze<A: AxisSelector>(node: &Node, axes: &[A]) -> Report {
+    let mut structures = StructureCache::default();
     let axes = axes
         .iter()
         .map(|&selector| {
             let a = selector
                 .resolve_axis(node, "analyze")
                 .expect("analyze axis is absent from the selected node");
-            let structure = structure(node, a);
+            let structure = structures.classify(node, a);
             let (carrier, decline) = match structure.level {
-                Parallelism::Monoidal => match derive::derive(node, a) {
-                    Ok(c) => (Some(c), None),
-                    Err(d) => (None, Some(d)),
-                },
+                Parallelism::Monoidal => {
+                    match derive::derive_with_structure_cache(node, a, &mut structures) {
+                        Ok(c) => (Some(c), None),
+                        Err(d) => (None, Some(d)),
+                    }
+                }
                 _ => (None, None),
             };
             AxisReport {

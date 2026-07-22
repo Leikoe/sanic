@@ -71,6 +71,10 @@ impl Gen {
     }
 
     fn coordinate<'a>(&self, coord: &'a HashMap<AxisRef, String>, axis: AxisRef) -> &'a String {
+        static ZERO: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "0".to_string());
+        if axis.extent == ir::Extent::Static(1) {
+            return &ZERO;
+        }
         if let Some(value) = coord.get(&axis) {
             return value;
         }
@@ -98,8 +102,10 @@ impl Gen {
         if axes.is_empty() {
             return "0".into();
         }
-        axes.iter()
+        let terms = axes
+            .iter()
             .enumerate()
+            .filter(|(_, axis)| axis.extent() != 1)
             .map(|(index, &axis)| {
                 let stride: usize = axes[index + 1..].iter().map(|axis| axis.extent()).product();
                 let value = self.coordinate(coord, axis);
@@ -109,8 +115,12 @@ impl Gen {
                     format!("{value}*{stride}")
                 }
             })
-            .collect::<Vec<_>>()
-            .join(" + ")
+            .collect::<Vec<_>>();
+        if terms.is_empty() {
+            "0".into()
+        } else {
+            terms.join(" + ")
+        }
     }
 }
 impl Default for Gen {
@@ -282,10 +292,9 @@ pub fn value<L: Lang>(
                     let mut input_coord = coord.clone();
                     for output_axis in ir::axis_refs(node) {
                         let input_axis = ir::map_input_axis(node, input, output_axis);
-                        if input_axis != output_axis
-                            && let Some(index) = coord.get(&output_axis)
-                        {
-                            input_coord.insert(input_axis, index.clone());
+                        if input_axis != output_axis {
+                            input_coord
+                                .insert(input_axis, g.coordinate(coord, output_axis).clone());
                         }
                     }
                     value(lang, input, &input_coord, g, out)
@@ -531,4 +540,20 @@ pub fn grid_of(node: &Node) -> (Vec<AxisRef>, usize) {
             .product::<usize>()
             .max(1),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{axis, axis_refs, input};
+
+    #[test]
+    fn singleton_storage_axes_need_no_loop_coordinate() {
+        let node = input("x", &[axis("singleton", 1), axis("hidden", 8)], Dtype::F32);
+        let axes = axis_refs(&node);
+        let coord = HashMap::from([(axes[1], "h".to_string())]);
+        assert_eq!(Gen::new().coordinate(&HashMap::new(), axes[0]), "0");
+        assert_eq!(Gen::new().buffer_offset(&axes, &coord), "h");
+        assert_eq!(Gen::new().buffer_offset(&axes[..1], &HashMap::new()), "0");
+    }
 }

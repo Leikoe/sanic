@@ -270,7 +270,97 @@ fn shape_rc(
 /// This is the compiler's axis-resolution pass in lazy form. It annotates the
 /// existing positional DAG; it does not rebuild it into another IR.
 pub fn axis_refs(node: &NodeRef) -> Vec<AxisRef> {
-    (*axis_refs_rc(node, &mut std::collections::HashMap::new())).clone()
+    Resolver::default().axes(node)
+}
+
+/// Cached positional resolution for compiler passes over one retained DAG.
+/// This is pass metadata only; nodes remain the sole IR.
+#[derive(Default)]
+pub(crate) struct Resolver {
+    shapes: std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
+    axes: std::collections::HashMap<*const Node, Rc<Vec<AxisRef>>>,
+}
+
+impl Resolver {
+    pub(crate) fn axes(&mut self, node: &NodeRef) -> Vec<AxisRef> {
+        (*axis_refs_rc(node, &mut self.axes, &mut self.shapes)).clone()
+    }
+
+    pub(crate) fn source_axis(&mut self, src: &NodeRef, dim: usize) -> AxisRef {
+        self.axes(src)[dim]
+    }
+
+    pub(crate) fn map_input_axis(
+        &mut self,
+        map_node: &NodeRef,
+        input: &NodeRef,
+        axis: AxisRef,
+    ) -> AxisRef {
+        let output_axes = self.axes(map_node);
+        let Some(output_dim) = output_axes.iter().position(|candidate| *candidate == axis) else {
+            return axis;
+        };
+        let output_shape = shape_memo(map_node, &mut self.shapes);
+        let input_shape = shape_memo(input, &mut self.shapes);
+        let Some(input_dim) = output_dim.checked_sub(output_shape.len() - input_shape.len()) else {
+            return axis;
+        };
+        if input_shape[input_dim].extent == Extent::Static(1)
+            && output_shape[output_dim].extent != Extent::Static(1)
+        {
+            axis
+        } else {
+            self.axes(input)[input_dim]
+        }
+    }
+
+    pub(crate) fn view_groups(&mut self, node: &NodeRef) -> Vec<(Vec<AxisRef>, AxisRef)> {
+        let Node::View { src, dims } = node.as_ref() else {
+            return Vec::new();
+        };
+        let source = self.axes(src);
+        let output = self.axes(node);
+        dims.iter()
+            .enumerate()
+            .filter(|(output_dim, dim)| {
+                !dim.sources.is_empty()
+                    && !matches!(dim.sources.as_slice(), [source_dim]
+                        if source[*source_dim] == output[*output_dim])
+            })
+            .map(|(output_dim, dim)| {
+                (
+                    dim.sources
+                        .iter()
+                        .map(|&source_dim| source[source_dim])
+                        .collect(),
+                    output[output_dim],
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn resolved_reindex(
+        &mut self,
+        node: &NodeRef,
+    ) -> Vec<(AxisRef, Vec<(i64, AxisRef)>, i64)> {
+        let Node::Reindex { src, map, .. } = node.as_ref() else {
+            return Vec::new();
+        };
+        let source = self.axes(src);
+        let output = self.axes(node);
+        map.iter()
+            .map(|(source_dim, terms, offset)| {
+                (
+                    source[*source_dim],
+                    terms
+                        .iter()
+                        .map(|(coefficient, output_dim)| (*coefficient, output[*output_dim]))
+                        .collect(),
+                    *offset,
+                )
+            })
+            .collect()
+    }
 }
 
 fn own_axis(node: &NodeRef, dim: usize, descriptor: Axis) -> AxisRef {
@@ -285,13 +375,14 @@ fn own_axis(node: &NodeRef, dim: usize, descriptor: Axis) -> AxisRef {
 fn axis_refs_rc(
     node: &NodeRef,
     cache: &mut std::collections::HashMap<*const Node, Rc<Vec<AxisRef>>>,
+    shape_cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
 ) -> Rc<Vec<AxisRef>> {
     let key = Rc::as_ptr(node);
     if let Some(axes) = cache.get(&key) {
         return axes.clone();
     }
 
-    let descriptors = node.shape();
+    let descriptors = shape_memo(node, shape_cache);
     let axes = match node.as_ref() {
         Node::Input { shape, .. } => shape
             .iter()
@@ -301,20 +392,20 @@ fn axis_refs_rc(
             .collect(),
         Node::Const { .. } => Vec::new(),
         Node::Iota { axis } => vec![own_axis(node, 0, *axis)],
-        Node::Coordinate { src, .. } => (*axis_refs_rc(src, cache)).clone(),
+        Node::Coordinate { src, .. } => (*axis_refs_rc(src, cache, shape_cache)).clone(),
         Node::Map { inputs, .. } => {
             let rank = descriptors.len();
             (0..rank)
                 .map(|output_dim| {
                     let mut fallback = None;
                     for input in inputs {
-                        let input_shape = input.shape();
+                        let input_shape = shape_memo(input, shape_cache);
                         let Some(input_dim) =
                             output_dim.checked_sub(rank.saturating_sub(input_shape.len()))
                         else {
                             continue;
                         };
-                        let candidate = axis_refs_rc(input, cache)[input_dim];
+                        let candidate = axis_refs_rc(input, cache, shape_cache)[input_dim];
                         fallback = fallback.or(Some(candidate));
                         if input_shape[input_dim].extent != Extent::Static(1) {
                             return candidate;
@@ -325,19 +416,22 @@ fn axis_refs_rc(
                 .collect()
         }
         Node::Reduce { src, dim, .. } => {
-            let mut axes = (*axis_refs_rc(src, cache)).clone();
+            let mut axes = (*axis_refs_rc(src, cache, shape_cache)).clone();
             axes.remove(*dim);
             axes
         }
-        Node::Scan { src, .. } => (*axis_refs_rc(src, cache)).clone(),
+        Node::Scan { src, .. } => (*axis_refs_rc(src, cache, shape_cache)).clone(),
         Node::Gather { src, index, dim } => {
-            let mut axes = (*axis_refs_rc(src, cache)).clone();
-            axes.splice(*dim..=*dim, axis_refs_rc(index, cache).iter().copied());
+            let mut axes = (*axis_refs_rc(src, cache, shape_cache)).clone();
+            axes.splice(
+                *dim..=*dim,
+                axis_refs_rc(index, cache, shape_cache).iter().copied(),
+            );
             axes
         }
         Node::View { src, dims } => {
-            let source_axes = axis_refs_rc(src, cache);
-            let source_shape = src.shape();
+            let source_axes = axis_refs_rc(src, cache, shape_cache);
+            let source_shape = shape_memo(src, shape_cache);
             dims.iter()
                 .enumerate()
                 .map(|(output_dim, view_dim)| match view_dim.sources.as_slice() {
@@ -362,76 +456,24 @@ fn axis_refs_rc(
 
 /// Axis consumed by a reduction, scan, or gather.
 pub fn source_axis(src: &NodeRef, dim: usize) -> AxisRef {
-    axis_refs(src)[dim]
+    Resolver::default().source_axis(src, dim)
 }
 
 /// Translate one map-output axis to the corresponding occurrence in `input`.
 /// An axis consumed inside an input is not an output dimension of the map; in
 /// that case it passes through unchanged so recursive analysis can find it.
 pub fn map_input_axis(map_node: &NodeRef, input: &NodeRef, axis: AxisRef) -> AxisRef {
-    let output_axes = axis_refs(map_node);
-    let Some(output_dim) = output_axes.iter().position(|candidate| *candidate == axis) else {
-        return axis;
-    };
-    let output_shape = map_node.shape();
-    let input_shape = input.shape();
-    let Some(input_dim) = output_dim.checked_sub(output_shape.len() - input_shape.len()) else {
-        return axis;
-    };
-    if input_shape[input_dim].extent == Extent::Static(1)
-        && output_shape[output_dim].extent != Extent::Static(1)
-    {
-        axis
-    } else {
-        axis_refs(input)[input_dim]
-    }
+    Resolver::default().map_input_axis(map_node, input, axis)
 }
 
 /// Flatten/view relations in resolved axis coordinates.
 pub fn view_groups(node: &NodeRef) -> Vec<(Vec<AxisRef>, AxisRef)> {
-    let Node::View { src, dims } = node.as_ref() else {
-        return Vec::new();
-    };
-    let source = axis_refs(src);
-    let output = axis_refs(node);
-    dims.iter()
-        .enumerate()
-        .filter(|(output_dim, dim)| {
-            !dim.sources.is_empty()
-                && !matches!(dim.sources.as_slice(), [source_dim]
-                    if source[*source_dim] == output[*output_dim])
-        })
-        .map(|(output_dim, dim)| {
-            (
-                dim.sources
-                    .iter()
-                    .map(|&source_dim| source[source_dim])
-                    .collect(),
-                output[output_dim],
-            )
-        })
-        .collect()
+    Resolver::default().view_groups(node)
 }
 
 /// Positional affine reindexing expressed in resolved axis coordinates.
 pub fn resolved_reindex(node: &NodeRef) -> Vec<(AxisRef, Vec<(i64, AxisRef)>, i64)> {
-    let Node::Reindex { src, map, .. } = node.as_ref() else {
-        return Vec::new();
-    };
-    let source = axis_refs(src);
-    let output = axis_refs(node);
-    map.iter()
-        .map(|(source_dim, terms, offset)| {
-            (
-                source[*source_dim],
-                terms
-                    .iter()
-                    .map(|(coefficient, output_dim)| (*coefficient, output[*output_dim]))
-                    .collect(),
-                *offset,
-            )
-        })
-        .collect()
+    Resolver::default().resolved_reindex(node)
 }
 
 /// Every logical dimension occurrence reachable from `node`, in first-seen
@@ -952,31 +994,40 @@ pub fn input_axes(node: &NodeRef) -> Vec<(&'static str, Vec<AxisRef>)> {
 }
 
 pub fn input_dtypes(node: &NodeRef) -> Vec<(&'static str, Dtype)> {
-    let mut output = Vec::new();
-    for (name, _) in input_axes(node) {
-        if output.iter().any(|(existing, _)| *existing == name) {
-            continue;
+    fn walk(
+        node: &NodeRef,
+        output: &mut Vec<(&'static str, Dtype)>,
+        seen: &mut std::collections::HashSet<*const Node>,
+    ) {
+        if !seen.insert(Rc::as_ptr(node)) {
+            return;
         }
-        fn find(node: &NodeRef, wanted: &str) -> Option<Dtype> {
-            match node.as_ref() {
-                Node::Input { name, dtype, .. } if *name == wanted => Some(*dtype),
-                Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => None,
-                Node::Coordinate { src, .. }
-                | Node::Reduce { src, .. }
-                | Node::Scan { src, .. }
-                | Node::View { src, .. }
-                | Node::Reindex { src, .. } => find(src, wanted),
-                Node::Map { inputs, .. } => inputs.iter().find_map(|input| find(input, wanted)),
-                Node::Gather { src, index, .. } => {
-                    find(src, wanted).or_else(|| find(index, wanted))
+        match node.as_ref() {
+            Node::Input { name, dtype, .. } => {
+                if !output.iter().any(|(existing, _)| existing == name) {
+                    output.push((*name, *dtype));
                 }
             }
+            Node::Const { .. } | Node::Iota { .. } => {}
+            Node::Coordinate { src, .. }
+            | Node::Reduce { src, .. }
+            | Node::Scan { src, .. }
+            | Node::View { src, .. }
+            | Node::Reindex { src, .. } => walk(src, output, seen),
+            Node::Map { inputs, .. } => {
+                for input in inputs {
+                    walk(input, output, seen);
+                }
+            }
+            Node::Gather { src, index, .. } => {
+                walk(src, output, seen);
+                walk(index, output, seen);
+            }
         }
-        output.push((
-            name,
-            find(node, name).expect("input disappeared during traversal"),
-        ));
     }
+
+    let mut output = Vec::new();
+    walk(node, &mut output, &mut std::collections::HashSet::new());
     output
 }
 

@@ -202,18 +202,17 @@ fn full_transformer_block_schedule_executes_to_reference() {
     assert_close(&executed, &reference);
 
     // The decline census (CRITIQUE.md §2.2): the declines THIS workload hit,
-    // not the syllabus's. Printed for inspection; the assertions pin that
-    // every bucket is in the deriver's stable rule vocabulary, so a new kind
-    // of decline showing up on a transformer is a visible event, not noise.
+    // not the syllabus's. A reduction hidden behind the nearest reduction
+    // frontier is a producer for a later stage, not a candidate for this one;
+    // this transformer therefore reaches no genuine derivation declines.
     let census = sched.decline_census();
     println!("{census}");
     let mut buckets = std::collections::BTreeMap::new();
     for decline in &sched.declines {
         *buckets.entry(decline.rule).or_insert(0) += 1;
     }
-    assert_eq!(
-        buckets,
-        [("not-streamed", 25)].into_iter().collect(),
-        "a transformer decline bucket changed; inspect the census above"
+    assert!(
+        buckets.is_empty(),
+        "a transformer decline bucket appeared; inspect the census above"
     );
 }
