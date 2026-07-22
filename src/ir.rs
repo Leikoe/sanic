@@ -442,12 +442,35 @@ fn axis_refs_rc(
                 })
                 .collect()
         }
-        Node::Reindex { shape, .. } => shape
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(dim, axis)| own_axis(node, dim, axis))
-            .collect(),
+        Node::Reindex {
+            src, shape, map, ..
+        } => {
+            let source_axes = axis_refs_rc(src, cache, shape_cache);
+            let source_shape = shape_memo(src, shape_cache);
+            shape
+                .iter()
+                .enumerate()
+                .map(|(output_dim, axis)| {
+                    // A dimension the reindex does not act on — exactly one
+                    // source dimension reads it, with coefficient 1, offset 0
+                    // and an unchanged descriptor — keeps its identity, the
+                    // same rule the View arm applies to 1:1 dimensions. Only
+                    // transformed dimensions get an occurrence of their own.
+                    let mut readers = map
+                        .iter()
+                        .filter(|(_, terms, _)| terms.iter().any(|(_, dim)| *dim == output_dim));
+                    match (readers.next(), readers.next()) {
+                        (Some((source_dim, terms, 0)), None)
+                            if terms.as_slice() == [(1, output_dim)]
+                                && *axis == source_shape[*source_dim] =>
+                        {
+                            source_axes[*source_dim]
+                        }
+                        _ => own_axis(node, output_dim, *axis),
+                    }
+                })
+                .collect()
+        }
     };
     let axes = Rc::new(axes);
     cache.insert(key, axes.clone());

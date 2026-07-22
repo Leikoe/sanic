@@ -1219,3 +1219,54 @@ fn probe_discovered_laws_are_sound() {
         }
     }
 }
+
+// ── free-axis reindexing commutes with folding ───────────────────────────────
+// A reindex acts only on the dimensions it transforms; a dimension it passes
+// through 1:1 keeps its identity, so a coupled carrier composes through a
+// broadcast along a FREE axis exactly as it does without one. The GQA head
+// repeat is one instance; nothing here names it.
+#[test]
+fn coupled_carrier_composes_through_free_axis_repeat() {
+    let (g, r, s) = (axis("g", 2), axis("r", 3), axis("s", 8));
+    let grouped = axis("grouped", 6);
+
+    let softmax_denominator = |x: NodeRef| {
+        let rank = x.shape().len();
+        let maximum = unsqueeze(reduce(x.clone(), rank - 1, Monoid::Max), rank - 1);
+        reduce(
+            map(MapOp::Exp, vec![map(MapOp::Sub, vec![x, maximum])]),
+            rank - 1,
+            Monoid::Add,
+        )
+    };
+    let repeat_middle = |src: NodeRef| {
+        let source = src.shape();
+        let mut expanded = source.clone();
+        expanded.insert(1, r);
+        let map = source
+            .iter()
+            .enumerate()
+            .map(|(dim, _)| (dim, vec![(1, if dim == 0 { 0 } else { dim + 1 })], 0))
+            .collect();
+        positional_reindex(src, expanded, map, false)
+    };
+
+    let base = input("x", [g, s], Dtype::F32);
+    let stream = source_axis(&base, 1);
+    for (label, node) in [
+        ("no repeat", softmax_denominator(base.clone())),
+        ("repeat", softmax_denominator(repeat_middle(base.clone()))),
+        (
+            "repeat + flatten",
+            softmax_denominator(flatten(
+                repeat_middle(base.clone()),
+                &[0usize, 1usize][..],
+                grouped,
+            )),
+        ),
+    ] {
+        let carrier = derive(&node, stream)
+            .unwrap_or_else(|decline| panic!("{label} must derive, got: {decline}"));
+        assert_eq!(carrier.kinds.len(), 2, "{label}: the (max, Σexp) tuple");
+    }
+}
