@@ -351,7 +351,7 @@ fn incremental_decode_compiles_and_equals_prefill() {
     main.push_str(
         "    assert_eq!(got.len(), expected.len());\n\
          \x20   let mut maxe = 0.0f64;\n\
-         \x20   for (a, b) in got.iter().zip(&expected) { maxe = maxe.max((a - b).abs()); }\n\
+         \x20   for (a, b) in got.iter().zip(&expected) { maxe = std::cmp::max_by(maxe, (a - b).abs(), f64::total_cmp); }\n\
          \x20   if maxe < 1e-9 { println!(\"OK {maxe:e}\"); } else { eprintln!(\"MISMATCH {maxe:e}\"); std::process::exit(1); }\n\
          }\n",
     );

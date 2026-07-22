@@ -82,7 +82,7 @@ fn max_rel_err(got: &[f32], expected: &[f64]) -> f64 {
     got.iter()
         .zip(expected)
         .map(|(g, e)| (*g as f64 - e).abs() / (1.0 + e.abs()))
-        .fold(0.0, f64::max)
+        .fold(0.0, |worst, e| std::cmp::max_by(worst, e, f64::total_cmp))
 }
 
 /// Run one fused kernel on the GPU and check it against the oracle.
@@ -1739,6 +1739,67 @@ fn coop_lane_stream_flash_matches_oracle() {
         return;
     };
     eprintln!("lane-stream flash (sgs=4) on GPU: {}", out.trim());
+}
+
+/// A prefix-masked flash fold whose visible prefix is far shorter than the
+/// split width: whole lanes fold only `-inf`-masked elements, so their
+/// partials stay at the carrier identity (m = −∞, ℓ = o = 0) and reach the
+/// rescale merge. `exp(−∞ − −∞)` is NaN unless the merge forces a −∞ side's
+/// weight to zero — decode attention at any real context length hits this on
+/// every prefill step.
+#[test]
+fn masked_flash_with_short_prefix_survives_lane_split() {
+    use sanic::plan::FoldSched;
+    let (sq, k, d, e) = (axis("sq", 4), axis("k", 256), axis("d", 8), axis("e", 8));
+    let visible = 2usize;
+    let mut rng = Lcg(0x3A5C);
+    let env: Env = [
+        ("Q", rand_tensor(&[sq, d], &mut rng)),
+        ("K", rand_tensor(&[k, d], &mut rng)),
+        ("V", rand_tensor(&[k, e], &mut rng)),
+        (
+            "mask",
+            Value::from_shape_fn(&[k.extent()], |position| {
+                if position[0] < visible {
+                    0.0
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let key = input("K", [k, d], Dtype::F32);
+    let stream = source_axis(&key, 0);
+    let scores = map(
+        MapOp::Add,
+        vec![
+            matmul(
+                input("Q", [sq, d], Dtype::F32),
+                transpose(key, 0usize, 1usize),
+            ),
+            input("mask", [k], Dtype::F32),
+        ],
+    );
+    let attn = matmul(softmax(scores, -1isize), input("V", [k, e], Dtype::F32));
+    let carrier = derive(&attn, stream).unwrap();
+    let sched = FoldSched {
+        lane_axis: None,
+        sgs: 4,
+        lane_stream: true,
+        chunk: 1,
+    };
+    let kernel = emit_fused_metal_sched("masked_ls_flash", &carrier, stream, &attn, sched);
+    let reference = eval(&attn, &env);
+    let Some(out) = run_coop_on_gpu("masked_ls_flash", &kernel, &env, &reference) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!(
+        "short-prefix masked lane-stream flash on GPU: {}",
+        out.trim()
+    );
 }
 
 /// The value head dim distributed across lanes: the o slot vectorizes per

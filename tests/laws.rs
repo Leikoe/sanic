@@ -119,8 +119,14 @@ fn renders_derived_flash_attention() {
     let car = derive(&attention(q, kk, v), stream).unwrap();
     let r = car.render();
     assert!(r.contains("into:    s0 = x0;  s1 = 1;  s2 = x1"));
-    assert!(r.contains("s1 = a1·exp(a0 - max(a0, b0)) + b1·exp(b0 - max(a0, b0))"));
-    assert!(r.contains("s2 = a2·exp(a0 - max(a0, b0)) + b2·exp(b0 - max(a0, b0))"));
+    // each side's rescale factor is guarded: a −∞ max (the identity of an
+    // all-masked partial) contributes weight 0 instead of exp(−∞ − −∞) = NaN
+    assert!(r.contains(
+        "s1 = a1·where(-∞ < a0, exp(a0 - max(a0, b0)), 0) + b1·where(-∞ < b0, exp(b0 - max(a0, b0)), 0)"
+    ));
+    assert!(r.contains(
+        "s2 = a2·where(-∞ < a0, exp(a0 - max(a0, b0)), 0) + b2·where(-∞ < b0, exp(b0 - max(a0, b0)), 0)"
+    ));
     assert!(r.contains("project: s2 / s1"));
 }
 

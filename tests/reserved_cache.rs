@@ -658,7 +658,9 @@ fn computed_iota_mask_reaches_the_fused_attention_fold() {
         .iter()
         .zip(&reference.data)
         .map(|(got, expected)| (*got as f64 - expected).abs() / (1.0 + expected.abs()))
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, |worst, e| {
+            std::cmp::max_by(worst, e, f64::total_cmp)
+        });
     assert!(error < 2e-3, "computed-mask attention off by {error:e}");
 }
 
@@ -687,7 +689,9 @@ fn reserved_cache_extent_does_not_change_decode_logits() {
                 .iter()
                 .zip(final_logits)
                 .map(|(a, b)| (a - b).abs())
-                .fold(0.0f64, f64::max);
+                .fold(0.0f64, |worst, e| {
+                    std::cmp::max_by(worst, e, f64::total_cmp)
+                });
             if drift > 1e-9 {
                 failures.push(format!("interp drift {drift:e} at extent {context_length}"));
             }
@@ -704,8 +708,10 @@ fn reserved_cache_extent_does_not_change_decode_logits() {
                     .iter()
                     .zip(got)
                     .map(|(expected, got)| (*got as f64 - expected).abs() / (1.0 + expected.abs()))
-                    .fold(0.0f64, f64::max);
-                worst = worst.max(error);
+                    .fold(0.0f64, |worst, e| {
+                        std::cmp::max_by(worst, e, f64::total_cmp)
+                    });
+                worst = std::cmp::max_by(worst, error, f64::total_cmp);
                 if error > 2e-3 {
                     let name = graph.cache_names.get(root).copied().unwrap_or("logits");
                     eprintln!("extent {context_length} step {step}: {name} err {error:e}");

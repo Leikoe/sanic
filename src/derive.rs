@@ -1848,10 +1848,22 @@ fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
             SlotKind::Plain(Monoid::Max) => emax(Expr::A(i), Expr::B(i)),
             SlotKind::Plain(Monoid::Min) => emin(Expr::A(i), Expr::B(i)),
             SlotKind::ExpShifted { max_slot: mx } => {
-                // s' = sₐ·exp(mₐ − M) + s_b·exp(m_b − M),  M = max(mₐ, m_b)
+                // s' = sₐ·exp(mₐ − M) + s_b·exp(m_b − M),  M = max(mₐ, m_b).
+                // A side whose max is −∞ carries no weight, and its factor is
+                // FORCED to zero: `exp(−∞ − M)` is NaN when M is also −∞,
+                // which is exactly the identity accumulator of a lane that
+                // folded only masked elements (softmax masking past the
+                // visible prefix). The guard makes the identity absorbing.
                 let big = emax(Expr::A(mx), Expr::B(mx));
-                let ra = exp(sub(Expr::A(mx), big.clone()));
-                let rb = exp(sub(Expr::B(mx), big));
+                let rescale = |m: Expr, big: Expr| {
+                    ewhere(
+                        elt(cst(f64::NEG_INFINITY), m.clone()),
+                        exp(sub(m, big)),
+                        cst(0.0),
+                    )
+                };
+                let ra = rescale(Expr::A(mx), big.clone());
+                let rb = rescale(Expr::B(mx), big);
                 padd(pmul(Expr::A(i), ra), pmul(Expr::B(i), rb))
             }
             SlotKind::AtExtremum {

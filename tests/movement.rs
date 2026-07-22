@@ -36,7 +36,8 @@ fn assert_close(x: &Value, y: &Value) {
     assert_eq!(x.shape, y.shape, "shape: {:?} vs {:?}", x.axes, y.axes);
     let mut worst = 0.0f64;
     for (a, b) in x.data.iter().zip(&y.data) {
-        worst = worst.max((a - b).abs() / (1.0 + a.abs().max(b.abs())));
+        let error = (a - b).abs() / (1.0 + a.abs().max(b.abs()));
+        worst = std::cmp::max_by(worst, error, f64::total_cmp);
     }
     // the one tolerance policy at this file's deepest fold chain
     assert!(
