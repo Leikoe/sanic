@@ -803,6 +803,19 @@ fn run_metal() -> Result<(), String> {
     let mut decode_gpu_seconds = 0.0f64;
     while generated < arguments.new_tokens {
         let scores = device.read_tensor_f32(logits.as_ref().unwrap());
+        if std::env::var_os("LLAMA3_2_DEBUG_LOGITS").is_some() {
+            let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
+            ranked.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+            eprintln!(
+                "step {generated}: {}",
+                ranked
+                    .iter()
+                    .take(3)
+                    .map(|(token, score)| format!("{token}:{score:.6}"))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+        }
         let next = scores
             .iter()
             .enumerate()

@@ -129,10 +129,17 @@ impl MetalDevice {
     // ── compiler ─────────────────────────────────────────────────────────────
 
     /// Compile one MSL source; index every kernel it defines.
+    ///
+    /// Math mode is RELAXED, not the default FAST: fast math lets the shader
+    /// compiler assume no ±inf ever occurs, which deletes additive `-INFINITY`
+    /// masks (softmax masking) at compile time. Relaxed keeps the value
+    /// optimizations but preserves inf/nan semantics.
     pub fn compile(&self, msl: &str) -> Pipelines {
+        let options = objc2_metal::MTLCompileOptions::new();
+        options.setMathMode(objc2_metal::MTLMathMode::Relaxed);
         let lib = self
             .dev
-            .newLibraryWithSource_options_error(&NSString::from_str(msl), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(msl), Some(&options))
             .unwrap_or_else(|e| panic!("generated MSL failed to compile: {e}"));
         let mut map = HashMap::new();
         for name in kernel_names(msl) {
