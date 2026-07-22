@@ -37,7 +37,7 @@ use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, ite
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
     self, AxisRef, Canonicalizer, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
-    all_axis_refs, leaf_names,
+    ResolvedAffineIndex, all_axis_refs, leaf_names,
 };
 use crate::plan::{KernelSpec, plan_axis};
 
@@ -693,7 +693,7 @@ impl Partitioner<'_> {
                 // a materialized buffer read
                 let read = self
                     .canon
-                    .shallow(ir::input(name, &node.shape(), Dtype::F32));
+                    .shallow(ir::input(name, node.shape(), Dtype::F32));
                 memo.insert(Rc::as_ptr(node), read.clone());
                 return read;
             }
@@ -1260,7 +1260,7 @@ impl Partitioner<'_> {
                 if i != hi {
                     let name = self.cut(p);
                     extra.push(name);
-                    let read = self.canon.shallow(ir::input(name, &p.shape(), Dtype::F32));
+                    let read = self.canon.shallow(ir::input(name, p.shape(), Dtype::F32));
                     subs.push((p.clone(), read));
                 }
             }
@@ -1294,7 +1294,7 @@ impl Partitioner<'_> {
                 };
                 subs.push((
                     producer.clone(),
-                    ir::input(sentinel, &producer.shape(), Dtype::F32),
+                    ir::input(sentinel, producer.shape(), Dtype::F32),
                 ));
                 let epi = replace_many(node, &subs, &mut HashMap::new(), &mut self.canon);
                 spec.output_name = out.to_string();
@@ -1657,10 +1657,7 @@ fn stream_below_view(axes: &[AxisRef], groups: &[(Vec<AxisRef>, AxisRef)]) -> Ve
     below
 }
 
-fn stream_below_reindex(
-    axes: &[AxisRef],
-    map: &[(AxisRef, Vec<(i64, AxisRef)>, i64)],
-) -> Vec<AxisRef> {
+fn stream_below_reindex(axes: &[AxisRef], map: &[ResolvedAffineIndex]) -> Vec<AxisRef> {
     let mut below = Vec::new();
     for &a in axes {
         let mut driving = map
@@ -2254,7 +2251,7 @@ mod tests {
     #[test]
     fn stream_provenance_visits_a_shared_dag_once_per_axis_state() {
         let n = axis("n", 8);
-        let source = input("X", &[n], Dtype::F32);
+        let source = input("X", [n], Dtype::F32);
         let mut diamond = source.clone();
         for _ in 0..40 {
             diamond = map(MapOp::Add, vec![diamond.clone(), diamond]);
@@ -2273,13 +2270,13 @@ mod tests {
     fn fold_candidates_stop_at_the_nearest_reduction_frontier() {
         let old_axis = axis("old", 8);
         let new_axis = axis("new", 8);
-        let old = input("old", &[old_axis], Dtype::F32);
+        let old = input("old", [old_axis], Dtype::F32);
         let old_stream = source_axis(&old, 0);
         let mut history = reduce(old, 0usize, Monoid::Add);
         for _ in 0..40 {
             history = map(MapOp::Add, vec![history, konst(1.0)]);
         }
-        let new = input("new", &[new_axis], Dtype::F32);
+        let new = input("new", [new_axis], Dtype::F32);
         let new_stream = source_axis(&new, 0);
         let current = reduce(new, 0usize, Monoid::Add);
         let root = map(MapOp::Add, vec![history, current]);
@@ -2304,9 +2301,9 @@ mod tests {
             axis("d", 64),
             axis("e", 64),
         );
-        let q = input("Q", &[s, d], Dtype::F32);
-        let kk = input("K", &[k, d], Dtype::F32);
-        let v = input("V", &[k, e], Dtype::F32);
+        let q = input("Q", [s, d], Dtype::F32);
+        let kk = input("K", [k, d], Dtype::F32);
+        let v = input("V", [k, e], Dtype::F32);
         let q = unsqueeze(q, 1usize);
         let kk = unsqueeze(kk, 0usize);
         let scaled_scores: Vec<NodeRef> = vec![
@@ -2382,12 +2379,12 @@ mod tests {
             axis("d", 64),
             axis("e", 64),
         );
-        let key = input("K", &[k, d], Dtype::F32);
+        let key = input("K", [k, d], Dtype::F32);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
-            input("Q", &[s, d], Dtype::F32),
+            input("Q", [s, d], Dtype::F32),
             key,
-            input("V", &[k, e], Dtype::F32),
+            input("V", [k, e], Dtype::F32),
             None,
             0.0,
             false,
@@ -2416,22 +2413,22 @@ mod tests {
             axis("dq", 64),
             axis("dv", 64),
         );
-        let x_q = input("Xq", &[s, dm], Dtype::F32);
-        let x_kv = input("Xkv", &[k, dm], Dtype::F32);
+        let x_q = input("Xq", [s, dm], Dtype::F32);
+        let x_kv = input("Xkv", [k, dm], Dtype::F32);
         let query_stream = axis_refs(&x_q)[1];
         let kv_stream = axis_refs(&x_kv)[1];
         let key_axis = axis_refs(&x_kv)[0];
         let q = matmul(
             x_q,
-            transpose(input("Wq", &[dq, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize),
         ); // [s, dq]
         let kk = matmul(
             x_kv.clone(),
-            transpose(input("Wk", &[dq, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wk", [dq, dm], Dtype::F32), 0usize, 1usize),
         ); // [k, dq]
         let v = matmul(
             x_kv,
-            transpose(input("Wv", &[dv, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
         ); // [k, dv]
 
         let scores = matmul(q, transpose(kk, 0usize, 1usize));
@@ -2474,11 +2471,11 @@ mod tests {
     #[test]
     fn rmsnorm_splits_into_fold_plus_map() {
         let (s, d) = (axis("s", 1024), axis("d", 1024));
-        let x = input("X", &[s, d], Dtype::F32);
+        let x = input("X", [s, d], Dtype::F32);
         let stream = axis_refs(&x)[1];
-        let g = input("G", &[d], Dtype::F32);
-        let inv_d = input("inv_d", &[], Dtype::F32);
-        let eps = input("eps", &[], Dtype::F32);
+        let g = input("G", [d], Dtype::F32);
+        let inv_d = input("inv_d", [], Dtype::F32);
+        let eps = input("eps", [], Dtype::F32);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, inv_d]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
@@ -2505,8 +2502,8 @@ mod tests {
     #[test]
     fn rmsnorm_fuses_into_a_projection_gemm() {
         let (s, d, f) = (axis("s", 1024), axis("d", 1024), axis("f", 512));
-        let x = input("X", &[s, d], Dtype::F32);
-        let g = input("G", &[d], Dtype::F32);
+        let x = input("X", [s, d], Dtype::F32);
+        let g = input("G", [d], Dtype::F32);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
@@ -2516,7 +2513,7 @@ mod tests {
         );
         let proj = matmul(
             norm,
-            transpose(input("W", &[f, d], Dtype::F32), 0usize, 1usize),
+            transpose(input("W", [f, d], Dtype::F32), 0usize, 1usize),
         );
 
         let sched = partition(&proj, &DeviceProfile::toy());
@@ -2536,8 +2533,8 @@ mod tests {
             axis("hidden", 2048),
             axis("projected", 256),
         );
-        let embedding = input("E", &[vocab, hidden], Dtype::BF16);
-        let tokens = input("tokens", &[token], Dtype::F32);
+        let embedding = input("E", [vocab, hidden], Dtype::BF16);
+        let tokens = input("tokens", [token], Dtype::F32);
         let x = gather(embedding, tokens, 0usize);
         let sum_square = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean_square = map(
@@ -2551,17 +2548,13 @@ mod tests {
         let norm = map(
             MapOp::Div,
             vec![
-                map(MapOp::Mul, vec![x, input("G", &[hidden], Dtype::BF16)]),
+                map(MapOp::Mul, vec![x, input("G", [hidden], Dtype::BF16)]),
                 unsqueeze(denominator, 1usize),
             ],
         );
         let projection = matmul(
             norm,
-            transpose(
-                input("W", &[projected, hidden], Dtype::BF16),
-                0usize,
-                1usize,
-            ),
+            transpose(input("W", [projected, hidden], Dtype::BF16), 0usize, 1usize),
         );
 
         let sum_sched = partition(&sum_square, &DeviceProfile::m1_pro());
@@ -2595,9 +2588,9 @@ mod tests {
             axis("head_dim", 64),
         );
         let attention = scaled_dot_product_attention(
-            input("q", &[query_heads, query_sequence, head_dim], Dtype::F32),
-            input("k", &[kv_heads, cache_sequence, head_dim], Dtype::F32),
-            input("v", &[kv_heads, cache_sequence, head_dim], Dtype::F32),
+            input("q", [query_heads, query_sequence, head_dim], Dtype::F32),
+            input("k", [kv_heads, cache_sequence, head_dim], Dtype::F32),
+            input("v", [kv_heads, cache_sequence, head_dim], Dtype::F32),
             None,
             0.0,
             false,
@@ -2616,9 +2609,9 @@ mod tests {
     #[test]
     fn unplannable_norm_head_cuts_the_normalizer() {
         let (s, d, v) = (axis("s", 1), axis("d", 1024), axis("v", 200192));
-        let x = input("X", &[s, d], Dtype::F32);
+        let x = input("X", [s, d], Dtype::F32);
         let stream = axis_refs(&x)[1];
-        let g = input("G", &[d], Dtype::F32);
+        let g = input("G", [d], Dtype::F32);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
@@ -2628,7 +2621,7 @@ mod tests {
         );
         let head = matmul(
             norm,
-            transpose(input("W", &[v, d], Dtype::F32), 0usize, 1usize),
+            transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize),
         );
 
         let sched = partition(&head, &DeviceProfile::toy());
@@ -2659,10 +2652,10 @@ mod tests {
     #[test]
     fn residual_add_fuses_as_epilogue() {
         let (s, f, dm) = (axis("s", 1024), axis("f", 4096), axis("dm", 1024));
-        let x = input("X", &[s, dm], Dtype::F32);
-        let h = input("H", &[s, f], Dtype::F32);
+        let x = input("X", [s, dm], Dtype::F32);
+        let h = input("H", [s, f], Dtype::F32);
         let stream = axis_refs(&h)[1];
-        let w = input("W", &[f, dm], Dtype::F32);
+        let w = input("W", [f, dm], Dtype::F32);
         let proj = matmul(h, w); // [s, dm]
         let y = map(MapOp::Add, vec![proj, x]); // residual
 
@@ -2689,18 +2682,18 @@ mod tests {
     #[test]
     fn silu_fuses_into_the_down_gemm() {
         let (s, dm, f) = (axis("s", 1024), axis("dm", 1024), axis("f", 4096));
-        let x = input("Xn", &[s, dm], Dtype::F32);
+        let x = input("Xn", [s, dm], Dtype::F32);
         let gate = matmul(
             x.clone(),
-            transpose(input("Wg", &[f, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
         ); // [s, f]
         let up = matmul(
             x,
-            transpose(input("Wu", &[f, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
         ); // [s, f]
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let stream = axis_refs(&act)[1];
-        let down = matmul(act, input("Wd", &[f, dm], Dtype::F32));
+        let down = matmul(act, input("Wd", [f, dm], Dtype::F32));
 
         let sched = partition(&down, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 3, "gate GEMM, up GEMM, fused down GEMM");
@@ -2725,7 +2718,7 @@ mod tests {
     #[test]
     fn composed_logsumexp_folds_as_one_carrier() {
         let (b, c) = (axis("b", 128), axis("c", 32));
-        let z = input("Z", &[b, c], Dtype::F32);
+        let z = input("Z", [b, c], Dtype::F32);
         let stream = axis_refs(&z)[1];
         let m = reduce(z.clone(), 1usize, Monoid::Max);
         let sumexp = reduce(
@@ -2775,15 +2768,15 @@ mod tests {
             axis("ri", 32),
             axis("fl", 4096),
         );
-        let gate = input("G", &[f], Dtype::F32);
-        let up = input("U", &[f], Dtype::F32);
+        let gate = input("G", [f], Dtype::F32);
+        let up = input("U", [f], Dtype::F32);
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let xs = split(act, 0usize, gi, ri);
         let prod = map(
             MapOp::Mul,
             vec![
-                map(MapOp::Mul, vec![input("Wd", &[dm, gi, ri], Dtype::F32), xs]),
-                unsqueeze(input("Sc", &[dm, gi], Dtype::F32), 2usize),
+                map(MapOp::Mul, vec![input("Wd", [dm, gi, ri], Dtype::F32), xs]),
+                unsqueeze(input("Sc", [dm, gi], Dtype::F32), 2usize),
             ],
         );
         let flattened = flatten(prod, &[1usize, 2usize][..], fl);
@@ -2835,15 +2828,15 @@ mod tests {
             axis("ri", 32),
             axis("fl", 4096),
         );
-        let x = input("Xn", &[s, dm], Dtype::F32);
+        let x = input("Xn", [s, dm], Dtype::F32);
         let stream = axis_refs(&x)[1];
         let gate = matmul(
             x.clone(),
-            transpose(input("Wg", &[f, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
         ); // [s, f]
         let up = matmul(
             x,
-            transpose(input("Wu", &[f, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
         ); // [s, f]
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let coupled = crate::derive::derive(&act, stream)
@@ -2856,8 +2849,8 @@ mod tests {
         let prod = map(
             MapOp::Mul,
             vec![
-                map(MapOp::Mul, vec![input("Wd", &[dm, gi, ri], Dtype::F32), xs]),
-                unsqueeze(input("Sc", &[dm, gi], Dtype::F32), 2usize),
+                map(MapOp::Mul, vec![input("Wd", [dm, gi, ri], Dtype::F32), xs]),
+                unsqueeze(input("Sc", [dm, gi], Dtype::F32), 2usize),
             ],
         );
         let flattened = flatten(prod, &[1usize, 2usize][..], fl);
@@ -2881,9 +2874,9 @@ mod tests {
     #[test]
     fn embedding_is_a_gather_stage() {
         let (v, dm, s) = (axis("v", 32000), axis("dm", 1024), axis("s", 1024));
-        let table = input("E", &[v, dm], Dtype::F32);
+        let table = input("E", [v, dm], Dtype::F32);
         let vocabulary = axis_refs(&table)[0];
-        let emb = embedding(table, input("ids", &[s], Dtype::F32), 0usize);
+        let emb = embedding(table, input("ids", [s], Dtype::F32), 0usize);
         let sched = partition(&emb, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1);
         assert!(matches!(&sched.stages[0], Stage::Gather { axis, .. } if *axis == vocabulary));
@@ -2901,10 +2894,10 @@ mod tests {
             axis("dq", 64),
             axis("dv", 64),
         );
-        let x = input("X", &[s, dm], Dtype::F32);
-        let g = input("g", &[dm], Dtype::F32);
-        let inv = input("inv_dm", &[], Dtype::F32);
-        let eps = input("eps", &[], Dtype::F32);
+        let x = input("X", [s, dm], Dtype::F32);
+        let g = input("g", [dm], Dtype::F32);
+        let inv = input("inv_dm", [], Dtype::F32);
+        let eps = input("eps", [], Dtype::F32);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, inv]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
@@ -2916,15 +2909,15 @@ mod tests {
 
         let q = matmul(
             xn,
-            transpose(input("Wq", &[dq, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize),
         ); // [s, dq]
         let k = matmul(
             xn_t.clone(),
-            transpose(input("Wk", &[dq, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wk", [dq, dm], Dtype::F32), 0usize, 1usize),
         ); // [t, dq]
         let v = matmul(
             xn_t,
-            transpose(input("Wv", &[dv, dm], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
         ); // [t, dv]
         let attn = matmul(softmax(matmul(q, transpose(k, 0usize, 1usize)), 1usize), v);
 
@@ -2954,12 +2947,12 @@ mod tests {
             axis("dmv", 512),
             axis("dm", 512),
         );
-        let key = input("K", &[h, t, dk], Dtype::F32);
+        let key = input("K", [h, t, dk], Dtype::F32);
         let key_axis = axis_refs(&key)[1];
         let attn = scaled_dot_product_attention(
-            input("Q", &[h, s, dk], Dtype::F32),
+            input("Q", [h, s, dk], Dtype::F32),
             key,
-            input("V", &[h, t, dv], Dtype::F32),
+            input("V", [h, t, dv], Dtype::F32),
             None,
             0.0,
             false,
@@ -2968,7 +2961,7 @@ mod tests {
         );
         let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv); // [s, dmv]
         let projection_stream = axis_refs(&flat)[1];
-        let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32)); // [s, dm]
+        let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32)); // [s, dm]
 
         let sched = partition(&o, &DeviceProfile::toy());
 
@@ -2996,15 +2989,15 @@ mod tests {
             axis("dv", 64),
         );
         let scores = matmul(
-            input("Q", &[s, dk], Dtype::F32),
-            transpose(input("K", &[t, dk], Dtype::F32), 0usize, 1usize),
+            input("Q", [s, dk], Dtype::F32),
+            transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
         );
         let scaled = map(MapOp::Mul, vec![scores, konst(0.125)]);
         let masked = map(
             MapOp::Add,
             vec![scaled.clone(), causal_mask_like(scaled, 0usize, 1usize)],
         );
-        let out = matmul(softmax(masked, 1usize), input("V", &[t, dv], Dtype::F32));
+        let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
 
         let sched = partition(&out, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "mask and scale ride the lift");

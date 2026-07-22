@@ -713,8 +713,8 @@ mod tests {
         let env: Env = [("A", a.clone()), ("B", b.clone())].into_iter().collect();
 
         let mm = matmul(
-            input("A", &[i, k], Dtype::F32),
-            input("B", &[k, j], Dtype::F32),
+            input("A", [i, k], Dtype::F32),
+            input("B", [k, j], Dtype::F32),
         );
         let got = eval(&mm, &env);
 
@@ -736,7 +736,7 @@ mod tests {
         let mut rng = Lcg(9);
         let x = rand_tensor(&[r, k], &mut rng);
         let env: Env = [("X", x)].into_iter().collect();
-        let sm = eval(&softmax(input("X", &[r, k], Dtype::F32), 1usize), &env);
+        let sm = eval(&softmax(input("X", [r, k], Dtype::F32), 1usize), &env);
         for r_i in 0..4 {
             let mut s = 0.0;
             for k_i in 0..7 {
@@ -759,12 +759,12 @@ mod tests {
         let v = rand_tensor(&[k, e], &mut rng);
         let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
 
-        let key = input("K", &[k, d], Dtype::F32);
+        let key = input("K", [k, d], Dtype::F32);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
-            input("Q", &[sq, d], Dtype::F32),
+            input("Q", [sq, d], Dtype::F32),
             key,
-            input("V", &[k, e], Dtype::F32),
+            input("V", [k, e], Dtype::F32),
             None,
             0.0,
             false,
@@ -790,12 +790,12 @@ mod tests {
         let v = rand_tensor(&[t, dv], &mut rng);
         let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
 
-        let key = input("K", &[t, dk], Dtype::F32);
+        let key = input("K", [t, dk], Dtype::F32);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
-            input("Q", &[s, dk], Dtype::F32),
+            input("Q", [s, dk], Dtype::F32),
             key,
-            input("V", &[t, dv], Dtype::F32),
+            input("V", [t, dv], Dtype::F32),
             None,
             0.0,
             true,
@@ -819,8 +819,8 @@ mod tests {
         let env: Env = [("E", table.clone()), ("ids", ids)].into_iter().collect();
 
         let emb = embedding(
-            input("E", &[v, dm], Dtype::F32),
-            input("ids", &[s], Dtype::F32),
+            input("E", [v, dm], Dtype::F32),
+            input("ids", [s], Dtype::F32),
             0usize,
         );
         let got = eval(&emb, &env);
@@ -840,7 +840,7 @@ mod tests {
         let x = rand_tensor(&[h, dv], &mut rng);
         let env: Env = [("X", x.clone())].into_iter().collect();
         let flat = eval(
-            &flatten(input("X", &[h, dv], Dtype::F32), &[0, 1][..], dmv),
+            &flatten(input("X", [h, dv], Dtype::F32), &[0, 1][..], dmv),
             &env,
         );
         assert_eq!(flat.shape, vec![6]);

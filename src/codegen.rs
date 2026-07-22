@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn singleton_storage_axes_need_no_loop_coordinate() {
-        let node = input("x", &[axis("singleton", 1), axis("hidden", 8)], Dtype::F32);
+        let node = input("x", [axis("singleton", 1), axis("hidden", 8)], Dtype::F32);
         let axes = axis_refs(&node);
         let coord = HashMap::from([(axes[1], "h".to_string())]);
         assert_eq!(Gen::new().coordinate(&HashMap::new(), axes[0]), "0");

@@ -152,12 +152,12 @@ fn flash_attention_runs_on_gpu() {
     .into_iter()
     .collect();
 
-    let key = input("K", &[k, d], Dtype::F32);
+    let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
     let attn = attention(
-        input("Q", &[sq, d], Dtype::F32),
+        input("Q", [sq, d], Dtype::F32),
         key,
-        input("V", &[k, e], Dtype::F32),
+        input("V", [k, e], Dtype::F32),
     );
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal("flash", &carrier, stream, &attn);
@@ -382,10 +382,10 @@ fn causal_flash_runs_on_gpu() {
     .into_iter()
     .collect();
 
-    let key = input("K", &[t, dk], Dtype::F32);
+    let key = input("K", [t, dk], Dtype::F32);
     let stream = source_axis(&key, 0);
     let scores = matmul(
-        input("Q", &[s, dk], Dtype::F32),
+        input("Q", [s, dk], Dtype::F32),
         transpose(key, 0usize, 1usize),
     );
     let scaled = map(MapOp::Mul, vec![scores, konst(0.125)]);
@@ -393,7 +393,7 @@ fn causal_flash_runs_on_gpu() {
         MapOp::Add,
         vec![scaled.clone(), causal_mask_like(scaled, 0usize, 1usize)],
     );
-    let attn = matmul(softmax(masked, 1usize), input("V", &[t, dv], Dtype::F32));
+    let attn = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
 
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal("causal_flash", &carrier, stream, &attn);
@@ -421,10 +421,10 @@ fn cosine_bias_flash_runs_on_gpu() {
     .into_iter()
     .collect();
 
-    let key = input("K", &[t, dk], Dtype::F32);
+    let key = input("K", [t, dk], Dtype::F32);
     let stream = source_axis(&key, 0);
     let scores = matmul(
-        input("Q", &[s, dk], Dtype::F32),
+        input("Q", [s, dk], Dtype::F32),
         transpose(key, 0usize, 1usize),
     );
     let rel = map(
@@ -436,7 +436,7 @@ fn cosine_bias_flash_runs_on_gpu() {
     );
     let bias = map(MapOp::Cos, vec![map(MapOp::Mul, vec![rel, konst(0.1)])]);
     let biased = map(MapOp::Add, vec![scores, bias]);
-    let attn = matmul(softmax(biased, 1usize), input("V", &[t, dv], Dtype::F32));
+    let attn = matmul(softmax(biased, 1usize), input("V", [t, dv], Dtype::F32));
 
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal("cos_bias_flash", &carrier, stream, &attn);
@@ -506,14 +506,14 @@ fn rope_flash_runs_on_gpu() {
 
     let qr = squeeze(
         matmul(
-            unsqueeze(input("Q", &[s, p, i], Dtype::F32), 2usize),
+            unsqueeze(input("Q", [s, p, i], Dtype::F32), 2usize),
             rope_rotation(s, p, j, i, c),
         ),
         2usize,
     );
     let kr = squeeze(
         matmul(
-            unsqueeze(input("K", &[t, p, i], Dtype::F32), 2usize),
+            unsqueeze(input("K", [t, p, i], Dtype::F32), 2usize),
             rope_rotation(t, p, j, i, c),
         ),
         2usize,
@@ -522,7 +522,7 @@ fn rope_flash_runs_on_gpu() {
     let q_flat = flatten(qr, &[1usize, 2usize][..], dk);
     let k_flat = flatten(kr, &[1usize, 2usize][..], dk);
     let scores = matmul(q_flat, transpose(k_flat, 0usize, 1usize));
-    let attn = matmul(softmax(scores, 1usize), input("V", &[t, e], Dtype::F32));
+    let attn = matmul(softmax(scores, 1usize), input("V", [t, e], Dtype::F32));
 
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal("rope_flash", &carrier, stream, &attn);
@@ -554,11 +554,11 @@ fn quantized_matmul_runs_on_gpu() {
     let dw = map(
         MapOp::Mul,
         vec![
-            input("qW", &[o, dm], Dtype::F32),
-            unsqueeze(input("scale", &[o], Dtype::F32), 1usize),
+            input("qW", [o, dm], Dtype::F32),
+            unsqueeze(input("scale", [o], Dtype::F32), 1usize),
         ],
     );
-    let x = input("X", &[s, dm], Dtype::F32);
+    let x = input("X", [s, dm], Dtype::F32);
     let stream = source_axis(&x, 1);
     let y = matmul(x, transpose(dw, 0usize, 1usize));
     let carrier = derive(&y, stream).unwrap();
@@ -587,8 +587,8 @@ fn greedy_sampling_runs_on_gpu() {
     .collect();
 
     let logits = matmul(
-        input("Y", &[s, dm], Dtype::F32),
-        transpose(input("W_lm", &[v, dm], Dtype::F32), 0usize, 1usize),
+        input("Y", [s, dm], Dtype::F32),
+        transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize),
     ); // [s, v]
     let token = argmax(logits, 1usize); // [s]
 
@@ -661,23 +661,23 @@ fn greedy_decode_step_runs_on_gpu() {
         )
     };
     let x = embedding(
-        input("E", &[vv, dm], Dtype::F32),
-        input("ids", &[s], Dtype::F32),
+        input("E", [vv, dm], Dtype::F32),
+        input("ids", [s], Dtype::F32),
         0usize,
     ); // [s, dm]
-    let xn = rms(x.clone(), input("g1", &[dm], Dtype::F32));
+    let xn = rms(x.clone(), input("g1", [dm], Dtype::F32));
     let xn_kv = rename(xn.clone(), 0usize, t);
     let q = matmul(
         xn,
-        transpose(input("Wq", &[h, dk, dm], Dtype::F32), 1usize, 2usize),
+        transpose(input("Wq", [h, dk, dm], Dtype::F32), 1usize, 2usize),
     );
     let k = matmul(
         xn_kv.clone(),
-        transpose(input("Wk", &[h, dk, dm], Dtype::F32), 1usize, 2usize),
+        transpose(input("Wk", [h, dk, dm], Dtype::F32), 1usize, 2usize),
     );
     let vvv = matmul(
         xn_kv,
-        transpose(input("Wv", &[h, dvh, dm], Dtype::F32), 1usize, 2usize),
+        transpose(input("Wv", [h, dvh, dm], Dtype::F32), 1usize, 2usize),
     );
     let scores = matmul(q, transpose(k, 1usize, 2usize));
     let scaled = map(
@@ -690,23 +690,23 @@ fn greedy_decode_step_runs_on_gpu() {
     );
     let attn = matmul(softmax(masked, 2usize), vvv);
     let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv);
-    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32));
+    let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32));
     let res1 = map(MapOp::Add, vec![o, x]);
-    let hn = rms(res1.clone(), input("g2", &[dm], Dtype::F32));
+    let hn = rms(res1.clone(), input("g2", [dm], Dtype::F32));
     let gate = matmul(
         hn.clone(),
-        transpose(input("Wg", &[f, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
     );
     let up = matmul(
         hn,
-        transpose(input("Wu", &[f, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
     );
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let mlp = matmul(act, input("Wd", &[f, dm], Dtype::F32));
+    let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
     let logits = matmul(
         yb,
-        transpose(input("W_lm", &[vv, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("W_lm", [vv, dm], Dtype::F32), 0usize, 1usize),
     ); // [s, v]
     let token = argmax(logits, 1usize); // [s] — next-token per position
 
@@ -769,20 +769,20 @@ fn full_transformer_block_runs_on_gpu() {
             vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, dim)],
         )
     };
-    let x = input("X", &[s, dm], Dtype::F32);
-    let xn = rms(x.clone(), input("g1", &[dm], Dtype::F32));
+    let x = input("X", [s, dm], Dtype::F32);
+    let xn = rms(x.clone(), input("g1", [dm], Dtype::F32));
     let xn_kv = rename(xn.clone(), 0usize, t);
     let q = matmul(
         xn,
-        transpose(input("Wq", &[h, dk, dm], Dtype::F32), 1usize, 2usize),
+        transpose(input("Wq", [h, dk, dm], Dtype::F32), 1usize, 2usize),
     );
     let k = matmul(
         xn_kv.clone(),
-        transpose(input("Wk", &[h, dk, dm], Dtype::F32), 1usize, 2usize),
+        transpose(input("Wk", [h, dk, dm], Dtype::F32), 1usize, 2usize),
     );
     let vv = matmul(
         xn_kv,
-        transpose(input("Wv", &[h, dv, dm], Dtype::F32), 1usize, 2usize),
+        transpose(input("Wv", [h, dv, dm], Dtype::F32), 1usize, 2usize),
     );
     let scores = matmul(q, transpose(k, 1usize, 2usize));
     let scaled = map(
@@ -795,23 +795,23 @@ fn full_transformer_block_runs_on_gpu() {
     );
     let attn = matmul(softmax(masked, 2usize), vv);
     let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv);
-    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32));
+    let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32));
     let res1 = map(MapOp::Add, vec![o, x]);
-    let hn = rms(res1.clone(), input("g2", &[dm], Dtype::F32));
+    let hn = rms(res1.clone(), input("g2", [dm], Dtype::F32));
     let gate = matmul(
         hn.clone(),
-        transpose(input("Wg", &[f, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
     );
     let up = matmul(
         hn,
-        transpose(input("Wu", &[f, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
     );
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let mlp = matmul(act, input("Wd", &[f, dm], Dtype::F32));
+    let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
     let logits = matmul(
         yb,
-        transpose(input("W_lm", &[v, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize),
     );
 
     let sched = partition(&logits, &DeviceProfile::toy());
@@ -853,7 +853,7 @@ fn conv2d_runs_on_gpu() {
     .collect();
 
     let xw = window(
-        window(input("X", &[ci, h0, w0], Dtype::F32), 1usize, oh, kh, 1, 1),
+        window(input("X", [ci, h0, w0], Dtype::F32), 1usize, oh, kh, 1, 1),
         3usize,
         ow,
         kw,
@@ -887,7 +887,7 @@ fn conv2d_runs_on_gpu() {
     );
     let xf = flatten(xw, &[2usize, 3usize, 4usize][..], r);
     let wf = flatten(
-        input("W", &[co, ci, kh, kw], Dtype::F32),
+        input("W", [co, ci, kh, kw], Dtype::F32),
         &[1usize, 2usize, 3usize][..],
         r,
     );
@@ -927,14 +927,14 @@ fn sliding_window_flash_runs_on_gpu() {
 
     let off = -((w - 1) as i64);
     let kw = positional_reindex(
-        input("K", &[t, d], Dtype::F32),
+        input("K", [t, d], Dtype::F32),
         vec![s, j, d],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     );
     let stream = source_axis(&kw, 1);
     let vw = positional_reindex(
-        input("V", &[t, e], Dtype::F32),
+        input("V", [t, e], Dtype::F32),
         vec![s, j, e],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
@@ -942,7 +942,7 @@ fn sliding_window_flash_runs_on_gpu() {
     let scores = reduce(
         map(
             MapOp::Mul,
-            vec![unsqueeze(input("Q", &[s, d], Dtype::F32), 1usize), kw],
+            vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw],
         ),
         2usize,
         Monoid::Add,
@@ -1023,12 +1023,12 @@ fn decode_loop_runs_on_gpu() {
     .collect();
 
     // the decode-step schedule: cache updates + logits, three outputs
-    let x = input("x", &[dm], Dtype::F32);
-    let pos = input("pos", &[], Dtype::F32);
-    let new_k = linear_vector(x.clone(), input("Wk", &[dk, dm], Dtype::F32));
-    let new_v = linear_vector(x.clone(), input("Wv", &[dv, dm], Dtype::F32));
-    let q = linear_vector(x, input("Wq", &[dk, dm], Dtype::F32));
-    let cache_k = input("cache_k", &[t, dk], Dtype::F32);
+    let x = input("x", [dm], Dtype::F32);
+    let pos = input("pos", [], Dtype::F32);
+    let new_k = linear_vector(x.clone(), input("Wk", [dk, dm], Dtype::F32));
+    let new_v = linear_vector(x.clone(), input("Wv", [dv, dm], Dtype::F32));
+    let q = linear_vector(x, input("Wq", [dk, dm], Dtype::F32));
+    let cache_k = input("cache_k", [t, dk], Dtype::F32);
     let ck = map(
         MapOp::Where,
         vec![
@@ -1037,7 +1037,7 @@ fn decode_loop_runs_on_gpu() {
             cache_k,
         ],
     );
-    let cache_v = input("cache_v", &[t, dv], Dtype::F32);
+    let cache_v = input("cache_v", [t, dv], Dtype::F32);
     let cv = map(
         MapOp::Where,
         vec![
@@ -1068,7 +1068,7 @@ fn decode_loop_runs_on_gpu() {
         0usize,
         Monoid::Add,
     );
-    let logits = linear_vector(out, input("Wl", &[v, dv], Dtype::F32));
+    let logits = linear_vector(out, input("Wl", [v, dv], Dtype::F32));
     let sched = sanic::partition::partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
         &DeviceProfile::toy(),
@@ -1076,19 +1076,19 @@ fn decode_loop_runs_on_gpu() {
     let program = emit_schedule_metal(&sched);
 
     // the reference: full causal prefill by the oracle
-    let xq = input("X", &[s, dm], Dtype::F32);
+    let xq = input("X", [s, dm], Dtype::F32);
     let xt = rename(xq.clone(), 0usize, t2);
     let qa = matmul(
         xq,
-        transpose(input("Wq", &[dk, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize),
     );
     let ka = matmul(
         xt.clone(),
-        transpose(input("Wk", &[dk, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize),
     );
     let va = matmul(
         xt,
-        transpose(input("Wv", &[dv, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
     );
     let sc = map(
         MapOp::Mul,
@@ -1105,7 +1105,7 @@ fn decode_loop_runs_on_gpu() {
     let logits_ref = eval(
         &matmul(
             oa,
-            transpose(input("Wl", &[v, dv], Dtype::F32), 0usize, 1usize),
+            transpose(input("Wl", [v, dv], Dtype::F32), 0usize, 1usize),
         ),
         &env,
     );
@@ -1176,14 +1176,14 @@ fn attention_backward_runs_on_gpu() {
     .collect();
 
     let scores = matmul(
-        input("Q", &[s, dk], Dtype::F32),
-        transpose(input("K", &[t, dk], Dtype::F32), 0usize, 1usize),
+        input("Q", [s, dk], Dtype::F32),
+        transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
     );
     let masked = map(
         MapOp::Add,
         vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
     );
-    let out = matmul(softmax(masked, 1usize), input("V", &[t, dv], Dtype::F32));
+    let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
     let sq = map(MapOp::Mul, vec![out.clone(), out]);
     let loss = reduce(reduce(sq, 0usize, Monoid::Add), 0usize, Monoid::Add);
 
@@ -1222,12 +1222,12 @@ fn split_reduction_runs_on_gpu() {
     .into_iter()
     .collect();
 
-    let key = input("K", &[k, d], Dtype::F32);
+    let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
     let attn = attention(
-        input("Q", &[s, d], Dtype::F32),
+        input("Q", [s, d], Dtype::F32),
         key,
-        input("V", &[k, e], Dtype::F32),
+        input("V", [k, e], Dtype::F32),
     );
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal_sched(
@@ -1261,7 +1261,7 @@ fn tanh_survives_large_arguments_on_gpu() {
     });
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let t = map(MapOp::Tanh, vec![input("X", &[n], Dtype::F32)]);
+    let t = map(MapOp::Tanh, vec![input("X", [n], Dtype::F32)]);
     let kernel = sanic::emit_metal::emit_pointwise_metal("tanh_big", &t);
     let reference = eval(&t, &env);
     let Some(out) = run_on_gpu("tanh", &kernel, &env, &reference) else {
@@ -1307,10 +1307,10 @@ fn bf16_matvec_runs_on_gpu() {
     .into_iter()
     .collect();
 
-    let weight = input("W", &[o, k], Dtype::BF16);
+    let weight = input("W", [o, k], Dtype::BF16);
     let stream = source_axis(&weight, 1);
     let y = reduce(
-        map(MapOp::Mul, vec![weight, input("x", &[k], Dtype::F32)]),
+        map(MapOp::Mul, vec![weight, input("x", [k], Dtype::F32)]),
         1usize,
         Monoid::Add,
     );
@@ -1415,11 +1415,11 @@ fn w4_grouped_matvec_runs_on_gpu() {
             map(
                 MapOp::Mul,
                 vec![
-                    input("Wq", &[o, gq, r], Dtype::I4),
-                    input("x", &[gq, r], Dtype::F32),
+                    input("Wq", [o, gq, r], Dtype::I4),
+                    input("x", [gq, r], Dtype::F32),
                 ],
             ),
-            unsqueeze(input("S", &[o, gq], Dtype::F16), 2usize),
+            unsqueeze(input("S", [o, gq], Dtype::F16), 2usize),
         ],
     );
     let flattened = flatten(prod, &[1usize, 2usize][..], c);
@@ -1477,7 +1477,7 @@ fn topk_compositions_run_on_gpu() {
         .into_iter()
         .collect();
 
-    let x = input("X", &[n], Dtype::F32);
+    let x = input("X", [n], Dtype::F32);
     for (r, (v, i)) in topk(x, 0usize, 8).into_iter().enumerate() {
         for (tag, node) in [("val", v), ("idx", i)] {
             let name = format!("top8_{tag}_{r}");
@@ -1507,7 +1507,7 @@ fn topk_all_composition_runs_on_gpu() {
         .into_iter()
         .collect();
 
-    let x = input("X", &[n], Dtype::F32);
+    let x = input("X", [n], Dtype::F32);
     let all = topk_all(x, 0usize, 8, rk, true);
     let schedule = partition(&all, &DeviceProfile::toy());
     let program = emit_schedule_metal(&schedule);
@@ -1539,7 +1539,7 @@ fn graph_replay_matches_oracle() {
 
     // rmsnorm(X)·Wᵀ then a softmax-weighted reduction back over v — a chain
     // with real read-after-write hazards at every stage
-    let x = input("X", &[s, dm], Dtype::F32);
+    let x = input("X", [s, dm], Dtype::F32);
     let ms = reduce(
         map(MapOp::Mul, vec![x.clone(), x.clone()]),
         1usize,
@@ -1555,13 +1555,13 @@ fn graph_replay_matches_oracle() {
     let xn = map(
         MapOp::Mul,
         vec![
-            map(MapOp::Mul, vec![x, input("G", &[dm], Dtype::F32)]),
+            map(MapOp::Mul, vec![x, input("G", [dm], Dtype::F32)]),
             unsqueeze(inv, 1usize),
         ],
     );
     let logits = matmul(
         xn,
-        transpose(input("W", &[v, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("W", [v, dm], Dtype::F32), 0usize, 1usize),
     ); // [s, v]
     let out = reduce(logits, 1usize, Monoid::LogSumExp); // [s]
 
@@ -1710,12 +1710,12 @@ fn coop_lane_stream_flash_matches_oracle() {
     ]
     .into_iter()
     .collect();
-    let key = input("K", &[k, d], Dtype::F32);
+    let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
     let attn = attention(
-        input("Q", &[sq, d], Dtype::F32),
+        input("Q", [sq, d], Dtype::F32),
         key,
-        input("V", &[k, e], Dtype::F32),
+        input("V", [k, e], Dtype::F32),
     );
     let carrier = derive(&attn, stream).unwrap();
     let sched = FoldSched {
@@ -1757,12 +1757,12 @@ fn coop_lane_axis_flash_matches_oracle() {
     ]
     .into_iter()
     .collect();
-    let key = input("K", &[k, d], Dtype::F32);
+    let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
     let attn = attention(
-        input("Q", &[sq, d], Dtype::F32),
+        input("Q", [sq, d], Dtype::F32),
         key,
-        input("V", &[k, e], Dtype::F32),
+        input("V", [k, e], Dtype::F32),
     );
     let carrier = derive(&attn, stream).unwrap();
     let sched = FoldSched {
@@ -1801,14 +1801,14 @@ fn coop_norm_fused_matvec_matches_oracle() {
     ]
     .into_iter()
     .collect();
-    let x = input("x", &[dm], Dtype::F32);
+    let x = input("x", [dm], Dtype::F32);
     let stream = source_axis(&x, 0);
     let dot = reduce(
         map(
             MapOp::Mul,
             vec![
-                map(MapOp::Mul, vec![x.clone(), input("ln", &[dm], Dtype::F32)]),
-                input("w", &[o, dm], Dtype::F32),
+                map(MapOp::Mul, vec![x.clone(), input("ln", [dm], Dtype::F32)]),
+                input("w", [o, dm], Dtype::F32),
             ],
         ),
         1usize,
@@ -1917,11 +1917,11 @@ fn coop_chunked_w4_matvec_matches_oracle() {
             map(
                 MapOp::Mul,
                 vec![
-                    input("Wq", &[o, gq, r], Dtype::I4),
-                    input("x", &[gq, r], Dtype::F32),
+                    input("Wq", [o, gq, r], Dtype::I4),
+                    input("x", [gq, r], Dtype::F32),
                 ],
             ),
-            unsqueeze(input("S", &[o, gq], Dtype::F32), 2usize),
+            unsqueeze(input("S", [o, gq], Dtype::F32), 2usize),
         ],
     );
     let flattened = flatten(prod, &[1usize, 2usize][..], c);
@@ -1993,15 +1993,15 @@ fn honest_window_flash_matches_full_oracle() {
     .collect();
 
     // decode attention: scores + where(pos < iota(t), -1e30, 0), softmax·V
-    let key = input("K", &[t, d], Dtype::F32);
+    let key = input("K", [t, d], Dtype::F32);
     let stream = source_axis(&key, 0);
     let scores = reduce(
-        map(MapOp::Mul, vec![key, input("q", &[d], Dtype::F32)]),
+        map(MapOp::Mul, vec![key, input("q", [d], Dtype::F32)]),
         1usize,
         Monoid::Add,
     );
     let position = coordinate(scores.clone(), 0usize);
-    let future = map(MapOp::Lt, vec![input("pos", &[], Dtype::F32), position]);
+    let future = map(MapOp::Lt, vec![input("pos", [], Dtype::F32), position]);
     let masked = map(
         MapOp::Add,
         vec![
@@ -2009,7 +2009,7 @@ fn honest_window_flash_matches_full_oracle() {
             map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)]),
         ],
     );
-    let value = input("V", &[t, e], Dtype::F32);
+    let value = input("V", [t, e], Dtype::F32);
     let attn = reduce(
         map(
             MapOp::Mul,
@@ -2062,7 +2062,7 @@ fn coop_declines_order_sensitive_argmax() {
         t.data[row * 64 + 33] = 9.0;
     }
     let env: Env = [("x", t)].into_iter().collect();
-    let x = input("x", &[b, n], Dtype::F32);
+    let x = input("x", [b, n], Dtype::F32);
     let stream = source_axis(&x, 1);
     let am = argmax(x, 1usize);
     let carrier = derive(&am, stream).unwrap();
@@ -2099,7 +2099,7 @@ fn monoidal_prefix_scans_run_on_gpu() {
         .into_iter()
         .collect();
     for (label, m) in [("cumsum", Monoid::Add), ("cummax", Monoid::Max)] {
-        let node = scan(input("X", &[s, t], Dtype::F32), 1usize, m);
+        let node = scan(input("X", [s, t], Dtype::F32), 1usize, m);
         let kernel = sanic::emit_metal::emit_pointwise_metal(label, &node);
         let reference = eval(&node, &env);
         let Some(out) = run_on_gpu(label, &kernel, &env, &reference) else {
@@ -2163,8 +2163,8 @@ kernel void zc_add(
         dev.read_f32(&out, n)
     };
     let got = run(&dev);
-    for i in 0..n {
-        assert_eq!(got[i], (i as f32) * 1.5, "offset-bound reads");
+    for (i, &value) in got.iter().enumerate() {
+        assert_eq!(value, (i as f32) * 1.5, "offset-bound reads");
     }
     // the zero-copy property itself: mutate through the HOST pointer, the
     // device sees it without any re-upload

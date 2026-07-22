@@ -70,8 +70,8 @@ fn check(car: &Carrier, items: &[Vec<f64>], reference: &[f64]) {
 #[test]
 fn matmul_axis_tags() {
     let (i, j, k) = (axis("i", 5), axis("j", 6), axis("k", 8));
-    let a = input("A", &[i, k], Dtype::F32);
-    let b = input("B", &[k, j], Dtype::F32);
+    let a = input("A", [i, k], Dtype::F32);
+    let b = input("B", [k, j], Dtype::F32);
     let [i_axis, k_axis] = axis_refs(&a).try_into().unwrap();
     let j_axis = axis_refs(&b)[1];
     let mm = matmul(a, b);
@@ -89,8 +89,8 @@ fn matmul_axis_tags() {
 #[test]
 fn dot_product_carrier() {
     let k = axis("k", 17);
-    let a = input("A", &[k], Dtype::F32);
-    let b = input("B", &[k], Dtype::F32);
+    let a = input("A", [k], Dtype::F32);
+    let b = input("B", [k], Dtype::F32);
     let stream = axis_refs(&a)[0];
     let mm = reduce(map(MapOp::Mul, vec![a, b]), 0usize, Monoid::Add);
 
@@ -112,9 +112,9 @@ fn dot_product_carrier() {
 #[test]
 fn renders_derived_flash_attention() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let stream = axis_refs(&kk)[0];
     let car = derive(&attention(q, kk, v), stream).unwrap();
     let r = car.render();
@@ -129,9 +129,9 @@ fn renders_derived_flash_attention() {
 #[test]
 fn structure_map_for_attention() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let query_axis = axis_refs(&q)[0];
     let key_axis = axis_refs(&kk)[0];
     let report = analyze(&attention(q, kk, v), &[query_axis, key_axis]);
@@ -155,9 +155,9 @@ fn structure_map_for_attention() {
 #[test]
 fn structure_map_auto_discovers_axes() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let query_axis = axis_refs(&q)[0];
     let contract_axis = axis_refs(&q)[1];
     let key_axis = axis_refs(&kk)[0];
@@ -202,9 +202,9 @@ fn carrier_knows_its_accumulator_size() {
     use std::collections::BTreeSet;
 
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let stream = axis_refs(&kk)[0];
     let value_axis = axis_refs(&v)[1];
     let attn = attention(q, kk, v);
@@ -257,19 +257,19 @@ fn multi_head_attention_derives_identically_to_single_head() {
         axis("d", 64),
         axis("e", 64),
     );
-    let mq = input("Q", &[b, h, sq, d], Dtype::F32);
-    let mk = input("K", &[b, h, k, d], Dtype::F32);
-    let mv = input("V", &[b, h, k, e], Dtype::F32);
+    let mq = input("Q", [b, h, sq, d], Dtype::F32);
+    let mk = input("K", [b, h, k, d], Dtype::F32);
+    let mv = input("V", [b, h, k, e], Dtype::F32);
     let [batch_axis, head_axis, _, _] = axis_refs(&mq).try_into().unwrap();
     let multi_stream = axis_refs(&mk)[2];
     let value_axis = axis_refs(&mv)[3];
     let mha = attention(mq, mk, mv);
-    let sk = input("K", &[k, d], Dtype::F32);
+    let sk = input("K", [k, d], Dtype::F32);
     let single_stream = axis_refs(&sk)[0];
     let sha = attention(
-        input("Q", &[sq, d], Dtype::F32),
+        input("Q", [sq, d], Dtype::F32),
         sk,
-        input("V", &[k, e], Dtype::F32),
+        input("V", [k, e], Dtype::F32),
     );
     let cm = derive(&mha, multi_stream).unwrap();
     let cs = derive(&sha, single_stream).unwrap();
@@ -293,9 +293,9 @@ fn multi_head_attention_derives_identically_to_single_head() {
 #[test]
 fn attention_axis_tags_and_carrier() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 23), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let query_axis = axis_refs(&q)[0];
     let key_axis = axis_refs(&kk)[0];
     let attn = attention(q, kk, v);
@@ -329,7 +329,7 @@ fn attention_axis_tags_and_carrier() {
 fn mean_carrier() {
     // mean = (Σ x) / (Σ 1) — the count is a fold over a literal 1.
     let a = axis("a", 31);
-    let x = input("X", &[a], Dtype::F32);
+    let x = input("X", [a], Dtype::F32);
     let stream = axis_refs(&x)[0];
     let sum = reduce(x.clone(), 0usize, add_r());
     let count = reduce(ones_like(x.clone()), 0usize, add_r());
@@ -351,7 +351,7 @@ fn mean_carrier() {
 fn variance_carrier() {
     // var = E[x²] − E[x]²  =  Σx²/n − (Σx/n)²
     let a = axis("a", 40);
-    let x = input("X", &[a], Dtype::F32);
+    let x = input("X", [a], Dtype::F32);
     let stream = axis_refs(&x)[0];
     let sumx2 = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 0usize, add_r());
     let sumx = reduce(x.clone(), 0usize, add_r());
@@ -377,7 +377,7 @@ fn variance_carrier() {
 fn logsumexp_carrier() {
     // lse(x) = log(Σ exp(x − m)) + m,   m = max x
     let a = axis("a", 29);
-    let x = input("X", &[a], Dtype::F32);
+    let x = input("X", [a], Dtype::F32);
     let stream = axis_refs(&x)[0];
     let m = reduce(x.clone(), 0usize, max_r());
     let e = map(
@@ -402,8 +402,8 @@ fn logsumexp_carrier() {
 #[test]
 fn payloads_at_an_extremal_key_derive_generically() {
     let n = axis("n", 7);
-    let key = input("K", &[n], Dtype::F32);
-    let payload = input("P", &[n], Dtype::F32);
+    let key = input("K", [n], Dtype::F32);
+    let payload = input("P", [n], Dtype::F32);
     let stream = axis_refs(&key)[0];
     let maximum = reduce(key.clone(), 0usize, max_r());
     let at_maximum = map(
@@ -429,8 +429,8 @@ fn payloads_at_an_extremal_key_derive_generically() {
         .collect();
     check(&carrier, &items, &[10.0]);
 
-    let key = input("K", &[n], Dtype::F32);
-    let payload = input("P", &[n], Dtype::F32);
+    let key = input("K", [n], Dtype::F32);
+    let payload = input("P", [n], Dtype::F32);
     let stream = axis_refs(&key)[0];
     let minimum = reduce(key.clone(), 0usize, Monoid::Min);
     let at_minimum = map(
@@ -472,9 +472,9 @@ fn planted_scores(center: f64, n: usize, max_pos: usize, seed: u64) -> Vec<f64> 
 #[test]
 fn attention_rescale_survives_overflow_magnitudes() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 16), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let stream = axis_refs(&kk)[0];
     let car = derive(&attention(q, kk, v), stream).unwrap();
 
@@ -506,7 +506,7 @@ fn attention_rescale_survives_overflow_magnitudes() {
 #[test]
 fn logsumexp_rescale_survives_overflow_magnitudes() {
     let a = axis("a", 23);
-    let x = input("X", &[a], Dtype::F32);
+    let x = input("X", [a], Dtype::F32);
     let stream = axis_refs(&x)[0];
     let m = reduce(x.clone(), 0usize, max_r());
     let e = map(
@@ -545,11 +545,11 @@ fn logsumexp_rescale_survives_overflow_magnitudes() {
 #[test]
 fn masked_scaled_attention_derives() {
     let (s, k, e) = (axis("s", 8), axis("k", 21), axis("e", 64));
-    let scores = input("S", &[s, k], Dtype::F32);
+    let scores = input("S", [s, k], Dtype::F32);
     let stream = axis_refs(&scores)[1];
-    let scale = input("scale", &[], Dtype::F32);
-    let mask = input("M", &[s, k], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let scale = input("scale", [], Dtype::F32);
+    let mask = input("M", [s, k], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
 
     let sc = map(MapOp::Add, vec![map(MapOp::Mul, vec![scores, scale]), mask]);
     let out = matmul(softmax(sc, 1usize), v);
@@ -582,9 +582,9 @@ fn masked_scaled_attention_derives() {
 #[test]
 fn computed_causal_mask_derives() {
     let (s, t, e) = (axis("s", 8), axis("t", 12), axis("e", 64));
-    let scores = input("S", &[s, t], Dtype::F32);
+    let scores = input("S", [s, t], Dtype::F32);
     let stream = axis_refs(&scores)[1];
-    let v = input("V", &[t, e], Dtype::F32);
+    let v = input("V", [t, e], Dtype::F32);
     let masked = map(
         MapOp::Add,
         vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
@@ -614,7 +614,7 @@ fn computed_causal_mask_derives() {
 #[test]
 fn tanh_fuses_into_a_reduction() {
     let n = axis("n", 17);
-    let x = input("X", &[n], Dtype::F32);
+    let x = input("X", [n], Dtype::F32);
     let stream = axis_refs(&x)[0];
     let sum = reduce(map(MapOp::Tanh, vec![x]), 0usize, Monoid::Add);
     let carrier = derive(&sum, stream).expect("tanh should ride the additive lift");
@@ -636,10 +636,10 @@ fn tanh_fuses_into_a_reduction() {
 #[test]
 fn silu_fuses_into_a_contraction() {
     let f = axis("f", 27);
-    let gate = input("G", &[f], Dtype::F32);
+    let gate = input("G", [f], Dtype::F32);
     let stream = axis_refs(&gate)[0];
-    let up = input("U", &[f], Dtype::F32);
-    let w = input("Wd", &[f], Dtype::F32);
+    let up = input("U", [f], Dtype::F32);
+    let w = input("Wd", [f], Dtype::F32);
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let down = reduce(map(MapOp::Mul, vec![act, w]), 0usize, add_r());
 
@@ -664,10 +664,10 @@ fn silu_fuses_into_a_contraction() {
 #[test]
 fn rmsnorm_fused_projection_carrier() {
     let d = axis("d", 16);
-    let x = input("X", &[d], Dtype::F32);
+    let x = input("X", [d], Dtype::F32);
     let stream = axis_refs(&x)[0];
-    let g = input("G", &[d], Dtype::F32);
-    let w = input("W", &[d], Dtype::F32);
+    let g = input("G", [d], Dtype::F32);
+    let w = input("W", [d], Dtype::F32);
     let n = 16.0;
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 0usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
@@ -700,7 +700,7 @@ fn view_scoping_rules() {
         axis("f", 6),
         axis("sf", 24),
     );
-    let x = input("X", &[s, dm], Dtype::F32);
+    let x = input("X", [s, dm], Dtype::F32);
     let [source_s, _] = axis_refs(&x).try_into().unwrap();
     let xt = rename(x.clone(), 0usize, t);
     let renamed_t = axis_refs(&xt)[0];
@@ -715,7 +715,7 @@ fn view_scoping_rules() {
     // a grouped output joins its members' structures; the members go out of
     // scope — asking about them above the view is asking about variables
     // that no longer exist.
-    let weight = input("W", &[f, dm], Dtype::F32);
+    let weight = input("W", [f, dm], Dtype::F32);
     let output_f = axis_refs(&weight)[0];
     let mm = matmul(x, transpose(weight, 0usize, 1usize)); // [s, f]
     let grouped = flatten(mm, &[0, 1][..], sf);
@@ -731,12 +731,12 @@ fn view_scoping_rules() {
 fn fold_through_a_flattened_view() {
     // out = Σ_dmv flat[dmv]·w[dmv], where flat reindexes a *computed* [h, dv]
     let (h, dv, dmv) = (axis("h", 4), axis("dv", 6), axis("dmv", 24));
-    let a = input("A", &[h, dv], Dtype::F32);
-    let b = input("B", &[h, dv], Dtype::F32);
+    let a = input("A", [h, dv], Dtype::F32);
+    let b = input("B", [h, dv], Dtype::F32);
     let prod = map(MapOp::Mul, vec![a, b]); // computed, not a raw input
     let flat = flatten(prod, &[0, 1][..], dmv);
     let stream = axis_refs(&flat)[0];
-    let w = input("W", &[dmv], Dtype::F32);
+    let w = input("W", [dmv], Dtype::F32);
     let out = reduce(map(MapOp::Mul, vec![flat, w]), 0usize, add_r());
 
     let car = derive(&out, stream).expect("folds over the flattened axis");
@@ -755,9 +755,9 @@ fn fold_through_a_flattened_view() {
 #[test]
 fn embedding_is_opaque() {
     let (vocab, d, seq) = (axis("vocab", 32), axis("d", 16), axis("seq", 8));
-    let table = input("E", &[vocab, d], Dtype::F32);
+    let table = input("E", [vocab, d], Dtype::F32);
     let selected = axis_refs(&table)[0];
-    let ids = input("ids", &[seq], Dtype::F32);
+    let ids = input("ids", [seq], Dtype::F32);
     let emb = embedding(table, ids, 0usize);
     assert_eq!(structure(&emb, selected).level, Parallelism::Opaque);
     assert!(!streamable(&emb, selected));
@@ -774,7 +774,7 @@ fn scalar_prefix_scan_executes_through_the_fallback() {
     let n = axis("n", 5);
     let values = Value::from_shape_fn(&[5], |coordinate| [2.0, -1.0, 3.0, 0.5, 4.0][coordinate[0]]);
     let env: Env = [("X", values)].into_iter().collect();
-    let prefix = scan(input("X", &[n], Dtype::F32), 0usize, Monoid::Add);
+    let prefix = scan(input("X", [n], Dtype::F32), 0usize, Monoid::Add);
 
     assert_eq!(eval(&prefix, &env).data, vec![2.0, 1.0, 4.0, 4.5, 8.5]);
     let schedule = partition(&prefix, &DeviceProfile::toy());
@@ -794,11 +794,11 @@ fn per_node_axis_double_gemm() {
     // only because the analysis is per (node, axis) rather than collapsed
     // onto the output.
     let (i, a, m, j) = (axis("i", 4), axis("a", 5), axis("m", 6), axis("j", 7));
-    let x = input("X", &[i, a], Dtype::F32);
-    let y = input("Y", &[a, m], Dtype::F32);
+    let x = input("X", [i, a], Dtype::F32);
+    let y = input("Y", [a, m], Dtype::F32);
     let middle = axis_refs(&y)[1];
     let g1 = matmul(x, y); // contracts a → output [i, m]
-    let z = input("Z", &[m, j], Dtype::F32);
+    let z = input("Z", [m, j], Dtype::F32);
     let g2 = matmul(g1.clone(), z); // contracts m → output [i, j]
 
     // `m` is a free output index of GEMM-1 ...
@@ -812,9 +812,9 @@ fn per_node_axis_double_gemm() {
 #[test]
 fn flash_attention_associative_all_splits() {
     let (sq, k, d, e) = (axis("sq", 8), axis("k", 12), axis("d", 64), axis("e", 64));
-    let q = input("Q", &[sq, d], Dtype::F32);
-    let kk = input("K", &[k, d], Dtype::F32);
-    let v = input("V", &[k, e], Dtype::F32);
+    let q = input("Q", [sq, d], Dtype::F32);
+    let kk = input("K", [k, d], Dtype::F32);
+    let v = input("V", [k, e], Dtype::F32);
     let stream = axis_refs(&kk)[0];
     let attn = attention(q, kk, v);
     let car = derive(&attn, stream).unwrap();
@@ -840,10 +840,10 @@ fn multi_value_attention_generalizes() {
     // Σ softmax(scores)·V1 and Σ softmax(scores)·V2, summed — the coupling
     // with two deferred linear reductions sharing one (m, s).
     let k = axis("k", 15);
-    let scores = input("S", &[k], Dtype::F32);
+    let scores = input("S", [k], Dtype::F32);
     let stream = axis_refs(&scores)[0];
-    let v1 = input("V1", &[k], Dtype::F32);
-    let v2 = input("V2", &[k], Dtype::F32);
+    let v1 = input("V1", [k], Dtype::F32);
+    let v2 = input("V2", [k], Dtype::F32);
     let w = softmax(scores, 0usize);
     let o1 = reduce(map(MapOp::Mul, vec![w.clone(), v1]), 0usize, add_r());
     let o2 = reduce(map(MapOp::Mul, vec![w, v2]), 0usize, add_r());
@@ -906,13 +906,13 @@ fn ctc_logsumexp_carriers_match() {
         axis("pred", 6),
         axis("v", 32),
     );
-    let logp = input("logp", &[b, t, v], Dtype::F32);
+    let logp = input("logp", [b, t, v], Dtype::F32);
     let batch_axis = axis_refs(&logp)[0];
     let vocab_axis = axis_refs(&logp)[2];
-    let labels = input("labels", &[s], Dtype::F32);
+    let labels = input("labels", [s], Dtype::F32);
     let emit = gather(logp, labels, 2usize); // logp_t[ℓ(s)] — index vocab by label
 
-    let prev = input("alpha_prev", &[b, pred, s], Dtype::F32); // α_{t-1} at predecessors
+    let prev = input("alpha_prev", [b, pred, s], Dtype::F32); // α_{t-1} at predecessors
     let pred_axis = axis_refs(&prev)[1];
     let state_axis = axis_refs(&prev)[2];
     let trans = reduce(prev, 1usize, lse_r()); // logsumexp over predecessors
@@ -920,7 +920,7 @@ fn ctc_logsumexp_carriers_match() {
         MapOp::Add,
         vec![unsqueeze(trans.clone(), 1usize), emit.clone()],
     ); // + emission
-    let alpha_t = input("alpha_T", &[b, s], Dtype::F32);
+    let alpha_t = input("alpha_T", [b, s], Dtype::F32);
     let final_state_axis = axis_refs(&alpha_t)[1];
     let loss = reduce(alpha_t, 1usize, lse_r()); // final logsumexp over states
 
@@ -984,13 +984,13 @@ fn soft_attention_over_logspace_dp() {
         axis("h", 14),
         axis("t", 6),
     );
-    let q = input("Q", &[b, d], Dtype::F32);
+    let q = input("Q", [b, d], Dtype::F32);
     let batch_axis = axis_refs(&q)[0];
     let contract_axis = axis_refs(&q)[1];
-    let ktable = input("Ktable", &[idx, k, d], Dtype::F32);
+    let ktable = input("Ktable", [idx, k, d], Dtype::F32);
     let index_axis = axis_refs(&ktable)[0];
     let key_axis = axis_refs(&ktable)[1];
-    let labels = input("labels", &[b], Dtype::F32);
+    let labels = input("labels", [b], Dtype::F32);
     let kgath = gather(ktable, labels, 0usize); // K[b,k,d] via runtime index → OPAQUE on idx
     let score = reduce(
         map(MapOp::Mul, vec![unsqueeze(q, 1usize), kgath.clone()]),
@@ -1000,10 +1000,10 @@ fn soft_attention_over_logspace_dp() {
     let weight = softmax(score.clone(), 1usize); // (m, s) coupling
 
     // VALUES are themselves a streamed reduction: a logsumexp-matmul over h.
-    let wv = input("Wv", &[k, h], Dtype::F32);
+    let wv = input("Wv", [k, h], Dtype::F32);
     let value_key_axis = axis_refs(&wv)[0];
     let hidden_axis = axis_refs(&wv)[1];
-    let hmat = input("H", &[b, t, k, h], Dtype::F32);
+    let hmat = input("H", [b, t, k, h], Dtype::F32);
     let value = reduce(map(MapOp::Add, vec![wv, hmat]), 3usize, lse_r()); // LogMatMul contract=h
 
     let out = reduce(
@@ -1187,7 +1187,7 @@ fn probe_discovered_laws_are_sound() {
         for trial in 0..6 {
             let len = 3 + trial;
             let n = axis("n", len);
-            let x = input("X", &[n], Dtype::F32);
+            let x = input("X", [n], Dtype::F32);
             let stream = axis_refs(&x)[0];
             let g = build(x);
             let c = derive(&g, stream).unwrap_or_else(|d| panic!("{name}: must derive, got {d}"));

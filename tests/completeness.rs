@@ -122,7 +122,7 @@ type Sketch = fn(&[f64]) -> f64;
 
 fn run_h(build: Build, xs: &[f64]) -> f64 {
     let n = axis("n", xs.len());
-    let g = build(input("X", &[n], Dtype::F32), 0);
+    let g = build(input("X", [n], Dtype::F32), 0);
     let x = xs.to_vec();
     let env: Env = [(
         "X",
@@ -492,7 +492,7 @@ fn every_decline_is_justified_or_pinned() {
         // hides a producer fold. (`derive` alone answers a weaker question —
         // "does the root stream over its leaves" — median's rank reduces,
         // say, are legal leaves but each is its own kernel.)
-        let x = input("X", &[n], Dtype::F32);
+        let x = input("X", [n], Dtype::F32);
         let stream = axis_refs(&x)[0];
         let derived = derive(&build(x, 0), stream)
             .ok()
@@ -593,7 +593,7 @@ fn random_declines_survive_the_probe() {
     for seed in 0..24u64 {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
-        let x = input("X", &[n], Dtype::F32);
+        let x = input("X", [n], Dtype::F32);
         let stream = axis_refs(&x)[0];
         let g = build(x, 0);
         let one_pass = derive(&g, stream).is_ok_and(|c| c.leaves.iter().all(|l| !contains_fold(l)));
@@ -693,7 +693,7 @@ fn inspect_flagged_seeds() {
     for seed in [7u64, 13, 23] {
         SEED.with(|s| s.set(seed));
         let build: Build = |x, n| random_program(x, n, SEED.with(|s| s.get()));
-        let x = input("X", &[n], Dtype::F32);
+        let x = input("X", [n], Dtype::F32);
         let stream = axis_refs(&x)[0];
         let g = build(x, 0);
         println!(

@@ -56,7 +56,7 @@ fn cross_entropy(logits: &NodeRef, primitive: bool) -> NodeRef {
                 one_hot_like(
                     logits.clone(),
                     1usize,
-                    unsqueeze(input("y", &[logits.shape()[0]], Dtype::F32), 1usize),
+                    unsqueeze(input("y", [logits.shape()[0]], Dtype::F32), 1usize),
                 ),
             ],
         ),
@@ -83,7 +83,7 @@ fn simplify_preserves_the_gradient() {
     .into_iter()
     .collect();
 
-    let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), false);
+    let loss = cross_entropy(&input("Z", [b, c], Dtype::F32), false);
     let dz = grad(&loss, &["Z"])["Z"].clone();
     let simplified = simplify_many(&[loss, dz.clone()]).pop().unwrap();
 
@@ -106,7 +106,7 @@ fn simplify_preserves_the_gradient() {
 fn composed_logsumexp_backward_matches_the_primitive() {
     let (b, c) = (axis("b", 100), axis("c", 10));
     let schedule = |primitive: bool| {
-        let loss = cross_entropy(&input("Z", &[b, c], Dtype::F32), primitive);
+        let loss = cross_entropy(&input("Z", [b, c], Dtype::F32), primitive);
         let dz = grad(&loss, &["Z"])["Z"].clone();
         let roots = simplify_many(&[loss, dz]);
         partition_many(
@@ -131,7 +131,7 @@ fn composed_logsumexp_backward_matches_the_primitive() {
 #[test]
 fn canonicalize_merges_structural_duplicates() {
     let (b, c) = (axis("b", 4), axis("c", 6));
-    let x = input("x", &[b, c], Dtype::F32);
+    let x = input("x", [b, c], Dtype::F32);
     let row_energy = |x: &NodeRef| {
         reduce(
             map(MapOp::Mul, vec![x.clone(), x.clone()]),
@@ -167,7 +167,7 @@ fn canonicalize_merges_structural_duplicates() {
 #[test]
 fn partition_computes_a_structural_duplicate_once() {
     let (b, c) = (axis("b", 4), axis("c", 6));
-    let x = || input("x", &[b, c], Dtype::F32);
+    let x = || input("x", [b, c], Dtype::F32);
     let row_energy = |x: NodeRef| reduce(map(MapOp::Mul, vec![x.clone(), x]), 1usize, Monoid::Add);
     // One fold consumed by two different parents — written once with the
     // node shared, once with the fold rebuilt from scratch.

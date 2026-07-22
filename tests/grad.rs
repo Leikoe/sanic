@@ -90,8 +90,8 @@ fn matmul_squared_loss() {
     .collect();
 
     let y = matmul(
-        input("X", &[s, d], Dtype::F32),
-        transpose(input("W", &[f, d], Dtype::F32), 0usize, 1usize),
+        input("X", [s, d], Dtype::F32),
+        transpose(input("W", [f, d], Dtype::F32), 0usize, 1usize),
     ); // [s, f]
     let sq = map(MapOp::Mul, vec![y.clone(), y]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
@@ -117,13 +117,13 @@ fn softmax_cross_entropy() {
     .collect();
 
     let logits = matmul(
-        input("X", &[s, d], Dtype::F32),
-        transpose(input("W", &[v, d], Dtype::F32), 0usize, 1usize),
+        input("X", [s, d], Dtype::F32),
+        transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize),
     ); // [s, v]
     let p = softmax(logits, 1usize);
     let ll = map(
         MapOp::Mul,
-        vec![input("T", &[s, v], Dtype::F32), map(MapOp::Log, vec![p])],
+        vec![input("T", [s, v], Dtype::F32), map(MapOp::Log, vec![p])],
     );
     let loss = map(
         MapOp::Neg,
@@ -144,8 +144,8 @@ fn rmsnorm_gain_and_input() {
     .into_iter()
     .collect();
 
-    let x = input("X", &[s, d], Dtype::F32);
-    let g = input("G", &[d], Dtype::F32);
+    let x = input("X", [s, d], Dtype::F32);
+    let g = input("G", [d], Dtype::F32);
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 5.0)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
@@ -172,15 +172,15 @@ fn masked_attention_qkv() {
     .collect();
 
     let scores = matmul(
-        input("Q", &[s, dk], Dtype::F32),
-        transpose(input("K", &[t, dk], Dtype::F32), 0usize, 1usize),
+        input("Q", [s, dk], Dtype::F32),
+        transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
     );
     let scaled = map(MapOp::Mul, vec![scores, konst(0.5)]);
     let masked = map(
         MapOp::Add,
         vec![scaled.clone(), causal_mask_like(scaled, 0usize, 1usize)],
     );
-    let out = matmul(softmax(masked, 1usize), input("V", &[t, dv], Dtype::F32)); // [s, dv]
+    let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32)); // [s, dv]
     let sq = map(MapOp::Mul, vec![out.clone(), out]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
     check_grads(&loss, &env, &["Q", "K", "V"]);
@@ -205,11 +205,11 @@ fn conv1d_input_and_filter() {
     .into_iter()
     .collect();
 
-    let xw = window(input("X", &[ci, w0], Dtype::F32), 1usize, o, kk, 1, 1);
+    let xw = window(input("X", [ci, w0], Dtype::F32), 1usize, o, kk, 1, 1);
     let xf = transpose(flatten(xw, &[0usize, 2usize][..], r), 0usize, 1usize);
     let wf = transpose(
         flatten(
-            input("W", &[co, ci, kk], Dtype::F32),
+            input("W", [co, ci, kk], Dtype::F32),
             &[1usize, 2usize][..],
             r,
         ),
@@ -238,11 +238,11 @@ fn embedding_table_gradient() {
     .collect();
 
     let emb = embedding(
-        input("E", &[v, d], Dtype::F32),
-        input("ids", &[s], Dtype::F32),
+        input("E", [v, d], Dtype::F32),
+        input("ids", [s], Dtype::F32),
         0usize,
     ); // [s, d]
-    let err = map(MapOp::Sub, vec![emb, input("Y", &[s, d], Dtype::F32)]);
+    let err = map(MapOp::Sub, vec![emb, input("Y", [s, d], Dtype::F32)]);
     let sq = map(MapOp::Mul, vec![err.clone(), err]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
     check_grads(&loss, &env, &["E"]);
@@ -263,7 +263,7 @@ fn shared_input_through_a_rename() {
     // X is read at query positions and, through a rename, at key positions.
     // Explicit singleton insertion defines the shared [s, t, d] iteration
     // space; the gradient must sum both paths back into X.
-    let x = input("X", &[s, d], Dtype::F32);
+    let x = input("X", [s, d], Dtype::F32);
     let xt = rename(x.clone(), 0usize, t);
     let y = map(
         MapOp::Mul,
@@ -271,7 +271,7 @@ fn shared_input_through_a_rename() {
             map(
                 MapOp::Mul,
                 vec![
-                    unsqueeze(input("A", &[s, t], Dtype::F32), 2usize),
+                    unsqueeze(input("A", [s, t], Dtype::F32), 2usize),
                     unsqueeze(xt, 0usize),
                 ],
             ),
@@ -303,14 +303,14 @@ fn gradient_schedules_like_any_graph() {
     .collect();
 
     let scores = matmul(
-        input("Q", &[s, dk], Dtype::F32),
-        transpose(input("K", &[t, dk], Dtype::F32), 0usize, 1usize),
+        input("Q", [s, dk], Dtype::F32),
+        transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
     );
     let masked = map(
         MapOp::Add,
         vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
     );
-    let out = matmul(softmax(masked, 1usize), input("V", &[t, dv], Dtype::F32));
+    let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
     let sq = map(MapOp::Mul, vec![out.clone(), out]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
 
@@ -356,22 +356,19 @@ fn sgd_training_loop_converges() {
     let pred = reduce(
         map(
             MapOp::Mul,
-            vec![
-                input("X", &[s, d], Dtype::F32),
-                input("Wt", &[d], Dtype::F32),
-            ],
+            vec![input("X", [s, d], Dtype::F32), input("Wt", [d], Dtype::F32)],
         ),
         1usize,
         add_r(),
     ); // [s]
-    let err = map(MapOp::Sub, vec![pred, input("T", &[s], Dtype::F32)]);
+    let err = map(MapOp::Sub, vec![pred, input("T", [s], Dtype::F32)]);
     let loss_node = reduce(map(MapOp::Mul, vec![err.clone(), err]), 0usize, add_r());
 
     let grads = grad(&loss_node, &["Wt"]);
     let step = map(
         MapOp::Sub,
         vec![
-            input("Wt", &[d], Dtype::F32),
+            input("Wt", [d], Dtype::F32),
             map(MapOp::Mul, vec![konst(0.05), grads["Wt"].clone()]),
         ],
     );
@@ -416,8 +413,8 @@ fn cumsum_backward_is_the_reversed_cumsum() {
     .collect();
 
     // loss = Σ (W ⊙ cumsum_t(X))² — the scan inside a nonlinear consumer
-    let cs = scan(input("X", &[s, t], Dtype::F32), 1usize, Monoid::Add);
-    let wx = map(MapOp::Mul, vec![cs, input("W", &[s, t], Dtype::F32)]);
+    let cs = scan(input("X", [s, t], Dtype::F32), 1usize, Monoid::Add);
+    let wx = map(MapOp::Mul, vec![cs, input("W", [s, t], Dtype::F32)]);
     let sq = map(MapOp::Mul, vec![wx.clone(), wx]);
     let loss = reduce(reduce(sq, 1usize, Monoid::Add), 0usize, Monoid::Add);
     check_grads(&loss, &env, &["X", "W"]);
@@ -438,9 +435,9 @@ fn strided_dilated_conv_backward() {
     .into_iter()
     .collect();
 
-    let xw = window(input("X", &[w0], Dtype::F32), 0usize, o, kk, 2, 2); // [o, k]
+    let xw = window(input("X", [w0], Dtype::F32), 0usize, o, kk, 2, 2); // [o, k]
     let conv = reduce(
-        map(MapOp::Mul, vec![xw, input("W", &[kk], Dtype::F32)]),
+        map(MapOp::Mul, vec![xw, input("W", [kk], Dtype::F32)]),
         1usize,
         add_r(),
     ); // [o]

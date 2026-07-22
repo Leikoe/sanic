@@ -54,7 +54,7 @@ fn slice_reads_the_shifted_range() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let sl = slice(input("X", &[n], Dtype::F32), 0usize, m, 3);
+    let sl = slice(input("X", [n], Dtype::F32), 0usize, m, 3);
     let got = eval(&sl, &env);
     assert_eq!(got.shape, vec![4]);
     for i in 0..4 {
@@ -69,7 +69,7 @@ fn pad_reads_zero_outside() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let pd = pad(input("X", &[n], Dtype::F32), 0usize, p, 2);
+    let pd = pad(input("X", [n], Dtype::F32), 0usize, p, 2);
     let got = eval(&pd, &env);
     for i in 0..9usize {
         let want = if (2..7).contains(&i) {
@@ -91,7 +91,7 @@ fn split_is_the_inverse_of_flatten() {
 
     // flatten [h,w] → f, then split f → (h2, w2): the identity, relabeled.
     let round = split(
-        flatten(input("X", &[h, w], Dtype::F32), &[0, 1][..], f),
+        flatten(input("X", [h, w], Dtype::F32), &[0, 1][..], f),
         0usize,
         h2,
         w2,
@@ -108,7 +108,7 @@ fn window_matches_the_hand_window() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let wd = window(input("X", &[n], Dtype::F32), 0usize, o, k, 2, 1);
+    let wd = window(input("X", [n], Dtype::F32), 0usize, o, k, 2, 1);
     let got = eval(&wd, &env);
     for oi in 0..3 {
         for ki in 0..3 {
@@ -134,10 +134,10 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
     let w = rand_tensor(&[co, ci, kk], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
-    let xw = window(input("X", &[ci, w0], Dtype::F32), 1usize, o, kk, 1, 1); // [ci, o, k]
+    let xw = window(input("X", [ci, w0], Dtype::F32), 1usize, o, kk, 1, 1); // [ci, o, k]
     let xf = flatten(xw, &[0, 2][..], r); // [r, o]
     let stream = axis_refs(&xf)[0];
-    let wf = flatten(input("W", &[co, ci, kk], Dtype::F32), &[1, 2][..], r); // [co, r]
+    let wf = flatten(input("W", [co, ci, kk], Dtype::F32), &[1, 2][..], r); // [co, r]
     let conv = matmul(transpose(xf, 0usize, 1usize), transpose(wf, 0usize, 1usize)); // [o, co]
 
     // the naive semantics equal a hand-written convolution
@@ -196,7 +196,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
 
     // both spatial axes window in a single Reindex node
     let xw = positional_reindex(
-        input("X", &[ci, h0, w0], Dtype::F32),
+        input("X", [ci, h0, w0], Dtype::F32),
         vec![ci, oh, kh, ow, kw],
         vec![
             (0, vec![(1, 0)], 0),
@@ -207,7 +207,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     ); // [ci, oh, kh, ow, kw]
     let xf = flatten(xw, &[0, 2, 4][..], r); // [r, oh, ow]
     let xf = transpose(transpose(xf, 0usize, 1usize), 1usize, 2usize); // [oh, ow, r]
-    let wf = flatten(input("W", &[co, ci, kh, kw], Dtype::F32), &[1, 2, 3][..], r); // [co, r]
+    let wf = flatten(input("W", [co, ci, kh, kw], Dtype::F32), &[1, 2, 3][..], r); // [co, r]
     let conv = matmul(xf, transpose(wf, 0usize, 1usize)); // [oh, ow, co]
 
     let got = eval(&conv, &env);
@@ -255,10 +255,10 @@ fn padded_conv1d_matches_hand() {
     let w = rand_tensor(&[co, ci, kk], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
-    let xp = pad(input("X", &[ci, w0], Dtype::F32), 1usize, p0, 1); // [ci, p0]
+    let xp = pad(input("X", [ci, w0], Dtype::F32), 1usize, p0, 1); // [ci, p0]
     let xw = window(xp, 1usize, o, kk, 1, 1); // [ci, o, k]
     let xf = flatten(xw, &[0, 2][..], r);
-    let wf = flatten(input("W", &[co, ci, kk], Dtype::F32), &[1, 2][..], r);
+    let wf = flatten(input("W", [co, ci, kk], Dtype::F32), &[1, 2][..], r);
     let conv = matmul(transpose(xf, 0usize, 1usize), transpose(wf, 0usize, 1usize)); // [o, co]
 
     let got = eval(&conv, &env);
@@ -292,7 +292,7 @@ fn maxpool_is_one_kernel_and_matches_hand() {
     let x = rand_tensor(&[c, w0], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let xw = window(input("X", &[c, w0], Dtype::F32), 1usize, o, kk, 2, 1); // [c, o, k]
+    let xw = window(input("X", [c, w0], Dtype::F32), 1usize, o, kk, 2, 1); // [c, o, k]
     let pool = reduce(xw, 2usize, Monoid::Max); // [c, o]
 
     let got = eval(&pool, &env);
@@ -337,14 +337,14 @@ fn sliding_window_attention_is_one_flash_kernel() {
     // key position read at (s, j): t = s + j − (w−1); j ranges over the window
     let off = -((w - 1) as i64);
     let kw = positional_reindex(
-        input("K", &[t, d], Dtype::F32),
+        input("K", [t, d], Dtype::F32),
         vec![s, j, d],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     ); // [s, j, d]
     let stream = axis_refs(&kw)[1];
     let vw = positional_reindex(
-        input("V", &[t, e], Dtype::F32),
+        input("V", [t, e], Dtype::F32),
         vec![s, j, e],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
@@ -353,7 +353,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
     let scores = reduce(
         map(
             MapOp::Mul,
-            vec![unsqueeze(input("Q", &[s, d], Dtype::F32), 1usize), kw],
+            vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw],
         ),
         2usize,
         Monoid::Add,

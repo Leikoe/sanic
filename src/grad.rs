@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ir::{
-    self, Axis, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ViewDim, konst, map,
-    positional_reindex, positional_view, reduce, scan, split,
+    self, AffineIndex, Axis, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ViewDim,
+    konst, map, positional_reindex, positional_view, reduce, scan, split,
 };
 
 /// d(loss)/d(each named input), as graphs. `loss` must be a scalar (no free
@@ -302,7 +302,7 @@ fn transpose_reindex(
     g: Node,
     source_shape: &[Axis],
     output_shape: &[Axis],
-    reindex: &[(usize, Vec<(i64, usize)>, i64)],
+    reindex: &[AffineIndex],
 ) -> Node {
     let output_rank = output_shape.len();
     let mut iteration = output_shape.to_vec();

@@ -54,6 +54,9 @@ pub fn axis(name: &'static str, extent: impl Into<Extent>) -> Axis {
 /// `(source dimension, (coefficient, output dimension) terms, offset)`.
 pub type AffineIndex = (usize, Vec<(i64, usize)>, i64);
 
+/// [`AffineIndex`] with every dimension resolved to its axis occurrence.
+pub type ResolvedAffineIndex = (AxisRef, Vec<(i64, AxisRef)>, i64);
+
 /// One output dimension of a storage-preserving view.
 ///
 /// `sources` are positions in the source shape. A singleton insertion has no
@@ -339,10 +342,7 @@ impl Resolver {
             .collect()
     }
 
-    pub(crate) fn resolved_reindex(
-        &mut self,
-        node: &NodeRef,
-    ) -> Vec<(AxisRef, Vec<(i64, AxisRef)>, i64)> {
+    pub(crate) fn resolved_reindex(&mut self, node: &NodeRef) -> Vec<ResolvedAffineIndex> {
         let Node::Reindex { src, map, .. } = node.as_ref() else {
             return Vec::new();
         };
@@ -472,7 +472,7 @@ pub fn view_groups(node: &NodeRef) -> Vec<(Vec<AxisRef>, AxisRef)> {
 }
 
 /// Positional affine reindexing expressed in resolved axis coordinates.
-pub fn resolved_reindex(node: &NodeRef) -> Vec<(AxisRef, Vec<(i64, AxisRef)>, i64)> {
+pub fn resolved_reindex(node: &NodeRef) -> Vec<ResolvedAffineIndex> {
     Resolver::default().resolved_reindex(node)
 }
 

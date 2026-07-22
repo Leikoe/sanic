@@ -47,7 +47,7 @@ fn argmax_is_one_generic_product_fold() {
     let data = [2.0, 5.0, 5.0, 1.0, 5.0, 2.0, 0.0, 5.0];
     let values = Value::from_shape_fn(&[8], |coordinate| data[coordinate[0]]);
     let env: Env = [("X", values)].into_iter().collect();
-    let x = input("X", &[n], Dtype::F32);
+    let x = input("X", [n], Dtype::F32);
     let stream = axis_refs(&x)[0];
     let node = argmax(x, 0usize);
 
@@ -90,7 +90,7 @@ fn topk_matches_a_hand_sort() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n], Dtype::F32), 0usize, k);
+    let pairs = topk(input("X", [n], Dtype::F32), 0usize, k);
 
     // hand reference: sort (value, index) descending by value
     let mut order: Vec<(f64, usize)> = x.data.iter().copied().zip(0..).collect();
@@ -115,7 +115,7 @@ fn topk_partitions_and_executes() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let k = 3;
-    let pairs = topk(input("X", &[n], Dtype::F32), 0usize, k);
+    let pairs = topk(input("X", [n], Dtype::F32), 0usize, k);
     let names: Vec<(NodeRef, &'static str)> = pairs
         .iter()
         .enumerate()
@@ -151,7 +151,7 @@ fn topk_all_composition_matches_and_schedules() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let scores = input("X", &[n], Dtype::F32);
+    let scores = input("X", [n], Dtype::F32);
     let all_indices = topk_all(scores.clone(), 0usize, k, rk, true);
     let all_values = topk_all(scores, 0usize, k, rk, false);
 
@@ -203,9 +203,9 @@ fn topk_all_ties_match_per_rank_folds() {
     let x = Value::from_shape_fn(&[8], |coordinate| data[coordinate[0]]);
     let env: Env = [("X", x)].into_iter().collect();
 
-    let all = topk_all(input("X", &[n], Dtype::F32), 0usize, k, rk, true);
+    let all = topk_all(input("X", [n], Dtype::F32), 0usize, k, rk, true);
     let got = eval(&all, &env);
-    let pairs = topk(input("X", &[n], Dtype::F32), 0usize, k);
+    let pairs = topk(input("X", [n], Dtype::F32), 0usize, k);
     for (r, (_, i)) in pairs.iter().enumerate() {
         assert_eq!(
             got.at_index(&[r]),
@@ -226,7 +226,7 @@ fn batched_top1_routes_rows() {
     let gates = rand_tensor(&[b, e], &mut rng);
     let env: Env = [("G", gates.clone())].into_iter().collect();
 
-    let pairs = topk(input("G", &[b, e], Dtype::F32), 1usize, 1);
+    let pairs = topk(input("G", [b, e], Dtype::F32), 1usize, 1);
     let idx = eval(&pairs[0].1, &env);
     for bi in 0..5 {
         let mut best = 0usize;
@@ -245,7 +245,7 @@ fn batched_top1_routes_rows() {
 #[should_panic(expected = "topk requires k >= 1")]
 fn topk_rejects_an_empty_selection() {
     let n = axis("n", 4);
-    let _ = topk(input("X", &[n], Dtype::F32), 0usize, 0);
+    let _ = topk(input("X", [n], Dtype::F32), 0usize, 0);
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn topk_rejects_an_empty_selection() {
 fn topk_all_requires_one_rank_axis_position_per_result() {
     let n = axis("n", 4);
     let ranks = axis("ranks", 3);
-    let _ = topk_all(input("X", &[n], Dtype::F32), 0usize, 2, ranks, true);
+    let _ = topk_all(input("X", [n], Dtype::F32), 0usize, 2, ranks, true);
 }
 
 // ── scatter-add: the inverse of gather, collisions summed ────────────────────
@@ -269,8 +269,8 @@ fn scatter_add_matches_hand_with_collisions() {
     let env: Env = [("S", src.clone()), ("idx", idx)].into_iter().collect();
 
     let sc = scatter_add(
-        input("S", &[i, d], Dtype::F32),
-        input("idx", &[i], Dtype::F32),
+        input("S", [i, d], Dtype::F32),
+        input("idx", [i], Dtype::F32),
         0usize,
         j,
     );
@@ -316,11 +316,11 @@ fn scatter_add_inverts_a_permutation_gather() {
     let env: Env = [("T", table.clone()), ("ids", ids)].into_iter().collect();
 
     let gathered = gather(
-        input("T", &[v, d], Dtype::F32),
-        input("ids", &[s], Dtype::F32),
+        input("T", [v, d], Dtype::F32),
+        input("ids", [s], Dtype::F32),
         0usize,
     ); // [s, d]
-    let back = scatter_add(gathered, input("ids", &[s], Dtype::F32), 0usize, v2); // [v2, d]
+    let back = scatter_add(gathered, input("ids", [s], Dtype::F32), 0usize, v2); // [v2, d]
     let got = eval(&back, &env);
     for vi in 0..5 {
         for di in 0..3 {

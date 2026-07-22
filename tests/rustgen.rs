@@ -141,9 +141,9 @@ fn flash_attention_compiles_and_matches() {
     .collect();
 
     let attn = scaled_dot_product_attention(
-        input("Q", &[sq, d], Dtype::F32),
-        input("K", &[k, d], Dtype::F32),
-        input("V", &[k, e], Dtype::F32),
+        input("Q", [sq, d], Dtype::F32),
+        input("K", [k, d], Dtype::F32),
+        input("V", [k, e], Dtype::F32),
         None,
         0.0,
         false,
@@ -176,12 +176,12 @@ fn quantized_matmul_compiles_and_matches() {
     let dw = map(
         MapOp::Mul,
         vec![
-            input("qW", &[o, dm], Dtype::F32),
-            unsqueeze(input("scale", &[o], Dtype::F32), 1usize),
+            input("qW", [o, dm], Dtype::F32),
+            unsqueeze(input("scale", [o], Dtype::F32), 1usize),
         ],
     );
     let y = matmul(
-        input("X", &[s, dm], Dtype::F32),
+        input("X", [s, dm], Dtype::F32),
         transpose(dw, 0usize, 1usize),
     );
     let sched = partition(&y, &DeviceProfile::toy());
@@ -215,13 +215,13 @@ fn conv2d_compiles_and_matches() {
     .into_iter()
     .collect();
 
-    let xw = window(input("X", &[ci, h0, w0], Dtype::F32), 1usize, oh, kh, 1, 1);
+    let xw = window(input("X", [ci, h0, w0], Dtype::F32), 1usize, oh, kh, 1, 1);
     let xw = window(xw, 3usize, ow, kw, 1, 1);
     let xf = flatten(xw, &[0usize, 2usize, 4usize][..], r);
     let xf = transpose(transpose(xf, 0usize, 1usize), 1usize, 2usize);
     let wf = transpose(
         flatten(
-            input("W", &[co, ci, kh, kw], Dtype::F32),
+            input("W", [co, ci, kh, kw], Dtype::F32),
             &[1usize, 2usize, 3usize][..],
             r,
         ),
@@ -258,18 +258,18 @@ fn sliding_window_attention_compiles_and_matches() {
 
     let off = -((w - 1) as i64);
     let kw = positional_reindex(
-        input("K", &[t, d], Dtype::F32),
+        input("K", [t, d], Dtype::F32),
         vec![s, j, d],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     );
     let vw = positional_reindex(
-        input("V", &[t, e], Dtype::F32),
+        input("V", [t, e], Dtype::F32),
         vec![s, j, e],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     );
-    let q = unsqueeze(input("Q", &[s, d], Dtype::F32), 1usize);
+    let q = unsqueeze(input("Q", [s, d], Dtype::F32), 1usize);
     let scores = reduce(map(MapOp::Mul, vec![q, kw]), 2usize, add_r());
     let invalid = map(
         MapOp::Lt,
@@ -353,12 +353,12 @@ fn transformer_block_compiles_and_matches() {
         reduce(map(MapOp::Mul, vec![x, weight]), 3usize, add_r())
     };
 
-    let x = input("X", &[s, dm], Dtype::F32);
-    let xn = rmsnorm(x.clone(), input("g1", &[dm], Dtype::F32));
+    let x = input("X", [s, dm], Dtype::F32);
+    let xn = rmsnorm(x.clone(), input("g1", [dm], Dtype::F32));
     let xn_kv = rename(xn.clone(), 0usize, t);
-    let q = head_projection(xn, input("Wq", &[h, dk, dm], Dtype::F32));
-    let k = head_projection(xn_kv.clone(), input("Wk", &[h, dk, dm], Dtype::F32));
-    let vv = head_projection(xn_kv, input("Wv", &[h, dv, dm], Dtype::F32));
+    let q = head_projection(xn, input("Wq", [h, dk, dm], Dtype::F32));
+    let k = head_projection(xn_kv.clone(), input("Wk", [h, dk, dm], Dtype::F32));
+    let vv = head_projection(xn_kv, input("Wv", [h, dv, dm], Dtype::F32));
     let attn = scaled_dot_product_attention(
         q,
         k,
@@ -370,23 +370,23 @@ fn transformer_block_compiles_and_matches() {
         false,
     );
     let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv);
-    let o = matmul(flat, input("Wo", &[dmv, dm], Dtype::F32));
+    let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32));
     let res1 = map(MapOp::Add, vec![o, x]);
-    let hn = rmsnorm(res1.clone(), input("g2", &[dm], Dtype::F32));
+    let hn = rmsnorm(res1.clone(), input("g2", [dm], Dtype::F32));
     let gate = matmul(
         hn.clone(),
-        transpose(input("Wg", &[f, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
     );
     let up = matmul(
         hn,
-        transpose(input("Wu", &[f, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
     );
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let mlp = matmul(act, input("Wd", &[f, dm], Dtype::F32));
+    let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
     let logits = matmul(
         yb,
-        transpose(input("W_lm", &[v, dm], Dtype::F32), 0usize, 1usize),
+        transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize),
     );
 
     let sched = partition(&logits, &DeviceProfile::toy());
@@ -409,14 +409,14 @@ fn attention_gradient_compiles_and_matches() {
     .collect();
 
     let scores = matmul(
-        input("Q", &[s, dk], Dtype::F32),
-        transpose(input("K", &[t, dk], Dtype::F32), 0usize, 1usize),
+        input("Q", [s, dk], Dtype::F32),
+        transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
     );
     let masked = map(
         MapOp::Add,
         vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
     );
-    let out = matmul(softmax(masked, 1usize), input("V", &[t, dv], Dtype::F32));
+    let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
     let sq = map(MapOp::Mul, vec![out.clone(), out]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
 

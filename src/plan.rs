@@ -779,12 +779,12 @@ mod tests {
             axis("d", 64),
             axis("e", 64),
         );
-        let key = input("K", &[b, h, k, d], Dtype::F32);
+        let key = input("K", [b, h, k, d], Dtype::F32);
         let key_axis = axis_refs(&key)[2];
         let attn = scaled_dot_product_attention(
-            input("Q", &[b, h, sq, d], Dtype::F32),
+            input("Q", [b, h, sq, d], Dtype::F32),
             key,
-            input("V", &[b, h, k, e], Dtype::F32),
+            input("V", [b, h, k, e], Dtype::F32),
             None,
             0.0,
             false,
@@ -803,7 +803,7 @@ mod tests {
     fn a_scalar_output_fold_still_plans() {
         // Reduce(X[n], n, Add) → scalar output; no row axis.
         let n = axis("n", 4096);
-        let x = input("X", &[n], Dtype::F32);
+        let x = input("X", [n], Dtype::F32);
         let stream = axis_refs(&x)[0];
         let s = reduce(x, 0usize, Monoid::Add);
         let c = derive(&s, stream).unwrap();
@@ -820,11 +820,11 @@ mod tests {
             axis("singleton", 1),
             axis("output", 2048),
         );
-        let x = input("X", &[stream, singleton], Dtype::F32);
+        let x = input("X", [stream, singleton], Dtype::F32);
         let stream_axis = axis_refs(&x)[0];
         let dot = matmul(
             transpose(x, 0usize, 1usize),
-            transpose(input("W", &[output, stream], Dtype::BF16), 0usize, 1usize),
+            transpose(input("W", [output, stream], Dtype::BF16), 0usize, 1usize),
         );
         let mut carrier = derive(&dot, stream_axis).unwrap();
         let invariant = carrier.slots;
@@ -848,15 +848,15 @@ mod tests {
         let dev = DeviceProfile::toy();
 
         let cost_of = |w: NodeRef| {
-            let x = input("X", &[s, d], Dtype::F32);
+            let x = input("X", [s, d], Dtype::F32);
             let stream = axis_refs(&x)[1];
             let g = matmul(x, transpose(w, 0usize, 1usize));
             let c = derive(&g, stream).unwrap();
             plan_axis(&g, stream, &c, &dev).unwrap().cost
         };
-        let full = cost_of(input("W", &[f, d], Dtype::F32));
-        let int8 = cost_of(input("W8", &[f, d], Dtype::I8));
-        let int4 = cost_of(input("W4", &[f, d], Dtype::I4));
+        let full = cost_of(input("W", [f, d], Dtype::F32));
+        let int8 = cost_of(input("W8", [f, d], Dtype::I8));
+        let int4 = cost_of(input("W4", [f, d], Dtype::I4));
         assert!(
             int8 < full,
             "int8 weights must price below f32: {int8} vs {full}"

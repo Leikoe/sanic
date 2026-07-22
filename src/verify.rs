@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ir::{Axis, Dtype, Extent, Node as NodeKind, NodeRef as Node, ViewDim};
+use crate::ir::{AffineIndex, Axis, Dtype, Extent, Node as NodeKind, NodeRef as Node, ViewDim};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyError {
@@ -279,7 +279,7 @@ fn check_view(source: &[Axis], dims: &[ViewDim]) -> Result<(), String> {
 fn check_reindex(
     source: &[Axis],
     output: &[Axis],
-    map: &[(usize, Vec<(i64, usize)>, i64)],
+    map: &[AffineIndex],
     padded: bool,
 ) -> Result<(), String> {
     if map.len() != source.len() {
