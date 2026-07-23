@@ -23,8 +23,11 @@
 //! ```
 
 /// `SANIC_DEBUG` level, parsed once — the shape of tinygrad's `DEBUG`.
-/// `1` dumps the compiled schedule (see [`partition`]); `2` additionally
-/// times every kernel at runtime and prints one line per launch.
+/// `1` dumps the compiled schedule (see [`partition`]); `2` prints one line
+/// per replayed graph with its REAL command-buffer time; `3` additionally
+/// dumps each frozen graph's contents once (plan-side) and traces
+/// compile-time cut decisions; `4` abandons the frozen graph and times
+/// every kernel solo — accurate per launch, sync-floored in sum.
 pub(crate) fn debug_level() -> u32 {
     static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {

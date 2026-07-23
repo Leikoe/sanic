@@ -509,6 +509,14 @@ impl MetalDevice {
         g: &MetalGraph,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let cb = self.queue.commandBuffer().expect("command buffer");
+        let commands = match &g.execution {
+            MetalGraphExecution::Direct(dispatches) => dispatches.len(),
+            MetalGraphExecution::Indirect { command_buffer, .. } => command_buffer.len,
+        };
+        // Name the step for Instruments/Xcode GPU captures.
+        cb.setLabel(Some(&NSString::from_str(&format!(
+            "sanic batched {commands}"
+        ))));
         match &g.execution {
             MetalGraphExecution::Direct(dispatches) => {
                 for dispatch in dispatches {
