@@ -850,30 +850,28 @@ fn has_contraction(node: &Node, streaming: AxisRef, out_set: &HashSet<AxisRef>) 
 
 /// Rough flop count: one op per Map output element, one per Reduce/Scan source
 /// element. Good enough to rank on the roofline. Memoized by pointer — a DAG
-/// otherwise re-counts shared subtrees per path, the dominant cost profiling
-/// found; the `output_axes` cache is threaded through so per-node volumes are
-/// computed once for the whole walk.
+/// otherwise re-counts shared subtrees per path — and ONE resolver spans the
+/// walk: resolving each node's volume against a fresh memo would recompute
+/// every subtree per node, the dominant cost profiling found.
 fn count_flops(node: &Node) -> f64 {
-    let mut oa = HashMap::new();
-    let mut fc = HashMap::new();
-    count_flops_memo(node, &mut oa, &mut fc)
+    count_flops_memo(node, &mut ir::Resolver::default(), &mut HashMap::new())
 }
 
 fn count_flops_memo(
     node: &Node,
-    oa: &mut HashMap<*const NodeKind, Vec<AxisRef>>,
+    resolver: &mut ir::Resolver,
     fc: &mut HashMap<*const NodeKind, f64>,
 ) -> f64 {
     let key = std::sync::Arc::as_ptr(node);
     if let Some(f) = fc.get(&key) {
         return *f;
     }
-    let vol = |n: &Node, oa: &mut HashMap<*const NodeKind, Vec<AxisRef>>| -> f64 {
-        let axes = oa
-            .entry(std::sync::Arc::as_ptr(n))
-            .or_insert_with(|| ir::axis_refs(n))
-            .clone();
-        axes.iter().map(|ax| ax.extent() as f64).product()
+    let vol = |n: &Node, resolver: &mut ir::Resolver| -> f64 {
+        resolver
+            .axes(n)
+            .iter()
+            .map(|ax| ax.extent() as f64)
+            .product()
     };
     let f = match node.as_ref() {
         NodeKind::Input { .. }
@@ -881,17 +879,22 @@ fn count_flops_memo(
         | NodeKind::Iota { .. }
         | NodeKind::Coordinate { .. } => 0.0,
         NodeKind::Map { inputs, .. } => {
-            let child: f64 = inputs.iter().map(|i| count_flops_memo(i, oa, fc)).sum();
-            child + vol(node, oa)
+            let child: f64 = inputs
+                .iter()
+                .map(|i| count_flops_memo(i, resolver, fc))
+                .sum();
+            child + vol(node, resolver)
         }
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
-            count_flops_memo(src, oa, fc) + vol(src, oa)
+            count_flops_memo(src, resolver, fc) + vol(src, resolver)
         }
         NodeKind::Gather { src, index, .. } => {
-            count_flops_memo(src, oa, fc) + count_flops_memo(index, oa, fc)
+            count_flops_memo(src, resolver, fc) + count_flops_memo(index, resolver, fc)
         }
         // Reindexing costs nothing.
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => count_flops_memo(src, oa, fc),
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+            count_flops_memo(src, resolver, fc)
+        }
     };
     fc.insert(key, f);
     f

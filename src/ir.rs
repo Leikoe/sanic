@@ -514,16 +514,21 @@ pub fn resolved_reindex(node: &NodeRef) -> Vec<ResolvedAffineIndex> {
 /// Every logical dimension occurrence reachable from `node`, in first-seen
 /// order. Ordinary elementwise/pass-through axes deduplicate naturally;
 /// flatten and reindex boundaries introduce new occurrences.
+///
+/// ONE resolver spans the walk: resolving each visited node against a fresh
+/// memo would recompute every subtree per node — the walk itself would be
+/// quadratic in graph depth.
 pub fn all_axis_refs(node: &NodeRef) -> Vec<AxisRef> {
     fn walk(
         node: &NodeRef,
         out: &mut Vec<AxisRef>,
         seen: &mut std::collections::HashSet<*const Node>,
+        resolver: &mut Resolver,
     ) {
         if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
-        for axis in axis_refs(node) {
+        for axis in resolver.axes(node) {
             if !out.contains(&axis) {
                 out.push(axis);
             }
@@ -534,20 +539,25 @@ pub fn all_axis_refs(node: &NodeRef) -> Vec<AxisRef> {
             | Node::Reduce { src, .. }
             | Node::Scan { src, .. }
             | Node::View { src, .. }
-            | Node::Reindex { src, .. } => walk(src, out, seen),
+            | Node::Reindex { src, .. } => walk(src, out, seen, resolver),
             Node::Map { inputs, .. } => {
                 for input in inputs {
-                    walk(input, out, seen);
+                    walk(input, out, seen, resolver);
                 }
             }
             Node::Gather { src, index, .. } => {
-                walk(src, out, seen);
-                walk(index, out, seen);
+                walk(src, out, seen, resolver);
+                walk(index, out, seen, resolver);
             }
         }
     }
     let mut axes = Vec::new();
-    walk(node, &mut axes, &mut std::collections::HashSet::new());
+    walk(
+        node,
+        &mut axes,
+        &mut std::collections::HashSet::new(),
+        &mut Resolver::default(),
+    );
     axes
 }
 
