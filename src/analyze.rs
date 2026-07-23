@@ -82,6 +82,12 @@ impl StructureCache {
     pub(crate) fn classify(&mut self, node: &Node, axis: AxisRef) -> Structure {
         structure_memo(node, axis, self)
     }
+
+    /// The positional resolver this cache memoizes with, for passes that
+    /// resolve many occurrences over the same retained DAG.
+    pub(crate) fn resolver(&mut self) -> &mut ir::Resolver {
+        &mut self.resolver
+    }
 }
 
 fn structure_memo(node: &Node, axis: AxisRef, cache: &mut StructureCache) -> Structure {

@@ -776,27 +776,32 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     out
 }
 
-fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
+fn axis_aliases(
+    root: &Node,
+    stream: AxisRef,
+    resolver: &mut ir::Resolver,
+) -> HashMap<AxisRef, AxisRef> {
     fn alias_collapsed(
         node: &Node,
         insertion: usize,
         target: AxisRef,
         aliases: &mut HashMap<AxisRef, AxisRef>,
+        resolver: &mut ir::Resolver,
     ) {
         match node.as_ref() {
             NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
-                let collapsed = ir::source_axis(src, *dim);
+                let collapsed = resolver.source_axis(src, *dim);
                 if collapsed.extent == target.extent {
                     aliases.insert(collapsed, target);
                 }
             }
             NodeKind::Map { inputs, .. } => {
-                let output_rank = node.shape().len();
+                let output_rank = resolver.shape(node).len();
                 for input in inputs {
-                    let input_rank = input.shape().len();
+                    let input_rank = resolver.shape(input).len();
                     let lead = output_rank - input_rank;
                     if insertion >= lead && insertion - lead <= input_rank {
-                        alias_collapsed(input, insertion - lead, target, aliases);
+                        alias_collapsed(input, insertion - lead, target, aliases, resolver);
                     }
                 }
             }
@@ -806,7 +811,7 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
                     .take(insertion)
                     .map(|dim| dim.sources.len())
                     .sum();
-                alias_collapsed(src, source_insertion, target, aliases);
+                alias_collapsed(src, source_insertion, target, aliases, resolver);
             }
             _ => {}
         }
@@ -818,8 +823,9 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
         stream: AxisRef,
         aliases: &mut HashMap<AxisRef, AxisRef>,
         seen: &mut std::collections::HashSet<*const NodeKind>,
+        resolver: &mut ir::Resolver,
     ) {
-        let axes = ir::axis_refs(node);
+        let axes = resolver.axes(node);
         for (&local, target) in axes.iter().zip(&canonical) {
             if let Some(target) = target {
                 aliases.entry(local).or_insert(*target);
@@ -832,12 +838,12 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
         match node.as_ref() {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
             NodeKind::Coordinate { src, .. } => {
-                walk(src, canonical, stream, aliases, seen);
+                walk(src, canonical, stream, aliases, seen, resolver);
             }
             NodeKind::Map { inputs, .. } => {
-                let output_shape = node.shape();
+                let output_shape = resolver.shape(node);
                 for input in inputs {
-                    let input_shape = input.shape();
+                    let input_shape = resolver.shape(input);
                     let lead = output_shape.len() - input_shape.len();
                     let child = input_shape
                         .iter()
@@ -853,11 +859,11 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
                             }
                         })
                         .collect();
-                    walk(input, child, stream, aliases, seen);
+                    walk(input, child, stream, aliases, seen, resolver);
                 }
             }
             NodeKind::Reduce { src, dim, .. } => {
-                let source_axes = ir::axis_refs(src);
+                let source_axes = resolver.axes(src);
                 let child = source_axes
                     .iter()
                     .enumerate()
@@ -877,14 +883,14 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
                         }
                     })
                     .collect();
-                walk(src, child, stream, aliases, seen);
+                walk(src, child, stream, aliases, seen, resolver);
             }
             NodeKind::Scan { src, .. } => {
-                walk(src, canonical, stream, aliases, seen);
+                walk(src, canonical, stream, aliases, seen, resolver);
             }
             NodeKind::Gather { src, index, dim } => {
-                let source_axes = ir::axis_refs(src);
-                let index_rank = ir::axis_refs(index).len();
+                let source_axes = resolver.axes(src);
+                let index_rank = resolver.axes(index).len();
                 let source = source_axes
                     .iter()
                     .enumerate()
@@ -904,17 +910,18 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
                         }
                     })
                     .collect();
-                walk(src, source, stream, aliases, seen);
+                walk(src, source, stream, aliases, seen, resolver);
                 walk(
                     index,
                     canonical[*dim..*dim + index_rank].to_vec(),
                     stream,
                     aliases,
                     seen,
+                    resolver,
                 );
             }
             NodeKind::View { src, dims } => {
-                let mut source = vec![None; ir::axis_refs(src).len()];
+                let mut source = vec![None; resolver.axes(src).len()];
                 for (output_dim, dim) in dims.iter().enumerate() {
                     if let [source_dim] = dim.sources.as_slice() {
                         source[*source_dim] = canonical[output_dim];
@@ -929,13 +936,13 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
                     if dim.sources.is_empty()
                         && let Some(target) = canonical[inserted]
                     {
-                        alias_collapsed(src, inserted, target, aliases);
+                        alias_collapsed(src, inserted, target, aliases, resolver);
                     }
                 }
-                walk(src, source, stream, aliases, seen);
+                walk(src, source, stream, aliases, seen, resolver);
             }
             NodeKind::Reindex { src, map, .. } => {
-                let mut source = vec![None; ir::axis_refs(src).len()];
+                let mut source = vec![None; resolver.axes(src).len()];
                 for (source_dim, terms, offset) in map {
                     if *offset == 0
                         && let [(1, output_dim)] = terms.as_slice()
@@ -943,12 +950,12 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
                         source[*source_dim] = canonical[*output_dim];
                     }
                 }
-                walk(src, source, stream, aliases, seen);
+                walk(src, source, stream, aliases, seen, resolver);
             }
         }
     }
 
-    let root_axes = ir::axis_refs(root);
+    let root_axes = resolver.axes(root);
     let canonical = root_axes.iter().copied().map(Some).collect();
     let mut aliases = HashMap::new();
     walk(
@@ -957,6 +964,7 @@ fn axis_aliases(root: &Node, stream: AxisRef) -> HashMap<AxisRef, AxisRef> {
         stream,
         &mut aliases,
         &mut std::collections::HashSet::new(),
+        resolver,
     );
     aliases.insert(stream, stream);
     aliases
@@ -981,6 +989,7 @@ pub(crate) fn derive_with_structure_cache(
     let axis = axis
         .resolve_axis(node, "derive")
         .expect("derive axis is absent from the selected node");
+    let aliases = axis_aliases(node, axis, structures.resolver());
     let mut ctx = Ctx {
         slots: Vec::new(),
         leaves: Vec::new(),
@@ -988,7 +997,7 @@ pub(crate) fn derive_with_structure_cache(
         memo_log: Vec::new(),
         rules: BTreeSet::new(),
         other_folds: HashMap::new(),
-        aliases: axis_aliases(node, axis),
+        aliases,
         stream: axis,
         structures,
     };

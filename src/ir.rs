@@ -278,15 +278,26 @@ pub fn axis_refs(node: &NodeRef) -> Vec<AxisRef> {
 
 /// Cached positional resolution for compiler passes over one retained DAG.
 /// This is pass metadata only; nodes remain the sole IR.
+///
+/// Both memo tables are keyed by raw node pointer, so every node answered
+/// for is pinned in `keepalive`: a dropped node's address could otherwise be
+/// reused by a NEW node, and the stale entry would answer for it.
 #[derive(Default)]
 pub(crate) struct Resolver {
     shapes: std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
     axes: std::collections::HashMap<*const Node, Rc<Vec<AxisRef>>>,
+    keepalive: Vec<NodeRef>,
 }
 
 impl Resolver {
     pub(crate) fn axes(&mut self, node: &NodeRef) -> Vec<AxisRef> {
+        self.keepalive.push(node.clone());
         (*axis_refs_rc(node, &mut self.axes, &mut self.shapes)).clone()
+    }
+
+    pub(crate) fn shape(&mut self, node: &NodeRef) -> Vec<Axis> {
+        self.keepalive.push(node.clone());
+        shape_memo(node, &mut self.shapes)
     }
 
     pub(crate) fn source_axis(&mut self, src: &NodeRef, dim: usize) -> AxisRef {
