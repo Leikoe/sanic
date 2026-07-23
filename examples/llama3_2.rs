@@ -792,10 +792,26 @@ fn run_metal() -> Result<(), String> {
             .step(token)
             .map_err(|error| format!("initialize decoder: {error}"))?;
     }
-    print!("{}", arguments.prompt);
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
+    // Debug levels print per-step lines on stderr; streaming partial lines
+    // to stdout would interleave with them, so hold the text until the end.
+    let streaming = std::env::var("SANIC_DEBUG")
+        .ok()
+        .and_then(|level| level.parse::<u32>().ok())
+        .unwrap_or(0)
+        < 2;
+    let mut held_back = String::new();
+    let mut emit = |text: &str| -> Result<(), String> {
+        if streaming {
+            print!("{text}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| error.to_string())?;
+        } else {
+            held_back.push_str(text);
+        }
+        Ok(())
+    };
+    emit(&arguments.prompt)?;
 
     let started = std::time::Instant::now();
     let mut generated = 0usize;
@@ -827,10 +843,7 @@ fn run_metal() -> Result<(), String> {
             .step(next)
             .map_err(|error| format!("decode token {next}: {error}"))?
         {
-            print!("{text}");
-            std::io::stdout()
-                .flush()
-                .map_err(|error| error.to_string())?;
+            emit(&text)?;
         }
         if next == 128_001 || generated == arguments.new_tokens {
             break;
@@ -840,7 +853,11 @@ fn run_metal() -> Result<(), String> {
         decode_gpu_seconds += seconds;
         decode_steps += 1;
     }
-    println!();
+    if streaming {
+        println!();
+    } else {
+        println!("{held_back}");
+    }
     let elapsed = started.elapsed().as_secs_f32();
     if decode_steps == 0 {
         eprintln!("generated {generated} token from the prefill logits");
