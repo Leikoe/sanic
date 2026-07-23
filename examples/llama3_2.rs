@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use safetensors::SafeTensors;
 use sanic::nn::functional::scaled_dot_product_attention;
@@ -453,7 +453,7 @@ fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
         specs: &mut HashMap<String, (Vec<usize>, Dtype)>,
         seen: &mut HashSet<*const Node>,
     ) {
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {

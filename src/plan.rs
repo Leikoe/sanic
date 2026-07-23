@@ -6,7 +6,7 @@
 //! inputs carry the streamed axis; the cost model ranks the candidates.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
@@ -65,7 +65,7 @@ impl GroupCache {
     fn collect(&mut self, node: &Node) {
         let mut stack = vec![node.clone()];
         while let Some(current) = stack.pop() {
-            if !self.visited.insert(Rc::as_ptr(&current)) {
+            if !self.visited.insert(Arc::as_ptr(&current)) {
                 continue;
             }
             for (group, grouped) in ir::view_groups(&current) {
@@ -864,13 +864,13 @@ fn count_flops_memo(
     oa: &mut HashMap<*const NodeKind, Vec<AxisRef>>,
     fc: &mut HashMap<*const NodeKind, f64>,
 ) -> f64 {
-    let key = std::rc::Rc::as_ptr(node);
+    let key = std::sync::Arc::as_ptr(node);
     if let Some(f) = fc.get(&key) {
         return *f;
     }
     let vol = |n: &Node, oa: &mut HashMap<*const NodeKind, Vec<AxisRef>>| -> f64 {
         let axes = oa
-            .entry(std::rc::Rc::as_ptr(n))
+            .entry(std::sync::Arc::as_ptr(n))
             .or_insert_with(|| ir::axis_refs(n))
             .clone();
         axes.iter().map(|ax| ax.extent() as f64).product()

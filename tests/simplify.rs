@@ -142,7 +142,7 @@ fn canonicalize_merges_structural_duplicates() {
     // Built twice on purpose: equal structure, distinct nodes.
     let once = row_energy(&x);
     let again = row_energy(&x);
-    assert!(!std::rc::Rc::ptr_eq(&once, &again));
+    assert!(!std::sync::Arc::ptr_eq(&once, &again));
 
     let y = map(MapOp::Add, vec![once, again]); // 2·Σx² per row
     let canonical = canonicalize_many(std::slice::from_ref(&y)).pop().unwrap();
@@ -150,7 +150,7 @@ fn canonicalize_merges_structural_duplicates() {
         panic!("expected the root Add to survive canonicalization");
     };
     assert!(
-        std::rc::Rc::ptr_eq(&inputs[0], &inputs[1]),
+        std::sync::Arc::ptr_eq(&inputs[0], &inputs[1]),
         "the duplicated reduction must canonicalize to one shared node"
     );
 

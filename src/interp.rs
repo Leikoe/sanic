@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::derive::Carrier;
 use crate::ir::{
@@ -277,7 +278,7 @@ pub fn eval(node: &Node, env: &Env) -> Value {
 }
 
 fn eval_rc(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Value>>) -> Rc<Value> {
-    let ptr = Rc::as_ptr(node);
+    let ptr = Arc::as_ptr(node);
     if let Some(t) = cache.get(&ptr) {
         return t.clone();
     }

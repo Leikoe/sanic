@@ -31,7 +31,7 @@
 //! windows). Each panics with a message naming the gap.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ir::{
     self, AffineIndex, Axis, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ViewDim,
@@ -55,7 +55,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
 
     // cotangent per node, accumulated across consumers
     let mut adj: HashMap<*const NodeKind, Node> = HashMap::new();
-    adj.insert(Rc::as_ptr(loss), konst(1.0));
+    adj.insert(Arc::as_ptr(loss), konst(1.0));
 
     // gradient per input NAME: distinct `Input` nodes with the same name are
     // the same buffer read under (possibly) different axis labels, so their
@@ -63,7 +63,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
     let mut by_name: HashMap<&'static str, (Vec<Axis>, Node)> = HashMap::new();
 
     for node in order.iter().rev() {
-        let Some(g) = adj.get(&Rc::as_ptr(node)).cloned() else {
+        let Some(g) = adj.get(&Arc::as_ptr(node)).cloned() else {
             continue; // the loss does not depend on this node
         };
         // A map can consume a broadcastable cotangent directly. Keeping the
@@ -593,13 +593,13 @@ fn reduce_to(n: Node, target: &[Axis]) -> Node {
 }
 
 fn add_adj(adj: &mut HashMap<*const NodeKind, Node>, child: &Node, contrib: Node) {
-    match adj.get(&Rc::as_ptr(child)) {
+    match adj.get(&Arc::as_ptr(child)) {
         None => {
-            adj.insert(Rc::as_ptr(child), contrib);
+            adj.insert(Arc::as_ptr(child), contrib);
         }
         Some(prev) => {
             adj.insert(
-                Rc::as_ptr(child),
+                Arc::as_ptr(child),
                 map(MapOp::Add, vec![prev.clone(), contrib]),
             );
         }
@@ -607,7 +607,7 @@ fn add_adj(adj: &mut HashMap<*const NodeKind, Node>, child: &Node, contrib: Node
 }
 
 fn postorder(node: &Node, seen: &mut Vec<*const NodeKind>, out: &mut Vec<Node>) {
-    let ptr = Rc::as_ptr(node);
+    let ptr = Arc::as_ptr(node);
     if seen.contains(&ptr) {
         return;
     }

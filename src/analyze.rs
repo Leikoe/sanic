@@ -91,7 +91,7 @@ impl StructureCache {
 }
 
 fn structure_memo(node: &Node, axis: AxisRef, cache: &mut StructureCache) -> Structure {
-    let key = (std::rc::Rc::as_ptr(node), axis);
+    let key = (std::sync::Arc::as_ptr(node), axis);
     if let Some(s) = cache.entries.get(&key) {
         return *s;
     }

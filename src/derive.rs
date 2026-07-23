@@ -80,7 +80,7 @@
 //! `Decline` on the `Infeasible` stage it emits in the fold's stead.
 
 use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::analyze::{Parallelism, StructureCache};
 use crate::ir::{self, AxisRef, AxisSelector, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
@@ -611,7 +611,7 @@ fn plain_pe(s: &S) -> Option<Expr> {
 }
 
 /// A node key that compares by identity and KEEPS ITS NODE ALIVE. Holding the
-/// `Rc` is what makes an address-based map sound: an address can be reused
+/// `Arc` is what makes an address-based map sound: an address can be reused
 /// only after its node is dropped, and an entry here prevents that for as
 /// long as the map lives.
 #[derive(Clone)]
@@ -619,13 +619,13 @@ struct ByAddr(Node);
 
 impl PartialEq for ByAddr {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 impl Eq for ByAddr {}
 impl std::hash::Hash for ByAddr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Rc::as_ptr(&self.0), state)
+        std::ptr::hash(Arc::as_ptr(&self.0), state)
     }
 }
 
@@ -697,7 +697,7 @@ impl Ctx<'_> {
                 canonical.push(axis);
             }
         }
-        if let Some(i) = self.leaves.iter().position(|(n, _)| Rc::ptr_eq(n, node)) {
+        if let Some(i) = self.leaves.iter().position(|(n, _)| Arc::ptr_eq(n, node)) {
             i
         } else {
             self.leaves.push((node.clone(), canonical));
@@ -831,7 +831,7 @@ fn axis_aliases(
                 aliases.entry(local).or_insert(*target);
             }
         }
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
 
@@ -1515,12 +1515,12 @@ fn extremum_filtered_payload(
     };
 
     if let Some(key) = reduced(right, Monoid::Max)
-        && Rc::ptr_eq(through_shape_views(left), &key)
+        && Arc::ptr_eq(through_shape_views(left), &key)
     {
         return Some((key, Monoid::Max, payload.clone()));
     }
     if let Some(key) = reduced(left, Monoid::Min)
-        && Rc::ptr_eq(through_shape_views(right), &key)
+        && Arc::ptr_eq(through_shape_views(right), &key)
     {
         return Some((key, Monoid::Min, payload.clone()));
     }

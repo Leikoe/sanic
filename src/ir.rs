@@ -9,11 +9,12 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub use crate::scalar::{Dtype, Extent, MapOp, Monoid};
 
 /// A shared reference to an immutable graph node.
-pub type NodeRef = Rc<Node>;
+pub type NodeRef = Arc<Node>;
 
 /// Metadata for one position in a node's shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -376,7 +377,7 @@ impl Resolver {
 
 fn own_axis(node: &NodeRef, dim: usize, descriptor: Axis) -> AxisRef {
     AxisRef {
-        owner: Rc::as_ptr(node),
+        owner: Arc::as_ptr(node),
         dim,
         name: descriptor.name,
         extent: descriptor.extent,
@@ -388,7 +389,7 @@ fn axis_refs_rc(
     cache: &mut std::collections::HashMap<*const Node, Rc<Vec<AxisRef>>>,
     shape_cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
 ) -> Rc<Vec<AxisRef>> {
-    let key = Rc::as_ptr(node);
+    let key = Arc::as_ptr(node);
     if let Some(axes) = cache.get(&key) {
         return axes.clone();
     }
@@ -519,7 +520,7 @@ pub fn all_axis_refs(node: &NodeRef) -> Vec<AxisRef> {
         out: &mut Vec<AxisRef>,
         seen: &mut std::collections::HashSet<*const Node>,
     ) {
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
         for axis in axis_refs(node) {
@@ -615,7 +616,7 @@ impl Dimension for isize {
 
 pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> NodeRef {
     let name = Box::leak(name.into().into_boxed_str());
-    Rc::new(Node::Input {
+    Arc::new(Node::Input {
         name,
         shape: shape.as_ref().to_vec(),
         dtype,
@@ -623,7 +624,7 @@ pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -
 }
 
 pub fn konst(v: f64) -> NodeRef {
-    Rc::new(Node::Const { v })
+    Arc::new(Node::Const { v })
 }
 
 /// A tensor of ones with the same positional shape as `source`, expressed
@@ -636,13 +637,13 @@ pub fn ones_like(source: NodeRef) -> NodeRef {
 }
 
 pub fn iota(axis: Axis) -> NodeRef {
-    Rc::new(Node::Iota { axis })
+    Arc::new(Node::Iota { axis })
 }
 
 /// The positional index along `dim`, broadcast over the shape of `src`.
 pub fn coordinate(src: NodeRef, dim: impl Dimension) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "coordinate");
-    Rc::new(Node::Coordinate { src, dim })
+    Arc::new(Node::Coordinate { src, dim })
 }
 
 pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
@@ -652,22 +653,22 @@ pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
         &inputs.iter().map(|input| input.shape()).collect::<Vec<_>>(),
         op.name(),
     );
-    Rc::new(Node::Map { op, inputs })
+    Arc::new(Node::Map { op, inputs })
 }
 
 pub fn reduce(src: NodeRef, dim: impl Dimension, op: Monoid) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "reduce");
-    Rc::new(Node::Reduce { src, dim, op })
+    Arc::new(Node::Reduce { src, dim, op })
 }
 
 pub fn scan(src: NodeRef, dim: impl Dimension, op: Monoid) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "scan");
-    Rc::new(Node::Scan { src, dim, op })
+    Arc::new(Node::Scan { src, dim, op })
 }
 
 pub fn gather(src: NodeRef, index: NodeRef, dim: impl Dimension) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "gather");
-    Rc::new(Node::Gather { src, index, dim })
+    Arc::new(Node::Gather { src, index, dim })
 }
 
 pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
@@ -704,7 +705,7 @@ pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
         consumed.into_iter().all(|value| value),
         "view: every source dimension must be consumed exactly once"
     );
-    Rc::new(Node::View { src, dims })
+    Arc::new(Node::View { src, dims })
 }
 
 /// Swap two dimensions without copying storage.
@@ -785,7 +786,7 @@ pub fn positional_reindex(
             assert_dim(&shape, output_dim, "reindex output");
         }
     }
-    Rc::new(Node::Reindex {
+    Arc::new(Node::Reindex {
         src,
         shape,
         map,
@@ -824,7 +825,7 @@ pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> No
 /// Rebuild `roots` with maximal sharing: separately constructed but
 /// structurally identical subtrees collapse into ONE node. One table spans
 /// all roots, and a subtree that is already canonical keeps its original
-/// `Rc`.
+/// `Arc`.
 pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
     let mut canonicalizer = Canonicalizer::default();
     roots.iter().map(|root| canonicalizer.tree(root)).collect()
@@ -856,10 +857,10 @@ fn canonicalize_node(
     canonical: &mut std::collections::HashMap<String, NodeRef>,
     memo: &mut std::collections::HashMap<*const Node, NodeRef>,
 ) -> NodeRef {
-    if let Some(n) = memo.get(&Rc::as_ptr(node)) {
+    if let Some(n) = memo.get(&Arc::as_ptr(node)) {
         return n.clone();
     }
-    // Children first; keep the ORIGINAL `Rc` when nothing beneath changed.
+    // Children first; keep the ORIGINAL `Arc` when nothing beneath changed.
     let rebuilt = match node.as_ref() {
         Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
         Node::Map { op, inputs } => {
@@ -867,10 +868,10 @@ fn canonicalize_node(
                 .iter()
                 .map(|i| canonicalize_node(i, canonical, memo))
                 .collect();
-            if ins.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+            if ins.iter().zip(inputs).all(|(a, b)| Arc::ptr_eq(a, b)) {
                 node.clone()
             } else {
-                Rc::new(Node::Map {
+                Arc::new(Node::Map {
                     op: *op,
                     inputs: ins,
                 })
@@ -878,18 +879,18 @@ fn canonicalize_node(
         }
         Node::Coordinate { src, dim } => {
             let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) {
+            if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                Rc::new(Node::Coordinate { src: s, dim: *dim })
+                Arc::new(Node::Coordinate { src: s, dim: *dim })
             }
         }
         Node::Reduce { src, dim, op } => {
             let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) {
+            if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                Rc::new(Node::Reduce {
+                Arc::new(Node::Reduce {
                     src: s,
                     dim: *dim,
                     op: *op,
@@ -898,10 +899,10 @@ fn canonicalize_node(
         }
         Node::Scan { src, dim, op } => {
             let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) {
+            if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                Rc::new(Node::Scan {
+                Arc::new(Node::Scan {
                     src: s,
                     dim: *dim,
                     op: *op,
@@ -911,10 +912,10 @@ fn canonicalize_node(
         Node::Gather { src, index, dim } => {
             let s = canonicalize_node(src, canonical, memo);
             let i = canonicalize_node(index, canonical, memo);
-            if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+            if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
                 node.clone()
             } else {
-                Rc::new(Node::Gather {
+                Arc::new(Node::Gather {
                     src: s,
                     index: i,
                     dim: *dim,
@@ -923,10 +924,10 @@ fn canonicalize_node(
         }
         Node::View { src, dims } => {
             let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) {
+            if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                Rc::new(Node::View {
+                Arc::new(Node::View {
                     src: s,
                     dims: dims.clone(),
                 })
@@ -939,10 +940,10 @@ fn canonicalize_node(
             padded,
         } => {
             let s = canonicalize_node(src, canonical, memo);
-            if Rc::ptr_eq(&s, src) {
+            if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
-                Rc::new(Node::Reindex {
+                Arc::new(Node::Reindex {
                     src: s,
                     shape: shape.clone(),
                     map: map.clone(),
@@ -955,14 +956,14 @@ fn canonicalize_node(
         .entry(shallow_key(&rebuilt))
         .or_insert(rebuilt)
         .clone();
-    memo.insert(Rc::as_ptr(node), out.clone());
+    memo.insert(Arc::as_ptr(node), out.clone());
     out
 }
 
 /// One node's structure with children identified by POINTER — valid as an
 /// identity key exactly when the children are already canonical.
 pub(crate) fn shallow_key(n: &NodeRef) -> String {
-    let p = |c: &NodeRef| Rc::as_ptr(c) as usize;
+    let p = |c: &NodeRef| Arc::as_ptr(c) as usize;
     match n.as_ref() {
         Node::Input { name, shape, dtype } => format!("I{name}{shape:?}{dtype:?}"),
         Node::Const { v } => format!("C{}", v.to_bits()),
@@ -1014,7 +1015,7 @@ pub fn input_axes(node: &NodeRef) -> Vec<(&'static str, Vec<AxisRef>)> {
         output: &mut Vec<(&'static str, Vec<AxisRef>)>,
         seen: &mut std::collections::HashSet<*const Node>,
     ) {
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {
@@ -1047,7 +1048,7 @@ pub fn input_dtypes(node: &NodeRef) -> Vec<(&'static str, Dtype)> {
         output: &mut Vec<(&'static str, Dtype)>,
         seen: &mut std::collections::HashSet<*const Node>,
     ) {
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {

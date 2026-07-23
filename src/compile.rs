@@ -8,7 +8,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::cost;
 use crate::interp::{Env, Value};
@@ -358,7 +358,7 @@ fn leak(value: String) -> &'static str {
 
 fn contains_dynamic(roots: &[NodeRef]) -> bool {
     fn visit(node: &NodeRef, seen: &mut HashSet<*const Node>) -> bool {
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return false;
         }
         if node
@@ -389,7 +389,7 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
         seen: &mut HashSet<*const Node>,
         inputs: &mut Vec<InputSpec>,
     ) -> Result<(), CompileError> {
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return Ok(());
         }
         match node.as_ref() {

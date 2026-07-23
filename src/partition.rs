@@ -29,7 +29,7 @@
 //! Stages come out in execution order (producers first).
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::analyze::{Parallelism, StructureCache};
 use crate::cost::DeviceProfile;
@@ -167,7 +167,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
     for (r, name) in &roots {
         let landed = p.emit(r, name);
         // a later root (or leaf) reaching this one reuses the buffer
-        p.done.insert(Rc::as_ptr(r), landed);
+        p.done.insert(Arc::as_ptr(r), landed);
         outputs.push(landed.to_string());
     }
     // In-place updates: a root named after a graph input (`w = w − lr·∇w`)
@@ -400,7 +400,7 @@ struct Partitioner<'a> {
     /// (`replace_many` in a Reduce/backward cut); once such a node drops, the
     /// allocator can hand its address to a NEW node, and the stale `done` entry
     /// would then answer for the wrong node (a materialized read under totally
-    /// unrelated axes). Holding an `Rc` pins the address, so no reuse.
+    /// unrelated axes). Holding an `Arc` pins the address, so no reuse.
     keepalive: Vec<Node>,
     /// How many consumers each node has in the original graph. A node with
     /// more than one is a fusion barrier for elementwise cones: computing it
@@ -423,7 +423,7 @@ struct Partitioner<'a> {
 /// Count graph edges into each node (a DAG walk; every edge counts).
 fn count_parents(node: &Node, out: &mut HashMap<*const NodeKind, usize>) {
     let visit = |child: &Node, out: &mut HashMap<*const NodeKind, usize>| {
-        let n = out.entry(Rc::as_ptr(child)).or_insert(0);
+        let n = out.entry(Arc::as_ptr(child)).or_insert(0);
         *n += 1;
         if *n == 1 {
             count_parents(child, out); // recurse only on first visit
@@ -449,7 +449,7 @@ fn count_parents(node: &Node, out: &mut HashMap<*const NodeKind, usize>) {
 }
 
 fn contains_node(root: &Node, target: &Node) -> bool {
-    if Rc::ptr_eq(root, target) {
+    if Arc::ptr_eq(root, target) {
         return true;
     }
     match root.as_ref() {
@@ -597,14 +597,14 @@ impl Partitioner<'_> {
         if is_free_source(node) {
             return self.emit(node, "");
         }
-        if let Some(name) = self.done.get(&Rc::as_ptr(node)) {
+        if let Some(name) = self.done.get(&Arc::as_ptr(node)) {
             return name;
         }
         let t = self.fresh();
         // A view aliases its source, so the name things actually landed
         // under is emit's return value, not necessarily `t`.
         let name = self.emit(node, t);
-        self.done.insert(Rc::as_ptr(node), name);
+        self.done.insert(Arc::as_ptr(node), name);
         self.keepalive.push(node.clone());
         name
     }
@@ -627,7 +627,7 @@ impl Partitioner<'_> {
 
     /// Is this node consumed by more than one parent in the original graph?
     fn shared(&self, node: &Node) -> bool {
-        self.parents.get(&Rc::as_ptr(node)).copied().unwrap_or(1) > 1
+        self.parents.get(&Arc::as_ptr(node)).copied().unwrap_or(1) > 1
     }
 
     /// Build an executable version of `node`: the same computation, but every
@@ -646,7 +646,7 @@ impl Partitioner<'_> {
     }
 
     /// Memoized by pointer, and a subtree with nothing spliced beneath
-    /// returns the ORIGINAL `Rc`: DAG sharing survives the rebuild (the
+    /// returns the ORIGINAL `Arc`: DAG sharing survives the rebuild (the
     /// deriver dedups leaves by pointer, and `done` is keyed by pointer, so
     /// a node another consumer will cut must keep its identity), and deep
     /// shared chains splice in linear time.
@@ -660,18 +660,18 @@ impl Partitioner<'_> {
             if is_free_source(node) {
                 return node.clone(); // read a raw input / const / index directly
             }
-            if let Some(m) = memo.get(&Rc::as_ptr(node)) {
+            if let Some(m) = memo.get(&Arc::as_ptr(node)) {
                 return m.clone();
             }
             if let NodeKind::View { src, dims } = node.as_ref() {
                 let s = self.splice_memo(src, false, memo);
-                let out = if Rc::ptr_eq(&s, src) {
+                let out = if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
                     self.canon
                         .shallow(crate::ir::positional_view(s, dims.clone()))
                 };
-                memo.insert(Rc::as_ptr(node), out.clone());
+                memo.insert(Arc::as_ptr(node), out.clone());
                 return out;
             }
             if let NodeKind::Reindex {
@@ -682,7 +682,7 @@ impl Partitioner<'_> {
             } = node.as_ref()
             {
                 let s = self.splice_memo(src, false, memo);
-                let out = if Rc::ptr_eq(&s, src) {
+                let out = if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::positional_reindex(
@@ -692,15 +692,15 @@ impl Partitioner<'_> {
                         *padded,
                     ))
                 };
-                memo.insert(Rc::as_ptr(node), out.clone());
+                memo.insert(Arc::as_ptr(node), out.clone());
                 return out;
             }
-            if let Some(&name) = self.done.get(&Rc::as_ptr(node)) {
+            if let Some(&name) = self.done.get(&Arc::as_ptr(node)) {
                 // a materialized buffer read
                 let read = self
                     .canon
                     .shallow(ir::input(name, node.shape(), Dtype::F32));
-                memo.insert(Rc::as_ptr(node), read.clone());
+                memo.insert(Arc::as_ptr(node), read.clone());
                 return read;
             }
         }
@@ -708,7 +708,7 @@ impl Partitioner<'_> {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => node.clone(),
             NodeKind::Coordinate { src, dim } => {
                 let source = self.splice_memo(src, false, memo);
-                if Rc::ptr_eq(&source, src) {
+                if Arc::ptr_eq(&source, src) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::coordinate(source, *dim))
@@ -719,7 +719,7 @@ impl Partitioner<'_> {
                     .iter()
                     .map(|i| self.splice_memo(i, false, memo))
                     .collect();
-                if new.iter().zip(inputs).all(|(a, b)| Rc::ptr_eq(a, b)) {
+                if new.iter().zip(inputs).all(|(a, b)| Arc::ptr_eq(a, b)) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::map(*op, new))
@@ -727,7 +727,7 @@ impl Partitioner<'_> {
             }
             NodeKind::Reduce { src, dim, op } => {
                 let s = self.splice_memo(src, false, memo);
-                if Rc::ptr_eq(&s, src) {
+                if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::reduce(s, *dim, *op))
@@ -735,7 +735,7 @@ impl Partitioner<'_> {
             }
             NodeKind::Scan { src, dim, op } => {
                 let s = self.splice_memo(src, false, memo);
-                if Rc::ptr_eq(&s, src) {
+                if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::scan(s, *dim, *op))
@@ -744,7 +744,7 @@ impl Partitioner<'_> {
             NodeKind::Gather { src, index, dim } => {
                 let s = self.splice_memo(src, false, memo);
                 let i = self.splice_memo(index, false, memo);
-                if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+                if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::gather(s, i, *dim))
@@ -752,7 +752,7 @@ impl Partitioner<'_> {
             }
             NodeKind::View { src, dims } => {
                 let s = self.splice_memo(src, false, memo);
-                if Rc::ptr_eq(&s, src) {
+                if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
                     self.canon
@@ -766,7 +766,7 @@ impl Partitioner<'_> {
                 padded,
             } => {
                 let s = self.splice_memo(src, false, memo);
-                if Rc::ptr_eq(&s, src) {
+                if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
                     self.canon.shallow(crate::ir::positional_reindex(
@@ -779,7 +779,7 @@ impl Partitioner<'_> {
             }
         };
         if !is_root {
-            memo.insert(Rc::as_ptr(node), out.clone());
+            memo.insert(Arc::as_ptr(node), out.clone());
         }
         out
     }
@@ -804,11 +804,11 @@ impl Partitioner<'_> {
     /// row instead of evaluated once per element.
     fn leaf_cuts(&self, node: &Node, axes: &[AxisRef], pricing: &CutPricing, out: &mut Vec<Node>) {
         let push = |node: &Node, out: &mut Vec<Node>| {
-            if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
+            if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
                 out.push(node.clone());
             }
         };
-        if self.done.contains_key(&Rc::as_ptr(node)) {
+        if self.done.contains_key(&Arc::as_ptr(node)) {
             push(node, out); // splices to its buffer read
             return;
         }
@@ -930,7 +930,7 @@ impl Partitioner<'_> {
     /// materialize anyway. `None` when nothing below forces a cut. Same
     /// boundaries and axis translation as [`Partitioner::leaf_cuts`].
     fn hot_volume(&self, node: &Node, axes: &[AxisRef]) -> Option<(f64, Vec<usize>)> {
-        if self.done.contains_key(&Rc::as_ptr(node)) {
+        if self.done.contains_key(&Arc::as_ptr(node)) {
             return None;
         }
         {
@@ -994,7 +994,7 @@ impl Partitioner<'_> {
         if self.structures.classify(node, axis).level == Parallelism::Free {
             return;
         }
-        let private = !self.shared(node) && !self.done.contains_key(&Rc::as_ptr(node));
+        let private = !self.shared(node) && !self.done.contains_key(&Arc::as_ptr(node));
         match node.as_ref() {
             NodeKind::Map { inputs, .. } if private => {
                 for input in inputs {
@@ -1044,7 +1044,7 @@ impl Partitioner<'_> {
             }
             _ => {}
         }
-        if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
+        if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
             out.push(node.clone());
         }
     }
@@ -1120,7 +1120,7 @@ impl Partitioner<'_> {
             // its flat alias table cannot represent a split followed by a
             // flatten. Walking the path preserves that affine provenance.
             let local_axes = stream_provenance
-                .get(&Rc::as_ptr(leaf))
+                .get(&Arc::as_ptr(leaf))
                 .cloned()
                 .unwrap_or_default();
             let local_axes = if local_axes.is_empty() {
@@ -1170,7 +1170,7 @@ impl Partitioner<'_> {
             // cheaper — recomputing it is the cost-blind cut. Read it instead.
             if in_body.contains(&idx)
                 && is_contraction(leaf)
-                && !self.done.contains_key(&Rc::as_ptr(leaf))
+                && !self.done.contains_key(&Arc::as_ptr(leaf))
             {
                 // Fuse the contraction in-body; cut its operands WHOLE. An
                 // in-body operand is re-read on every step of the streamed
@@ -1357,7 +1357,7 @@ impl Partitioner<'_> {
             .rev()
             .find(|(_, p)| {
                 !self.shared(p)
-                    && !self.done.contains_key(&Rc::as_ptr(p))
+                    && !self.done.contains_key(&Arc::as_ptr(p))
                     && p.shape() == node.shape()
             })
             .map(|(i, _)| i);
@@ -1418,7 +1418,7 @@ impl Partitioner<'_> {
             }
             // The producer didn't land as a fused kernel — keep the map stage,
             // reading the producers' materialized buffers.
-            self.done.insert(Rc::as_ptr(&producer), landed);
+            self.done.insert(Arc::as_ptr(&producer), landed);
             self.keepalive.push(producer.clone());
             let exec = self.executable(node);
             let mut inputs = vec![landed];
@@ -1453,7 +1453,7 @@ impl Partitioner<'_> {
     /// multi-output partition, say — is a frontier read, not something to
     /// recompute inline.
     fn cone(&self, node: &Node, ops: &mut Vec<&'static str>, frontier: &mut Vec<Node>, top: bool) {
-        let live = !self.done.contains_key(&Rc::as_ptr(node));
+        let live = !self.done.contains_key(&Arc::as_ptr(node));
         match node.as_ref() {
             // A shared map joins the cone when its op is cheap — each
             // consumer recomputes a few ALU ops instead of forcing a
@@ -1473,7 +1473,7 @@ impl Partitioner<'_> {
                     if broadcast_repeats(&i.shape(), &node.shape())
                         && let Some(source) = expensive_map_below_views(i)
                     {
-                        if !frontier.iter().any(|item| Rc::ptr_eq(item, &source)) {
+                        if !frontier.iter().any(|item| Arc::ptr_eq(item, &source)) {
                             frontier.push(source);
                         }
                         continue;
@@ -1499,7 +1499,7 @@ impl Partitioner<'_> {
             // Literals and iotas are ambient — not inputs, not producers.
             NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
             _ => {
-                if !frontier.iter().any(|n| Rc::ptr_eq(n, node)) {
+                if !frontier.iter().any(|n| Arc::ptr_eq(n, node)) {
                     frontier.push(node.clone());
                 }
             }
@@ -1673,14 +1673,14 @@ fn nearest_fold_axes(node: &Node, done: &HashMap<*const NodeKind, &'static str>)
         done: &HashMap<*const NodeKind, &'static str>,
     ) {
         if depth > *nearest
-            || (depth > 0 && done.contains_key(&Rc::as_ptr(node)))
+            || (depth > 0 && done.contains_key(&Arc::as_ptr(node)))
             || seen
-                .get(&Rc::as_ptr(node))
+                .get(&Arc::as_ptr(node))
                 .is_some_and(|previous| *previous <= depth)
         {
             return;
         }
-        seen.insert(Rc::as_ptr(node), depth);
+        seen.insert(Arc::as_ptr(node), depth);
         match node.as_ref() {
             NodeKind::Reduce { src, dim, .. } | NodeKind::Scan { src, dim, .. } => {
                 let axis = ir::source_axis(src, *dim);
@@ -1737,17 +1737,17 @@ fn stream_provenance(
         seen: &mut HashSet<(*const NodeKind, Vec<AxisRef>)>,
         resolver: &mut ir::Resolver,
     ) {
-        let state = (Rc::as_ptr(node), axes.to_vec());
+        let state = (Arc::as_ptr(node), axes.to_vec());
         if !seen.insert(state) {
             return;
         }
-        let local = local_axes.entry(Rc::as_ptr(node)).or_default();
+        let local = local_axes.entry(Arc::as_ptr(node)).or_default();
         for &axis in axes {
             if !local.contains(&axis) {
                 local.push(axis);
             }
         }
-        if leaves.contains(&Rc::as_ptr(node)) {
+        if leaves.contains(&Arc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {
@@ -1795,7 +1795,7 @@ fn stream_provenance(
         }
     }
 
-    let leaves = leaves.iter().map(Rc::as_ptr).collect();
+    let leaves = leaves.iter().map(Arc::as_ptr).collect();
     let mut local_axes = HashMap::new();
     let mut seen = HashSet::new();
     walk(
@@ -1949,10 +1949,10 @@ fn replace_many(
     memo: &mut HashMap<*const NodeKind, Node>,
     canon: &mut Canonicalizer,
 ) -> Node {
-    if let Some((_, with)) = subs.iter().find(|(t, _)| Rc::ptr_eq(t, node)) {
+    if let Some((_, with)) = subs.iter().find(|(t, _)| Arc::ptr_eq(t, node)) {
         return with.clone();
     }
-    let key = Rc::as_ptr(node);
+    let key = Arc::as_ptr(node);
     if let Some(done) = memo.get(&key) {
         return done.clone();
     }
@@ -2437,7 +2437,7 @@ mod tests {
         let stream = source_axis(&diamond, 0);
         assert_eq!(
             stream_provenance(&diamond, &[stream], std::slice::from_ref(&source))
-                [&Rc::as_ptr(&source)],
+                [&Arc::as_ptr(&source)],
             vec![stream]
         );
         assert_eq!(input_dtypes(&diamond), vec![("X", Dtype::F32)]);

@@ -493,14 +493,14 @@ fn weight_env(graph: &DecodeGraph, context_length: usize, config: Config) -> Env
 
 fn input_names(roots: &[NodeRef]) -> Vec<&'static str> {
     use std::collections::HashSet;
-    use std::rc::Rc;
+    use std::sync::Arc;
     fn visit(
         node: &NodeRef,
         names: &mut Vec<&'static str>,
         seen: &mut HashSet<*const sanic::Node>,
     ) {
         use sanic::Node;
-        if !seen.insert(Rc::as_ptr(node)) {
+        if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {

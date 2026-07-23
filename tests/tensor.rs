@@ -99,11 +99,11 @@ fn structural_duplicates_canonicalize_to_one_node() {
         reduce(map(MapOp::Mul, vec![x.clone(), x]), 0usize, add())
     };
     let (first, second) = (energy(), energy());
-    assert!(!std::rc::Rc::ptr_eq(&first, &second));
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
 
     let canonical = sanic::canonicalize_many(&[first, second]);
     assert!(
-        std::rc::Rc::ptr_eq(&canonical[0], &canonical[1]),
+        std::sync::Arc::ptr_eq(&canonical[0], &canonical[1]),
         "identical subtrees must share one node after canonicalization"
     );
 }

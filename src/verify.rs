@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ir::{AffineIndex, Axis, Dtype, Extent, Node as NodeKind, NodeRef as Node, ViewDim};
 
@@ -84,7 +85,7 @@ struct Verifier {
 
 impl Verifier {
     fn visit(&mut self, node: &Node) -> Result<Rc<Vec<Axis>>, VerifyError> {
-        let pointer = Rc::as_ptr(node);
+        let pointer = Arc::as_ptr(node);
         if let Some(shape) = self.shapes.get(&pointer) {
             return Ok(shape.clone());
         }
@@ -386,7 +387,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_map_arity() {
-        let invalid = Rc::new(NodeKind::Map {
+        let invalid = Arc::new(NodeKind::Map {
             op: MapOp::Add,
             inputs: vec![konst(1.0)],
         });
@@ -407,7 +408,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_positional_dimension() {
         let n = axis("n", 4);
-        let invalid = Rc::new(NodeKind::Reduce {
+        let invalid = Arc::new(NodeKind::Reduce {
             src: input("X", [n], Dtype::F32),
             dim: 1,
             op: crate::ir::Monoid::Add,

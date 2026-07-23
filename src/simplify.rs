@@ -43,7 +43,7 @@
 //! the correctness check.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ir::{
     MapOp, Monoid, Node as NodeKind, NodeRef as Node, coordinate, gather, konst, map,
@@ -91,12 +91,12 @@ fn pass(
     memo: &mut HashMap<*const NodeKind, Node>,
     changed: &mut bool,
 ) -> Node {
-    let ptr = Rc::as_ptr(node);
+    let ptr = Arc::as_ptr(node);
     if let Some(n) = memo.get(&ptr) {
         return n.clone();
     }
     // Rebuild a node only when a child changed or a rule fires; otherwise keep
-    // the ORIGINAL `Rc`. This preserves the identity `grad` shares with the
+    // the ORIGINAL `Arc`. This preserves the identity `grad` shares with the
     // forward graph (the gradient reads forward nodes by pointer), so a
     // backward that recomputes the forward's `s` stays the *same* node and the
     // schedule materializes it once — and it keeps CSE keys (built from child
@@ -109,7 +109,7 @@ fn pass(
         NodeKind::Coordinate { src, dim } => {
             let source = pass(src, reconstruct, cse, memo, changed);
             hashcons(
-                if Rc::ptr_eq(&source, src) {
+                if Arc::ptr_eq(&source, src) {
                     node.clone()
                 } else {
                     coordinate(source, *dim)
@@ -143,14 +143,14 @@ fn pass(
                     *changed = true;
                     preserve_shape(r, &output_shape, &output_axes)
                 }
-                None if Rc::ptr_eq(&s, src) => node.clone(),
+                None if Arc::ptr_eq(&s, src) => node.clone(),
                 None => reduce(s, *dim, *op),
             };
             hashcons(rebuilt, cse)
         }
         NodeKind::Scan { src, dim, op } => {
             let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if Rc::ptr_eq(&s, src) {
+            let rebuilt = if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
                 scan(s, *dim, *op)
@@ -160,7 +160,7 @@ fn pass(
         NodeKind::Gather { src, index, dim } => {
             let s = pass(src, reconstruct, cse, memo, changed);
             let i = pass(index, reconstruct, cse, memo, changed);
-            let rebuilt = if Rc::ptr_eq(&s, src) && Rc::ptr_eq(&i, index) {
+            let rebuilt = if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
                 node.clone()
             } else {
                 gather(s, i, *dim)
@@ -176,7 +176,7 @@ fn pass(
             let rebuilt = if identity {
                 *changed = true;
                 s
-            } else if Rc::ptr_eq(&s, src) {
+            } else if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
                 positional_view(s, dims.clone())
@@ -193,7 +193,7 @@ fn pass(
             let rebuilt = if let Some(unwrapped) = cancel_view_reindex(&s, shape, m, *padded) {
                 *changed = true;
                 unwrapped
-            } else if Rc::ptr_eq(&s, src) {
+            } else if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
                 positional_reindex(s, shape.clone(), m.clone(), *padded)
@@ -216,11 +216,11 @@ fn hashcons(node: Node, cse: &mut HashMap<String, Node>) -> Node {
         .clone()
 }
 
-// ── local rewrites (children already canonical, so `≡` is `Rc::ptr_eq`) ───────
+// ── local rewrites (children already canonical, so `≡` is `Arc::ptr_eq`) ───────
 
 /// Are two operand lists pointer-identical (nothing rebuilt beneath)?
 fn same(a: &[Node], b: &[Node]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Rc::ptr_eq(x, y))
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y))
 }
 
 /// Cancel a reindex that merely removes singleton dimensions inserted by a
@@ -456,7 +456,7 @@ fn division_parts(node: &Node) -> Option<(Node, Node)> {
 /// `reconstruct`, the log-sum-exp regrouping rewrites are also enabled (phase
 /// 2 — see [`simplify`]).
 fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
-    let eq = |a: &Node, b: &Node| Rc::ptr_eq(a, b);
+    let eq = |a: &Node, b: &Node| Arc::ptr_eq(a, b);
     if let Some(factored) = factor_common_view(op, ins) {
         return Some(factored);
     }
