@@ -116,11 +116,28 @@ pub fn mem_occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
 /// Per-kernel time: the roofline (compute vs. bandwidth, whichever binds)
 /// plus a fixed launch cost. Compute is divided by block occupancy (latency
 /// hiding needs resident warps); bandwidth by memory occupancy (saturation
-/// needs loads in flight).
+/// needs loads in flight). Right for kernels that overlap compute with
+/// traffic — the cooperative tiled kind this module's searches rank.
 pub fn kernel_time(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
     let memory = k.hbm_bytes / (dev.hbm_bandwidth * mem_occupancy(dev, k));
     compute.max(memory) + dev.launch_overhead
+}
+
+/// The additive surrogate of [`kernel_time`]: compute PLUS bandwidth. The
+/// two are within a factor 2 of each other (kernel_fusion_theory.md §8, the
+/// surrogate bound), but only the sum can RANK a fusion that does strictly
+/// more work under the same traffic: under a max, a normalizer replicated
+/// into every thread of a memory-bound head prices identically to the head
+/// alone — the recompute hides under the bandwidth term, and a cut-placement
+/// comparison reads a tie where the machine reads a regression. This is the
+/// time for the kernels the emitter actually generates, whose serial
+/// per-thread stream loops overlap compute with traffic poorly; the roofline
+/// max stays the model for cooperative tiled kernels.
+pub fn kernel_time_additive(dev: &DeviceProfile, k: &Kernel) -> f64 {
+    let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
+    let memory = k.hbm_bytes / (dev.hbm_bandwidth * mem_occupancy(dev, k));
+    compute + memory + dev.launch_overhead
 }
 
 /// Total time for a schedule. `None` if any kernel is infeasible — an

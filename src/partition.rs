@@ -37,9 +37,11 @@ use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, ite
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
     self, AxisRef, Canonicalizer, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
-    ResolvedAffineIndex, all_axis_refs, leaf_names,
+    ResolvedAffineIndex, all_axis_refs, input_axes, input_dtypes, leaf_names,
 };
-use crate::plan::{GroupCache, KernelSpec, plan_axis_with_groups};
+use crate::plan::{
+    GroupCache, KernelSpec, SIMD, count_issue_ops, plan_axis_emitted, plan_axis_with_groups,
+};
 
 /// One kernel in the schedule.
 pub enum Stage {
@@ -784,12 +786,13 @@ impl Partitioner<'_> {
 
     /// The subtrees of a fold LEAF (streamed over `axes`) that must be
     /// materialized: anything carrying a fold of its own (a producer GEMM),
-    /// stream-varying transcendental chains, and anything already
-    /// materialized (read its buffer). Everything else — elementwise
-    /// arithmetic, views, reindexes, gathers, stream-INVARIANT
-    /// transcendentals — is per-element work the kernel computes in-body.
-    /// The [`Partitioner::entanglers`] idea, applied to leaves: cut as deep
-    /// as possible, keep the arithmetic.
+    /// anything already materialized (read its buffer), and any map cone
+    /// whose replicated recompute prices worse than a round trip
+    /// ([`Partitioner::inline_pays`], Prop 4.1). Everything else — views,
+    /// reindexes, gathers, and the arithmetic the inequality clears — is
+    /// per-element work the kernel computes in-body. The
+    /// [`Partitioner::entanglers`] idea, applied to leaves: cut as deep
+    /// as possible, keep the arithmetic that pays.
     ///
     /// `axes` is the streamed axis IN THE CURRENT FRAME: exactly as in
     /// `entanglers`, the axis translates at every structural boundary (below
@@ -799,7 +802,7 @@ impl Partitioner<'_> {
     /// under a flattened fold looks stream-invariant, and a SwiGLU's exp
     /// stays in-body of the down projection — recomputed once per output
     /// row instead of evaluated once per element.
-    fn leaf_cuts(&self, node: &Node, axes: &[AxisRef], out: &mut Vec<Node>) {
+    fn leaf_cuts(&self, node: &Node, axes: &[AxisRef], pricing: &CutPricing, out: &mut Vec<Node>) {
         let push = |node: &Node, out: &mut Vec<Node>| {
             if !out.iter().any(|n| Rc::ptr_eq(n, node)) {
                 out.push(node.clone());
@@ -809,19 +812,7 @@ impl Partitioner<'_> {
             push(node, out); // splices to its buffer read
             return;
         }
-        // In-body leaf arithmetic runs once per (grid × stream) point, where
-        // a materialized leaf is computed once per its own volume. Cheap ops
-        // (a dequant multiply, a mask, a residual add) win inline — even
-        // DAG-SHARED ones: recomputing an add per consumer is nothing next
-        // to a kernel launch plus a memory round trip, so sharing is a
-        // reason to cut only when the work is real. A transcendental map
-        // inlines exactly when its subtree does not vary along the streamed
-        // axis: hoisted out of the stream loop it costs one evaluation per
-        // grid point, the same as a buffer read (a norm's rsqrt of a row
-        // scalar); varying along the stream it is recomputed every step (a
-        // GELU inside a GEMM) and materializes instead.
-        //
-        // And when something below WILL be cut, cut at the TOP of the
+        // When something below WILL be cut, cut at the TOP of the
         // enclosing elementwise cone rather than around the offender — as
         // long as that doesn't materialize more elements. Cutting a SwiGLU's
         // exp alone leaves gate·recip(1+·)·up in-body: the fold then loads
@@ -834,12 +825,7 @@ impl Partitioner<'_> {
             | NodeKind::Const { .. }
             | NodeKind::Iota { .. }
             | NodeKind::Coordinate { .. } => {}
-            NodeKind::Map { inputs, op }
-                if cheap_op(*op) || {
-                    let na = all_axis_refs(node);
-                    !axes.iter().any(|a| na.contains(a))
-                } =>
-            {
+            NodeKind::Map { inputs, .. } if self.inline_pays(node, axes, pricing) => {
                 if let Some((hot_volume, hot_shape)) = self.hot_volume(node, axes)
                     && (self.volume(node) < hot_volume
                         || node.shape().iter().map(|axis| axis.extent()).eq(hot_shape))
@@ -848,7 +834,7 @@ impl Partitioner<'_> {
                     return;
                 }
                 for input in inputs {
-                    self.leaf_cuts(input, &map_input_axes(node, input, axes), out);
+                    self.leaf_cuts(input, &map_input_axes(node, input, axes), pricing, out);
                 }
             }
             // An indexed read shared by multiple paths is real reusable work:
@@ -858,19 +844,79 @@ impl Partitioner<'_> {
             NodeKind::Gather { .. } if self.shared(node) => push(node, out),
             NodeKind::Gather { src, index, dim } => {
                 let gathered = ir::source_axis(src, *dim);
-                self.leaf_cuts(src, &stream_below_gather(axes, index, gathered), out);
-                self.leaf_cuts(index, axes, out);
+                self.leaf_cuts(src, &stream_below_gather(axes, index, gathered), pricing, out);
+                self.leaf_cuts(index, axes, pricing, out);
             }
-            NodeKind::View { src, .. } => {
-                self.leaf_cuts(src, &stream_below_view(axes, &ir::view_groups(node)), out)
-            }
+            NodeKind::View { src, .. } => self.leaf_cuts(
+                src,
+                &stream_below_view(axes, &ir::view_groups(node)),
+                pricing,
+                out,
+            ),
             NodeKind::Reindex { src, .. } => self.leaf_cuts(
                 src,
                 &stream_below_reindex(axes, &ir::resolved_reindex(node)),
+                pricing,
                 out,
             ),
             _ => push(node, out),
         }
+    }
+
+    /// Proposition 4.1 (kernel_fusion_theory.md §4), read for THIS emitter:
+    /// one thread per output point means an in-body subtree is recomputed
+    /// once per output point that does not span it — the cover's m is the
+    /// thread grid, not a block count. Inlining u into m replicas beats
+    /// materializing iff
+    ///
+    ///   (m−1)·(w(u)/π + reads(u)/β)  <  (m+1)·|T|/β + λ
+    ///
+    /// — replicated work and replicated input traffic against the round trip
+    /// a materialization writes and the launch it costs. At m = 1 the left
+    /// side is zero: a subtree the kernel evaluates exactly once always
+    /// inlines, no matter how expensive. The old gates were the two easy
+    /// corners of this inequality (cheap ops ~ small w, stream-invariance
+    /// ~ m limited to the grid); what they missed is m in the tens of
+    /// thousands — a residual history re-ADDED per streamed element of a
+    /// 128k-output head is cheap per element and catastrophic in total.
+    /// Work is issue slots, not just flops: the measured disasters were
+    /// load chains, and loads are what the emitter issues.
+    ///
+    /// An output axis the subtree does not span but that only some
+    /// accumulator slots span (a column axis) is lane-sharable: the fold
+    /// schedule computes slot-invariant work once per simdgroup, so the
+    /// replication divides by the simd width (a mask add under flash
+    /// attention replicates per value lane on paper, once per simdgroup in
+    /// the emitted kernel).
+    fn inline_pays(&self, node: &Node, axes: &[AxisRef], pricing: &CutPricing) -> bool {
+        let volume = self.volume(node).max(1.0);
+        let canon = |axis: AxisRef| pricing.aliases.get(&axis).copied().unwrap_or(axis);
+        let node_axes: Vec<AxisRef> = all_axis_refs(node).into_iter().map(canon).collect();
+        let mut streamed_seen: Vec<AxisRef> = Vec::new();
+        let mut streamed = 1.0f64;
+        for &axis in axes {
+            let axis = canon(axis);
+            if node_axes.contains(&axis) && !streamed_seen.contains(&axis) {
+                streamed_seen.push(axis);
+                streamed *= axis.extent() as f64;
+            }
+        }
+        let mut replicas = (pricing.out_vol * streamed / volume).max(1.0);
+        if replicas > 1.0 {
+            let sharable: f64 = pricing
+                .lane_sharable
+                .iter()
+                .filter(|axis| !node_axes.contains(axis))
+                .map(|axis| axis.extent() as f64)
+                .product();
+            replicas = (replicas / sharable.clamp(1.0, SIMD as f64)).max(1.0);
+        }
+        let dev = self.dev;
+        let recompute_once = count_issue_ops(node) / dev.peak_flops
+            + subtree_read_bytes(node) / dev.hbm_bandwidth;
+        let round_trip = volume * dev.dtype_bytes / dev.hbm_bandwidth;
+        (replicas - 1.0) * recompute_once
+            < (replicas + 1.0) * round_trip + dev.launch_overhead
     }
 
     /// Elements this node materializes to (the product of its output axes'
@@ -1065,6 +1111,7 @@ impl Partitioner<'_> {
         // Collect every cut first, then substitute in ONE rebuild pass — the
         // targets are pointers into the original graph, and any rebuild
         // invalidates them for a second pass.
+        let pricing = CutPricing::for_kernel(node, carrier);
         let mut subs: Vec<(Node, Node)> = Vec::new();
         let cut_into = |p: &mut Self, leaf: &Node, subs: &mut Vec<(Node, Node)>| {
             let mut cuts = Vec::new();
@@ -1081,7 +1128,7 @@ impl Partitioner<'_> {
             } else {
                 local_axes
             };
-            p.leaf_cuts(leaf, &local_axes, &mut cuts);
+            p.leaf_cuts(leaf, &local_axes, &pricing, &mut cuts);
             for c in cuts {
                 p.cut(&c);
                 // splice, not `input(name, output_axes, dtype)`: a view/reindex above
@@ -1103,7 +1150,7 @@ impl Partitioner<'_> {
                 NodeKind::View { .. } | NodeKind::Reindex { .. }
             )
         {
-            self.leaf_cuts(src, &[axis], &mut structural_cuts);
+            self.leaf_cuts(src, &[axis], &pricing, &mut structural_cuts);
             for cut in &structural_cuts {
                 self.cut(cut);
                 subs.push((cut.clone(), self.splice(cut, false)));
@@ -1172,8 +1219,70 @@ impl Partitioner<'_> {
                 return leak(out);
             }
         };
-        match plan_axis_with_groups(&cut_graph, cut_axis, &c2, self.dev, &mut self.plan_groups) {
+        match plan_axis_emitted(&cut_graph, cut_axis, &c2, self.dev, &mut self.plan_groups) {
             Some(mut spec) => {
+                // Cost-driven cut placement at the carrier level: a deferred
+                // divisor keeps its whole normalizer fold in every output
+                // thread, and the execution bill makes that replication
+                // visible. Price the split at its FLOOR — the remainder's
+                // own plan, plus the divisor subtree's one-pass work and
+                // reads, its round trip, and a launch — and cut at the
+                // divisor's application site only when even that floor beats
+                // the fused kernel. The subtree term matters in both
+                // directions: without it a flash carrier's own o/ℓ (whose
+                // subtree IS the whole attention) prices as a free cut. The
+                // floor still under-counts occupancy, so ties keep the
+                // fusion. Each retry removes one Div, so the recursion
+                // terminates.
+                if let Some(div) = smallest_div(&cut_graph) {
+                    let probe = self
+                        .canon
+                        .shallow(ir::input("«div»", div.shape(), Dtype::F32));
+                    let remainder = replace_many(
+                        &cut_graph,
+                        &[(div.clone(), probe)],
+                        &mut HashMap::new(),
+                        &mut self.canon,
+                    );
+                    let alt_axis = relocate_axis(&cut_graph, &remainder, cut_axis, &c2.aliases)
+                        .unwrap_or(cut_axis);
+                    if let Ok(alt_carrier) =
+                        derive_with_structure_cache(&remainder, alt_axis, &mut self.structures)
+                        && let Some(alt) = plan_axis_emitted(
+                            &remainder,
+                            alt_axis,
+                            &alt_carrier,
+                            self.dev,
+                            &mut self.plan_groups,
+                        )
+                    {
+                        let dev = self.dev;
+                        let div_floor = count_issue_ops(&div) / dev.peak_flops
+                            + subtree_read_bytes(&div) / dev.hbm_bandwidth
+                            + 2.0 * self.volume(&div) * dev.dtype_bytes / dev.hbm_bandwidth
+                            + dev.launch_overhead;
+                        if crate::debug_level() >= 3 {
+                            eprintln!(
+                                "[div-cut?] fused {:.3e}  alt {:.3e} + floor {:.3e} → {}",
+                                spec.cost,
+                                alt.cost,
+                                div_floor,
+                                if alt.cost + div_floor < spec.cost { "CUT" } else { "keep" }
+                            );
+                        }
+                        if alt.cost + div_floor < spec.cost {
+                            self.cut(&div);
+                            let spliced = self.splice(&div, false);
+                            let rebuilt = replace_many(
+                                &cut_graph,
+                                &[(div, spliced)],
+                                &mut HashMap::new(),
+                                &mut self.canon,
+                            );
+                            return self.emit(&rebuilt, out);
+                        }
+                    }
+                }
                 spec.output_name = out.to_string();
                 self.stages.push(Stage::Fused {
                     spec: Box::new(spec),
@@ -1453,6 +1562,67 @@ fn relocate_axis(
 
 fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
+}
+
+/// What a fold kernel's cut decisions need to price replication
+/// ([`Partitioner::inline_pays`]): the output grid the emitter launches (one
+/// thread per point), the column axes a fold schedule can lane-share, and
+/// the alias table that translates leaf-frame axes into the kernel's frame.
+struct CutPricing<'c> {
+    out_vol: f64,
+    lane_sharable: Vec<AxisRef>,
+    aliases: &'c HashMap<AxisRef, AxisRef>,
+}
+
+impl<'c> CutPricing<'c> {
+    /// `node` is the fold kernel's root. Sharable columns are the axes some
+    /// slot span omits — exactly the axes `plan_axis` calls columns.
+    fn for_kernel(node: &Node, carrier: &'c Carrier) -> Self {
+        let out_vol = node
+            .shape()
+            .iter()
+            .map(|axis| axis.extent() as f64)
+            .product::<f64>()
+            .max(1.0);
+        let mut union: Vec<AxisRef> = Vec::new();
+        for span in &carrier.spans {
+            for &axis in span {
+                if !union.contains(&axis) {
+                    union.push(axis);
+                }
+            }
+        }
+        let lane_sharable = union
+            .into_iter()
+            .filter(|axis| carrier.spans.iter().any(|span| !span.contains(axis)))
+            .collect();
+        CutPricing {
+            out_vol,
+            lane_sharable,
+            aliases: &carrier.aliases,
+        }
+    }
+}
+
+/// Bytes one full evaluation of `node` reads from buffers — every distinct
+/// named input at its declared storage width. A `done` producer below is
+/// still counted as its own subtree's reads: pricing an ancestor before the
+/// recursion reaches the materialized node overstates the recompute side,
+/// which only errs toward materializing the ancestor too.
+fn subtree_read_bytes(node: &Node) -> f64 {
+    let widths: HashMap<&'static str, f64> = input_dtypes(node)
+        .into_iter()
+        .map(|(name, dtype)| (name, dtype.bytes()))
+        .collect();
+    let mut seen = HashSet::new();
+    input_axes(node)
+        .into_iter()
+        .filter(|(name, _)| seen.insert(*name))
+        .map(|(name, axes)| {
+            let volume: f64 = axes.iter().map(|axis| axis.extent() as f64).product();
+            volume * widths.get(name).copied().unwrap_or(4.0)
+        })
+        .sum()
 }
 
 /// Per-element ops cheap enough to recompute rather than materialize — a
@@ -2608,13 +2778,19 @@ mod tests {
         crate::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &sched);
     }
 
-    // The SAME norm-into-GEMM fusion at a 200k-vocab head is legal but
-    // UNPLANNABLE (the deferred normalizer prices a per-slot column as
-    // SRAM-resident). The partitioner must not emit Infeasible: it cuts the
-    // normalizer's Div, the norm becomes its own stages, and the head
-    // re-derives as a plain GEMV — the cut Trinity used to place by hand.
+    // The SAME norm-into-GEMM fusion at a 200k-vocab head is legal AND —
+    // since the defer-div scheduling exclusion fell — plannable. What
+    // rejects it on this machine is the price: one thread per output point
+    // gives every one of 200k threads its own copy of the normalizer fold,
+    // and the execution bill makes that replication visible. The
+    // partitioner prices the fused kernel against cutting at the divisor's
+    // application site and places the cut Trinity used to place by hand:
+    // the norm becomes its own stages and the head re-derives as a plain
+    // GEMV. On `toy()` — 60× this device's flop peak — the same fusion
+    // prices FINE and stays one kernel: the rule is the price, not the
+    // shape.
     #[test]
-    fn unplannable_norm_head_cuts_the_normalizer() {
+    fn norm_into_fat_head_cuts_at_the_divisor_by_price() {
         let (s, d, v) = (axis("s", 1), axis("d", 1024), axis("v", 200192));
         let x = input("X", [s, d], Dtype::F32);
         let stream = axis_refs(&x)[1];
@@ -2631,7 +2807,7 @@ mod tests {
             transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize),
         );
 
-        let sched = partition(&head, &DeviceProfile::toy());
+        let sched = partition(&head, &DeviceProfile::m1_pro());
         assert!(
             !sched
                 .stages
@@ -2683,11 +2859,17 @@ mod tests {
         assert_eq!(epilogue_inputs, &vec!["X"]);
     }
 
-    // SwiGLU down-projection: gate and up GEMMs are cut, but the silu and the
-    // gating multiply fuse into the down GEMM's lift (activation-fused GEMM).
-    // `silu` is a composition of basis ops, not a special form.
+    // SwiGLU down-projection: the gate and up GEMMs are cut, and so is the
+    // activation cone between them — by price, not by rule. In a
+    // one-thread-per-output-point kernel the in-body silu·gate·up would be
+    // re-evaluated once per output column (m = |dm| replicas, Prop 4.1), and
+    // replicated recompute plus replicated gate/up re-reads lose to one
+    // round trip of the activation. This is the verdict the flattened twin
+    // below measured on Trinity, now uniform across both spellings. The
+    // down GEMM's lift still fuses the multiply (`fused-map`); what
+    // materializes is exactly the cone, once.
     #[test]
-    fn silu_fuses_into_the_down_gemm() {
+    fn swiglu_activation_materializes_once_for_the_down_gemm() {
         let (s, dm, f) = (axis("s", 1024), axis("dm", 1024), axis("f", 4096));
         let x = input("Xn", [s, dm], Dtype::F32);
         let gate = matmul(
@@ -2703,15 +2885,23 @@ mod tests {
         let down = matmul(act, input("Wd", [f, dm], Dtype::F32));
 
         let sched = partition(&down, &DeviceProfile::toy());
-        assert_eq!(sched.stages.len(), 3, "gate GEMM, up GEMM, fused down GEMM");
-        let Stage::Fused { spec, .. } = &sched.stages[2] else {
+        assert_eq!(
+            sched.stages.len(),
+            4,
+            "gate GEMM, up GEMM, the activation cone, the down GEMM"
+        );
+        assert!(
+            matches!(&sched.stages[2], Stage::Elementwise { .. }),
+            "the whole silu·gate·up cone materializes as one map"
+        );
+        let Stage::Fused { spec, .. } = &sched.stages[3] else {
             panic!()
         };
         assert_eq!(spec.streaming_axis.extent, stream.extent);
         assert_eq!(spec.streaming_axis.name, stream.name);
         assert!(
             spec.carrier.rules.contains(&"fused-map"),
-            "silu·gate·up fused into the lift: {:?}",
+            "the down GEMM's lift still fuses the multiply: {:?}",
             spec.carrier.rules
         );
     }

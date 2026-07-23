@@ -2234,3 +2234,115 @@ kernel void zc_add(
     assert_eq!(got[0], 100.0, "host write visible to the GPU: same memory");
     eprintln!("zero-copy wrap + offset binding on GPU: OK");
 }
+
+// ── the cost-honesty oracle ──────────────────────────────────────────────────
+// The committed plan's cost is the last oracle that can lie: the interpreter
+// checks values and the law tests check carriers, but only a measurement
+// checks the model that PLACES the cuts. This pins plan-vs-measured on the
+// decode shape that caught the model lying — an RMS-normalized input into a
+// fat vocab-style head. Under the old naive bill (each node counted once at
+// its own volume, roofline max) the fused norm+head kernel planned ×15
+// under its measurement, because one thread per output point recomputes the
+// whole normalizer fold and the max() hid that work under the bandwidth
+// term. The execution bill now prices the replication, the partitioner
+// splits at the divisor, and every stage it commits must measure within a
+// band of its committed cost:
+//
+//   measured ≤ 8 × planned   (no catastrophic underprediction — the
+//                             disease that picks 15× disasters), and
+//   planned  ≤ 32 × measured (the model may be pessimistic, not absurd).
+//
+// Per-stage times take the MIN over repetitions: a single dispatch can be
+// preempted (llama shows one-step ×40 spikes on stages that sit at ×1.5 on
+// every other step) — the min is the kernel, the spikes are the machine.
+#[test]
+fn committed_plan_costs_stay_within_a_band_of_measurement() {
+    let profile = DeviceProfile::m1_pro();
+    let (s, d, v) = (axis("s", 1), axis("d", 1024), axis("v", 16384));
+    let mut rng = Lcg(0x51CA);
+    let env: Env = [
+        ("X", rand_tensor(&[s, d], &mut rng)),
+        ("G", rand_tensor(&[d], &mut rng)),
+        ("W", rand_tensor(&[v, d], &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let x = input("X", [s, d], Dtype::F32);
+    let g = input("G", [d], Dtype::F32);
+    let ss = reduce(
+        map(MapOp::Mul, vec![x.clone(), x.clone()]),
+        1usize,
+        Monoid::Add,
+    );
+    let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
+    let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
+    let norm = map(
+        MapOp::Div,
+        vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
+    );
+    let head = matmul(
+        norm,
+        transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize),
+    );
+
+    let sched = partition(&head, &profile);
+    let planned: HashMap<String, f64> = sched
+        .stages
+        .iter()
+        .filter_map(|st| match st {
+            sanic::partition::Stage::Fused { spec, .. } => {
+                Some((spec.output_name.clone(), spec.cost))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        planned.len() >= 2,
+        "the norm's fold and the head must both be committed folds"
+    );
+
+    let program = emit_schedule_metal_on(&profile, &sched);
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    let pipes = dev.compile(&program.msl);
+    let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
+    for (n, _) in &program.inputs {
+        bufs.insert(n.to_string(), dev.from_f64(&env[*n].data));
+    }
+    for (n, size) in &program.buffers {
+        bufs.insert(n.clone(), dev.alloc_f32(*size));
+    }
+    let dispatches = program_dispatches(&program, &bufs, &pipes);
+
+    let mut best = vec![f64::INFINITY; dispatches.len()];
+    for _ in 0..5 {
+        for (slot, t) in best.iter_mut().zip(dev.run_each_timed(&dispatches)) {
+            *slot = slot.min(t);
+        }
+    }
+
+    for (stage, &measured) in program.stages.iter().zip(&best) {
+        let Some(&cost) = planned.get(&stage.output) else {
+            continue; // map stages carry no committed cost
+        };
+        assert!(
+            measured <= 8.0 * cost,
+            "{}: measured {:.1}us > 8x planned {:.1}us — the cost model \
+             underpredicts the kernels it commits",
+            stage.output,
+            measured * 1e6,
+            cost * 1e6,
+        );
+        assert!(
+            cost <= 32.0 * measured,
+            "{}: planned {:.1}us > 32x measured {:.1}us — the cost model has \
+             drifted into absurd pessimism",
+            stage.output,
+            cost * 1e6,
+            measured * 1e6,
+        );
+    }
+}

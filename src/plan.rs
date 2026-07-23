@@ -92,6 +92,44 @@ pub fn plan_axis_with_groups(
     let streaming_axis = streaming_axis
         .resolve_axis(node, "plan_axis")
         .expect("planning axis is absent from the selected node");
+    plan_axis_costed(node, streaming_axis, carrier, dev, groups, count_flops(node))
+}
+
+/// [`plan_axis_with_groups`], costed as the kernel will actually run. The
+/// tile enumeration below prices a cooperative blocked kernel that the
+/// emitter does not generate; its verdict is kept only as the feasibility
+/// gate (does ANY block structure fit the device). The committed cost is
+/// [`fold_sched`]'s own time for the schedule it will pick — execution
+/// flops, recompute included. The pre-cut ranking calls keep the naive
+/// surrogate — their carrier leaves are producer subtrees a cut will
+/// replace with buffer reads, so the execution bill would price recompute
+/// that never happens. The post-cut plan is the one the partitioner
+/// commits, the one `SANIC_DEBUG=2` audits, and the one fusion choices
+/// compare — it must not lie.
+pub fn plan_axis_emitted(
+    node: &Node,
+    streaming_axis: impl AxisSelector,
+    carrier: &Carrier,
+    dev: &DeviceProfile,
+    groups: &mut GroupCache,
+) -> Option<KernelSpec> {
+    let streaming_axis = streaming_axis
+        .resolve_axis(node, "plan_axis")
+        .expect("planning axis is absent from the selected node");
+    let (_, flops, time) = best_fold_sched(node, streaming_axis, carrier, dev);
+    let mut spec = plan_axis_costed(node, streaming_axis, carrier, dev, groups, flops)?;
+    spec.cost = time;
+    Some(spec)
+}
+
+fn plan_axis_costed(
+    node: &Node,
+    streaming_axis: AxisRef,
+    carrier: &Carrier,
+    dev: &DeviceProfile,
+    groups: &mut GroupCache,
+    total_flops: f64,
+) -> Option<KernelSpec> {
     let b_bytes = dev.dtype_bytes;
     // A streamed slab never exceeds the axis itself (a 7-token KV cache is
     // not a 64-element slab).
@@ -128,27 +166,15 @@ pub fn plan_axis_with_groups(
         .filter(|ax| !span_intersection.contains(ax))
         .copied()
         .collect();
-    let span_schedulable: Vec<AxisRef> = {
-        // A deferred divisor keeps its partial-span columns unscheduled — not
-        // because tiling them is illegal (it only duplicates the normalizer
-        // slot per block), but because the EMITTER recomputes everything per
-        // output point and the cost model does not yet price that
-        // duplication: measured with it scheduled, the vocab-head RMSNorm
-        // fused at 128k outputs runs 15× worse than planned and the fused
-        // projections re-add the whole residual history per streamed element
-        // (llama decode 28.6 → 141 ms/tok). Lift this exclusion when leaf
-        // cutting prices recomputation (Prop 4.1) so the roofline can reject
-        // those fusions itself. Other partial-span slots stay schedulable.
-        if carrier.rules.contains(&"defer-div") {
-            span_union
-                .iter()
-                .filter(|axis| span_intersection.contains(axis))
-                .copied()
-                .collect()
-        } else {
-            span_union.clone()
-        }
-    };
+    // Every span axis is schedulable, deferred divisors included: leaf
+    // cutting prices recomputation (Prop 4.1) and the committed plan carries
+    // the execution flop bill, so the roofline rejects the fusions this used
+    // to exclude by rule (the vocab-head RMSNorm fused at 128k outputs that
+    // measured 15× its plan; the projections that re-added the whole
+    // residual history per streamed element, llama decode 28.6 → 141
+    // ms/tok). The partitioner compares the fused plan against cutting at
+    // the divisor's application site and takes the cheaper one.
+    let span_schedulable: Vec<AxisRef> = span_union.clone();
 
     // ── classify inputs ──────────────────────────────────────────────────────
     // Dedup by name: a DAG can reach the same tensor along several paths
@@ -193,7 +219,6 @@ pub fn plan_axis_with_groups(
     let has_inner_contraction = has_contraction(node, streaming_axis, &out_set);
 
     let output_vol: f64 = out_axes.iter().map(|ax| ax.extent() as f64).product();
-    let total_flops = count_flops(node);
 
     // ── structure choice: no heuristics — price every assignment ────────────
     // Each shared-span axis plays one of four roles, and each has a real
@@ -493,7 +518,7 @@ fn expr_ops(e: &Expr) -> f64 {
 /// just the `count_flops` op. Schedule choice hinges on recompute, and
 /// recompute is paid in issue slots; pricing it at one flop per element is
 /// what made one-thread-per-output look cheap.
-fn count_issue_ops(node: &Node) -> f64 {
+pub(crate) fn count_issue_ops(node: &Node) -> f64 {
     let vol = |n: &Node| -> f64 { n.shape().iter().map(|ax| ax.extent() as f64).product() };
     match node.as_ref() {
         NodeKind::Const { .. } => 0.0,
@@ -563,9 +588,25 @@ pub fn fold_sched(
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> FoldSched {
-    if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
-        return FoldSched::scalar();
-    }
+    best_fold_sched(fold_node, streaming_axis, carrier, dev).0
+}
+
+/// The winning schedule with its flop bill and its ADDITIVE time
+/// ([`crate::cost::kernel_time_additive`]) — what the emitted code actually
+/// issues, recompute included. This is what [`plan_axis_emitted`] prices
+/// fusion with: `count_flops` counts each node once at its own volume, but
+/// one thread per output point re-issues every subtree its point does not
+/// span, and that difference is exactly the misprediction that let a
+/// normalizer fused into a fat head plan ×15 under its measurement. The
+/// candidates still RANK by the roofline max — the choice among schedules
+/// is unchanged; the additive figure is the committed cost, because only a
+/// sum can rank a fusion doing strictly more work under the same traffic.
+fn best_fold_sched(
+    fold_node: &Node,
+    streaming_axis: AxisRef,
+    carrier: &Carrier,
+    dev: &DeviceProfile,
+) -> (FoldSched, f64, f64) {
     let ext = |ax: AxisRef| ax.extent() as f64;
     let s_ext = ext(streaming_axis);
     let out_axes = ir::axis_refs(fold_node);
@@ -612,7 +653,7 @@ pub fn fold_sched(
 
     // Execution flops + the candidate kernel, for one schedule.
     let simd = SIMD as f64;
-    let price = |sched: &FoldSched| -> Option<f64> {
+    let price = |sched: &FoldSched| -> Option<(f64, f64, f64)> {
         let f = (if sched.lane_stream { simd } else { 1.0 }) * sched.sgs as f64;
         if f > s_ext {
             return None; // an empty split unit would merge identity (the −∞ edge)
@@ -680,18 +721,30 @@ pub fn fold_sched(
             parallel_blocks: if sched.is_scalar() { out_vol } else { groups },
             lanes_per_block: sched.tg_threads() as f64,
         };
-        feasible(dev, &k).then(|| kernel_time(dev, &k))
+        feasible(dev, &k).then(|| {
+            (
+                kernel_time(dev, &k),
+                k.flops,
+                crate::cost::kernel_time_additive(dev, &k),
+            )
+        })
     };
 
     let cands = fold_sched_candidates(fold_node, streaming_axis, carrier);
     let mut best = FoldSched::scalar();
     let mut best_t = f64::INFINITY;
+    // No feasible candidate (the scalar schedule always fits in practice):
+    // fall back to the naive bill so the caller still has a finite figure.
+    let mut best_flops = count_flops(fold_node);
+    let mut best_add = f64::INFINITY;
     for c in cands {
-        if let Some(t) = price(&c)
+        if let Some((t, flops, add)) = price(&c)
             && t < best_t
         {
             best = c;
             best_t = t;
+            best_flops = flops;
+            best_add = add;
         }
     }
     // A refinement of the winner, not a candidate: when the fold reads a
@@ -712,7 +765,7 @@ pub fn fold_sched(
             best.chunk = 8;
         }
     }
-    best
+    (best, best_flops, best_add)
 }
 
 /// Every LEGAL cooperative schedule for a fold — the candidate set the
