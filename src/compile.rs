@@ -324,9 +324,8 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         return Err(CompileError::DynamicShapesNotYetSupported);
     }
 
-    // One canonical table spans every output so independently constructed,
-    // structurally identical subtrees become one immutable DAG node.
-    let roots = crate::ir::canonicalize_many(&roots);
+    // Constructors intern: structurally identical subtrees are already one
+    // immutable DAG node, across roots and across the whole process.
     let inputs = collect_inputs(&roots)?;
     let output_shapes = roots
         .iter()

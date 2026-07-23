@@ -9,7 +9,7 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 pub use crate::scalar::{Dtype, Extent, MapOp, Monoid};
 
@@ -616,7 +616,7 @@ impl Dimension for isize {
 
 pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> NodeRef {
     let name = Box::leak(name.into().into_boxed_str());
-    Arc::new(Node::Input {
+    intern(Node::Input {
         name,
         shape: shape.as_ref().to_vec(),
         dtype,
@@ -624,7 +624,7 @@ pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -
 }
 
 pub fn konst(v: f64) -> NodeRef {
-    Arc::new(Node::Const { v })
+    intern(Node::Const { v })
 }
 
 /// A tensor of ones with the same positional shape as `source`, expressed
@@ -637,13 +637,13 @@ pub fn ones_like(source: NodeRef) -> NodeRef {
 }
 
 pub fn iota(axis: Axis) -> NodeRef {
-    Arc::new(Node::Iota { axis })
+    intern(Node::Iota { axis })
 }
 
 /// The positional index along `dim`, broadcast over the shape of `src`.
 pub fn coordinate(src: NodeRef, dim: impl Dimension) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "coordinate");
-    Arc::new(Node::Coordinate { src, dim })
+    intern(Node::Coordinate { src, dim })
 }
 
 pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
@@ -653,22 +653,22 @@ pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
         &inputs.iter().map(|input| input.shape()).collect::<Vec<_>>(),
         op.name(),
     );
-    Arc::new(Node::Map { op, inputs })
+    intern(Node::Map { op, inputs })
 }
 
 pub fn reduce(src: NodeRef, dim: impl Dimension, op: Monoid) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "reduce");
-    Arc::new(Node::Reduce { src, dim, op })
+    intern(Node::Reduce { src, dim, op })
 }
 
 pub fn scan(src: NodeRef, dim: impl Dimension, op: Monoid) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "scan");
-    Arc::new(Node::Scan { src, dim, op })
+    intern(Node::Scan { src, dim, op })
 }
 
 pub fn gather(src: NodeRef, index: NodeRef, dim: impl Dimension) -> NodeRef {
     let dim = dim.resolve(&src.shape(), "gather");
-    Arc::new(Node::Gather { src, index, dim })
+    intern(Node::Gather { src, index, dim })
 }
 
 pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
@@ -705,7 +705,7 @@ pub fn positional_view(src: NodeRef, dims: Vec<ViewDim>) -> NodeRef {
         consumed.into_iter().all(|value| value),
         "view: every source dimension must be consumed exactly once"
     );
-    Arc::new(Node::View { src, dims })
+    intern(Node::View { src, dims })
 }
 
 /// Swap two dimensions without copying storage.
@@ -786,7 +786,7 @@ pub fn positional_reindex(
             assert_dim(&shape, output_dim, "reindex output");
         }
     }
-    Arc::new(Node::Reindex {
+    intern(Node::Reindex {
         src,
         shape,
         map,
@@ -822,149 +822,66 @@ pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> No
     positional_reindex(src, shape, map, false)
 }
 
-/// Rebuild `roots` with maximal sharing: separately constructed but
-/// structurally identical subtrees collapse into ONE node. One table spans
-/// all roots, and a subtree that is already canonical keeps its original
-/// `Arc`.
-pub fn canonicalize_many(roots: &[NodeRef]) -> Vec<NodeRef> {
-    let mut canonicalizer = Canonicalizer::default();
-    roots.iter().map(|root| canonicalizer.tree(root)).collect()
+// ── the intern table ─────────────────────────────────────────────────────────
+//
+// Every constructor returns THE node for its shallow structure, so
+// separately constructed but structurally identical subtrees are one node
+// and structural equality IS pointer equality — always, not only downstream
+// of a canonicalization pass. Entries are weak; a node's `Drop` evicts its
+// own entry. Sharded so parallel compilations contend on a slice of the
+// table, not one lock.
+
+const INTERN_SHARDS: usize = 16;
+
+type InternShard = Mutex<std::collections::HashMap<String, Weak<Node>>>;
+
+static INTERN: LazyLock<[InternShard; INTERN_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(std::collections::HashMap::new())));
+
+fn intern_shard(key: &str) -> &'static InternShard {
+    let mut hasher = std::hash::DefaultHasher::new();
+    key.hash(&mut hasher);
+    &INTERN[hasher.finish() as usize % INTERN_SHARDS]
 }
 
-/// Canonical table retained by passes that rebuild nodes after entry.
-#[derive(Default)]
-pub struct Canonicalizer {
-    canonical: std::collections::HashMap<String, NodeRef>,
-    memo: std::collections::HashMap<*const Node, NodeRef>,
-}
-
-impl Canonicalizer {
-    pub fn tree(&mut self, node: &NodeRef) -> NodeRef {
-        canonicalize_node(node, &mut self.canonical, &mut self.memo)
+/// The canonical `Arc` for `node`'s structure, minted on first sight. When
+/// the structure is already interned, the freshly built duplicate is
+/// discarded — safely: its `Drop` runs when the parameter goes out of scope,
+/// after the body's table guard is released, and the pointer check below
+/// keeps it from evicting the survivor's entry.
+fn intern(node: Node) -> NodeRef {
+    let key = shallow_key(&node);
+    let mut table = intern_shard(&key).lock().unwrap();
+    if let Some(existing) = table.get(&key).and_then(Weak::upgrade) {
+        return existing;
     }
+    let fresh = Arc::new(node);
+    table.insert(key, Arc::downgrade(&fresh));
+    fresh
+}
 
-    /// Canonicalize one node whose children are already canonical.
-    pub fn shallow(&mut self, node: NodeRef) -> NodeRef {
-        self.canonical
-            .entry(shallow_key(&node))
-            .or_insert(node)
-            .clone()
+/// Eviction half of the intern table. By the time a node drops, `upgrade` on
+/// its entry already fails, so a racing constructor may have REPLACED the
+/// entry with a fresh node of the same structure — remove it only if it is
+/// still ours. Children are dropped after this body returns, so their
+/// evictions never nest inside our shard lock.
+impl Drop for Node {
+    fn drop(&mut self) {
+        let key = shallow_key(self);
+        let mut table = intern_shard(&key).lock().unwrap();
+        if let Some(entry) = table.get(&key) {
+            if std::ptr::eq(entry.as_ptr(), self) {
+                table.remove(&key);
+            }
+        }
     }
 }
 
-fn canonicalize_node(
-    node: &NodeRef,
-    canonical: &mut std::collections::HashMap<String, NodeRef>,
-    memo: &mut std::collections::HashMap<*const Node, NodeRef>,
-) -> NodeRef {
-    if let Some(n) = memo.get(&Arc::as_ptr(node)) {
-        return n.clone();
-    }
-    // Children first; keep the ORIGINAL `Arc` when nothing beneath changed.
-    let rebuilt = match node.as_ref() {
-        Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => node.clone(),
-        Node::Map { op, inputs } => {
-            let ins: Vec<NodeRef> = inputs
-                .iter()
-                .map(|i| canonicalize_node(i, canonical, memo))
-                .collect();
-            if ins.iter().zip(inputs).all(|(a, b)| Arc::ptr_eq(a, b)) {
-                node.clone()
-            } else {
-                Arc::new(Node::Map {
-                    op: *op,
-                    inputs: ins,
-                })
-            }
-        }
-        Node::Coordinate { src, dim } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Arc::ptr_eq(&s, src) {
-                node.clone()
-            } else {
-                Arc::new(Node::Coordinate { src: s, dim: *dim })
-            }
-        }
-        Node::Reduce { src, dim, op } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Arc::ptr_eq(&s, src) {
-                node.clone()
-            } else {
-                Arc::new(Node::Reduce {
-                    src: s,
-                    dim: *dim,
-                    op: *op,
-                })
-            }
-        }
-        Node::Scan { src, dim, op } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Arc::ptr_eq(&s, src) {
-                node.clone()
-            } else {
-                Arc::new(Node::Scan {
-                    src: s,
-                    dim: *dim,
-                    op: *op,
-                })
-            }
-        }
-        Node::Gather { src, index, dim } => {
-            let s = canonicalize_node(src, canonical, memo);
-            let i = canonicalize_node(index, canonical, memo);
-            if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
-                node.clone()
-            } else {
-                Arc::new(Node::Gather {
-                    src: s,
-                    index: i,
-                    dim: *dim,
-                })
-            }
-        }
-        Node::View { src, dims } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Arc::ptr_eq(&s, src) {
-                node.clone()
-            } else {
-                Arc::new(Node::View {
-                    src: s,
-                    dims: dims.clone(),
-                })
-            }
-        }
-        Node::Reindex {
-            src,
-            shape,
-            map,
-            padded,
-        } => {
-            let s = canonicalize_node(src, canonical, memo);
-            if Arc::ptr_eq(&s, src) {
-                node.clone()
-            } else {
-                Arc::new(Node::Reindex {
-                    src: s,
-                    shape: shape.clone(),
-                    map: map.clone(),
-                    padded: *padded,
-                })
-            }
-        }
-    };
-    let out = canonical
-        .entry(shallow_key(&rebuilt))
-        .or_insert(rebuilt)
-        .clone();
-    memo.insert(Arc::as_ptr(node), out.clone());
-    out
-}
-
-/// One node's structure with children identified by POINTER — valid as an
-/// identity key exactly when the children are already canonical.
-pub(crate) fn shallow_key(n: &NodeRef) -> String {
+/// One node's structure with children identified by POINTER — a valid
+/// identity key because the children are themselves interned.
+fn shallow_key(n: &Node) -> String {
     let p = |c: &NodeRef| Arc::as_ptr(c) as usize;
-    match n.as_ref() {
+    match n {
         Node::Input { name, shape, dtype } => format!("I{name}{shape:?}{dtype:?}"),
         Node::Const { v } => format!("C{}", v.to_bits()),
         Node::Iota { axis } => format!("O{axis:?}"),

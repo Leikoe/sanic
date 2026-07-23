@@ -125,11 +125,11 @@ fn composed_logsumexp_backward_matches_the_primitive() {
     );
 }
 
-/// Two separately constructed, structurally identical subgraphs become ONE
-/// shared node: after canonicalization, structural equality is pointer
-/// equality — and the merge preserves the computed value.
+/// Two separately constructed, structurally identical subgraphs ARE one
+/// shared node: constructors intern, so structural equality is pointer
+/// equality at construction — and the sharing preserves the computed value.
 #[test]
-fn canonicalize_merges_structural_duplicates() {
+fn interned_construction_merges_structural_duplicates() {
     let (b, c) = (axis("b", 4), axis("c", 6));
     let x = input("x", [b, c], Dtype::F32);
     let row_energy = |x: &NodeRef| {
@@ -139,26 +139,29 @@ fn canonicalize_merges_structural_duplicates() {
             Monoid::Add,
         )
     };
-    // Built twice on purpose: equal structure, distinct nodes.
+    // Built twice on purpose: equal structure interns to the same node.
     let once = row_energy(&x);
     let again = row_energy(&x);
-    assert!(!std::sync::Arc::ptr_eq(&once, &again));
+    assert!(std::sync::Arc::ptr_eq(&once, &again));
 
     let y = map(MapOp::Add, vec![once, again]); // 2·Σx² per row
-    let canonical = canonicalize_many(std::slice::from_ref(&y)).pop().unwrap();
-    let Node::Map { inputs, .. } = canonical.as_ref() else {
-        panic!("expected the root Add to survive canonicalization");
+    let Node::Map { inputs, .. } = y.as_ref() else {
+        panic!("expected a root Add");
     };
     assert!(
         std::sync::Arc::ptr_eq(&inputs[0], &inputs[1]),
-        "the duplicated reduction must canonicalize to one shared node"
+        "the duplicated reduction must intern to one shared node"
     );
 
     let mut rng = Lcg(0xCA11);
-    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))]
-        .into_iter()
+    let tensor = rand_tensor(&[b, c], &mut rng);
+    let expected: Vec<f64> = tensor
+        .data
+        .chunks(c.extent())
+        .map(|row| 2.0 * row.iter().map(|v| v * v).sum::<f64>())
         .collect();
-    assert_eq!(eval(&canonical, &env).data, eval(&y, &env).data);
+    let env: Env = [("x", tensor)].into_iter().collect();
+    assert_eq!(eval(&y, &env).data, expected);
 }
 
 /// Partition computes a structurally duplicated subgraph ONCE: building the

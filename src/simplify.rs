@@ -1,6 +1,7 @@
 //! Algebraic simplification of a graph — the ring/lattice identities and the
 //! one distributivity law the engine already trusts, applied as rewrites to a
-//! fixpoint, with common-subexpression elimination.
+//! fixpoint. Interned construction gives common-subexpression elimination
+//! for free.
 //!
 //! Its reason to exist is the backward pass. [`crate::grad`] transposes a
 //! graph faithfully but naively: differentiating logsumexp's numerically
@@ -16,15 +17,15 @@
 //! * **factor an invariant out of an `Add`-reduce** — `Σ(k·x) = k·Σx` when
 //!   `k` does not carry the axis (the same defer-scale `derive` uses), and
 //!   `Σ(−x) = −Σx`;
-//! * **CSE** — hash-consing makes the gradient's `Σ exp(x − m)` share the
-//!   forward `s`'s node, so `(g/s)·Σexp` becomes `(g/s)·s`;
+//! * **CSE** — interned constructors make the gradient's `Σ exp(x − m)` share
+//!   the forward `s`'s node, so `(g/s)·Σexp` becomes `(g/s)·s`;
 //! * **ring identities** — `(a/b)·b → a`, `x − x → 0`, `k·0 → 0`, `x + 0 → x`.
 //!
 //! Then `m`'s cotangent is `0`, the winner-mask is `winner·0 = 0`, and the
 //! bare `max` fold falls out as dead code — the result is exactly
 //! `softmax − onehot`. A second phase then adds the log-sum-exp regrouping
 //! `(g/s)·exp(z−m) → g·exp(z − lse)`; run over the forward AND backward
-//! together ([`simplify_many`], one shared CSE table), it makes the backward's
+//! together ([`simplify_many`]), it makes the backward's
 //! softmax the SAME node as the forward's materialized logsumexp, so the
 //! schedule reuses that carrier instead of recomputing the `(max, Σexp)` fold.
 //! The composed cross-entropy's forward+backward then derives to the same
@@ -50,10 +51,10 @@ use crate::ir::{
     positional_reindex, positional_view, reduce, scan,
 };
 
-/// Simplify several roots TOGETHER, in two phases, each to a fixpoint. One
-/// CSE table is shared per pass, so a subtree computed in one root and
-/// recomputed in another (a forward value and its reappearance in the
-/// backward) becomes a single node.
+/// Simplify several roots TOGETHER, in two phases, each to a fixpoint.
+/// Constructors intern, so a subtree computed in one root and recomputed in
+/// another (a forward value and its reappearance in the backward) is a
+/// single node already; the passes only need to rewrite.
 ///
 /// Phase 1 is cancellation only — the ring identities, the defer-scale factor
 /// and CSE — which collapses a stabilizing max-shift's winner-mask cotangent to
@@ -68,12 +69,11 @@ pub fn simplify_many(roots: &[Node]) -> Vec<Node> {
     let mut cur: Vec<Node> = roots.to_vec();
     for reconstruct in [false, true] {
         for _ in 0..32 {
-            let mut cse: HashMap<String, Node> = HashMap::new();
             let mut memo: HashMap<*const NodeKind, Node> = HashMap::new();
             let mut changed = false;
             cur = cur
                 .iter()
-                .map(|r| pass(r, reconstruct, &mut cse, &mut memo, &mut changed))
+                .map(|r| pass(r, reconstruct, &mut memo, &mut changed))
                 .collect();
             if !changed {
                 break;
@@ -83,11 +83,11 @@ pub fn simplify_many(roots: &[Node]) -> Vec<Node> {
     cur
 }
 
-/// One bottom-up pass: canonicalize children, apply a local rewrite, hash-cons.
+/// One bottom-up pass: rewrite children, then apply a local rule. Interned
+/// construction keeps the result maximally shared as a side effect.
 fn pass(
     node: &Node,
     reconstruct: bool,
-    cse: &mut HashMap<String, Node>,
     memo: &mut HashMap<*const NodeKind, Node>,
     changed: &mut bool,
 ) -> Node {
@@ -99,89 +99,77 @@ fn pass(
     // the ORIGINAL `Arc`. This preserves the identity `grad` shares with the
     // forward graph (the gradient reads forward nodes by pointer), so a
     // backward that recomputes the forward's `s` stays the *same* node and the
-    // schedule materializes it once — and it keeps CSE keys (built from child
-    // pointers) stable, which is what unifies the gradient's `Σ exp(x − m)`
-    // with that forward `s` in the first place.
+    // schedule materializes it once.
     let out = match node.as_ref() {
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {
-            hashcons(node.clone(), cse)
-        }
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => node.clone(),
         NodeKind::Coordinate { src, dim } => {
-            let source = pass(src, reconstruct, cse, memo, changed);
-            hashcons(
-                if Arc::ptr_eq(&source, src) {
-                    node.clone()
-                } else {
-                    coordinate(source, *dim)
-                },
-                cse,
-            )
+            let source = pass(src, reconstruct, memo, changed);
+            if Arc::ptr_eq(&source, src) {
+                node.clone()
+            } else {
+                coordinate(source, *dim)
+            }
         }
         NodeKind::Map { op, inputs } => {
             let output_shape = node.shape();
             let output_axes = crate::ir::axis_refs(node);
             let ins: Vec<Node> = inputs
                 .iter()
-                .map(|i| pass(i, reconstruct, cse, memo, changed))
+                .map(|i| pass(i, reconstruct, memo, changed))
                 .collect();
-            let rebuilt = match map_rule(*op, &ins, reconstruct) {
+            match map_rule(*op, &ins, reconstruct) {
                 Some(r) => {
                     *changed = true;
                     preserve_shape(r, &output_shape, &output_axes)
                 }
                 None if same(&ins, inputs) => node.clone(),
                 None => map(*op, ins),
-            };
-            hashcons(rebuilt, cse)
+            }
         }
         NodeKind::Reduce { src, dim, op } => {
             let output_shape = node.shape();
             let output_axes = crate::ir::axis_refs(node);
-            let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = match reduce_rule(&s, *dim, *op) {
+            let s = pass(src, reconstruct, memo, changed);
+            match reduce_rule(&s, *dim, *op) {
                 Some(r) => {
                     *changed = true;
                     preserve_shape(r, &output_shape, &output_axes)
                 }
                 None if Arc::ptr_eq(&s, src) => node.clone(),
                 None => reduce(s, *dim, *op),
-            };
-            hashcons(rebuilt, cse)
+            }
         }
         NodeKind::Scan { src, dim, op } => {
-            let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if Arc::ptr_eq(&s, src) {
+            let s = pass(src, reconstruct, memo, changed);
+            if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
                 scan(s, *dim, *op)
-            };
-            hashcons(rebuilt, cse)
+            }
         }
         NodeKind::Gather { src, index, dim } => {
-            let s = pass(src, reconstruct, cse, memo, changed);
-            let i = pass(index, reconstruct, cse, memo, changed);
-            let rebuilt = if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
+            let s = pass(src, reconstruct, memo, changed);
+            let i = pass(index, reconstruct, memo, changed);
+            if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
                 node.clone()
             } else {
                 gather(s, i, *dim)
-            };
-            hashcons(rebuilt, cse)
+            }
         }
         NodeKind::View { src, dims } => {
-            let s = pass(src, reconstruct, cse, memo, changed);
+            let s = pass(src, reconstruct, memo, changed);
             let identity = dims.len() == s.shape().len()
                 && dims.iter().enumerate().all(|(output_dim, dim)| {
                     dim.sources == [output_dim] && dim.axis == s.shape()[output_dim]
                 });
-            let rebuilt = if identity {
+            if identity {
                 *changed = true;
                 s
             } else if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
                 positional_view(s, dims.clone())
-            };
-            hashcons(rebuilt, cse)
+            }
         }
         NodeKind::Reindex {
             src,
@@ -189,34 +177,22 @@ fn pass(
             map: m,
             padded,
         } => {
-            let s = pass(src, reconstruct, cse, memo, changed);
-            let rebuilt = if let Some(unwrapped) = cancel_view_reindex(&s, shape, m, *padded) {
+            let s = pass(src, reconstruct, memo, changed);
+            if let Some(unwrapped) = cancel_view_reindex(&s, shape, m, *padded) {
                 *changed = true;
                 unwrapped
             } else if Arc::ptr_eq(&s, src) {
                 node.clone()
             } else {
                 positional_reindex(s, shape.clone(), m.clone(), *padded)
-            };
-            hashcons(rebuilt, cse)
+            }
         }
     };
     memo.insert(ptr, out.clone());
     out
 }
 
-/// Return the canonical node for this shallow structure — two structurally
-/// identical nodes (identical op and identical, already-canonical children)
-/// collapse to one, which is what turns structural equality into a pointer
-/// test for the rewrites below. The key is [`crate::ir::shallow_key`], shared
-/// with the pipeline-entry [`crate::ir::canonicalize_many`].
-fn hashcons(node: Node, cse: &mut HashMap<String, Node>) -> Node {
-    cse.entry(crate::ir::shallow_key(&node))
-        .or_insert(node)
-        .clone()
-}
-
-// ── local rewrites (children already canonical, so `≡` is `Arc::ptr_eq`) ───────
+// ── local rewrites (construction interns, so `≡` is `Arc::ptr_eq`) ───────────
 
 /// Are two operand lists pointer-identical (nothing rebuilt beneath)?
 fn same(a: &[Node], b: &[Node]) -> bool {

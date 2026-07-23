@@ -36,7 +36,7 @@ use crate::cost::DeviceProfile;
 use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
-    self, AxisRef, Canonicalizer, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
+    self, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
     ResolvedAffineIndex, all_axis_refs, input_axes, input_dtypes, leaf_names,
 };
 use crate::plan::{
@@ -132,23 +132,17 @@ pub fn partition(node: &Node, dev: &DeviceProfile) -> Schedule {
 /// root reachable from a *later* root is reused through its materialization
 /// (so put producers before consumers). Each root lands under its given name.
 pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Schedule {
-    // Canonicalize FIRST: everything below reads sharing through
-    // pointer-keyed maps (`parents`, `done`), so two separately built but
-    // structurally identical subgraphs must already be one node when the
-    // counting starts — otherwise the same value is derived, and possibly
-    // computed, once per copy. The partitioner KEEPS the canonical table:
-    // every node it constructs while emitting (spliced reads, rebuilt cut
-    // graphs) goes back through it, so a rebuilt structural twin resolves to
-    // the original node and an already-cut value is read, not re-emitted.
-    let mut canon = Canonicalizer::default();
-    let graph_roots: Vec<Node> = roots.iter().map(|(root, _)| canon.tree(root)).collect();
-    crate::verify::assert_valid_many(&graph_roots);
-    let roots: Vec<(Node, &'static str)> = graph_roots
-        .into_iter()
-        .zip(roots.iter().map(|(_, name)| *name))
-        .collect();
+    // Everything below reads sharing through pointer-keyed maps (`parents`,
+    // `done`), which is sound because construction interns: two separately
+    // built but structurally identical subgraphs are already one node, and a
+    // node rebuilt while emitting (a spliced read, a rebuilt cut graph)
+    // resolves to the original, so an already-cut value is read, not
+    // re-emitted.
+    crate::verify::assert_valid_many(
+        &roots.iter().map(|(root, _)| root.clone()).collect::<Vec<_>>(),
+    );
     let mut parents = HashMap::new();
-    for (r, _) in &roots {
+    for (r, _) in roots {
         count_parents(r, &mut parents);
     }
     let mut p = Partitioner {
@@ -159,12 +153,11 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         done: HashMap::new(),
         keepalive: Vec::new(),
         parents,
-        canon,
         structures: StructureCache::default(),
         plan_groups: GroupCache::default(),
     };
     let mut outputs = Vec::new();
-    for (r, name) in &roots {
+    for (r, name) in roots {
         let landed = p.emit(r, name);
         // a later root (or leaf) reaching this one reuses the buffer
         p.done.insert(Arc::as_ptr(r), landed);
@@ -406,11 +399,6 @@ struct Partitioner<'a> {
     /// more than one is a fusion barrier for elementwise cones: computing it
     /// inside one consumer would recompute or corrupt it for the others.
     parents: HashMap<*const NodeKind, usize>,
-    /// The canonical table the roots were canonicalized with at entry. Every
-    /// node the partitioner constructs afterwards (spliced reads, rebuilt
-    /// cut graphs) goes back through it, so a rebuilt structural twin IS the
-    /// original node and `done` keeps deduplicating across consumers.
-    canon: Canonicalizer,
     /// Shared across the whole retained DAG. Partitioning asks about many
     /// nodes and dimensions; rebuilding this memo table per query is
     /// quadratic on deep residual graphs.
@@ -575,10 +563,8 @@ impl Partitioner<'_> {
                         (c.clone(), self.splice(c, false))
                     })
                     .collect();
-                let spliced_src = replace_many(src, &subs, &mut HashMap::new(), &mut self.canon);
-                let rebuilt = self
-                    .canon
-                    .shallow(crate::ir::reduce(spliced_src, *dim, *op));
+                let spliced_src = replace_many(src, &subs, &mut HashMap::new());
+                let rebuilt = crate::ir::reduce(spliced_src, *dim, *op);
                 self.emit(&rebuilt, out)
             }
 
@@ -668,8 +654,7 @@ impl Partitioner<'_> {
                 let out = if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon
-                        .shallow(crate::ir::positional_view(s, dims.clone()))
+                    crate::ir::positional_view(s, dims.clone())
                 };
                 memo.insert(Arc::as_ptr(node), out.clone());
                 return out;
@@ -685,21 +670,19 @@ impl Partitioner<'_> {
                 let out = if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::positional_reindex(
+                    crate::ir::positional_reindex(
                         s,
                         shape.clone(),
                         map.clone(),
                         *padded,
-                    ))
+                    )
                 };
                 memo.insert(Arc::as_ptr(node), out.clone());
                 return out;
             }
             if let Some(&name) = self.done.get(&Arc::as_ptr(node)) {
                 // a materialized buffer read
-                let read = self
-                    .canon
-                    .shallow(ir::input(name, node.shape(), Dtype::F32));
+                let read = ir::input(name, node.shape(), Dtype::F32);
                 memo.insert(Arc::as_ptr(node), read.clone());
                 return read;
             }
@@ -711,7 +694,7 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&source, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::coordinate(source, *dim))
+                    crate::ir::coordinate(source, *dim)
                 }
             }
             NodeKind::Map { op, inputs } => {
@@ -722,7 +705,7 @@ impl Partitioner<'_> {
                 if new.iter().zip(inputs).all(|(a, b)| Arc::ptr_eq(a, b)) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::map(*op, new))
+                    crate::ir::map(*op, new)
                 }
             }
             NodeKind::Reduce { src, dim, op } => {
@@ -730,7 +713,7 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::reduce(s, *dim, *op))
+                    crate::ir::reduce(s, *dim, *op)
                 }
             }
             NodeKind::Scan { src, dim, op } => {
@@ -738,7 +721,7 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::scan(s, *dim, *op))
+                    crate::ir::scan(s, *dim, *op)
                 }
             }
             NodeKind::Gather { src, index, dim } => {
@@ -747,7 +730,7 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&s, src) && Arc::ptr_eq(&i, index) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::gather(s, i, *dim))
+                    crate::ir::gather(s, i, *dim)
                 }
             }
             NodeKind::View { src, dims } => {
@@ -755,8 +738,7 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon
-                        .shallow(crate::ir::positional_view(s, dims.clone()))
+                    crate::ir::positional_view(s, dims.clone())
                 }
             }
             NodeKind::Reindex {
@@ -769,12 +751,12 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    self.canon.shallow(crate::ir::positional_reindex(
+                    crate::ir::positional_reindex(
                         s,
                         shape.clone(),
                         map.clone(),
                         *padded,
-                    ))
+                    )
                 }
             }
         };
@@ -1196,7 +1178,7 @@ impl Partitioner<'_> {
                 cut_into(self, leaf, &mut subs);
             }
         }
-        let cut_graph = replace_many(node, &subs, &mut HashMap::new(), &mut self.canon);
+        let cut_graph = replace_many(node, &subs, &mut HashMap::new());
 
         // Rebuilding around cuts creates new node-relative axis occurrences.
         // Anchor the stream in the replacement dimension corresponding to an
@@ -1235,14 +1217,11 @@ impl Partitioner<'_> {
                 // fusion. Each retry removes one Div, so the recursion
                 // terminates.
                 if let Some(div) = smallest_div(&cut_graph) {
-                    let probe = self
-                        .canon
-                        .shallow(ir::input("«div»", div.shape(), Dtype::F32));
+                    let probe = ir::input("«div»", div.shape(), Dtype::F32);
                     let remainder = replace_many(
                         &cut_graph,
                         &[(div.clone(), probe)],
                         &mut HashMap::new(),
-                        &mut self.canon,
                     );
                     let alt_axis = relocate_axis(&cut_graph, &remainder, cut_axis, &c2.aliases)
                         .unwrap_or(cut_axis);
@@ -1277,7 +1256,6 @@ impl Partitioner<'_> {
                                 &cut_graph,
                                 &[(div, spliced)],
                                 &mut HashMap::new(),
-                                &mut self.canon,
                             );
                             return self.emit(&rebuilt, out);
                         }
@@ -1309,7 +1287,6 @@ impl Partitioner<'_> {
                         &cut_graph,
                         &[(div, spliced)],
                         &mut HashMap::new(),
-                        &mut self.canon,
                     );
                     return self.emit(&rebuilt, out);
                 }
@@ -1370,7 +1347,7 @@ impl Partitioner<'_> {
                 if i != hi {
                     let name = self.cut(p);
                     extra.push(name);
-                    let read = self.canon.shallow(ir::input(name, p.shape(), Dtype::F32));
+                    let read = ir::input(name, p.shape(), Dtype::F32);
                     subs.push((p.clone(), read));
                 }
             }
@@ -1406,7 +1383,7 @@ impl Partitioner<'_> {
                     producer.clone(),
                     ir::input(sentinel, producer.shape(), Dtype::F32),
                 ));
-                let epi = replace_many(node, &subs, &mut HashMap::new(), &mut self.canon);
+                let epi = replace_many(node, &subs, &mut HashMap::new());
                 spec.output_name = out.to_string();
                 *epilogue = ops;
                 let mut all_inputs = plain_inputs;
@@ -1939,15 +1916,14 @@ fn is_contraction(node: &Node) -> bool {
 /// Memoized by pointer so a DAG-shared sub-expression is rebuilt once and
 /// stays shared — the deriver dedups leaves by pointer, so losing sharing
 /// would split slots.
-/// Rebuild `node` with `subs` substituted. Every rebuilt node goes back
-/// through `canon`, so a spine whose children came out unchanged collapses
-/// onto the ORIGINAL node — and two consumers substituting the same reads
-/// rebuild the SAME spine, which is what lets `done` deduplicate their cuts.
+/// Rebuild `node` with `subs` substituted. Constructors intern, so a spine
+/// whose children came out unchanged collapses onto the ORIGINAL node — and
+/// two consumers substituting the same reads rebuild the SAME spine, which
+/// is what lets `done` deduplicate their cuts.
 fn replace_many(
     node: &Node,
     subs: &[(Node, Node)],
     memo: &mut HashMap<*const NodeKind, Node>,
-    canon: &mut Canonicalizer,
 ) -> Node {
     if let Some((_, with)) = subs.iter().find(|(t, _)| Arc::ptr_eq(t, node)) {
         return with.clone();
@@ -1959,28 +1935,28 @@ fn replace_many(
     let rebuilt = match node.as_ref() {
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => node.clone(),
         NodeKind::Coordinate { src, dim } => {
-            crate::ir::coordinate(replace_many(src, subs, memo, canon), *dim)
+            crate::ir::coordinate(replace_many(src, subs, memo), *dim)
         }
         NodeKind::Map { op, inputs } => crate::ir::map(
             *op,
             inputs
                 .iter()
-                .map(|i| replace_many(i, subs, memo, canon))
+                .map(|i| replace_many(i, subs, memo))
                 .collect(),
         ),
         NodeKind::Reduce { src, dim, op } => {
-            crate::ir::reduce(replace_many(src, subs, memo, canon), *dim, *op)
+            crate::ir::reduce(replace_many(src, subs, memo), *dim, *op)
         }
         NodeKind::Scan { src, dim, op } => {
-            crate::ir::scan(replace_many(src, subs, memo, canon), *dim, *op)
+            crate::ir::scan(replace_many(src, subs, memo), *dim, *op)
         }
         NodeKind::Gather { src, index, dim } => crate::ir::gather(
-            replace_many(src, subs, memo, canon),
-            replace_many(index, subs, memo, canon),
+            replace_many(src, subs, memo),
+            replace_many(index, subs, memo),
             *dim,
         ),
         NodeKind::View { src, dims } => {
-            crate::ir::positional_view(replace_many(src, subs, memo, canon), dims.clone())
+            crate::ir::positional_view(replace_many(src, subs, memo), dims.clone())
         }
         NodeKind::Reindex {
             src,
@@ -1988,13 +1964,12 @@ fn replace_many(
             map,
             padded,
         } => crate::ir::positional_reindex(
-            replace_many(src, subs, memo, canon),
+            replace_many(src, subs, memo),
             shape.clone(),
             map.clone(),
             *padded,
         ),
     };
-    let rebuilt = canon.shallow(rebuilt);
     memo.insert(key, rebuilt.clone());
     rebuilt
 }

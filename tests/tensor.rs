@@ -88,22 +88,20 @@ fn only_inputs_reachable_from_the_selected_roots_are_compiled() {
     assert_eq!(program.input_names().collect::<Vec<_>>(), ["x"]);
 }
 
-/// Two separately built, structurally identical public subtrees become ONE
-/// node before compiler analysis. This lets a RoPE frequency table built once
-/// per layer compile once for the whole model.
+/// Two separately built, structurally identical public subtrees ARE one
+/// node: constructors intern, so structural identity is pointer identity at
+/// construction, with no canonicalization pass in between. This lets a RoPE
+/// frequency table built once per layer compile once for the whole model.
 #[test]
-fn structural_duplicates_canonicalize_to_one_node() {
+fn structural_duplicates_are_one_node_at_construction() {
     let d = axis("d", 8);
     let energy = || {
         let x = input("x", [d], Dtype::F32);
         reduce(map(MapOp::Mul, vec![x.clone(), x]), 0usize, add())
     };
     let (first, second) = (energy(), energy());
-    assert!(!std::sync::Arc::ptr_eq(&first, &second));
-
-    let canonical = sanic::canonicalize_many(&[first, second]);
     assert!(
-        std::sync::Arc::ptr_eq(&canonical[0], &canonical[1]),
-        "identical subtrees must share one node after canonicalization"
+        std::sync::Arc::ptr_eq(&first, &second),
+        "identical subtrees must intern to one node at construction"
     );
 }
