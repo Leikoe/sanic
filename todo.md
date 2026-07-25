@@ -275,12 +275,26 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    handles. `=4` keeps encoder-per-kernel (stage boundaries are the only
    Apple sampling points); `=2` wall adjudicates the win (~3ms ceiling).
 
-2. **The launch-floor folds.** The table shows a family of `grid≤128`
-   folds (RMSNorm-family `fold_sequence1_over_hidden2048` et al.) at
-   30–40µs, bw ≤3%, `plan ×6–7` — dozens per step, ~1–2ms of pure launch
-   floor. Two directions: fuse them into consumers (or batch across
-   heads/layers), and teach the cost model the per-launch floor so
-   `plan ×` stops undercounting tiny kernels by 6×.
+2. **The launch-floor folds — mostly EATEN by item 1 (re-measured
+   2026-07-25).** In the concurrent-encoder regime the tiny norm folds
+   profile at ~700µs/step (≈25µs × 33, and the profiled regime overstates
+   them — production hides part behind overlap). The two-pass fusion
+   feature is no longer justified by decode perf alone; keep it parked
+   for training/prefill. What the post-overlap profile DOES say
+   (bf16, Σ 16.4ms profiled): the four matmul-fold families are ~95% of
+   kernel time — MLP up+gate 6.3ms at 85% bw, MLP down 3.5ms at **77%**,
+   logits 2.9ms at 90%, QKV/attn ~2.3ms. The remaining MLX gap is fold
+   DRAM rate: P1 chunk+wide-loads and the measured tuner are the attack.
+
+   Discovery while checking why 16 "isomorphic" layers emit 33 distinct
+   norm folds (`SANIC_MSL` dump, kernel names made it visible): the
+   RESIDUAL STREAM IS NEVER MATERIALIZED — layer N's norm fold re-sums
+   all N+2 prior residual contributions in-register (growing arity, so
+   layers genuinely aren't isomorphic and dedup is correct). At batch-1
+   decode re-reading k×4KB beats a materialize round-trip — the right
+   call. At long-context prefill the re-reads grow ~quadratically with
+   depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
+   decision to revisit when prefill matters.
 
 3. **The measured tuner (`--tune`).** `fold_sched_candidates`
    (plan.rs:751-795) still has no runtime behind it.

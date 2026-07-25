@@ -622,6 +622,12 @@ mod metal_backend {
                 )));
             }
             let program = emit_schedule_metal_on(&self.profile(), schedule);
+            // `SANIC_MSL=<path>` dumps the whole generated source — the raw
+            // artifact behind every kernel name the runtime dumps print.
+            if let Some(path) = std::env::var_os("SANIC_MSL") {
+                std::fs::write(&path, &program.msl)
+                    .unwrap_or_else(|error| panic!("SANIC_MSL: cannot write {path:?}: {error}"));
+            }
             let pipelines = MetalDevice::compile(self, &program.msl);
             Ok(MetalExecutable { program, pipelines })
         }
