@@ -1150,6 +1150,18 @@ fn kernel_name(kind: &str, output_axes: &[Axis], fold: Option<AxisRef>) -> Strin
 /// [`crate::rustgen::emit_schedule`]), fold schedules priced against the
 /// device the kernels will run on.
 pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule) -> MetalProgram {
+    emit_schedule_metal_tuned(dev, sched, &HashMap::new())
+}
+
+/// [`emit_schedule_metal_on`] with measured verdicts: `tuned` maps a fused
+/// stage's OUTPUT name to the schedule the tuner timed fastest on the real
+/// device (`SANIC_TUNE=1`), overruling the analytic chooser for exactly
+/// those stages.
+pub fn emit_schedule_metal_tuned(
+    dev: &crate::cost::DeviceProfile,
+    sched: &Schedule,
+    tuned: &HashMap<String, FoldSched>,
+) -> MetalProgram {
     let mut msl = String::from(MSL_HEADER);
     let mut all_dtypes: HashMap<String, Dtype> = HashMap::new();
     let mut stages: Vec<MetalStageInfo> = Vec::new();
@@ -1229,7 +1241,10 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
                     &epilogue_node.as_ref().unwrap_or(fold_node).shape(),
                     Some(spec.streaming_axis),
                 );
-                let sched = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev);
+                let sched = tuned
+                    .get(&out)
+                    .copied()
+                    .unwrap_or_else(|| fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev));
                 if crate::debug_level() >= 3 {
                     eprintln!(
                         "[sched] {out}: sgs {} lane_stream {} lane_axis {:?} chunk {}",

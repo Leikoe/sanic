@@ -29,6 +29,12 @@
 /// compile-time cut decisions; `4` times every kernel INSIDE the step's one
 /// command buffer via encoder-boundary GPU timestamps (solo re-timing,
 /// sync-floored in sum, where the device can't sample counters).
+///
+/// The other switches, all read where they act: `SANIC_TUNE=1` measures
+/// fold schedules on the real device instead of trusting the cost model
+/// (`tune_fold_scheds`), `SANIC_MSL=<path>` writes the generated Metal
+/// source, and `SANIC_NANSCAN=1` names the first stage with a non-finite
+/// output.
 pub(crate) fn debug_level() -> u32 {
     static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {

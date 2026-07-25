@@ -551,22 +551,30 @@ pub fn fold_sched(fold_node: &Node, streaming_axis: AxisRef, carrier: &Carrier, 
     best_fold_sched(fold_node, streaming_axis, carrier, dev).0
 }
 
-/// The winning schedule with its flop bill and its ADDITIVE time
-/// ([`crate::cost::kernel_time_additive`]) — what the emitted code actually
-/// issues, recompute included. This is what [`plan_axis_emitted`] prices
-/// fusion with: `count_flops` counts each node once at its own volume, but
-/// one thread per output point re-issues every subtree its point does not
-/// span, and that difference is exactly the misprediction that let a
-/// normalizer fused into a fat head plan ×15 under its measurement. The
-/// candidates still RANK by the roofline max — the choice among schedules
-/// is unchanged; the additive figure is the committed cost, because only a
-/// sum can rank a fusion doing strictly more work under the same traffic.
-fn best_fold_sched(
+/// What the roofline says one schedule costs.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedPrice {
+    /// Roofline time — what RANKS candidates against each other.
+    pub time: f64,
+    /// Execution flop bill, recompute included.
+    pub flops: f64,
+    /// [`crate::cost::kernel_time_additive`] — the cost the partitioner
+    /// COMMITS for this kernel, because only a sum can rank a fusion doing
+    /// strictly more work under the same traffic.
+    pub additive: f64,
+}
+
+/// Every legal candidate paired with its analytic price, or `None` where the
+/// DEVICE cannot run the schedule (`feasible`: threadgroup scratch and
+/// register limits). One rule, two readers: [`best_fold_sched`] ranks by the
+/// price, and the measured tuner (`SANIC_TUNE=1`) times exactly the feasible
+/// entries on the real machine.
+pub fn priced_fold_sched_candidates(
     fold_node: &Node,
     streaming_axis: AxisRef,
     carrier: &Carrier,
     dev: &DeviceProfile,
-) -> (FoldSched, f64, f64) {
+) -> Vec<(FoldSched, Option<SchedPrice>)> {
     let ext = |ax: AxisRef| ax.extent() as f64;
     let s_ext = ext(streaming_axis);
     let out_axes = ir::axis_refs(fold_node);
@@ -629,7 +637,7 @@ fn best_fold_sched(
 
     // Execution flops + the candidate kernel, for one schedule.
     let simd = SIMD as f64;
-    let price = |sched: &FoldSched| -> Option<(f64, f64, f64)> {
+    let price = |sched: &FoldSched| -> Option<SchedPrice> {
         let f = (if sched.lane_stream { simd } else { 1.0 }) * sched.sgs as f64;
         if f > s_ext {
             return None; // an empty split unit would merge identity (the −∞ edge)
@@ -693,23 +701,46 @@ fn best_fold_sched(
             lanes_per_block: sched.tg_threads() as f64,
             bytes_in_flight_per_lane: streamed_bytes_per_lane * sched.chunk as f64,
         };
-        feasible(dev, &k).then(|| {
-            (
-                kernel_time(dev, &k),
-                k.flops,
-                crate::cost::kernel_time_additive(dev, &k),
-            )
+        feasible(dev, &k).then(|| SchedPrice {
+            time: kernel_time(dev, &k),
+            flops: k.flops,
+            additive: crate::cost::kernel_time_additive(dev, &k),
         })
     };
 
-    let cands = fold_sched_candidates(fold_node, streaming_axis, carrier);
+    fold_sched_candidates(fold_node, streaming_axis, carrier)
+        .into_iter()
+        .map(|candidate| {
+            let priced = price(&candidate);
+            (candidate, priced)
+        })
+        .collect()
+}
+
+/// The winning schedule with its flop bill and its ADDITIVE time
+/// ([`crate::cost::kernel_time_additive`]) — what the emitted code actually
+/// issues, recompute included. This is what [`plan_axis_emitted`] prices
+/// fusion with: `count_flops` counts each node once at its own volume, but
+/// one thread per output point re-issues every subtree its point does not
+/// span, and that difference is exactly the misprediction that let a
+/// normalizer fused into a fat head plan ×15 under its measurement. The
+/// candidates still RANK by the roofline max — the choice among schedules
+/// is unchanged; the additive figure is the committed cost, because only a
+/// sum can rank a fusion doing strictly more work under the same traffic.
+fn best_fold_sched(
+    fold_node: &Node,
+    streaming_axis: AxisRef,
+    carrier: &Carrier,
+    dev: &DeviceProfile,
+) -> (FoldSched, f64, f64) {
+    let s_ext = streaming_axis.extent();
     let mut best = FoldSched::scalar();
     let mut best_t = f64::INFINITY;
     // No feasible candidate (the scalar schedule always fits in practice):
     // fall back to the naive bill so the caller still has a finite figure.
     let mut best_flops = count_flops(fold_node);
     let mut best_add = f64::INFINITY;
-    for c in cands {
+    for (c, priced) in priced_fold_sched_candidates(fold_node, streaming_axis, carrier, dev) {
         // A tie-break the roofline cannot make: at equal price, a
         // lane-stream split beats the scalar schedule. Scalar hands each
         // thread its own output point, so a warp's 32 loads land whole rows
@@ -717,13 +748,13 @@ fn best_fold_sched(
         // STREAM read consecutive elements — one transaction serves the
         // warp. Contiguity is invisible to the cost model (same bytes, same
         // lane count), so this is a stated rule, not a priced choice.
-        if let Some((t, flops, add)) = price(&c)
-            && (t < best_t || (t == best_t && c.lane_stream && best.is_scalar()))
+        if let Some(price) = priced
+            && (price.time < best_t || (price.time == best_t && c.lane_stream && best.is_scalar()))
         {
             best = c;
-            best_t = t;
-            best_flops = flops;
-            best_add = add;
+            best_t = price.time;
+            best_flops = price.flops;
+            best_add = price.additive;
         }
     }
     // A refinement of the winner, not a candidate: each lane folds a
@@ -738,20 +769,16 @@ fn best_fold_sched(
     // not a priced choice.
     if best.lane_stream && best.lane_axis.is_none() {
         let f_split = SIMD * best.sgs;
-        if let Some(chunk) = [8usize, 4, 2]
-            .into_iter()
-            .find(|chunk| (s_ext as usize) % (f_split * chunk) == 0)
-        {
+        if let Some(chunk) = [8usize, 4, 2].into_iter().find(|chunk| s_ext % (f_split * chunk) == 0) {
             best.chunk = chunk;
         }
     }
     (best, best_flops, best_add)
 }
 
-/// Every LEGAL cooperative schedule for a fold — the candidate set the
-/// analytical chooser prices, exposed so a measured tuner can time the same
-/// set on the real device and overrule the model (`--tune`). Order-sensitive
-/// carriers get only the scalar entry, exactly as the chooser treats them.
+/// Every LEGAL cooperative schedule for a fold — the raw candidate set
+/// behind [`priced_fold_sched_candidates`]. Order-sensitive carriers get
+/// only the scalar entry, exactly as the chooser treats them.
 fn fold_sched_candidates(fold_node: &Node, streaming_axis: AxisRef, carrier: &Carrier) -> Vec<FoldSched> {
     let mut cands = vec![FoldSched::scalar()];
     if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {

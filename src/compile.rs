@@ -565,8 +565,9 @@ impl Backend for CpuDevice {
 #[cfg(target_os = "macos")]
 mod metal_backend {
     use super::*;
-    use crate::emit_metal::{MetalProgram, emit_schedule_metal_on};
+    use crate::emit_metal::{MetalProgram, emit_schedule_metal_on, emit_schedule_metal_tuned};
     use crate::metal::{Dispatch, MetalBuf, MetalDevice, MetalGraph, Pipelines, program_dispatches};
+    use crate::plan::FoldSched;
 
     pub struct MetalExecutable {
         program: MetalProgram,
@@ -621,7 +622,11 @@ mod metal_backend {
                     schedule.render()
                 )));
             }
-            let program = emit_schedule_metal_on(&self.profile(), schedule);
+            let program = if std::env::var_os("SANIC_TUNE").is_some() {
+                emit_schedule_metal_tuned(&self.profile(), schedule, &tune_fold_scheds(self, schedule))
+            } else {
+                emit_schedule_metal_on(&self.profile(), schedule)
+            };
             // `SANIC_MSL=<path>` dumps the whole generated source — the raw
             // artifact behind every kernel name the runtime dumps print.
             if let Some(path) = std::env::var_os("SANIC_MSL") {
@@ -1190,6 +1195,242 @@ mod metal_backend {
         }
         eprintln!("*** metal top:  {top}  rest {rest:.0}%  |  {calibration}");
         wall_seconds.unwrap_or_else(|| times.iter().sum())
+    }
+
+    /// `SANIC_TUNE=1` — measured schedule tuning. Every plausibly
+    /// competitive fold schedule is timed IN CONTEXT: substituted into the
+    /// full step over zeroed scratch bindings and judged by the
+    /// production-replay wall time, and the fastest overrules the analytic
+    /// chooser. Solo microbenchmarks mislead here — candidates re-reading
+    /// warm scratch reward extra parallelism that a DRAM-bound step
+    /// punishes (measured: solo winners made the real step 12% slower) —
+    /// so the step itself is the instrument.
+    ///
+    /// Isomorphic stages form one FAMILY (keyed on the scalar probe's
+    /// canonical source): all of a family's stages swap to a candidate
+    /// together and one wall time judges them. Candidates priced beyond 2×
+    /// the family's analytic best are not worth a replay; stages past the
+    /// direct-bind cap keep the analytic choice; and the tuned program is
+    /// re-measured against the analytic one at the end — a tune that does
+    /// not win ships nothing.
+    ///
+    /// Every verdict is a DIFFERENCE of adjacent measurements: each family
+    /// re-measures its own baseline next to its rivals, because the GPU's
+    /// clock drifts over a tuning run and a stale baseline hands every
+    /// candidate a free half-millisecond. Overruling needs a 1% margin;
+    /// shipping needs the combined program to beat a fresh baseline.
+    ///
+    /// Costs compile time (llama-3.2-1B: 5.2s → 13.3s) to buy ~6% (bf16) /
+    /// ~14% (f32) per step, so it is opt-in rather than the default.
+    fn tune_fold_scheds(device: &MetalDevice, schedule: &Schedule) -> HashMap<String, FoldSched> {
+        use crate::emit_metal::{METAL_MAX_BUFFERS, MSL_HEADER, canonical_source, emit_fused_metal_sched_with};
+        use crate::partition::Stage;
+        use crate::plan::{fold_sched, priced_fold_sched_candidates};
+
+        /// Fastest of a few replays — the min sheds clock ramp and paging.
+        const ROUNDS: usize = 3;
+
+        // The analytic program over zeroed scratch is the instrument: the
+        // real dispatch list, barrier schedule, and DRAM pressure.
+        let program = emit_schedule_metal_on(&device.profile(), schedule);
+        let pipelines = device.compile(&program.msl);
+        let mut bindings: HashMap<String, MetalBuf> = HashMap::new();
+        for (name, axes) in &program.inputs {
+            let elements: usize = axes.iter().map(|axis| axis.extent()).product();
+            let dtype = program.dtypes.get(*name).copied().unwrap_or(program.storage);
+            bindings.insert(name.to_string(), device.alloc_elems(elements.max(1), dtype));
+        }
+        for (name, elements) in &program.buffers {
+            bindings.insert(name.clone(), alloc_scratch(device, &program, name, *elements));
+        }
+        let base = program_dispatches(&program, &bindings, &pipelines);
+        let step_wall = |dispatches: &[Dispatch]| -> f64 {
+            let graph = device.capture(dispatches);
+            (0..ROUNDS)
+                .filter_map(|_| device.run_graph_timed(&graph).ok())
+                .fold(f64::INFINITY, f64::min)
+        };
+        // Warm the machine before ANY verdict: the first replays carry clock
+        // ramp and paging, and a cold baseline would flatter every later
+        // candidate (measured: an unwarmed baseline "lost" to noise-level
+        // rivals in every family).
+        let _ = step_wall(&base);
+        let analytic_wall = step_wall(&base);
+
+        // Group the fused stages into isomorphism families —
+        // `schedule.stages`, `program.stages`, and `base` are index-parallel.
+        let mut families: Vec<(String, Vec<usize>)> = Vec::new();
+        for (index, stage) in schedule.stages.iter().enumerate() {
+            let Stage::Fused {
+                spec,
+                fold_node,
+                epilogue_node,
+                epi_fold_read,
+                ..
+            } = stage
+            else {
+                continue;
+            };
+            let epi = epilogue_node.as_ref().map(|node| (node, *epi_fold_read));
+            let probe = emit_fused_metal_sched_with(
+                "tune_probe",
+                &spec.carrier,
+                spec.streaming_axis,
+                fold_node,
+                FoldSched::scalar(),
+                epi,
+                device.storage(),
+            );
+            if probe.inputs.len() + 1 > METAL_MAX_BUFFERS {
+                continue; // bindless stage: keep the analytic choice
+            }
+            let family = canonical_source(&probe);
+            match families.iter_mut().find(|(key, _)| *key == family) {
+                Some((_, stage_indices)) => stage_indices.push(index),
+                None => families.push((family, vec![index])),
+            }
+        }
+
+        // A family whose whole planned time is a sliver of the step cannot
+        // win more than measurement noise — don't spend replays on it (the
+        // norm folds are ~33 single-stage families of ~25µs each).
+        let family_price = |stage_indices: &[usize]| -> f64 {
+            let Stage::Fused { spec, fold_node, .. } = &schedule.stages[stage_indices[0]] else {
+                unreachable!("families hold fused stages");
+            };
+            let best = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &device.profile())
+                .into_iter()
+                .filter_map(|(_, priced)| priced.map(|price| price.time))
+                .fold(f64::INFINITY, f64::min);
+            if best.is_finite() {
+                best * stage_indices.len() as f64
+            } else {
+                0.0
+            }
+        };
+        let planned_total: f64 = families
+            .iter()
+            .map(|(_, stage_indices)| family_price(stage_indices))
+            .sum::<f64>()
+            .max(1e-12);
+
+        let mut winners: HashMap<String, FoldSched> = HashMap::new();
+        for (_, stage_indices) in &families {
+            if family_price(stage_indices) < 0.02 * planned_total {
+                continue;
+            }
+            let Stage::Fused {
+                spec,
+                fold_node,
+                epilogue_node,
+                epi_fold_read,
+                ..
+            } = &schedule.stages[stage_indices[0]]
+            else {
+                unreachable!("families hold fused stages");
+            };
+            let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, &device.profile());
+            let priced = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &device.profile());
+            let best_price = priced
+                .iter()
+                .filter_map(|(_, priced)| priced.map(|price| price.time))
+                .fold(f64::INFINITY, f64::min);
+            let candidates: Vec<FoldSched> = priced
+                .into_iter()
+                .filter_map(|(candidate, priced)| priced.map(|price| (candidate, price.time)))
+                .filter(|&(candidate, t)| candidate != analytic && t <= 2.0 * best_price)
+                .map(|(candidate, _)| candidate)
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let epi = epilogue_node.as_ref().map(|node| (node, *epi_fold_read));
+            let mut msl = String::from(MSL_HEADER);
+            let mut emitted = Vec::new();
+            for (index, &candidate) in candidates.iter().enumerate() {
+                let kernel = emit_fused_metal_sched_with(
+                    &format!("cand_{index}"),
+                    &spec.carrier,
+                    spec.streaming_axis,
+                    fold_node,
+                    candidate,
+                    epi,
+                    device.storage(),
+                );
+                msl.push_str(&kernel.msl.replace(MSL_HEADER, ""));
+                msl.push('\n');
+                emitted.push(kernel);
+            }
+            let candidate_pipes = device.compile(&msl);
+
+            // The baseline must be measured ADJACENT to its rivals: the GPU's
+            // clock drifts across a whole tuning run, so a stale baseline
+            // loses to noise (measured: every family "won" ~0.5ms against
+            // the start-of-run figure, and the combined program shipped
+            // nothing of it).
+            let family_baseline = step_wall(&base);
+            let (mut winner, mut winner_wall) = (analytic, family_baseline);
+            for (kernel, &candidate) in emitted.iter().zip(&candidates) {
+                let mut dispatches = base.clone();
+                for &stage in stage_indices {
+                    dispatches[stage].pipe = candidate_pipes.get(&kernel.name);
+                    dispatches[stage].grid = kernel.grid_size;
+                }
+                let wall = step_wall(&dispatches);
+                if wall < winner_wall {
+                    winner = candidate;
+                    winner_wall = wall;
+                }
+            }
+            // Overrule only past the noise floor — the analytic choice wins
+            // ties, exactly as scalar wins ties in the chooser.
+            let wins = winner != analytic && winner_wall < family_baseline * 0.99;
+            if crate::debug_level() >= 1 {
+                eprintln!(
+                    "*** tune {}×{}: {} rivals vs analytic {analytic:?} at {:.2}ms{}",
+                    spec.output_name,
+                    stage_indices.len(),
+                    candidates.len(),
+                    family_baseline * 1e3,
+                    if wins {
+                        format!(" → {winner:?} {:.2}ms", winner_wall * 1e3)
+                    } else {
+                        String::from(" — none beats it past noise")
+                    },
+                );
+            }
+            if wins {
+                for &stage in stage_indices {
+                    let Stage::Fused { spec, .. } = &schedule.stages[stage] else {
+                        unreachable!("families hold fused stages");
+                    };
+                    winners.insert(spec.output_name.clone(), winner);
+                }
+            }
+        }
+
+        // The combined verdict must beat the analytic program on the same
+        // instrument, against a FRESH baseline (the machine is warmest now)
+        // — a tune that does not win ships nothing.
+        if !winners.is_empty() {
+            let tuned_program = emit_schedule_metal_tuned(&device.profile(), schedule, &winners);
+            let tuned_pipes = device.compile(&tuned_program.msl);
+            let tuned_wall = step_wall(&program_dispatches(&tuned_program, &bindings, &tuned_pipes));
+            let analytic_fresh = step_wall(&base).min(analytic_wall);
+            let ships = tuned_wall < analytic_fresh * 0.995;
+            if crate::debug_level() >= 1 {
+                eprintln!(
+                    "*** tune verdict: analytic {:.2}ms, tuned {:.2}ms — {} ships",
+                    analytic_fresh * 1e3,
+                    tuned_wall * 1e3,
+                    if ships { "tuned" } else { "analytic" },
+                );
+            }
+            if !ships {
+                winners.clear();
+            }
+        }
+        winners
     }
 
     impl MetalDevice {

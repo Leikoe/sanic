@@ -296,11 +296,33 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
    decision to revisit when prefill matters.
 
-3. **The measured tuner (`--tune`).** `fold_sched_candidates`
-   (plan.rs:751-795) still has no runtime behind it.
-   `run_kernel_timed` is the measurement primitive it was waiting for:
-   time candidate schedules in-context — one command buffer, production
-   regime — and overrule the cost model where the device disagrees.
+3. **The measured tuner — LANDED 2026-07-25 as `SANIC_TUNE=1`.**
+   Measured: bf16 15.8→14.9ms/step (60.2→63.5 tok/s), f32
+   18.7→16.1ms (51.2→59.4 tok/s); costs compile time (5.2→13.3s), so
+   opt-in. `priced_fold_sched_candidates` is now the one rule with two
+   readers — the analytic chooser ranks by the price, the tuner times
+   the feasible entries — and `emit_schedule_metal_tuned` takes the
+   verdicts.
+
+   Two lessons worth keeping, both found by being wrong first:
+   - **Solo timing is a liar.** Timing candidates as isolated dispatches
+     (the obvious design, and what `run_kernel_timed` invites) picked
+     winners that made the real step ~12% SLOWER: a candidate re-reading
+     warm scratch rewards parallelism that a DRAM-bound step punishes.
+     The instrument has to be the step — substitute the candidate into
+     the full dispatch list over zeroed bindings and replay it.
+   - **Every verdict must be a difference of ADJACENT measurements.** The
+     GPU clock drifts across a tuning run; against a start-of-run
+     baseline every family "won" ~0.5ms and the combined program shipped
+     none of it. Each family re-measures its own baseline beside its
+     rivals, overruling needs a 1% margin, and the final program must
+     beat a fresh baseline or nothing ships.
+
+   Still open: the analytic chooser's `chunk` refinement is applied
+   post-hoc (`best_fold_sched`), so `analytic` is not always in the
+   candidate list the tuner enumerates; a persistent verdict cache
+   (keyed on the canonical source) would let a tuned build pay the 8s
+   once.
 
 4. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
