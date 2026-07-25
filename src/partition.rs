@@ -1967,12 +1967,10 @@ impl Schedule {
         }
         if !timings.is_empty() {
             let total = timings.iter().map(|(_, _, _, s)| s).sum::<f64>().max(1e-12);
-            let slowest = timings.iter().map(|(_, _, _, s)| *s).fold(0.0, f64::max).max(1e-12);
             for (index, (name, kind, elements, seconds)) in timings.iter().enumerate() {
                 eprintln!(
-                    "*** interp {index:4} {name:<12} {kind:<6} {:7.0}us {} {:4.1}%  {elements:>8} elems",
+                    "*** interp {index:4} {name:<12} {kind:<6} {:7.0}us {:4.1}%  {elements:>8} elems",
                     seconds * 1e6,
-                    crate::debug_bar(seconds / slowest, 10),
                     100.0 * seconds / total,
                 );
             }

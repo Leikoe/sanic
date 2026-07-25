@@ -20,7 +20,7 @@ use crate::codegen::{
     thread_grid_decode_from, value,
 };
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{self, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, input_dtypes, volume};
+use crate::ir::{self, Axis, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, input_dtypes, volume};
 use crate::partition::{Schedule, Stage};
 use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
 
@@ -1124,6 +1124,28 @@ pub struct MetalProgram {
     pub storage: Dtype,
 }
 
+/// A kernel entry name that says what the kernel computes — tinygrad's
+/// kind-plus-loop-structure names (`r_16_64_128`), using sanic's named axes:
+/// `fold_seq16_d64_over_k128` folds `k` (128 long) on a seq×d grid;
+/// `map_seq16_d64` is elementwise over that grid. Isomorphic stages compose
+/// the SAME name and dedup into one entry point; distinct kernels that
+/// collide on a name are numbered `_2`, `_3`… as they are emitted.
+fn kernel_name(kind: &str, output_axes: &[Axis], fold: Option<AxisRef>) -> String {
+    let ident = |name: &str| {
+        name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    };
+    let mut name = kind.to_string();
+    for axis in output_axes {
+        name.push_str(&format!("_{}{}", ident(axis.name), axis.extent()));
+    }
+    if let Some(axis) = fold {
+        name.push_str(&format!("_over_{}{}", ident(axis.name), axis.extent()));
+    }
+    name
+}
+
 /// Lower a whole schedule to a Metal program (the GPU analog of
 /// [`crate::rustgen::emit_schedule`]), fold schedules priced against the
 /// device the kernels will run on.
@@ -1158,15 +1180,35 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
     // them) — and buffers bind positionally at dispatch, so the shared
     // pipeline is exact, not approximate.
     let mut canon: HashMap<String, String> = HashMap::new();
-    let dedup = |k: &MetalKernel, msl: &mut String, canon: &mut HashMap<String, String>| {
+    let mut name_uses: HashMap<String, usize> = HashMap::new();
+    let dedup = |k: &MetalKernel,
+                 msl: &mut String,
+                 canon: &mut HashMap<String, String>,
+                 name_uses: &mut HashMap<String, usize>| {
         let c = canonical_source(k);
         match canon.get(&c) {
             Some(existing) => existing.clone(),
             None => {
-                canon.insert(c, k.name.clone());
-                msl.push_str(&strip(k));
+                // Distinct kernels can compose the same descriptive name
+                // (same kind and axes, different ops); number the later ones.
+                let uses = name_uses.entry(k.name.clone()).or_insert(0);
+                *uses += 1;
+                let name = if *uses == 1 {
+                    k.name.clone()
+                } else {
+                    format!("{}_{}", k.name, *uses)
+                };
+                let source = strip(k);
+                msl.push_str(&if name == k.name {
+                    source
+                } else {
+                    // a bindless kernel's `Args_{name}` struct renames too
+                    let renamed = replace_ident(&source, &format!("Args_{}", k.name), &format!("Args_{name}"));
+                    replace_ident(&renamed, &k.name, &name)
+                });
                 msl.push('\n');
-                k.name.clone()
+                canon.insert(c, name.clone());
+                name
             }
         }
     };
@@ -1182,7 +1224,11 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
             } => {
                 note_inputs(fold_node, &produced, &mut inputs);
                 let out = spec.output_name.clone();
-                let kname = format!("k_{}_fold", san(&out));
+                let kname = kernel_name(
+                    "fold",
+                    &epilogue_node.as_ref().unwrap_or(fold_node).shape(),
+                    Some(spec.streaming_axis),
+                );
                 let sched = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev);
                 if crate::debug_level() >= 3 {
                     eprintln!(
@@ -1209,7 +1255,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
                     all_dtypes.insert(n.to_string(), *d);
                 }
                 let argbuf = bindless_argbuf(&mut k, &out, &mut bufsizes);
-                let kname = dedup(&k, &mut msl, &mut canon);
+                let kname = dedup(&k, &mut msl, &mut canon, &mut name_uses);
                 // Size the output buffer by the output TENSOR VOLUME, not the
                 // dispatch grid: a cooperative/packed fold dispatches fewer
                 // threads than it writes elements (each thread projects a lane
@@ -1239,13 +1285,18 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
             | Stage::Gather { output, exec, .. }
             | Stage::Fallback { output, exec, .. } => {
                 note_inputs(exec, &produced, &mut inputs);
-                let kname = format!("k_{}", san(output));
+                let kind = match stage {
+                    Stage::Gather { .. } => "gather",
+                    Stage::Fallback { .. } => "fallback",
+                    _ => "map",
+                };
+                let kname = kernel_name(kind, &exec.shape(), None);
                 let mut k = emit_pointwise_metal(&kname, exec, dev.storage);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
                 let argbuf = bindless_argbuf(&mut k, output, &mut bufsizes);
-                let kname = dedup(&k, &mut msl, &mut canon);
+                let kname = dedup(&k, &mut msl, &mut canon, &mut name_uses);
                 note_buffer(output, volume(exec), &mut bufsizes);
                 stages.push(MetalStageInfo {
                     kernel: kname,

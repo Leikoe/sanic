@@ -2281,3 +2281,60 @@ fn round_to_bf16_matches_storage_bit_for_bit() {
         );
     }
 }
+
+// ── in-graph per-kernel timing: timestamps sampled at encoder boundaries ─────
+#[test]
+fn kernel_times_sampled_inside_one_command_buffer() {
+    let Some(dev) = MetalDevice::open() else {
+        println!("SKIP: no Metal device");
+        return;
+    };
+    let msl = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void double_it(device const float* x [[buffer(0)]],
+                              device float* y [[buffer(1)]],
+                              uint i [[thread_position_in_grid]]) { y[i] = 2.0f * x[i]; }
+        kernel void add_one(device const float* x [[buffer(0)]],
+                            device float* y [[buffer(1)]],
+                            uint i [[thread_position_in_grid]]) { y[i] = x[i] + 1.0f; }
+    "#;
+    let pipes = dev.compile(msl);
+    let n = 4096;
+    let x = dev.from_f64(&vec![3.0; n]);
+    let doubled = dev.alloc_f32(n);
+    let out = dev.alloc_f32(n);
+    let dispatches = [
+        Dispatch {
+            pipe: pipes.get("double_it"),
+            inputs: vec![x],
+            output: doubled.clone(),
+            grid: n,
+            argbuf: None,
+        },
+        Dispatch {
+            pipe: pipes.get("add_one"),
+            inputs: vec![doubled],
+            output: out.clone(),
+            grid: n,
+            argbuf: None,
+        },
+    ];
+    let Some((wall, times)) = dev.run_kernel_timed(&dispatches) else {
+        println!("SKIP: device can't sample timestamps at stage boundaries");
+        return;
+    };
+    // The step really executed, in order: (3*2)+1.
+    assert_eq!(dev.read_f32(&out, n), vec![7.0f32; n]);
+    assert!(wall > 0.0, "command buffer wall time {wall}");
+    assert_eq!(times.len(), dispatches.len());
+    for (i, &seconds) in times.iter().enumerate() {
+        // Each kernel ran within the command buffer, so its boundary-sampled
+        // time can't exceed the buffer's own GPU residency (the calibration
+        // maps the sampled span onto exactly that interval).
+        assert!(
+            seconds.is_finite() && seconds >= 0.0 && seconds <= wall * 1.000001,
+            "kernel {i}: {seconds}s outside command buffer wall {wall}s",
+        );
+    }
+}

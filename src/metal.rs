@@ -14,6 +14,8 @@
 //!   `[[buffer(i)]]` order, thread count); [`MetalDevice::run`] encodes a
 //!   dispatch list into one command buffer (an encoder per dispatch, so
 //!   Metal's hazard tracking serializes on buffer dependencies) and waits.
+//!   [`MetalDevice::run_kernel_timed`] additionally samples a GPU timestamp
+//!   at every encoder boundary — per-kernel time inside that one buffer.
 //!
 //! [`program_dispatches`] resolves a whole emitted [`MetalProgram`] against a
 //! name→buffer map — rebuilt per step when a runtime swaps buffers (the
@@ -31,11 +33,12 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction,
-    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
-    MTLLibrary, MTLPipelineOption, MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions,
-    MTLResourceUsage, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp,
+    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLComputePipelineDescriptor, MTLComputePipelineState,
+    MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
+    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStorageMode,
 };
 
 use crate::emit_metal::MetalProgram;
@@ -124,6 +127,15 @@ pub struct Dispatch {
     pub output: MetalBuf,
     pub grid: usize,
     pub argbuf: Option<MetalBuf>,
+}
+
+impl Dispatch {
+    /// Threads per threadgroup — CUDA's block size: the pipeline's occupancy
+    /// cap, clamped to the grid. The one launch-shape rule, shared by
+    /// [`encode`] and the debug dumps.
+    pub fn threadgroup_threads(&self) -> usize {
+        self.pipe.maxTotalThreadsPerThreadgroup().min(self.grid)
+    }
 }
 
 #[derive(Clone)]
@@ -292,16 +304,57 @@ impl MetalDevice {
     pub fn run(&self, dispatches: &[Dispatch]) {
         let cb = self.queue.commandBuffer().expect("command buffer");
         for d in dispatches {
-            encode(&cb, d);
+            encode(&cb, d, None);
         }
         cb.commit();
         cb.waitUntilCompleted();
     }
 
+    /// [`Self::run`] with a GPU timestamp sampled at every encoder boundary:
+    /// per-kernel times measured INSIDE the one command buffer — the
+    /// production regime, no per-launch sync floor. Returns the whole
+    /// buffer's GPU residency and each kernel's seconds; `None` when the
+    /// device cannot sample timestamps at stage boundaries (callers fall
+    /// back to [`Self::run_each_timed`]).
+    pub fn run_kernel_timed(&self, dispatches: &[Dispatch]) -> Option<(f64, Vec<f64>)> {
+        let timer = self.encoder_timestamps(dispatches.len())?;
+        let cb = self.queue.commandBuffer().expect("command buffer");
+        for (kernel, dispatch) in dispatches.iter().enumerate() {
+            encode(&cb, dispatch, Some(&timer.pass_descriptor(kernel)));
+        }
+        cb.commit();
+        cb.waitUntilCompleted();
+        let seconds = gpu_seconds(&cb);
+        Some((seconds, timer.kernel_seconds(seconds)?))
+    }
+
+    /// A timestamp sample buffer with room to bracket `kernels` dispatches.
+    /// `None` where the device can't sample at stage boundaries or has no
+    /// timestamp counter set — both are device capabilities, present on
+    /// Apple Silicon.
+    fn encoder_timestamps(&self, kernels: usize) -> Option<EncoderTimestamps> {
+        if kernels == 0
+            || !self
+                .dev
+                .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+        {
+            return None;
+        }
+        let sets = self.dev.counterSets()?;
+        let timestamp_name = unsafe { MTLCommonCounterSetTimestamp };
+        let timestamp_set = sets.iter().find(|set| &*set.name() == timestamp_name)?;
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(&timestamp_set));
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        unsafe { descriptor.setSampleCount(2 * kernels) };
+        let samples = self.dev.newCounterSampleBufferWithDescriptor_error(&descriptor).ok()?;
+        Some(EncoderTimestamps { samples, kernels })
+    }
+
     /// One command buffer PER dispatch: each kernel's own GPU residency, in
-    /// order. This is the `SANIC_DEBUG=2` path (tinygrad's `DEBUG=2` also
-    /// synchronizes per kernel to time it) — the per-dispatch submit adds a
-    /// sync floor, so the SUM is not a decode-speed number;
+    /// order (tinygrad's `DEBUG=2` also synchronizes per kernel to time it).
+    /// The fallback behind [`Self::run_kernel_timed`] — the per-dispatch
+    /// submit adds a sync floor, so the SUM is not a decode-speed number;
     /// [`Self::run_graph_timed`] is. Individual kernel times are accurate:
     /// GPU start→end, no CPU cost.
     pub fn run_each_timed(&self, dispatches: &[Dispatch]) -> Vec<f64> {
@@ -309,7 +362,7 @@ impl MetalDevice {
             .iter()
             .map(|d| {
                 let cb = self.queue.commandBuffer().expect("command buffer");
-                encode(&cb, d);
+                encode(&cb, d, None);
                 cb.commit();
                 cb.waitUntilCompleted();
                 gpu_seconds(&cb)
@@ -318,10 +371,69 @@ impl MetalDevice {
     }
 }
 
+/// GPU timestamps sampled at encoder boundaries DURING one command buffer.
+/// Apple GPUs sample counters only at stage boundaries — but [`encode`]
+/// gives every kernel its own encoder, so encoder boundaries ARE kernel
+/// boundaries: samples 2i and 2i+1 bracket dispatch i.
+struct EncoderTimestamps {
+    samples: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+    kernels: usize,
+}
+
+impl EncoderTimestamps {
+    /// A compute-pass descriptor directing kernel `kernel`'s encoder to
+    /// record its start/end GPU timestamps.
+    fn pass_descriptor(&self, kernel: usize) -> Retained<MTLComputePassDescriptor> {
+        let pass = MTLComputePassDescriptor::new();
+        let attachment = unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+        attachment.setSampleBuffer(Some(&self.samples));
+        unsafe { attachment.setStartOfEncoderSampleIndex(2 * kernel) };
+        unsafe { attachment.setEndOfEncoderSampleIndex(2 * kernel + 1) };
+        pass
+    }
+
+    /// Per-kernel seconds. The GPU tick rate is undocumented, so the sampled
+    /// tick span is scaled onto the command buffer's own GPU residency
+    /// (`cb_seconds`) — self-calibrating, no CPU/GPU clock correlation.
+    /// `None` if any sample resolved to the error value (`u64::MAX`,
+    /// `MTLCounterErrorValue`).
+    fn kernel_seconds(&self, cb_seconds: f64) -> Option<Vec<f64>> {
+        let range = NSRange {
+            location: 0,
+            length: 2 * self.kernels,
+        };
+        let resolved = unsafe { self.samples.resolveCounterRange(range) }?.to_vec();
+        let ticks: Vec<u64> = resolved
+            .chunks_exact(8)
+            .map(|bytes| u64::from_ne_bytes(bytes.try_into().expect("8-byte chunk")))
+            .collect();
+        if ticks.len() != 2 * self.kernels || ticks.contains(&u64::MAX) {
+            return None;
+        }
+        let first = *ticks.iter().min()?;
+        let span = ticks.iter().max()? - first;
+        if span == 0 {
+            return None;
+        }
+        let seconds_per_tick = cb_seconds / span as f64;
+        ticks
+            .chunks_exact(2)
+            .map(|pair| pair[1].checked_sub(pair[0]).map(|dt| dt as f64 * seconds_per_tick))
+            .collect()
+    }
+}
+
 /// Encode one kernel launch onto a command buffer — the one encode path
-/// behind [`MetalDevice::run`] and [`MetalDevice::run_each_timed`].
-fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch) {
-    let enc = cb.computeCommandEncoder().expect("compute encoder");
+/// behind every direct dispatch. `pass` opens the encoder through a
+/// compute-pass descriptor instead (same serial dispatch semantics), which
+/// is how [`MetalDevice::run_kernel_timed`] attaches its per-kernel
+/// timestamp samples.
+fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch, pass: Option<&MTLComputePassDescriptor>) {
+    let enc = match pass {
+        Some(pass) => cb.computeCommandEncoderWithDescriptor(pass),
+        None => cb.computeCommandEncoder(),
+    }
+    .expect("compute encoder");
     enc.setComputePipelineState(&d.pipe);
     if let Some(ab) = &d.argbuf {
         // bindless: one address table at 0, output at 1, inputs resident
@@ -337,7 +449,7 @@ fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch) {
         }
         unsafe { enc.setBuffer_offset_atIndex(Some(&d.output.0), d.output.1, d.inputs.len()) };
     }
-    let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
+    let tg = d.threadgroup_threads();
     enc.dispatchThreads_threadsPerThreadgroup(
         MTLSize {
             width: d.grid,
@@ -506,7 +618,7 @@ impl MetalDevice {
             if hazard {
                 cmd.setBarrier();
             }
-            let tg = d.pipe.maxTotalThreadsPerThreadgroup().min(d.grid);
+            let tg = d.threadgroup_threads();
             cmd.concurrentDispatchThreads_threadsPerThreadgroup(
                 MTLSize {
                     width: d.grid,
@@ -551,7 +663,7 @@ impl MetalDevice {
         match &g.execution {
             MetalGraphExecution::Direct(dispatches) => {
                 for dispatch in dispatches {
-                    encode(&cb, dispatch);
+                    encode(&cb, dispatch, None);
                 }
             }
             MetalGraphExecution::Indirect {

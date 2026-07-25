@@ -827,7 +827,7 @@ mod metal_backend {
         /// before calling. `SANIC_DEBUG=2` prints one line per replayed
         /// graph (its real time); `3` additionally dumps each graph's
         /// contents once; `4` abandons the frozen graph and times every
-        /// kernel solo.
+        /// kernel in-graph via encoder-boundary GPU timestamps.
         ///
         /// Errs on any command buffer error — the step's writes are
         /// untrustworthy and a decode loop must not continue on them.
@@ -836,9 +836,12 @@ mod metal_backend {
         }
 
         /// [`Self::step`], returning the replayed command buffer's GPU
-        /// residency in seconds (see [`crate::metal::MetalDevice::run_timed`]).
-        /// Under `SANIC_DEBUG=4` the returned time is the per-dispatch sum —
-        /// a debug number with a sync floor, as the dump's footer says.
+        /// residency in seconds (see
+        /// [`crate::metal::MetalDevice::run_graph_timed`]). Under
+        /// `SANIC_DEBUG=4` the step runs with in-graph timestamp sampling
+        /// and the returned time is that command buffer's residency — still
+        /// a real step time (or, on a device without counter sampling, the
+        /// sync-floored per-dispatch sum the dump's footer flags).
         pub fn step_timed(&mut self) -> Result<(&[MetalBuffer], f64), RunError> {
             let parity = self.advance();
             if crate::debug_level() >= 4 {
@@ -887,25 +890,6 @@ mod metal_backend {
         }
     }
 
-    /// The `SANIC_DEBUG=2` runtime dump. One line per launch, printed after
-    /// the step so shares are exact:
-    ///
-    /// ```text
-    /// *** metal  407 Out32        fold   grid   128256   7934us █████████▏ 16.6%  plan ×1.28  ~ 525.9MB bw  33%
-    /// ```
-    ///
-    /// The index and OUTPUT name match the `SANIC_DEBUG=1` schedule dump, so
-    /// the two dumps cross-reference. The bar is scaled to the slowest
-    /// launch; `plan ×r` is measured over the cost the planner CHOSE this
-    /// schedule by (fused stages), so the dump audits the cost model — the
-    /// footer's `plan Σ` is its aggregate calibration on this machine. `bw`
-    /// is the fraction of the device's memory bandwidth actually achieved;
-    /// bytes are logical buffer sizes (an upper bound — a gather reading one
-    /// row of a huge table overcounts, so implausible ratios print `--`).
-    ///
-    /// Times come from one command buffer per dispatch — accurate per
-    /// kernel, but the submits add overhead: the SUM is a debug number, and
-    /// `MetalDevice::run_timed` measures the production step.
     /// Allocate one scratch buffer from `program.buffers`. Tensor
     /// intermediates are sized at the boundary storage width; an ARGUMENT
     /// BUFFER is a table of 64-bit GPU addresses counted in f32 elements —
@@ -940,31 +924,72 @@ mod metal_backend {
         logical_bytes
     }
 
-    /// Kind and planned cost, by the output name each dispatch writes.
-    fn stage_plans(schedule: &Schedule) -> HashMap<&str, (&'static str, Option<f64>)> {
+    /// Planned cost by the output name each dispatch writes — the fused-stage
+    /// costs the planner CHOSE this schedule by; other stage kinds are unpriced.
+    fn stage_plans(schedule: &Schedule) -> HashMap<&str, f64> {
         use crate::partition::Stage;
-        let mut stage_info = HashMap::<&str, (&'static str, Option<f64>)>::new();
+        let mut planned_costs = HashMap::new();
         for stage in &schedule.stages {
-            let (kind, planned) = match stage {
-                Stage::Fused { spec, .. } => ("fold", Some(spec.cost)),
-                Stage::Elementwise { .. } => ("map", None),
-                Stage::Gather { .. } => ("gather", None),
-                Stage::Fallback { .. } => ("fallback", None),
-                Stage::Infeasible { .. } => ("infeasible", None),
-            };
-            stage_info.insert(crate::partition::stage_output(stage), (kind, planned));
+            if let Stage::Fused { spec, .. } = stage {
+                planned_costs.insert(crate::partition::stage_output(stage), spec.cost);
+            }
         }
-        stage_info
+        planned_costs
     }
 
-    /// Logical DRAM traffic of one dispatch: its stage's inputs plus output.
-    fn stage_bytes(stage: &crate::emit_metal::MetalStageInfo, logical_bytes: &HashMap<&str, f64>) -> f64 {
+    /// Logical DRAM traffic of one dispatch: its stage's inputs plus output —
+    /// except gather stages, whose table traffic is known statically and is
+    /// NOT the table's size (see [`gather_stage_bytes`]).
+    fn stage_bytes(
+        stage: &crate::emit_metal::MetalStageInfo,
+        logical_bytes: &HashMap<&str, f64>,
+        gather_bytes: &HashMap<&str, f64>,
+    ) -> f64 {
+        if let Some(&bytes) = gather_bytes.get(stage.output.as_str()) {
+            return bytes;
+        }
         stage
             .inputs
             .iter()
             .chain(std::iter::once(&stage.output))
             .map(|name| logical_bytes.get(name.as_str()).copied().unwrap_or(0.0))
             .sum()
+    }
+
+    /// Bytes a gather stage moves, known statically: each output element
+    /// loads exactly ONE table element, so the table's traffic is the OUTPUT
+    /// volume times its element width — an embedding lookup touches
+    /// `sequence×hidden` elements, never the whole table that
+    /// [`logical_byte_table`] would charge it. The index and the written
+    /// output keep their logical sizes.
+    fn gather_stage_bytes<'sched>(
+        schedule: &'sched Schedule,
+        program: &MetalProgram,
+        logical_bytes: &HashMap<&str, f64>,
+    ) -> HashMap<&'sched str, f64> {
+        use crate::partition::Stage;
+        let element_width = |name: &str| {
+            program
+                .dtypes
+                .get(name)
+                .map_or(program.storage.bytes(), |dtype| dtype.bytes())
+        };
+        let mut traffic = HashMap::new();
+        for stage in &schedule.stages {
+            if let Stage::Gather {
+                inputs, output, exec, ..
+            } = stage
+            {
+                let table_reads = ir::volume(exec) as f64 * element_width(inputs[0]);
+                let rest: f64 = inputs[1..]
+                    .iter()
+                    .chain(std::iter::once(&output.as_str()))
+                    .filter_map(|name| logical_bytes.get(*name))
+                    .sum();
+                traffic.insert(output.as_str(), table_reads + rest);
+            }
+        }
+        traffic
     }
 
     /// The `SANIC_DEBUG=2` runtime line — one per replayed graph, tinygrad
@@ -975,12 +1000,13 @@ mod metal_backend {
     /// end-to-end honesty number, not per-kernel calibration.
     fn print_step_line(device: &MetalDevice, program: &MetalProgram, schedule: &Schedule, seconds: f64) {
         let logical_bytes = logical_byte_table(program);
+        let gather_bytes = gather_stage_bytes(schedule, program, &logical_bytes);
         let plans = stage_plans(schedule);
         let mut planned = 0.0f64;
         let mut bytes = 0.0f64;
         for stage in &program.stages {
-            bytes += stage_bytes(stage, &logical_bytes);
-            if let Some((_, Some(cost))) = plans.get(stage.output.as_str()) {
+            bytes += stage_bytes(stage, &logical_bytes, &gather_bytes);
+            if let Some(cost) = plans.get(stage.output.as_str()) {
                 planned += cost;
             }
         }
@@ -1001,16 +1027,18 @@ mod metal_backend {
 
     /// The frozen graph's contents, once per parity at `SANIC_DEBUG=3`:
     /// execution order, each kernel's planned cost and share of the fold
-    /// plan. Plan-side only — Metal exposes no per-kernel time inside one
-    /// command buffer and we do not fake one; `SANIC_DEBUG=4` re-times each
-    /// kernel solo instead (a different execution regime).
+    /// plan. Plan-side only — measured per-kernel time is `SANIC_DEBUG=4`,
+    /// which samples GPU timestamps at encoder boundaries inside the one
+    /// command buffer (re-timing each kernel solo where the device can't
+    /// sample counters).
     fn dump_graph(program: &MetalProgram, schedule: &Schedule, dispatches: &[Dispatch], parity: usize) {
         let logical_bytes = logical_byte_table(program);
+        let gather_bytes = gather_stage_bytes(schedule, program, &logical_bytes);
         let plans = stage_plans(schedule);
         let plan_total = program
             .stages
             .iter()
-            .filter_map(|stage| plans.get(stage.output.as_str())?.1)
+            .filter_map(|stage| plans.get(stage.output.as_str()))
             .sum::<f64>()
             .max(1e-12);
         eprintln!(
@@ -1019,30 +1047,56 @@ mod metal_backend {
             plan_total * 1e3,
         );
         for (index, (stage, dispatch)) in program.stages.iter().zip(dispatches).enumerate() {
-            let (kind, planned) = plans.get(stage.output.as_str()).copied().unwrap_or(("?", None));
-            let plan = match planned {
-                Some(cost) if cost > 0.0 => format!(
-                    "plan {:7.0}us {} {:4.1}%",
-                    cost * 1e6,
-                    crate::debug_bar(cost / plan_total, 10),
-                    100.0 * cost / plan_total,
-                ),
-                _ => format!("plan {:>7}   {}      ", "--", " ".repeat(10)),
+            let plan = match plans.get(stage.output.as_str()) {
+                Some(&cost) if cost > 0.0 => {
+                    format!("plan {:7.0}us {:4.1}%", cost * 1e6, 100.0 * cost / plan_total)
+                }
+                _ => format!("plan {:>7}        ", "--"),
             };
+            let block = dispatch.threadgroup_threads();
             eprintln!(
-                "***   {index:4} {:<12} {kind:<6} grid {:>8} {plan}  ~{:>6.1}MB",
+                "***   {index:4} {:<12} grid=({:>6},1,1) block=({:>4},1,1) {plan}  ~{:>6.1}MB  {}",
                 stage.output,
-                dispatch.grid,
-                stage_bytes(stage, &logical_bytes) / 1e6,
+                dispatch.grid.div_ceil(block),
+                block,
+                stage_bytes(stage, &logical_bytes, &gather_bytes) / 1e6,
+                stage.kernel,
             );
         }
     }
 
+    /// The per-kernel runtime dump (`SANIC_DEBUG=2` one-shot, `=4` replay).
+    /// One line per launch, printed after the step so shares are exact:
+    ///
+    /// ```text
+    /// *** metal  407 Out32        grid=(   126,1,1) block=(1024,1,1)   7934us 16.6%  plan ×1.28  ~ 525.9MB bw  33%  fold_batch4_vocab128256_over_hidden2048
+    /// ```
+    ///
+    /// The index and OUTPUT name match the `SANIC_DEBUG=1` schedule dump, so
+    /// the two dumps cross-reference. `plan ×r` is measured over the cost
+    /// the planner CHOSE this schedule by (fused stages), so the dump audits
+    /// the cost model — the footer's `plan Σ` is its aggregate calibration
+    /// on this machine. `bw`
+    /// is the fraction of the device's memory bandwidth actually achieved;
+    /// bytes are logical buffer sizes (an upper bound), except gathers,
+    /// whose table traffic is statically the output volume (see
+    /// [`gather_stage_bytes`]); a still-implausible ratio prints `--`.
+    ///
+    /// Times are GPU timestamps sampled at each encoder's boundaries inside
+    /// ONE command buffer (`MetalDevice::run_kernel_timed`) — the production
+    /// regime, so the returned wall time is a real step time. Where the
+    /// device can't sample counters, the fallback is one command buffer per
+    /// dispatch: accurate per kernel, but the submits add a sync floor, so
+    /// that SUM is a debug number and the footer says so.
     fn run_debug(device: &MetalDevice, program: &MetalProgram, schedule: &Schedule, dispatches: &[Dispatch]) -> f64 {
         let logical_bytes = logical_byte_table(program);
+        let gather_bytes = gather_stage_bytes(schedule, program, &logical_bytes);
         let stage_info = stage_plans(schedule);
 
-        let times = device.run_each_timed(dispatches);
+        let (times, wall_seconds) = match device.run_kernel_timed(dispatches) {
+            Some((wall, times)) => (times, Some(wall)),
+            None => (device.run_each_timed(dispatches), None),
+        };
         if std::env::var_os("SANIC_NANSCAN").is_some() {
             for (stage, dispatch) in program.stages.iter().zip(dispatches) {
                 let width = program.storage.bytes();
@@ -1059,18 +1113,16 @@ mod metal_backend {
             }
         }
         let total = times.iter().sum::<f64>().max(1e-12);
-        let slowest = times.iter().copied().fold(0.0, f64::max).max(1e-12);
         let (mut fused_measured, mut fused_planned) = (0.0f64, 0.0f64);
         for (index, ((stage, dispatch), &seconds)) in program.stages.iter().zip(dispatches).zip(&times).enumerate() {
-            let bytes = stage_bytes(stage, &logical_bytes);
-            let (kind, planned) = stage_info.get(stage.output.as_str()).copied().unwrap_or(("?", None));
+            let bytes = stage_bytes(stage, &logical_bytes, &gather_bytes);
             let micros = seconds * 1e6;
             let time = if micros >= 1000.0 {
                 format!("\x1b[33m{micros:7.0}us\x1b[0m") // slow launch: yellow
             } else {
                 format!("{micros:7.0}us")
             };
-            let plan = match planned {
+            let plan = match stage_info.get(stage.output.as_str()).copied() {
                 Some(p) if p > 0.0 => {
                     fused_measured += seconds;
                     fused_planned += p;
@@ -1084,13 +1136,15 @@ mod metal_backend {
             } else {
                 format!("bw {:3.0}%", peak_fraction * 100.0)
             };
+            let block = dispatch.threadgroup_threads();
             eprintln!(
-                "*** metal {index:4} {:<12} {kind:<6} grid {:>8} {time} {} {:4.1}%  {plan} ~{:>6.1}MB {bandwidth}",
+                "*** metal {index:4} {:<12} grid=({:>6},1,1) block=({:>4},1,1) {time} {:4.1}%  {plan} ~{:>6.1}MB {bandwidth}  {}",
                 stage.output,
-                dispatch.grid,
-                crate::debug_bar(seconds / slowest, 10),
+                dispatch.grid.div_ceil(block),
+                block,
                 100.0 * seconds / total,
                 bytes / 1e6,
+                stage.kernel,
             );
         }
 
@@ -1113,13 +1167,21 @@ mod metal_backend {
         } else {
             String::new()
         };
-        eprintln!(
-            "*** metal step: {} launches {:.2}ms GPU (per-launch sync; production time = run_timed)",
-            times.len(),
-            total * 1e3,
-        );
+        match wall_seconds {
+            Some(wall) => eprintln!(
+                "*** metal step: {} launches, {:.2}ms GPU wall, Σ kernels {:.2}ms (in-graph timestamps)",
+                times.len(),
+                wall * 1e3,
+                total * 1e3,
+            ),
+            None => eprintln!(
+                "*** metal step: {} launches {:.2}ms GPU (per-launch sync; production time = run_timed)",
+                times.len(),
+                total * 1e3,
+            ),
+        }
         eprintln!("*** metal top:  {top}  rest {rest:.0}%  |  {calibration}");
-        times.iter().sum()
+        wall_seconds.unwrap_or_else(|| times.iter().sum())
     }
 
     impl MetalDevice {
