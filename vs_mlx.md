@@ -30,16 +30,26 @@ running `mlx-community/Llama-3.2-1B-Instruct-bf16`; sanic running
 (`examples/llama3_2.rs --bf16`), which is the same architecture and the
 same arithmetic.
 
+Per DECODE STEP, which is the unit both sides actually execute (the first
+token falls out of the prefill logits and costs no step — counting it as
+one flatters sanic by ~1.5%):
+
 |  | sanic (analytic) | sanic (`SANIC_TUNE=1`) | mlx-lm bf16 |
 |---|---|---|---|
-| decode wall | 16.6 ms/tok | **15.9 ms/tok** | 16.2 ms/tok |
-| decode rate | 59.4 tok/s | **61.6 tok/s** | 61.8 tok/s |
+| decode wall | 16.9 ms/step | **16.2 ms/step** | 16.2 ms/step |
+| decode rate | 59.4 steps/s | **61.6 steps/s** | 61.8 steps/s |
 | step GPU time | 16.0 ms | **15.3 ms** | — |
 
-**Parity, within the ~1% these trials resolve.** Not "within 1.3× on a
-fatter model" — the same work, the same speed, against the framework whose
-kernels are hand-written for this hardware. sanic's generated kernels are
-derived from naive dataflow by algebra; nothing in the path is a template.
+**Parity, within the ~1% these trials resolve** — MLX a hair ahead on wall.
+Not "within 1.3× on a fatter model" any more: the same work at the same
+speed, against the framework whose kernels are hand-written for this
+hardware, with kernels sanic derived from naive dataflow by algebra.
+
+The interesting part is the third row. sanic's GPU step (15.3 ms) is
+already BELOW MLX's total wall, and the ~0.9 ms/step it gives back is host
+work: re-encoding 263 dispatches, plus reading all 128k logits to the CPU
+to argmax them there — which MLX does on the GPU. The GPU race is won; the
+host loop is where the remaining time is.
 
 The three rungs that closed the last gap, all on 2026-07-25 and all
 documented in `todo.md` § "Runtime timing arc": per-kernel GPU timestamps
@@ -51,8 +61,8 @@ the device overrule the cost model (a further ~6% bf16 / ~14% f32).
 Honest edges: MLX grows its KV cache while sanic bakes a fixed cache extent
 into the compiled graph, so at 64 tokens sanic attends over slightly more
 slots than it needs (attention is ~1% of the step, so this does not carry
-the result); and sanic's wall carries ~0.6 ms/tok of CPU encode above its
-GPU time, which is the next thing to shave.
+the result); and the comparison is decode steps against decode steps, since
+the two harnesses count *tokens* differently.
 
 ## Scoreboard (one decode step)
 
