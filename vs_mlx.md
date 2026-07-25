@@ -20,6 +20,40 @@ each side's *full-step* ground truth anchors the totals, and both
 reconstruct from the parts (sanic: Σ 236.5 ms vs 211.7 ms replayed, the gap
 is replay overlap; MLX: Σ over census counts ≈ 16.4 ms vs 15.7 measured).
 
+## Parity, head to head on llama-3.2-1B (2026-07-25)
+
+The Trinity autopsy below is the reasoning; this is where it arrived. Same
+machine (M1 Pro 16 GB), same model size and dtype, batch-1 greedy decode,
+prefill excluded, 64 tokens, three trials each. MLX 0.32.0 / mlx-lm 0.31.3
+running `mlx-community/Llama-3.2-1B-Instruct-bf16`; sanic running
+`meta-llama/Llama-3.2-1B` through the public library API
+(`examples/llama3_2.rs --bf16`), which is the same architecture and the
+same arithmetic.
+
+|  | sanic (analytic) | sanic (`SANIC_TUNE=1`) | mlx-lm bf16 |
+|---|---|---|---|
+| decode wall | 16.6 ms/tok | **15.9 ms/tok** | 16.2 ms/tok |
+| decode rate | 59.4 tok/s | **61.6 tok/s** | 61.8 tok/s |
+| step GPU time | 16.0 ms | **15.3 ms** | — |
+
+**Parity, within the ~1% these trials resolve.** Not "within 1.3× on a
+fatter model" — the same work, the same speed, against the framework whose
+kernels are hand-written for this hardware. sanic's generated kernels are
+derived from naive dataflow by algebra; nothing in the path is a template.
+
+The three rungs that closed the last gap, all on 2026-07-25 and all
+documented in `todo.md` § "Runtime timing arc": per-kernel GPU timestamps
+sampled INSIDE the step (which showed 15% of every step was inter-encoder
+bubbles), one concurrent encoder per graph with barriers derived at capture
+(22.3 → 18.9 ms f32, 23.5 → 15.6 bf16), and the measured tuner that lets
+the device overrule the cost model (a further ~6% bf16 / ~14% f32).
+
+Honest edges: MLX grows its KV cache while sanic bakes a fixed cache extent
+into the compiled graph, so at 64 tokens sanic attends over slightly more
+slots than it needs (attention is ~1% of the step, so this does not carry
+the result); and sanic's wall carries ~0.6 ms/tok of CPU encode above its
+GPU time, which is the next thing to shave.
+
 ## Scoreboard (one decode step)
 
 The document below is the AUTOPSY that started at 211.7 ms; the ladder was
@@ -343,6 +377,11 @@ int4 load rung, unchanged.
 ## Reproduce
 
 ```
+# the llama-3.2-1B head-to-head at the top of this file
+SANIC_TUNE=1 cargo run --release --example llama3_2 -- "The capital of France is" -n 64 --bf16
+.venv/bin/python weights/mlx_llama_bench.py 64     # MLX side, same conditions
+
+# the Trinity autopsy below it
 cargo run --release --example trinity -- --bench   # per-class GPU profile
 cargo run --release --example trinity -- --proto   # scheduled variants vs emitted, oracle-checked
 .venv/bin/python weights/mlx_trinity_bench.py      # MLX per-op (nanoinfer venv)
