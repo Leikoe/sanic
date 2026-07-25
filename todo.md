@@ -216,10 +216,20 @@ production-regime for the first time. llama-3.2-1B f32 decode, M1 Pro:
 **23.7ms wall, Σ kernels 19.4ms** — the difference is inter-encoder
 bubbles no prior mode could see. Four work items fall out, in value order:
 
-1. **Close the wall−Σ gap (~3–4ms/step, ~15%).** A 263-kernel step is 263
-   compute encoders in one command buffer (`encode`, metal.rs) so Metal's
-   hazard tracking orders them; each encoder boundary idles the GPU
-   ~10–16µs. The neighbors' answers (both in `references/`):
+1. **Close the wall−Σ gap — LANDED 2026-07-25.** Measured: f32
+   22.3→18.9ms/step (40.9→49.6 tok/s); bf16 23.5→15.6ms/step
+   (59.7 tok/s) with `plan Σ ×1.04` — the encoder bubbles WERE most of
+   the cost-model miscalibration. The wall now sits below the old
+   Σ-kernels (19.4ms): independent stages really overlap. Implementation:
+   `encode_graph` + `barrier_schedule` in metal.rs; both old paths
+   (encoder-per-dispatch and the 64-capped ICB) deleted, `run` and replay
+   share the one law, the in-file `barrier_before` unit test pins the
+   phase-boundary semantics, and the whole oracle suite runs through the
+   concurrent encoder. Original analysis kept below for the record.
+
+   A 263-kernel step was 263 compute encoders in one command buffer so
+   Metal's hazard tracking ordered them; each encoder boundary idled the
+   GPU ~10–16µs. The neighbors' answers (both in `references/`):
    - **MLX**: ONE `DispatchTypeConcurrent` encoder spans many dispatches
      (committed every 20–50 ops); a wrapper tracks prev/next input/output
      buffer sets and emits `memoryBarrier(BarrierScopeBuffers)` before a

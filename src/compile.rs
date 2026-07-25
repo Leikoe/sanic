@@ -1083,11 +1083,13 @@ mod metal_backend {
     /// [`gather_stage_bytes`]); a still-implausible ratio prints `--`.
     ///
     /// Times are GPU timestamps sampled at each encoder's boundaries inside
-    /// ONE command buffer (`MetalDevice::run_kernel_timed`) — the production
-    /// regime, so the returned wall time is a real step time. Where the
-    /// device can't sample counters, the fallback is one command buffer per
-    /// dispatch: accurate per kernel, but the submits add a sync floor, so
-    /// that SUM is a debug number and the footer says so.
+    /// ONE command buffer (`MetalDevice::run_kernel_timed`). Production runs
+    /// ONE concurrent encoder instead — stage-boundary sampling is what the
+    /// per-kernel encoders pay for — so the profiled wall carries the
+    /// boundary cost production doesn't. Where the device can't sample
+    /// counters, the fallback is one command buffer per dispatch: accurate
+    /// per kernel, but the submits add a sync floor, so that SUM is a debug
+    /// number and the footer says so.
     fn run_debug(device: &MetalDevice, program: &MetalProgram, schedule: &Schedule, dispatches: &[Dispatch]) -> f64 {
         let logical_bytes = logical_byte_table(program);
         let gather_bytes = gather_stage_bytes(schedule, program, &logical_bytes);

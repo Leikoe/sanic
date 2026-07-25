@@ -12,19 +12,22 @@
 //!   f16 storage.
 //! * **Program** — a [`Dispatch`] is one kernel launch (pipeline, buffers in
 //!   `[[buffer(i)]]` order, thread count); [`MetalDevice::run`] encodes a
-//!   dispatch list into one command buffer (an encoder per dispatch, so
-//!   Metal's hazard tracking serializes on buffer dependencies) and waits.
-//!   [`MetalDevice::run_kernel_timed`] additionally samples a GPU timestamp
-//!   at every encoder boundary — per-kernel time inside that one buffer.
+//!   dispatch list as ONE concurrent compute encoder in one command buffer,
+//!   a buffer-scope memory barrier at each statically computed dependency
+//!   frontier ([`barrier_schedule`]), and waits. Metal does no hazard
+//!   tracking inside a concurrent encoder — the schedule is load-bearing,
+//!   and every oracle test runs through it.
+//!   [`MetalDevice::run_kernel_timed`] instead gives every kernel its own
+//!   encoder and samples a GPU timestamp at each boundary — per-kernel time,
+//!   at the price of per-kernel encoder boundaries.
 //!
 //! [`program_dispatches`] resolves a whole emitted [`MetalProgram`] against a
 //! name→buffer map — rebuilt per step when a runtime swaps buffers (the
 //! KV-cache commit), since dispatches bind by name at build time.
 //!
-//! * **Graphs** — [`MetalDevice::capture`] freezes a dispatch list and its
-//!   bindings. Small lists replay through an `MTLIndirectCommandBuffer`; large
-//!   lists use ordered encoders in one command buffer because large concurrent
-//!   ICBs are unstable on Apple7. Swap commits keep one frozen graph per parity.
+//! * **Graphs** — [`MetalDevice::capture`] freezes a dispatch list, its
+//!   bindings, and its barrier schedule; a replay re-encodes them cheaply
+//!   each step. Swap commits keep one frozen graph per parity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,12 +36,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp,
     MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLComputePipelineDescriptor, MTLComputePipelineState,
     MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
-    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStorageMode,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLFunction, MTLLibrary, MTLPipelineOption, MTLResource,
+    MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStorageMode,
 };
 
 use crate::emit_metal::MetalProgram;
@@ -194,12 +196,9 @@ impl MetalDevice {
         Pipelines { map }
     }
 
-    /// Every pipeline opts into indirect command buffers, so any dispatch
-    /// list can be captured into a [`MetalGraph`]; free for direct dispatch.
     fn pipeline(&self, f: &ProtocolObject<dyn MTLFunction>, name: &str) -> Pipeline {
         let desc = MTLComputePipelineDescriptor::new();
         desc.setComputeFunction(Some(f));
-        desc.setSupportIndirectCommandBuffers(true);
         self.dev
             .newComputePipelineStateWithDescriptor_options_reflection_error(&desc, MTLPipelineOption::empty(), None)
             .unwrap_or_else(|e| panic!("pipeline `{name}`: {e}"))
@@ -298,14 +297,12 @@ impl MetalDevice {
 
     // ── execution ────────────────────────────────────────────────────────────
 
-    /// Encode every dispatch into ONE command buffer — an encoder per
-    /// dispatch, so Metal serializes on buffer hazards while still
-    /// overlapping independent stages — run it, and wait.
+    /// Run every dispatch now: one command buffer, ONE concurrent encoder,
+    /// barriers where [`barrier_schedule`] found dependency frontiers — the
+    /// same execution law as a frozen graph replay — and wait.
     pub fn run(&self, dispatches: &[Dispatch]) {
         let cb = self.queue.commandBuffer().expect("command buffer");
-        for d in dispatches {
-            encode(&cb, d, None);
-        }
+        encode_graph(&cb, dispatches, &barrier_schedule(dispatches));
         cb.commit();
         cb.waitUntilCompleted();
     }
@@ -423,17 +420,47 @@ impl EncoderTimestamps {
     }
 }
 
-/// Encode one kernel launch onto a command buffer — the one encode path
-/// behind every direct dispatch. `pass` opens the encoder through a
-/// compute-pass descriptor instead (same serial dispatch semantics), which
-/// is how [`MetalDevice::run_kernel_timed`] attaches its per-kernel
-/// timestamp samples.
+/// Encode one kernel launch in its OWN encoder — the PROFILING regime.
+/// [`MetalDevice::run_kernel_timed`] samples GPU timestamps at encoder
+/// boundaries (the only sampling points Apple GPUs expose), so per-kernel
+/// timing needs per-kernel encoders; `pass` carries its timestamp
+/// attachment. Production execution is [`encode_graph`]'s single
+/// concurrent encoder instead.
 fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch, pass: Option<&MTLComputePassDescriptor>) {
     let enc = match pass {
         Some(pass) => cb.computeCommandEncoderWithDescriptor(pass),
         None => cb.computeCommandEncoder(),
     }
     .expect("compute encoder");
+    encode_dispatch(&enc, d);
+    enc.endEncoding();
+}
+
+/// Encode a dispatch list into ONE concurrent compute encoder: binds and
+/// launches back-to-back, a buffer-scope memory barrier exactly where
+/// [`barrier_schedule`] found a dependency frontier. Independent neighbors
+/// overlap on the GPU; dependent ones pay a cheap in-encoder barrier, never
+/// an encoder boundary (an encoder per kernel idled the GPU ~10µs per
+/// launch — ~15% of a llama step). Inside a concurrent encoder Metal does
+/// NO hazard tracking between dispatches: the barrier schedule is
+/// load-bearing for correctness, and the whole oracle suite runs through
+/// this path to keep it honest.
+fn encode_graph(cb: &ProtocolObject<dyn MTLCommandBuffer>, dispatches: &[Dispatch], barriers: &[bool]) {
+    let enc = cb
+        .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+        .expect("compute encoder");
+    for (dispatch, &barrier) in dispatches.iter().zip(barriers) {
+        if barrier {
+            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        encode_dispatch(&enc, dispatch);
+    }
+    enc.endEncoding();
+}
+
+/// Bind and launch one kernel on an open compute encoder — the binding
+/// rules shared by [`encode`] and [`encode_graph`].
+fn encode_dispatch(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, d: &Dispatch) {
     enc.setComputePipelineState(&d.pipe);
     if let Some(ab) = &d.argbuf {
         // bindless: one address table at 0, output at 1, inputs resident
@@ -462,7 +489,6 @@ fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, d: &Dispatch, pass: Option<
             depth: 1,
         },
     );
-    enc.endEncoding();
 }
 
 /// A committed command buffer's GPU residency in seconds.
@@ -473,171 +499,33 @@ fn gpu_seconds(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
     t1 - t0
 }
 
-/// A dispatch sequence with frozen bindings. Small sequences use an indirect
-/// command buffer; large sequences retain their dispatches and replay them as
-/// ordered encoders in one command buffer.
+/// A dispatch sequence with frozen bindings and a capture-time barrier
+/// schedule, replayed each step as one concurrent encoder ([`encode_graph`]).
 ///
 /// Buffer BINDINGS are frozen at capture. A session's swap commits flip
 /// bindings with period two, so a decode loop keeps one graph per step
 /// parity and replays the matching one.
 ///
-/// Hazards: commands in an ICB run concurrently; a barrier is set on each
-/// command that conflicts with an earlier command. A barrier belongs to that
-/// command — it is not a phase boundary inherited by later commands — so the
-/// complete access history stays live for the whole ICB.
-const MAX_INDIRECT_COMMANDS: usize = 64;
-
+/// History note: this replaced an `MTLIndirectCommandBuffer` path — see
+/// `vs_tinygrad.md` § "The Metal ICB residency lesson" for why ICBs are not
+/// a foundation on Apple7 (two distinct failure modes; only pipeline
+/// residency has a clean fix).
 pub struct MetalGraph {
-    execution: MetalGraphExecution,
-}
-
-enum MetalGraphExecution {
-    /// Large concurrent ICBs have proven unstable on Apple7. Frozen direct
-    /// dispatches keep the same bindings and use ordered compute encoders in
-    /// one command buffer, letting Metal's normal hazard tracking apply.
-    Direct(Vec<Dispatch>),
-    Indirect {
-        command_buffer: MetalIndirectCommandBuffer,
-        /// Explicit residency for the command buffer's resources and pipelines.
-        residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    },
-}
-
-struct MetalIndirectCommandBuffer {
-    icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
-    /// Every resource referenced by an indirect command, with read/write
-    /// usage combined per underlying allocation. The executing encoder must
-    /// declare these; a residency set alone does not track their hazards.
-    resources: Vec<(MetalBuf, MTLResourceUsage)>,
-    len: usize,
+    dispatches: Vec<Dispatch>,
+    /// `barriers[i]` true — a memory barrier goes before dispatch `i`.
+    barriers: Vec<bool>,
 }
 
 impl MetalDevice {
-    /// Freeze a dispatch list into a replayable graph.
-    ///
-    /// On the indirect path, panics if a binding offset exceeds `u32::MAX`:
-    /// ICB offsets are u32 on the wire, so accepting one would silently
-    /// corrupt the binding. Large schedules already take the direct path.
+    /// Freeze a dispatch list into a replayable graph: the bindings as
+    /// given, the barrier schedule computed once. Sanic knows the whole
+    /// dependency structure statically, so unlike MLX's dynamic hazard
+    /// tracking the schedule is derived at capture, not rediscovered per
+    /// step.
     pub fn capture(&self, dispatches: &[Dispatch]) -> MetalGraph {
-        if dispatches.len() > MAX_INDIRECT_COMMANDS {
-            return MetalGraph {
-                execution: MetalGraphExecution::Direct(dispatches.to_vec()),
-            };
-        }
-        for d in dispatches {
-            for b in d
-                .inputs
-                .iter()
-                .chain(std::iter::once(&d.output))
-                .chain(d.argbuf.as_ref())
-            {
-                assert!(
-                    b.1 <= u32::MAX as usize,
-                    "buffer offset {} exceeds u32 — indirect command buffers cannot bind it",
-                    b.1
-                );
-            }
-        }
-        let command_buffer = self.capture_indirect(dispatches);
-
-        // An ICB does not make its referenced allocations resident at replay,
-        // and on Apple7/8 (M1/M2) that includes pipeline states. One set covers
-        // all chunks and strong-references every allocation for the graph's
-        // lifetime.
-        let residency = self
-            .dev
-            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
-            .expect("residency set");
-        for (buffer, _) in icb_resource_usages(dispatches) {
-            residency.addAllocation(ProtocolObject::from_ref(&*buffer.0));
-        }
-        let mut seen_pipelines = HashSet::new();
-        for dispatch in dispatches {
-            if seen_pipelines.insert(Retained::as_ptr(&dispatch.pipe) as usize) {
-                residency.addAllocation(ProtocolObject::from_ref(&*dispatch.pipe));
-            }
-        }
-        residency.commit();
-        residency.requestResidency();
-
         MetalGraph {
-            execution: MetalGraphExecution::Indirect {
-                command_buffer,
-                residency,
-            },
-        }
-    }
-
-    fn capture_indirect(&self, dispatches: &[Dispatch]) -> MetalIndirectCommandBuffer {
-        let desc = MTLIndirectCommandBufferDescriptor::new();
-        desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatchThreads);
-        desc.setInheritPipelineState(false);
-        desc.setInheritBuffers(false);
-        let max_bufs = dispatches
-            .iter()
-            .map(|d| if d.argbuf.is_some() { 2 } else { d.inputs.len() + 1 })
-            .max()
-            .unwrap_or(1);
-        desc.setMaxKernelBufferBindCount(max_bufs);
-        let icb = unsafe {
-            self.dev.newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
-                &desc,
-                dispatches.len(),
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("indirect command buffer");
-
-        // Every allocation touched/written by an earlier command. ICB
-        // barriers belong to one command, not to all commands after it, so
-        // neither history can be cleared after placing a barrier.
-        let mut accessed: HashSet<usize> = HashSet::new();
-        let mut written: HashSet<usize> = HashSet::new();
-        for (i, d) in dispatches.iter().enumerate() {
-            let cmd = unsafe { icb.indirectComputeCommandAtIndex(i) };
-            cmd.setComputePipelineState(&d.pipe);
-            // a bindless dispatch binds its address table at 0 and the output
-            // at 1; the inputs are reached through the table, so they need
-            // residency, not binding slots (mirrors `encode`)
-            if let Some(ab) = &d.argbuf {
-                unsafe { cmd.setKernelBuffer_offset_atIndex(&ab.0, ab.1, 0) };
-                unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, 1) };
-            } else {
-                for (bi, b) in d.inputs.iter().enumerate() {
-                    unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, b.1, bi) };
-                }
-                unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, d.inputs.len()) };
-            }
-            let input_allocations = d
-                .inputs
-                .iter()
-                .map(|buffer| Retained::as_ptr(&buffer.0) as usize)
-                .collect::<Vec<_>>();
-            let output_allocation = Retained::as_ptr(&d.output.0) as usize;
-            let hazard = icb_command_needs_barrier(&input_allocations, output_allocation, &mut accessed, &mut written);
-            if hazard {
-                cmd.setBarrier();
-            }
-            let tg = d.threadgroup_threads();
-            cmd.concurrentDispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: d.grid,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: tg,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        }
-        let resources = icb_resource_usages(dispatches);
-
-        MetalIndirectCommandBuffer {
-            icb,
-            resources,
-            len: dispatches.len(),
+            barriers: barrier_schedule(dispatches),
+            dispatches: dispatches.to_vec(),
         }
     }
 
@@ -654,39 +542,12 @@ impl MetalDevice {
     /// untrustworthy and a decode loop must not continue on them.
     fn replay_checked(&self, g: &MetalGraph) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let cb = self.queue.commandBuffer().expect("command buffer");
-        let commands = match &g.execution {
-            MetalGraphExecution::Direct(dispatches) => dispatches.len(),
-            MetalGraphExecution::Indirect { command_buffer, .. } => command_buffer.len,
-        };
         // Name the step for Instruments/Xcode GPU captures.
-        cb.setLabel(Some(&NSString::from_str(&format!("sanic batched {commands}"))));
-        match &g.execution {
-            MetalGraphExecution::Direct(dispatches) => {
-                for dispatch in dispatches {
-                    encode(&cb, dispatch, None);
-                }
-            }
-            MetalGraphExecution::Indirect {
-                command_buffer,
-                residency,
-            } => {
-                cb.useResidencySet(residency);
-                let enc = cb.computeCommandEncoder().expect("compute encoder");
-                for (buffer, usage) in &command_buffer.resources {
-                    let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*buffer.0);
-                    enc.useResource_usage(resource, *usage);
-                }
-                // objc2-metal 0.3 has no binding for the compute encoder's
-                // `executeCommandsInBuffer:withRange:` (macOS 11+); raw message.
-                let range = NSRange {
-                    location: 0,
-                    length: command_buffer.len,
-                };
-                let _: () =
-                    unsafe { msg_send![&*enc, executeCommandsInBuffer: &*command_buffer.icb, withRange: range] };
-                enc.endEncoding();
-            }
-        }
+        cb.setLabel(Some(&NSString::from_str(&format!(
+            "sanic batched {}",
+            g.dispatches.len()
+        ))));
+        encode_graph(&cb, &g.dispatches, &g.barriers);
         cb.commit();
         cb.waitUntilCompleted();
         match cb.error() {
@@ -696,55 +557,47 @@ impl MetalDevice {
     }
 }
 
-fn icb_resource_usages(dispatches: &[Dispatch]) -> Vec<(MetalBuf, MTLResourceUsage)> {
-    fn record(
-        resources: &mut Vec<(MetalBuf, MTLResourceUsage)>,
-        indices: &mut HashMap<usize, usize>,
-        buffer: &MetalBuf,
-        usage: MTLResourceUsage,
-    ) {
-        let allocation = Retained::as_ptr(&buffer.0) as usize;
-        if let Some(&index) = indices.get(&allocation) {
-            resources[index].1 |= usage;
-        } else {
-            indices.insert(allocation, resources.len());
-            resources.push((buffer.clone(), usage));
-        }
-    }
-
-    let mut resources = Vec::new();
-    let mut indices = HashMap::new();
-    for dispatch in dispatches {
-        for input in &dispatch.inputs {
-            record(&mut resources, &mut indices, input, MTLResourceUsage::Read);
-        }
-        if let Some(argument_buffer) = &dispatch.argbuf {
-            record(&mut resources, &mut indices, argument_buffer, MTLResourceUsage::Read);
-        }
-        record(&mut resources, &mut indices, &dispatch.output, MTLResourceUsage::Write);
-    }
-    resources
+/// Where memory barriers go when a dispatch list runs in ONE concurrent
+/// encoder: before every dispatch that conflicts with an access since the
+/// last barrier. Reading or overwriting an earlier write is RAW/WAW;
+/// overwriting an earlier read is WAR. An encoder barrier is a phase
+/// boundary — everything encoded after it waits on everything before — so
+/// both access histories reset where one is placed. Allocation identity is
+/// deliberately conservative: two slices of one `MTLBuffer` synchronize
+/// even when their byte ranges do not overlap (the zero-copy weights file
+/// is one allocation, but weights are only ever read).
+fn barrier_schedule(dispatches: &[Dispatch]) -> Vec<bool> {
+    let allocation = |buffer: &MetalBuf| Retained::as_ptr(&buffer.0) as usize;
+    let mut earlier_reads: HashSet<usize> = HashSet::new();
+    let mut earlier_writes: HashSet<usize> = HashSet::new();
+    dispatches
+        .iter()
+        .map(|d| {
+            let reads: Vec<usize> = d.inputs.iter().chain(d.argbuf.as_ref()).map(allocation).collect();
+            let write = allocation(&d.output);
+            barrier_before(&reads, write, &mut earlier_reads, &mut earlier_writes)
+        })
+        .collect()
 }
 
-/// Record one concurrent ICB command and report whether it conflicts with an
-/// earlier command. Reading or overwriting an earlier write is RAW/WAW;
-/// overwriting anything previously accessed is WAR. Allocation identity is
-/// deliberately conservative: two slices of one `MTLBuffer` synchronize even
-/// when their byte ranges do not overlap.
-fn icb_command_needs_barrier(
-    inputs: &[usize],
-    output: usize,
-    accessed: &mut HashSet<usize>,
-    written: &mut HashSet<usize>,
+/// One step of [`barrier_schedule`]: record a dispatch's accesses and report
+/// whether a barrier must precede it. Placing one resets both histories —
+/// the phase boundary fences every earlier access at once.
+fn barrier_before(
+    reads: &[usize],
+    write: usize,
+    earlier_reads: &mut HashSet<usize>,
+    earlier_writes: &mut HashSet<usize>,
 ) -> bool {
-    let hazard = inputs
-        .iter()
-        .chain(std::iter::once(&output))
-        .any(|allocation| written.contains(allocation))
-        || accessed.contains(&output);
-    accessed.extend(inputs.iter().copied());
-    accessed.insert(output);
-    written.insert(output);
+    let hazard = reads.iter().any(|read| earlier_writes.contains(read))
+        || earlier_writes.contains(&write)
+        || earlier_reads.contains(&write);
+    if hazard {
+        earlier_reads.clear();
+        earlier_writes.clear();
+    }
+    earlier_reads.extend(reads.iter().copied());
+    earlier_writes.insert(write);
     hazard
 }
 
@@ -792,26 +645,31 @@ pub fn program_dispatches(
 
 #[cfg(test)]
 mod tests {
-    use super::icb_command_needs_barrier;
+    use super::barrier_before;
     use std::collections::HashSet;
 
     #[test]
-    fn icb_barriers_cover_fanout_and_write_after_read() {
-        let mut accessed = HashSet::new();
-        let mut written = HashSet::new();
+    fn barriers_sit_on_dependency_frontiers_only() {
+        let mut reads = HashSet::new();
+        let mut writes = HashSet::new();
 
-        assert!(!icb_command_needs_barrier(&[], 1, &mut accessed, &mut written));
-        assert!(icb_command_needs_barrier(&[1], 2, &mut accessed, &mut written));
+        // producer writes 1; the first consumer barriers; the barrier is a
+        // PHASE boundary, so the second consumer of the same producer is
+        // already fenced and rides free.
+        assert!(!barrier_before(&[], 1, &mut reads, &mut writes));
+        assert!(barrier_before(&[1], 2, &mut reads, &mut writes));
         assert!(
-            icb_command_needs_barrier(&[1], 3, &mut accessed, &mut written),
-            "a barrier on the first consumer does not fence the second consumer"
+            !barrier_before(&[1], 3, &mut reads, &mut writes),
+            "the phase boundary already fenced the producer's write"
         );
+        // ...but a consumer of a post-barrier write must barrier again
+        assert!(barrier_before(&[2], 6, &mut reads, &mut writes));
 
-        let mut accessed = HashSet::new();
-        let mut written = HashSet::new();
-        assert!(!icb_command_needs_barrier(&[4], 5, &mut accessed, &mut written));
+        let mut reads = HashSet::new();
+        let mut writes = HashSet::new();
+        assert!(!barrier_before(&[4], 5, &mut reads, &mut writes));
         assert!(
-            icb_command_needs_barrier(&[], 4, &mut accessed, &mut written),
+            barrier_before(&[], 4, &mut reads, &mut writes),
             "an in-place writer must wait for earlier readers"
         );
     }

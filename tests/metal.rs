@@ -14,8 +14,9 @@
 //! macOS-only, and skips cleanly if the machine has no Metal device (CI
 //! without a GPU, etc.). The host is plain Rust: `MTLDevice` compiles the
 //! generated MSL at runtime, buffers are shared-memory `MTLBuffer`s, and one
-//! command buffer per step encodes every kernel in order (Metal serializes on
-//! buffer hazards).
+//! command buffer per step encodes every kernel into one concurrent encoder
+//! with barriers at statically computed dependency frontiers — so these
+//! oracle checks also gate the barrier schedule.
 
 #![cfg(target_os = "macos")]
 
