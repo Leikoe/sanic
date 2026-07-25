@@ -294,6 +294,26 @@ Also adopted after this comparison: tinygrad's closed-op-basis discipline
 (sanic's `MapOp` replaced an open set of named ops, dissolving the `exp_sub`
 and `silu` special forms into compositions) and integer axis identities.
 
+## The Metal ICB residency lesson (written down so it is not re-learned)
+
+tinygrad's `FIX_METAL_ICB` (`runtime/graph/metal.py:76-84`) works around a
+GPU fault on M1/M2 ICB replay — "the pipelines likely need to be added to
+the used resources … but I haven't figured out how" — by binding every
+pipeline and issuing a **zero-size dispatch** before `executeCommandsInBuffer`
+so the driver considers them used. Sanic found the first-class fix
+(`fb1b54f`, 2026-07-15): **an ICB does not make its referenced allocations
+resident at replay, and on Apple7/8 a non-resident *pipeline state* faults
+the GPU after enough replays. `MTLBuffer` and `MTLComputePipelineState`
+both conform to `MTLAllocation`, so one `MTLResidencySet` covers buffers
+AND pipelines** — no dummy-dispatch trick, no per-replay `useResource`
+sweep, and the set strong-references every allocation so they outlive the
+graph. (Unneeded on Apple9+/M3, matching tinygrad's `needs_icb_fix` gate.)
+
+Separately and NOT fixed by residency: >64-command *concurrent* ICBs still
+proved unstable on Apple7 even with buffers+pipelines resident
+(`4d200c1`, 2026-07-21, hence `MAX_INDIRECT_COMMANDS = 64`). The two
+failure modes are distinct; only the first has a known clean fix.
+
 ## Measured (2026-07-12)
 
 The claim above is now a number, on the same M1 Pro, batch-1 KV decode:

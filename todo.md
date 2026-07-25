@@ -207,6 +207,82 @@ strided-AND-dilated transposes CLOSED 2026-07-13 (see milestone notes);
 autotuning landed as measured device profiles + the `--bench`/`--proto`
 loop (see M10/vs_mlx.md) with on-line per-kernel re-choice still open.
 
+## Runtime timing arc — what the in-graph timer says to do (2026-07-25)
+
+Ground truth: `SANIC_DEBUG=4` now times every kernel INSIDE the replayed
+command buffer (stage-boundary GPU timestamp counters,
+`MetalDevice::run_kernel_timed`), so per-kernel numbers are
+production-regime for the first time. llama-3.2-1B f32 decode, M1 Pro:
+**23.7ms wall, Σ kernels 19.4ms** — the difference is inter-encoder
+bubbles no prior mode could see. Four work items fall out, in value order:
+
+1. **Close the wall−Σ gap (~3–4ms/step, ~15%).** A 263-kernel step is 263
+   compute encoders in one command buffer (`encode`, metal.rs) so Metal's
+   hazard tracking orders them; each encoder boundary idles the GPU
+   ~10–16µs. The neighbors' answers (both in `references/`):
+   - **MLX**: ONE `DispatchTypeConcurrent` encoder spans many dispatches
+     (committed every 20–50 ops); a wrapper tracks prev/next input/output
+     buffer sets and emits `memoryBarrier(BarrierScopeBuffers)` before a
+     dispatch only when a tracked hazard exists
+     (`mlx/backend/metal/device.cpp:352-416,576`). Independent kernels
+     overlap; dependent ones pay a cheap in-encoder barrier, never an
+     encoder teardown.
+   - **tinygrad**: the whole jitted graph is ONE concurrent-dispatch ICB
+     under ONE encoder, with `setBarrier()` on EVERY command — fully
+     serial, no hazard analysis (`tinygrad/runtime/graph/metal.py`). The
+     Apple7/8 ICB crash — the very reason sanic caps
+     `MAX_INDIRECT_COMMANDS` at 64 — is worked around there by forcing
+     every pipeline resident via a zero-size dispatch before
+     `executeCommandsInBuffer` (`FIX_METAL_ICB`, lines 76–84; unneeded on
+     Apple9+). Its graph profiling *fakes* per-kernel times by evenly
+     spacing GPUStart→End — the counter-sample timer is strictly ahead.
+   History that rules the ICB route out as the foundation: sanic already
+   found the first-class fix for tinygrad's crash (pipelines conform to
+   `MTLAllocation` → one residency set covers buffers AND pipelines,
+   `fb1b54f`; written up in `vs_tinygrad.md` § "The Metal ICB residency
+   lesson") — and >64-command concurrent ICBs were STILL unstable on
+   Apple7 after it (`4d200c1` → the 64 cap). The instability postdates
+   the fix; ICBs are not the proper path on this hardware.
+
+   **The proper design (decided 2026-07-25): one concurrent compute
+   encoder per frozen graph, direct dispatches, barriers computed at
+   capture time.** Sanic knows the whole dependency structure statically —
+   MLX must track hazards dynamically because it is eager; sanic can
+   compute the barrier schedule once at capture from the same
+   per-allocation read/write conflict analysis the ICB path already has
+   (`icb_command_needs_barrier`/`icb_resource_usages`), then replay as:
+   one `MTLDispatchTypeConcurrent` encoder, `dispatchThreads` per kernel,
+   `memoryBarrierWithScope(Buffers)` exactly at dependency frontiers.
+   Independent stages overlap; dependent ones pay an in-encoder barrier,
+   never an encoder teardown. This subsumes BOTH existing paths — delete
+   the ICB machinery (u32-offset trap, 64 cap, `executeCommandsInBuffer`
+   msg_send) and the encoder-per-dispatch Direct path, leaving one
+   execution law for every graph size; `MetalDevice::run` takes the same
+   path so the whole oracle suite gates the barrier analysis. The
+   analysis becomes load-bearing for correctness (no driver hazard
+   tracking inside a concurrent encoder) — slices aliasing one allocation
+   must conflict, which the per-allocation usage combining already
+   handles. `=4` keeps encoder-per-kernel (stage boundaries are the only
+   Apple sampling points); `=2` wall adjudicates the win (~3ms ceiling).
+
+2. **The launch-floor folds.** The table shows a family of `grid≤128`
+   folds (RMSNorm-family `fold_sequence1_over_hidden2048` et al.) at
+   30–40µs, bw ≤3%, `plan ×6–7` — dozens per step, ~1–2ms of pure launch
+   floor. Two directions: fuse them into consumers (or batch across
+   heads/layers), and teach the cost model the per-launch floor so
+   `plan ×` stops undercounting tiny kernels by 6×.
+
+3. **The measured tuner (`--tune`).** `fold_sched_candidates`
+   (plan.rs:751-795) still has no runtime behind it.
+   `run_kernel_timed` is the measurement primitive it was waiting for:
+   time candidate schedules in-context — one command buffer, production
+   regime — and overrule the cost model where the device disagrees.
+
+4. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
+   ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
+   launch floor dominates the measurement; number step footers so the
+   cold first step (clock ramp + weight page-in) is identifiable.
+
 ## What "done" looks like
 
 Two honest end states, pick the driving one:
