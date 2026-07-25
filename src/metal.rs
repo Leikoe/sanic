@@ -523,8 +523,17 @@ impl MetalDevice {
     /// tracking the schedule is derived at capture, not rediscovered per
     /// step.
     pub fn capture(&self, dispatches: &[Dispatch]) -> MetalGraph {
+        let barriers = barrier_schedule(dispatches);
+        if crate::debug_level() >= 3 {
+            eprintln!(
+                "*** metal capture: {} dispatches, {} barriers ({} concurrent phases)",
+                dispatches.len(),
+                barriers.iter().filter(|b| **b).count(),
+                barriers.iter().filter(|b| **b).count() + 1,
+            );
+        }
         MetalGraph {
-            barriers: barrier_schedule(dispatches),
+            barriers,
             dispatches: dispatches.to_vec(),
         }
     }

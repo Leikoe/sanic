@@ -324,7 +324,58 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    (keyed on the canonical source) would let a tuned build pay the 8s
    once.
 
-4. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
+4. **THE REMAINING PROBLEM IS SYNCHRONIZATION, NOT KERNELS (measured
+   2026-07-25).** Decompose a bf16 llama decode step (15.55 ms GPU):
+
+   | | ms | |
+   |---|---|---|
+   | traffic floor at 184 GB/s | 13.48 | 2480 MB, and the traffic is IRREDUCIBLE — every weight read exactly once, 0.8% overhead |
+   | measured with `barriers=none` | 13.87 | **97% of practical peak** |
+   | measured, real barrier schedule | 15.55 | |
+   | **= synchronization** | **1.68** | **11% of the step, 212 barriers × 7.9 µs** |
+
+   `barriers=none` is a deliberately WRONG run (races), used only as a
+   floor. Its verdict: the generated kernels are essentially optimal —
+   184 GB/s is the same ceiling MLX's best kernel reaches. **P2
+   rows-per-thread and any further wide-load work are therefore dead
+   ends; do not spend time there.** The whole remaining gap is phase
+   count, and the only lever on phase count is FUSION.
+
+   The graph is 263 dispatches in 213 serial phases (`SANIC_DEBUG=3`
+   prints this). 134 of the 263 are STARVED — ≤8 of the M1 Pro's 16
+   cores — while being only 8.8% of kernel time. The worst offenders,
+   and the fusion each one wants:
+
+   | starved family | n | grid | fusion |
+   |---|---|---|---|
+   | `fold_..._over_hidden2048` (RMS reduce) | 32 | **1 threadgroup** | two-pass row-resident (below) |
+   | `map_singleton1_hidden2048` (RMS apply) | 32 | 2 | same |
+   | `map_kv_heads8_cache_...` (cache write) | 32 | 5 | into rope |
+   | `map_singleton1_intermediate8192` (SwiGLU) | 16 | 8 | into down-proj as a leaf |
+
+   **The two-pass row-resident kernel is the single biggest item (64 of
+   263 dispatches, ~0.8 ms).** It is already named as the honest
+   remainder at line 196 with its recipe; what parked it — "no current
+   workload materializes a softmax, so the convention waits for a
+   consumer" — has expired: RMSNorm is that consumer, 32× per step.
+
+   Precisely what blocks it today: `emit_cone` (partition.rs) requires
+   an epilogue host of EXACTLY the cone's shape
+   (`p.shape() == node.shape()`), but the RMS denominator is `[1,1]`
+   while its cone is `[1,2048]`, so the apply cannot ride the reduce.
+   The interpreter (`eval` broadcasts) and rustgen (separate pointwise
+   pass) already handle a broadcast epilogue; only the Metal emitter
+   needs the second pass — after the projection lands in a register,
+   loop the threadgroup's threads over the streamed axis writing the
+   epilogue.
+
+   NOT the answer, verified by experiment: deferring the divisor into
+   the consumer (`SANIC_DIVCUT=never`) is **10× slower** (170 ms) — the
+   normalizer is then recomputed per OUTPUT POINT. The cost model is
+   right to cut; the missing option is the third one, computing the
+   normalizer once per THREADGROUP.
+
+5. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
    launch floor dominates the measurement; number step footers so the
    cold first step (clock ramp + weight page-in) is identifiable.
