@@ -375,6 +375,33 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    right to cut; the missing option is the third one, computing the
    normalizer once per THREADGROUP.
 
+   **First attempt at the two-pass, and why it failed (2026-07-25).**
+   Built and measured, then reverted: relax `epilogue_rides` to admit a
+   host the cone broadcasts over one reduced axis (right-aligned), and
+   give both Metal emitters a pass two — project into threadgroup
+   memory, barrier, stripe the row across the threadgroup's threads. It
+   FUSED as intended (263→230 dispatches, 212→179 barriers, llama text
+   unchanged) and was still **slower: 17.4 vs 15.0 ms/tok.**
+
+   The reason is geometric and is the thing to fix before trying again:
+   a fused kernel inherits the FOLD's launch geometry. The RMS reduce
+   dispatches `n_tgs = fold output volume = 1` threadgroup, so pass two
+   writes 2048 elements with 256 threads where the separate map kernel
+   had 2048 threads across 2 threadgroups. The fusion buys one barrier
+   and pays 8× parallelism on the apply — a bad trade at these shapes.
+   It also NaN'd `attention_backward_runs_on_gpu` (dq), so the
+   coordinate mapping is not yet right for gradient folds.
+
+   What a next attempt needs: the two-pass kernel's threadgroup count
+   must be sized by the ROW it writes, not by the fold's output — which
+   means a split (two-stage) reduction across threadgroups, or a
+   schedule search that raises `sgs` far enough that one threadgroup
+   covers the row (`sgs=32` gives 1024 threads; `SANIC_TUNE` would find
+   it if the candidate were legal here). Until then the separate map
+   kernel is genuinely the better shape, and item 4's ~0.8 ms estimate
+   for this fusion should be read as an upper bound that the geometry
+   does not currently allow collecting.
+
 5. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
    launch floor dominates the measurement; number step footers so the
