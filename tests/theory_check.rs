@@ -39,10 +39,7 @@ impl Lcg {
 }
 
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 // ── Claim A: the whole decode-attention cone derives and runs ────────────────
@@ -66,10 +63,7 @@ fn decode_cone_bisection() {
                 MapOp::Lt,
                 vec![iota(cache), map(MapOp::Add, vec![position, konst(1.0)])],
             );
-            map(
-                MapOp::Where,
-                vec![visible, konst(0.0), konst(f64::NEG_INFINITY)],
-            )
+            map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)])
         });
         let attention = scaled_dot_product_attention(
             input("q", [query_heads, sequence, head_dim], Dtype::F32),
@@ -108,10 +102,7 @@ fn decode_attention_cone_derives_as_one_kernel() {
     let sequence = axis("sequence", 1);
     let mut rng = Lcg(0xD0C5);
     let env: Env = [
-        (
-            "q",
-            rand_tensor(&[query_heads, sequence, head_dim], &mut rng),
-        ),
+        ("q", rand_tensor(&[query_heads, sequence, head_dim], &mut rng)),
         ("k", rand_tensor(&[kv_heads, cache, head_dim], &mut rng)),
         ("v", rand_tensor(&[kv_heads, cache, head_dim], &mut rng)),
         ("position", Value::from_shape_fn(&[], |_| 2.0)),
@@ -126,10 +117,7 @@ fn decode_attention_cone_derives_as_one_kernel() {
         MapOp::Lt,
         vec![iota(cache), map(MapOp::Add, vec![position, konst(1.0)])],
     );
-    let mask = map(
-        MapOp::Where,
-        vec![visible, konst(0.0), konst(f64::NEG_INFINITY)],
-    );
+    let mask = map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)]);
     let attention = scaled_dot_product_attention(
         input("q", [query_heads, sequence, head_dim], Dtype::F32),
         key,
@@ -153,7 +141,7 @@ fn decode_attention_cone_derives_as_one_kernel() {
     );
 
     let reference = eval(&attention, &env);
-    let kernel = emit_fused_metal_with("decode_cone", &carrier, stream, &attention, None);
+    let kernel = emit_fused_metal_with("decode_cone", &carrier, stream, &attention, None, sanic::Dtype::F32);
     let Some(device) = MetalDevice::open() else {
         eprintln!("skipping GPU check: no Metal device");
         return;
@@ -177,9 +165,7 @@ fn decode_attention_cone_derives_as_one_kernel() {
         .iter()
         .zip(&reference.data)
         .map(|(got, expected)| (*got as f64 - expected).abs() / (1.0 + expected.abs()))
-        .fold(0.0f64, |worst, e| {
-            std::cmp::max_by(worst, e, f64::total_cmp)
-        });
+        .fold(0.0f64, |worst, e| std::cmp::max_by(worst, e, f64::total_cmp));
     eprintln!("decode cone one-kernel GPU error vs interp: {error:e}");
     assert!(error < 2e-3, "one-kernel decode cone off by {error:e}");
 }
@@ -195,9 +181,7 @@ fn futures_matrix(h: &dyn Fn(&[f64]) -> f64, seed: u64) -> Vec<Vec<f64>> {
     let prefixes: Vec<Vec<f64>> = (0..40)
         .map(|row| (0..4 + row % 5).map(|_| quantized(&mut rng)).collect())
         .collect();
-    let suffixes: Vec<Vec<f64>> = (0..12)
-        .map(|_| (0..3).map(|_| quantized(&mut rng)).collect())
-        .collect();
+    let suffixes: Vec<Vec<f64>> = (0..12).map(|_| (0..3).map(|_| quantized(&mut rng)).collect()).collect();
     prefixes
         .iter()
         .map(|prefix| {
@@ -215,9 +199,7 @@ fn futures_matrix(h: &dyn Fn(&[f64]) -> f64, seed: u64) -> Vec<Vec<f64>> {
 /// Singular values by one-sided Jacobi, as in the completeness suite.
 fn singular_values(mut a: Vec<Vec<f64>>) -> Vec<f64> {
     if a[0].len() > a.len() {
-        a = (0..a[0].len())
-            .map(|j| a.iter().map(|row| row[j]).collect())
-            .collect();
+        a = (0..a[0].len()).map(|j| a.iter().map(|row| row[j]).collect()).collect();
     }
     let n = a[0].len();
     for _ in 0..60 {
@@ -277,13 +259,7 @@ fn widening_past_a_linear_consumer_can_grow_the_dimension() {
     let narrow = |xs: &[f64]| xs.iter().sum::<f64>();
     // widened past the LINEAR consumer Add(·, Σ i·xᵢ): convexity pulls the
     // sibling branch of the same stream into the cut
-    let widened = |xs: &[f64]| {
-        xs.iter().sum::<f64>()
-            + xs.iter()
-                .enumerate()
-                .map(|(i, x)| i as f64 * x)
-                .sum::<f64>()
-    };
+    let widened = |xs: &[f64]| xs.iter().sum::<f64>() + xs.iter().enumerate().map(|(i, x)| i as f64 * x).sum::<f64>();
     let narrow_rank = affine_rank(&narrow, 0x5EED);
     let widened_rank = affine_rank(&widened, 0x5EED);
     eprintln!("Σx rank (centered): {narrow_rank}; Add(Σx, Σi·x) rank: {widened_rank}");

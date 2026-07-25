@@ -56,10 +56,7 @@ fn rmsnorm(x: NodeRef, g: NodeRef, n: f64) -> NodeRef {
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-    map(
-        MapOp::Div,
-        vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-    )
+    map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)])
 }
 
 fn head_projection(x: NodeRef, weight: NodeRef) -> NodeRef {
@@ -71,13 +68,7 @@ fn head_projection(x: NodeRef, weight: NodeRef) -> NodeRef {
 // ── a focused case: flash attention + residual epilogue + output GEMM ────────
 #[test]
 fn attention_block_schedule_executes_to_reference() {
-    let (s, t, dm, dk, dv) = (
-        axis("s", 4),
-        axis("t", 4),
-        axis("dm", 6),
-        axis("dk", 5),
-        axis("dv", 6),
-    );
+    let (s, t, dm, dk, dv) = (axis("s", 4), axis("t", 4), axis("dm", 6), axis("dk", 5), axis("dv", 6));
     let mut rng = Lcg(0xBEEF);
     let env: Env = [
         ("X", rand_tensor(&[s, dm], &mut rng)),
@@ -91,23 +82,11 @@ fn attention_block_schedule_executes_to_reference() {
 
     let x = input("X", [s, dm], Dtype::F32);
     let xk = rename(x.clone(), 0usize, t);
-    let q = matmul(
-        x.clone(),
-        transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, dk]
-    let k = matmul(
-        xk.clone(),
-        transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize),
-    ); // [t, dk]
-    let v = matmul(
-        xk,
-        transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
-    ); // [t, dv]
+    let q = matmul(x.clone(), transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize)); // [s, dk]
+    let k = matmul(xk.clone(), transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize)); // [t, dk]
+    let v = matmul(xk, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [t, dv]
     let attn = scaled_dot_product_attention(q, k, v, None, 0.0, false, Some(1.0), false);
-    let o = matmul(
-        attn,
-        transpose(input("Wo", [dm, dv], Dtype::F32), 0usize, 1usize),
-    ); // [s, dm]
+    let o = matmul(attn, transpose(input("Wo", [dm, dv], Dtype::F32), 0usize, 1usize)); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
     let sched = partition(&y, &DeviceProfile::toy());
@@ -176,28 +155,16 @@ fn full_transformer_block_schedule_executes_to_reference() {
     let res1 = map(MapOp::Add, vec![o, x]);
 
     let hn = rmsnorm(res1.clone(), input("g2", [dm], Dtype::F32), n);
-    let gate = matmul(
-        hn.clone(),
-        transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, f]
-    let up = matmul(
-        hn,
-        transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, f]
+    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
+    let up = matmul(hn, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
 
-    let logits = matmul(
-        yb,
-        transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, v]
+    let logits = matmul(yb, transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize)); // [s, v]
 
     let sched = partition(&logits, &DeviceProfile::toy());
-    assert!(
-        sched.kernel_count() >= 2,
-        "expected a multi-kernel schedule"
-    );
+    assert!(sched.kernel_count() >= 2, "expected a multi-kernel schedule");
     let executed = sched.execute(&env);
     let reference = eval(&logits, &env);
     assert_close(&executed, &reference);

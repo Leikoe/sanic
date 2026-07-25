@@ -24,8 +24,7 @@ use std::collections::HashMap;
 use sanic::cost::DeviceProfile;
 use sanic::derive::{Carrier, derive};
 use sanic::emit_metal::{
-    MetalKernel, MetalProgram, emit_fused_metal_sched_with, emit_fused_metal_with,
-    emit_schedule_metal_on,
+    MetalKernel, MetalProgram, emit_fused_metal_sched_with, emit_fused_metal_with, emit_schedule_metal_on,
 };
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
@@ -33,7 +32,7 @@ use sanic::metal::{Dispatch, MetalBuf, MetalDevice, program_dispatches};
 use sanic::partition::partition;
 
 fn emit_fused_metal(name: &str, carrier: &Carrier, stream: AxisRef, node: &NodeRef) -> MetalKernel {
-    emit_fused_metal_with(name, carrier, stream, node, None)
+    emit_fused_metal_with(name, carrier, stream, node, None, Dtype::F32)
 }
 
 fn emit_fused_metal_sched(
@@ -43,7 +42,7 @@ fn emit_fused_metal_sched(
     node: &NodeRef,
     schedule: sanic::plan::FoldSched,
 ) -> MetalKernel {
-    emit_fused_metal_sched_with(name, carrier, stream, node, schedule, None)
+    emit_fused_metal_sched_with(name, carrier, stream, node, schedule, None, Dtype::F32)
 }
 
 fn emit_schedule_metal(schedule: &sanic::partition::Schedule) -> MetalProgram {
@@ -71,10 +70,7 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 fn max_rel_err(got: &[f32], expected: &[f64]) -> f64 {
@@ -91,11 +87,7 @@ fn run_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Value) -
     let dev = MetalDevice::open()?;
     let pipes = dev.compile(&kernel.msl);
     let pipe = pipes.get(&kernel.name);
-    let inputs: Vec<MetalBuf> = kernel
-        .inputs
-        .iter()
-        .map(|(n, _)| dev.from_f64(&env[n].data))
-        .collect();
+    let inputs: Vec<MetalBuf> = kernel.inputs.iter().map(|(n, _)| dev.from_f64(&env[n].data)).collect();
     let output = dev.alloc_f32(kernel.grid_size);
     dev.run(&[Dispatch {
         pipe,
@@ -112,11 +104,16 @@ fn run_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Value) -
 
 /// Run a whole multi-kernel schedule on the GPU, checking the final output
 /// against the oracle. `None` = clean skip (no Metal device).
-fn run_schedule_on_gpu(
+fn run_schedule_on_gpu(label: &str, program: &MetalProgram, env: &Env, reference: &Value) -> Option<String> {
+    run_schedule_on_gpu_tol(label, program, env, reference, 3e-3)
+}
+
+fn run_schedule_on_gpu_tol(
     label: &str,
     program: &MetalProgram,
     env: &Env,
     reference: &Value,
+    tolerance: f64,
 ) -> Option<String> {
     let dev = MetalDevice::open()?;
     let pipes = dev.compile(&program.msl);
@@ -125,17 +122,13 @@ fn run_schedule_on_gpu(
         bufs.insert(n.to_string(), dev.from_f64(&env[n].data));
     }
     for (n, size) in &program.buffers {
-        bufs.insert(n.clone(), dev.alloc_f32(*size));
+        bufs.insert(n.clone(), dev.alloc_elems(*size, program.storage));
     }
     dev.run(&program_dispatches(program, &bufs, &pipes));
-    let output = &program
-        .stages
-        .last()
-        .expect("Metal program has no stages")
-        .output;
-    let got = dev.read_f32(&bufs[output], reference.data.len());
+    let output = &program.stages.last().expect("Metal program has no stages").output;
+    let got = dev.read_as_f32(&bufs[output], reference.data.len(), program.storage);
     let maxrel = max_rel_err(&got, &reference.data);
-    assert!(maxrel < 3e-3, "GPU MISMATCH {maxrel:e} ({label})");
+    assert!(maxrel < tolerance, "GPU MISMATCH {maxrel:e} ({label})");
     Some(format!("GPU OK {maxrel:e}"))
 }
 
@@ -154,11 +147,7 @@ fn flash_attention_runs_on_gpu() {
 
     let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
-    let attn = attention(
-        input("Q", [sq, d], Dtype::F32),
-        key,
-        input("V", [k, e], Dtype::F32),
-    );
+    let attn = attention(input("Q", [sq, d], Dtype::F32), key, input("V", [k, e], Dtype::F32));
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal("flash", &carrier, stream, &attn);
     let reference = eval(&attn, &env);
@@ -192,20 +181,13 @@ fn masked_gqa_decode_attention_matches_oracle_on_gpu() {
         }
     }
     let env: Env = [
-        (
-            "Q",
-            rand_tensor(&[query_heads, query_sequence, features], &mut rng),
-        ),
+        ("Q", rand_tensor(&[query_heads, query_sequence, features], &mut rng)),
         ("K", key),
         ("V", value),
         (
             "mask",
             Value::from_shape_fn(&[cache.extent()], |position| {
-                if position[0] == 0 {
-                    0.0
-                } else {
-                    f64::NEG_INFINITY
-                }
+                if position[0] == 0 { 0.0 } else { f64::NEG_INFINITY }
             }),
         ),
     ]
@@ -271,15 +253,9 @@ fn rmsnorm_of_a_shared_residual_matches_oracle_on_gpu() {
     let norm = map(
         MapOp::Div,
         vec![
-            map(
-                MapOp::Mul,
-                vec![residual, input("gain", [hidden], Dtype::F32)],
-            ),
+            map(MapOp::Mul, vec![residual, input("gain", [hidden], Dtype::F32)]),
             unsqueeze(
-                map(
-                    MapOp::Sqrt,
-                    vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])],
-                ),
+                map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])]),
                 1usize,
             ),
         ],
@@ -335,34 +311,22 @@ fn residual_rmsnorm_fused_projection_matches_oracle_on_gpu() {
     let norm = map(
         MapOp::Div,
         vec![
-            map(
-                MapOp::Mul,
-                vec![residual, input("gain", [hidden], Dtype::F32)],
-            ),
+            map(MapOp::Mul, vec![residual, input("gain", [hidden], Dtype::F32)]),
             unsqueeze(
-                map(
-                    MapOp::Sqrt,
-                    vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])],
-                ),
+                map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])]),
                 1usize,
             ),
         ],
     );
     let projection = matmul(
         norm,
-        transpose(
-            input("weight", [output, hidden], Dtype::F32),
-            0usize,
-            1usize,
-        ),
+        transpose(input("weight", [output, hidden], Dtype::F32), 0usize, 1usize),
     );
     let reference = eval(&projection, &env);
     let schedule = partition(&projection, &DeviceProfile::m1_pro());
     let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
 
-    let Some(result) =
-        run_schedule_on_gpu("residual-rmsnorm-projection", &program, &env, &reference)
-    else {
+    let Some(result) = run_schedule_on_gpu("residual-rmsnorm-projection", &program, &env, &reference) else {
         eprintln!("skipping: no Metal device");
         return;
     };
@@ -384,10 +348,7 @@ fn causal_flash_runs_on_gpu() {
 
     let key = input("K", [t, dk], Dtype::F32);
     let stream = source_axis(&key, 0);
-    let scores = matmul(
-        input("Q", [s, dk], Dtype::F32),
-        transpose(key, 0usize, 1usize),
-    );
+    let scores = matmul(input("Q", [s, dk], Dtype::F32), transpose(key, 0usize, 1usize));
     let scaled = map(MapOp::Mul, vec![scores, konst(0.125)]);
     let masked = map(
         MapOp::Add,
@@ -423,16 +384,10 @@ fn cosine_bias_flash_runs_on_gpu() {
 
     let key = input("K", [t, dk], Dtype::F32);
     let stream = source_axis(&key, 0);
-    let scores = matmul(
-        input("Q", [s, dk], Dtype::F32),
-        transpose(key, 0usize, 1usize),
-    );
+    let scores = matmul(input("Q", [s, dk], Dtype::F32), transpose(key, 0usize, 1usize));
     let rel = map(
         MapOp::Sub,
-        vec![
-            coordinate(scores.clone(), 0usize),
-            coordinate(scores.clone(), 1usize),
-        ],
+        vec![coordinate(scores.clone(), 0usize), coordinate(scores.clone(), 1usize)],
     );
     let bias = map(MapOp::Cos, vec![map(MapOp::Mul, vec![rel, konst(0.1)])]);
     let biased = map(MapOp::Add, vec![scores, bias]);
@@ -458,19 +413,13 @@ fn rope_rotation(pos: Axis, p: Axis, j: Axis, i: Axis, c: f64) -> NodeRef {
     let pair_coord = coordinate(template.clone(), 1usize);
     let i_coord = coordinate(template.clone(), 2usize);
     let j_coord = coordinate(template, 3usize);
-    let freq = map(
-        MapOp::Exp,
-        vec![map(MapOp::Mul, vec![pair_coord, konst(c)])],
-    );
+    let freq = map(MapOp::Exp, vec![map(MapOp::Mul, vec![pair_coord, konst(c)])]);
     let theta = map(MapOp::Mul, vec![pos_coord, freq]);
     let lt_ij = map(MapOp::Lt, vec![i_coord.clone(), j_coord.clone()]);
     let lt_ji = map(MapOp::Lt, vec![j_coord, i_coord]);
     let eq = map(
         MapOp::Sub,
-        vec![
-            map(MapOp::Sub, vec![konst(1.0), lt_ij.clone()]),
-            lt_ji.clone(),
-        ],
+        vec![map(MapOp::Sub, vec![konst(1.0), lt_ij.clone()]), lt_ji.clone()],
     );
     let offdiag = map(MapOp::Sub, vec![lt_ij, lt_ji]);
     map(
@@ -543,10 +492,7 @@ fn quantized_matmul_runs_on_gpu() {
     let env: Env = [
         ("X", rand_tensor(&[s, dm], &mut rng)),
         ("qW", qw),
-        (
-            "scale",
-            Value::from_shape_fn(&[o.extent()], |_| 0.05 * (rng.f() + 1.5)),
-        ),
+        ("scale", Value::from_shape_fn(&[o.extent()], |_| 0.05 * (rng.f() + 1.5))),
     ]
     .into_iter()
     .collect();
@@ -648,42 +594,22 @@ fn greedy_decode_step_runs_on_gpu() {
 
     let rms = |x: NodeRef, g: NodeRef| {
         let dim = x.shape().len() - 1;
-        let ss = reduce(
-            map(MapOp::Mul, vec![x.clone(), x.clone()]),
-            dim,
-            Monoid::Add,
-        );
+        let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), dim, Monoid::Add);
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-        map(
-            MapOp::Div,
-            vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, dim)],
-        )
+        map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, dim)])
     };
-    let x = embedding(
-        input("E", [vv, dm], Dtype::F32),
-        input("ids", [s], Dtype::F32),
-        0usize,
-    ); // [s, dm]
+    let x = embedding(input("E", [vv, dm], Dtype::F32), input("ids", [s], Dtype::F32), 0usize); // [s, dm]
     let xn = rms(x.clone(), input("g1", [dm], Dtype::F32));
     let xn_kv = rename(xn.clone(), 0usize, t);
-    let q = matmul(
-        xn,
-        transpose(input("Wq", [h, dk, dm], Dtype::F32), 1usize, 2usize),
-    );
+    let q = matmul(xn, transpose(input("Wq", [h, dk, dm], Dtype::F32), 1usize, 2usize));
     let k = matmul(
         xn_kv.clone(),
         transpose(input("Wk", [h, dk, dm], Dtype::F32), 1usize, 2usize),
     );
-    let vvv = matmul(
-        xn_kv,
-        transpose(input("Wv", [h, dvh, dm], Dtype::F32), 1usize, 2usize),
-    );
+    let vvv = matmul(xn_kv, transpose(input("Wv", [h, dvh, dm], Dtype::F32), 1usize, 2usize));
     let scores = matmul(q, transpose(k, 1usize, 2usize));
-    let scaled = map(
-        MapOp::Mul,
-        vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())],
-    );
+    let scaled = map(MapOp::Mul, vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())]);
     let masked = map(
         MapOp::Add,
         vec![scaled.clone(), causal_mask_like(scaled, 1usize, 2usize)],
@@ -693,21 +619,12 @@ fn greedy_decode_step_runs_on_gpu() {
     let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32));
     let res1 = map(MapOp::Add, vec![o, x]);
     let hn = rms(res1.clone(), input("g2", [dm], Dtype::F32));
-    let gate = matmul(
-        hn.clone(),
-        transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
-    );
-    let up = matmul(
-        hn,
-        transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
-    );
+    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize));
+    let up = matmul(hn, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize));
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
-    let logits = matmul(
-        yb,
-        transpose(input("W_lm", [vv, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, v]
+    let logits = matmul(yb, transpose(input("W_lm", [vv, dm], Dtype::F32), 0usize, 1usize)); // [s, v]
     let token = argmax(logits, 1usize); // [s] — next-token per position
 
     let sched = partition(&token, &DeviceProfile::toy());
@@ -757,38 +674,22 @@ fn full_transformer_block_runs_on_gpu() {
 
     let rms = |x: NodeRef, g: NodeRef| {
         let dim = x.shape().len() - 1;
-        let ss = reduce(
-            map(MapOp::Mul, vec![x.clone(), x.clone()]),
-            dim,
-            Monoid::Add,
-        );
+        let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), dim, Monoid::Add);
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-        map(
-            MapOp::Div,
-            vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, dim)],
-        )
+        map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, dim)])
     };
     let x = input("X", [s, dm], Dtype::F32);
     let xn = rms(x.clone(), input("g1", [dm], Dtype::F32));
     let xn_kv = rename(xn.clone(), 0usize, t);
-    let q = matmul(
-        xn,
-        transpose(input("Wq", [h, dk, dm], Dtype::F32), 1usize, 2usize),
-    );
+    let q = matmul(xn, transpose(input("Wq", [h, dk, dm], Dtype::F32), 1usize, 2usize));
     let k = matmul(
         xn_kv.clone(),
         transpose(input("Wk", [h, dk, dm], Dtype::F32), 1usize, 2usize),
     );
-    let vv = matmul(
-        xn_kv,
-        transpose(input("Wv", [h, dv, dm], Dtype::F32), 1usize, 2usize),
-    );
+    let vv = matmul(xn_kv, transpose(input("Wv", [h, dv, dm], Dtype::F32), 1usize, 2usize));
     let scores = matmul(q, transpose(k, 1usize, 2usize));
-    let scaled = map(
-        MapOp::Mul,
-        vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())],
-    );
+    let scaled = map(MapOp::Mul, vec![scores, konst(1.0 / (dk.extent() as f64).sqrt())]);
     let masked = map(
         MapOp::Add,
         vec![scaled.clone(), causal_mask_like(scaled, 1usize, 2usize)],
@@ -798,21 +699,12 @@ fn full_transformer_block_runs_on_gpu() {
     let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32));
     let res1 = map(MapOp::Add, vec![o, x]);
     let hn = rms(res1.clone(), input("g2", [dm], Dtype::F32));
-    let gate = matmul(
-        hn.clone(),
-        transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
-    );
-    let up = matmul(
-        hn,
-        transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
-    );
+    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize));
+    let up = matmul(hn, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize));
     let act = map(MapOp::Mul, vec![silu(gate), up]);
     let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
     let yb = map(MapOp::Add, vec![mlp, res1]);
-    let logits = matmul(
-        yb,
-        transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize),
-    );
+    let logits = matmul(yb, transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize));
 
     let sched = partition(&logits, &DeviceProfile::toy());
     let program = emit_schedule_metal(&sched);
@@ -909,13 +801,7 @@ fn conv2d_runs_on_gpu() {
 #[test]
 fn sliding_window_flash_runs_on_gpu() {
     let (ns, w) = (24usize, 6usize);
-    let (s, t, j, d, e) = (
-        axis("s", ns),
-        axis("t", ns),
-        axis("j", w),
-        axis("d", 8),
-        axis("e", 8),
-    );
+    let (s, t, j, d, e) = (axis("s", ns), axis("t", ns), axis("j", w), axis("d", 8), axis("e", 8));
     let mut rng = Lcg(0x51DE60);
     let env: Env = [
         ("Q", rand_tensor(&[s, d], &mut rng)),
@@ -940,10 +826,7 @@ fn sliding_window_flash_runs_on_gpu() {
         true,
     );
     let scores = reduce(
-        map(
-            MapOp::Mul,
-            vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw],
-        ),
+        map(MapOp::Mul, vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw]),
         2usize,
         Monoid::Add,
     );
@@ -952,26 +835,17 @@ fn sliding_window_flash_runs_on_gpu() {
         vec![
             map(
                 MapOp::Add,
-                vec![
-                    coordinate(scores.clone(), 0usize),
-                    coordinate(scores.clone(), 1usize),
-                ],
+                vec![coordinate(scores.clone(), 0usize), coordinate(scores.clone(), 1usize)],
             ),
             konst((w - 1) as f64),
         ],
     );
     let masked = map(
         MapOp::Add,
-        vec![
-            scores,
-            map(MapOp::Where, vec![invalid, konst(-1e30), konst(0.0)]),
-        ],
+        vec![scores, map(MapOp::Where, vec![invalid, konst(-1e30), konst(0.0)])],
     );
     let attn = reduce(
-        map(
-            MapOp::Mul,
-            vec![unsqueeze(softmax(masked, 1usize), 2usize), vw],
-        ),
+        map(MapOp::Mul, vec![unsqueeze(softmax(masked, 1usize), 2usize), vw]),
         1usize,
         Monoid::Add,
     );
@@ -1031,36 +905,22 @@ fn decode_loop_runs_on_gpu() {
     let cache_k = input("cache_k", [t, dk], Dtype::F32);
     let ck = map(
         MapOp::Where,
-        vec![
-            one_hot_like(cache_k.clone(), 0usize, pos.clone()),
-            new_k,
-            cache_k,
-        ],
+        vec![one_hot_like(cache_k.clone(), 0usize, pos.clone()), new_k, cache_k],
     );
     let cache_v = input("cache_v", [t, dv], Dtype::F32);
     let cv = map(
         MapOp::Where,
-        vec![
-            one_hot_like(cache_v.clone(), 0usize, pos.clone()),
-            new_v,
-            cache_v,
-        ],
+        vec![one_hot_like(cache_v.clone(), 0usize, pos.clone()), new_v, cache_v],
     );
     let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(
         MapOp::Mul,
-        vec![
-            reduce(map(MapOp::Mul, vec![ck.clone(), q]), 1usize, Monoid::Add),
-            scale,
-        ],
+        vec![reduce(map(MapOp::Mul, vec![ck.clone(), q]), 1usize, Monoid::Add), scale],
     );
     let future = map(MapOp::Lt, vec![pos, iota(t)]);
     let masked = map(
         MapOp::Add,
-        vec![
-            scores,
-            map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)]),
-        ],
+        vec![scores, map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)])],
     );
     let att = softmax(masked, 0usize);
     let out = reduce(
@@ -1078,18 +938,9 @@ fn decode_loop_runs_on_gpu() {
     // the reference: full causal prefill by the oracle
     let xq = input("X", [s, dm], Dtype::F32);
     let xt = rename(xq.clone(), 0usize, t2);
-    let qa = matmul(
-        xq,
-        transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize),
-    );
-    let ka = matmul(
-        xt.clone(),
-        transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize),
-    );
-    let va = matmul(
-        xt,
-        transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
-    );
+    let qa = matmul(xq, transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize));
+    let ka = matmul(xt.clone(), transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize));
+    let va = matmul(xt, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize));
     let sc = map(
         MapOp::Mul,
         vec![
@@ -1097,16 +948,10 @@ fn decode_loop_runs_on_gpu() {
             konst(1.0 / (dk.extent() as f64).sqrt()),
         ],
     );
-    let ma = map(
-        MapOp::Add,
-        vec![sc.clone(), causal_mask_like(sc, 0usize, 1usize)],
-    );
+    let ma = map(MapOp::Add, vec![sc.clone(), causal_mask_like(sc, 0usize, 1usize)]);
     let oa = matmul(softmax(ma, 1usize), va);
     let logits_ref = eval(
-        &matmul(
-            oa,
-            transpose(input("Wl", [v, dv], Dtype::F32), 0usize, 1usize),
-        ),
+        &matmul(oa, transpose(input("Wl", [v, dv], Dtype::F32), 0usize, 1usize)),
         &env,
     );
     let expected: Vec<f64> = (0..steps)
@@ -1224,11 +1069,7 @@ fn split_reduction_runs_on_gpu() {
 
     let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
-    let attn = attention(
-        input("Q", [s, d], Dtype::F32),
-        key,
-        input("V", [k, e], Dtype::F32),
-    );
+    let attn = attention(input("Q", [s, d], Dtype::F32), key, input("V", [k, e], Dtype::F32));
     let carrier = derive(&attn, stream).unwrap();
     let kernel = emit_fused_metal_sched(
         "swk",
@@ -1256,13 +1097,11 @@ fn split_reduction_runs_on_gpu() {
 #[test]
 fn tanh_survives_large_arguments_on_gpu() {
     let n = axis("n", 6);
-    let x = Value::from_shape_fn(&[n.extent()], |c| {
-        [-2000.0, -50.0, -1.0, 1.0, 50.0, 2000.0][c[0]]
-    });
+    let x = Value::from_shape_fn(&[n.extent()], |c| [-2000.0, -50.0, -1.0, 1.0, 50.0, 2000.0][c[0]]);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     let t = map(MapOp::Tanh, vec![input("X", [n], Dtype::F32)]);
-    let kernel = sanic::emit_metal::emit_pointwise_metal("tanh_big", &t);
+    let kernel = sanic::emit_metal::emit_pointwise_metal("tanh_big", &t, Dtype::F32);
     let reference = eval(&t, &env);
     let Some(out) = run_on_gpu("tanh", &kernel, &env, &reference) else {
         eprintln!("skipping: no Metal device");
@@ -1316,10 +1155,7 @@ fn bf16_matvec_runs_on_gpu() {
     );
     let carrier = derive(&y, stream).unwrap();
     let kernel = emit_fused_metal("bf16mv", &carrier, stream, &y);
-    assert!(
-        kernel.msl.contains("device const ushort* b_W"),
-        "bf16 buffer typed"
-    );
+    assert!(kernel.msl.contains("device const ushort* b_W"), "bf16 buffer typed");
     assert!(kernel.msl.contains("<< 16u"), "bf16 widen emitted");
     let reference = eval(&y, &env);
 
@@ -1361,12 +1197,7 @@ fn bf16_matvec_runs_on_gpu() {
 fn w4_grouped_matvec_runs_on_gpu() {
     let (n_out, n_g, n_r) = (16usize, 4usize, 128usize);
     let n_in = n_g * n_r;
-    let (o, gq, r, c) = (
-        axis("o", n_out),
-        axis("g", n_g),
-        axis("r", n_r),
-        axis("c", n_in),
-    );
+    let (o, gq, r, c) = (axis("o", n_out), axis("g", n_g), axis("r", n_r), axis("c", n_in));
     let mut rng = Lcg(0x144A16);
 
     // integer nibbles q ∈ [-8, 7], f16-exact scales, random activations
@@ -1414,10 +1245,7 @@ fn w4_grouped_matvec_runs_on_gpu() {
         vec![
             map(
                 MapOp::Mul,
-                vec![
-                    input("Wq", [o, gq, r], Dtype::I4),
-                    input("x", [gq, r], Dtype::F32),
-                ],
+                vec![input("Wq", [o, gq, r], Dtype::I4), input("x", [gq, r], Dtype::F32)],
             ),
             unsqueeze(input("S", [o, gq], Dtype::F16), 2usize),
         ],
@@ -1540,17 +1368,10 @@ fn graph_replay_matches_oracle() {
     // rmsnorm(X)·Wᵀ then a softmax-weighted reduction back over v — a chain
     // with real read-after-write hazards at every stage
     let x = input("X", [s, dm], Dtype::F32);
-    let ms = reduce(
-        map(MapOp::Mul, vec![x.clone(), x.clone()]),
-        1usize,
-        Monoid::Add,
-    );
+    let ms = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, Monoid::Add);
     let inv = map(
         MapOp::Recip,
-        vec![map(
-            MapOp::Sqrt,
-            vec![map(MapOp::Add, vec![ms, konst(1e-5)])],
-        )],
+        vec![map(MapOp::Sqrt, vec![map(MapOp::Add, vec![ms, konst(1e-5)])])],
     );
     let xn = map(
         MapOp::Mul,
@@ -1559,10 +1380,7 @@ fn graph_replay_matches_oracle() {
             unsqueeze(inv, 1usize),
         ],
     );
-    let logits = matmul(
-        xn,
-        transpose(input("W", [v, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, v]
+    let logits = matmul(xn, transpose(input("W", [v, dm], Dtype::F32), 0usize, 1usize)); // [s, v]
     let out = reduce(logits, 1usize, Monoid::LogSumExp); // [s]
 
     let sched = partition(&out, &DeviceProfile::toy());
@@ -1582,19 +1400,12 @@ fn graph_replay_matches_oracle() {
         bufs.insert(n.clone(), dev.alloc_f32(*size));
     }
     let graph: MetalGraph = dev.capture(&program_dispatches(&program, &bufs, &pipes));
-    let output = &program
-        .stages
-        .last()
-        .expect("Metal program has no stages")
-        .output;
+    let output = &program.stages.last().expect("Metal program has no stages").output;
     for replay in 0..2 {
         dev.run_graph_timed(&graph).unwrap();
         let got = dev.read_f32(&bufs[output], reference.data.len());
         let maxrel = max_rel_err(&got, &reference.data);
-        assert!(
-            maxrel < 3e-3,
-            "GRAPH MISMATCH on replay {replay}: {maxrel:e}"
-        );
+        assert!(maxrel < 3e-3, "GRAPH MISMATCH on replay {replay}: {maxrel:e}");
     }
     eprintln!(
         "graph replay on GPU: {} kernels in one indirect command buffer, two replays match",
@@ -1646,10 +1457,7 @@ fn bindless_graph_replay_declares_indirect_resources() {
         device.run_graph_timed(&graph).unwrap();
         let got = device.read_f32(&buffers[output], reference.data.len());
         let maxrel = max_rel_err(&got, &reference.data);
-        assert!(
-            maxrel < 3e-3,
-            "bindless graph mismatch on replay {replay}: {maxrel:e}"
-        );
+        assert!(maxrel < 3e-3, "bindless graph mismatch on replay {replay}: {maxrel:e}");
     }
 }
 
@@ -1664,20 +1472,11 @@ fn bindless_graph_replay_declares_indirect_resources() {
 // lane-split), and the order-sensitive decline (first-max-wins argmax must
 // NOT split out of stream order).
 
-fn run_coop_on_gpu(
-    label: &str,
-    kernel: &MetalKernel,
-    env: &Env,
-    reference: &Value,
-) -> Option<String> {
+fn run_coop_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Value) -> Option<String> {
     let dev = MetalDevice::open()?;
     let pipes = dev.compile(&kernel.msl);
     let pipe = pipes.get(&kernel.name);
-    let inputs: Vec<MetalBuf> = kernel
-        .inputs
-        .iter()
-        .map(|(n, _)| dev.from_f64(&env[n].data))
-        .collect();
+    let inputs: Vec<MetalBuf> = kernel.inputs.iter().map(|(n, _)| dev.from_f64(&env[n].data)).collect();
     // a cooperative kernel's grid_size is threads (TGs × TG width), not
     // output elements — read back the output volume
     let out_n = reference.data.len();
@@ -1712,11 +1511,7 @@ fn coop_lane_stream_flash_matches_oracle() {
     .collect();
     let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
-    let attn = attention(
-        input("Q", [sq, d], Dtype::F32),
-        key,
-        input("V", [k, e], Dtype::F32),
-    );
+    let attn = attention(input("Q", [sq, d], Dtype::F32), key, input("V", [k, e], Dtype::F32));
     let carrier = derive(&attn, stream).unwrap();
     let sched = FoldSched {
         lane_axis: None,
@@ -1725,14 +1520,8 @@ fn coop_lane_stream_flash_matches_oracle() {
         chunk: 1,
     };
     let kernel = emit_fused_metal_sched("coop_ls_flash", &carrier, stream, &attn, sched);
-    assert!(
-        kernel.msl.contains("simd_shuffle_xor"),
-        "lane merge emitted"
-    );
-    assert!(
-        kernel.msl.contains("threadgroup_barrier"),
-        "sg merge emitted"
-    );
+    assert!(kernel.msl.contains("simd_shuffle_xor"), "lane merge emitted");
+    assert!(kernel.msl.contains("threadgroup_barrier"), "sg merge emitted");
     let reference = eval(&attn, &env);
     let Some(out) = run_coop_on_gpu("coop_ls_flash", &kernel, &env, &reference) else {
         eprintln!("skipping: no Metal device");
@@ -1760,11 +1549,7 @@ fn masked_flash_with_short_prefix_survives_lane_split() {
         (
             "mask",
             Value::from_shape_fn(&[k.extent()], |position| {
-                if position[0] < visible {
-                    0.0
-                } else {
-                    f64::NEG_INFINITY
-                }
+                if position[0] < visible { 0.0 } else { f64::NEG_INFINITY }
             }),
         ),
     ]
@@ -1775,10 +1560,7 @@ fn masked_flash_with_short_prefix_survives_lane_split() {
     let scores = map(
         MapOp::Add,
         vec![
-            matmul(
-                input("Q", [sq, d], Dtype::F32),
-                transpose(key, 0usize, 1usize),
-            ),
+            matmul(input("Q", [sq, d], Dtype::F32), transpose(key, 0usize, 1usize)),
             input("mask", [k], Dtype::F32),
         ],
     );
@@ -1796,10 +1578,7 @@ fn masked_flash_with_short_prefix_survives_lane_split() {
         eprintln!("skipping: no Metal device");
         return;
     };
-    eprintln!(
-        "short-prefix masked lane-stream flash on GPU: {}",
-        out.trim()
-    );
+    eprintln!("short-prefix masked lane-stream flash on GPU: {}", out.trim());
 }
 
 /// The value head dim distributed across lanes: the o slot vectorizes per
@@ -1820,11 +1599,7 @@ fn coop_lane_axis_flash_matches_oracle() {
     .collect();
     let key = input("K", [k, d], Dtype::F32);
     let stream = source_axis(&key, 0);
-    let attn = attention(
-        input("Q", [sq, d], Dtype::F32),
-        key,
-        input("V", [k, e], Dtype::F32),
-    );
+    let attn = attention(input("Q", [sq, d], Dtype::F32), key, input("V", [k, e], Dtype::F32));
     let carrier = derive(&attn, stream).unwrap();
     let sched = FoldSched {
         lane_axis: Some(source_axis(&attn, 1)),
@@ -1888,10 +1663,7 @@ fn coop_norm_fused_matvec_matches_oracle() {
             dot,
             map(
                 MapOp::Recip,
-                vec![map(
-                    MapOp::Sqrt,
-                    vec![map(MapOp::Add, vec![ms, konst(1e-5)])],
-                )],
+                vec![map(MapOp::Sqrt, vec![map(MapOp::Add, vec![ms, konst(1e-5)])])],
             ),
         ],
     );
@@ -1936,12 +1708,7 @@ fn coop_chunked_w4_matvec_matches_oracle() {
     use sanic::plan::FoldSched;
     let (n_out, n_g, n_r) = (8usize, 8usize, 128usize);
     let n_in = n_g * n_r; // 1024 = 32 lanes × 8-chunks × 4
-    let (o, gq, r, c) = (
-        axis("o", n_out),
-        axis("g", n_g),
-        axis("r", n_r),
-        axis("c", n_in),
-    );
+    let (o, gq, r, c) = (axis("o", n_out), axis("g", n_g), axis("r", n_r), axis("c", n_in));
     let mut rng = Lcg(0xC4C4);
 
     let q: Vec<i8> = (0..n_out * n_in)
@@ -1977,10 +1744,7 @@ fn coop_chunked_w4_matvec_matches_oracle() {
         vec![
             map(
                 MapOp::Mul,
-                vec![
-                    input("Wq", [o, gq, r], Dtype::I4),
-                    input("x", [gq, r], Dtype::F32),
-                ],
+                vec![input("Wq", [o, gq, r], Dtype::I4), input("x", [gq, r], Dtype::F32)],
             ),
             unsqueeze(input("S", [o, gq], Dtype::F32), 2usize),
         ],
@@ -1996,14 +1760,8 @@ fn coop_chunked_w4_matvec_matches_oracle() {
         chunk: 8,
     };
     let kernel = emit_fused_metal_sched("coop_w4c", &carrier, stream, &y, sched);
-    assert!(
-        kernel.msl.contains("c_ * 8u"),
-        "chunked stream loop emitted"
-    );
-    assert!(
-        kernel.msl.contains("simd_shuffle_xor"),
-        "lane merge emitted"
-    );
+    assert!(kernel.msl.contains("c_ * 8u"), "chunked stream loop emitted");
+    assert!(kernel.msl.contains("simd_shuffle_xor"), "lane merge emitted");
     let reference = eval(&y, &env);
 
     let Some(dev) = MetalDevice::open() else {
@@ -2065,17 +1823,11 @@ fn honest_window_flash_matches_full_oracle() {
     let future = map(MapOp::Lt, vec![input("pos", [], Dtype::F32), position]);
     let masked = map(
         MapOp::Add,
-        vec![
-            scores,
-            map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)]),
-        ],
+        vec![scores, map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)])],
     );
     let value = input("V", [t, e], Dtype::F32);
     let attn = reduce(
-        map(
-            MapOp::Mul,
-            vec![unsqueeze(softmax(masked, 0usize), 1usize), value],
-        ),
+        map(MapOp::Mul, vec![unsqueeze(softmax(masked, 0usize), 1usize), value]),
         0usize,
         Monoid::Add,
     );
@@ -2143,10 +1895,7 @@ fn coop_declines_order_sensitive_argmax() {
         eprintln!("skipping: no Metal device");
         return;
     };
-    eprintln!(
-        "argmax declined to scalar, ties first-max-wins: {}",
-        out.trim()
-    );
+    eprintln!("argmax declined to scalar, ties first-max-wins: {}", out.trim());
 }
 
 /// A monoidal prefix scan (cumsum) EMITS now: each output point folds its
@@ -2156,12 +1905,10 @@ fn coop_declines_order_sensitive_argmax() {
 fn monoidal_prefix_scans_run_on_gpu() {
     let (s, t) = (axis("s", 3), axis("t", 17));
     let mut rng = Lcg(0x5CA9);
-    let env: Env = [("X", rand_tensor(&[s, t], &mut rng))]
-        .into_iter()
-        .collect();
+    let env: Env = [("X", rand_tensor(&[s, t], &mut rng))].into_iter().collect();
     for (label, m) in [("cumsum", Monoid::Add), ("cummax", Monoid::Max)] {
         let node = scan(input("X", [s, t], Dtype::F32), 1usize, m);
-        let kernel = sanic::emit_metal::emit_pointwise_metal(label, &node);
+        let kernel = sanic::emit_metal::emit_pointwise_metal(label, &node, Dtype::F32);
         let reference = eval(&node, &env);
         let Some(out) = run_on_gpu(label, &kernel, &env, &reference) else {
             eprintln!("skipping: no Metal device");
@@ -2185,8 +1932,7 @@ fn zero_copy_wrap_binds_tensors_at_offsets() {
     };
     const PAGE: usize = 16384;
     let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
-    let region: &'static mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), PAGE) };
+    let region: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), PAGE) };
     // two "tensors" at offsets 0 and 4096 (4-byte aligned, mid-page)
     let n = 64usize;
     for i in 0..n {
@@ -2270,30 +2016,18 @@ fn committed_plan_costs_stay_within_a_band_of_measurement() {
 
     let x = input("X", [s, d], Dtype::F32);
     let g = input("G", [d], Dtype::F32);
-    let ss = reduce(
-        map(MapOp::Mul, vec![x.clone(), x.clone()]),
-        1usize,
-        Monoid::Add,
-    );
+    let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, Monoid::Add);
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-    let norm = map(
-        MapOp::Div,
-        vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-    );
-    let head = matmul(
-        norm,
-        transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize),
-    );
+    let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
+    let head = matmul(norm, transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize));
 
     let sched = partition(&head, &profile);
     let planned: HashMap<String, f64> = sched
         .stages
         .iter()
         .filter_map(|st| match st {
-            sanic::partition::Stage::Fused { spec, .. } => {
-                Some((spec.output_name.clone(), spec.cost))
-            }
+            sanic::partition::Stage::Fused { spec, .. } => Some((spec.output_name.clone(), spec.cost)),
             _ => None,
         })
         .collect();
@@ -2343,6 +2077,207 @@ fn committed_plan_costs_stay_within_a_band_of_measurement() {
             stage.output,
             cost * 1e6,
             measured * 1e6,
+        );
+    }
+}
+
+// Boundary storage narrowed to bf16: the same norm→head pipeline must still
+// match the interpreter to rounding tolerance. Intermediates round once at
+// each store (8 mantissa bits ⇒ ~0.4% per round trip); accumulators stay f32
+// in registers, so error does NOT grow with the reduction length.
+#[test]
+fn bf16_storage_stays_within_rounding_of_the_interpreter() {
+    let profile = DeviceProfile::m1_pro().with_storage(Dtype::BF16);
+    let (s, d, v) = (axis("s", 1), axis("d", 256), axis("v", 512));
+    let mut rng = Lcg(0xBF16);
+    let env: Env = [
+        ("X", rand_tensor(&[s, d], &mut rng)),
+        ("G", rand_tensor(&[d], &mut rng)),
+        ("W", rand_tensor(&[v, d], &mut rng)),
+    ]
+    .into_iter()
+    .collect();
+
+    let x = input("X", [s, d], Dtype::F32);
+    let g = input("G", [d], Dtype::F32);
+    let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, Monoid::Add);
+    let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 256.0)]);
+    let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
+    let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
+    let head = matmul(norm, transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize));
+    let expected = eval(&head, &env);
+
+    let sched = partition(&head, &profile);
+    let program = emit_schedule_metal_on(&profile, &sched);
+    assert_eq!(program.storage, Dtype::BF16);
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    let pipes = dev.compile(&program.msl);
+    let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
+    for (n, _) in &program.inputs {
+        bufs.insert(n.to_string(), dev.from_f64(&env[*n].data));
+    }
+    for (n, size) in &program.buffers {
+        bufs.insert(n.clone(), dev.alloc_elems(*size, program.storage));
+    }
+    let dispatches = program_dispatches(&program, &bufs, &pipes);
+    dev.run(&dispatches);
+
+    let out = dev.read_as_f32(&bufs[&sched.outputs[0]], v.extent(), program.storage);
+    let mut worst = 0.0f64;
+    for (m, e) in out.iter().zip(&expected.data) {
+        let rel = ((*m as f64 - e) / e.abs().max(1e-3)).abs();
+        worst = worst.max(rel);
+        assert!(
+            rel.is_finite(),
+            "bf16 storage produced a non-finite logit (expected {e})"
+        );
+    }
+    assert!(
+        worst < 2e-2,
+        "bf16 storage drifted {worst:.4} relative from the interpreter"
+    );
+}
+
+// The llama decode shape at step 0 — GQA heads, a −∞ prefix mask, zeroed
+// cache rows — with boundary storage narrowed to bf16. The mask and every
+// attention intermediate round through 16-bit stores; the fold must still
+// match the interpreter to rounding tolerance, with no NaN escape.
+#[test]
+fn bf16_storage_masked_gqa_decode_matches_oracle() {
+    let profile = DeviceProfile::m1_pro().with_storage(Dtype::BF16);
+    let (query_heads, kv_heads, cache, features) = (
+        axis("query_heads", 32),
+        axis("kv_heads", 8),
+        axis("cache", 7),
+        axis("features", 64),
+    );
+    let query_sequence = axis("query_sequence", 1);
+    let mut rng = Lcg(0x6A7A);
+    let mut key = rand_tensor(&[kv_heads, cache, features], &mut rng);
+    let mut value = rand_tensor(&[kv_heads, cache, features], &mut rng);
+    for head in 0..kv_heads.extent() {
+        for position in 1..cache.extent() {
+            for feature in 0..features.extent() {
+                let offset = (head * cache.extent() + position) * features.extent() + feature;
+                key.data[offset] = 0.0;
+                value.data[offset] = 0.0;
+            }
+        }
+    }
+    let env: Env = [
+        ("Q", rand_tensor(&[query_heads, query_sequence, features], &mut rng)),
+        ("K", key),
+        ("V", value),
+        (
+            "mask",
+            Value::from_shape_fn(&[cache.extent()], |position| {
+                if position[0] == 0 { 0.0 } else { f64::NEG_INFINITY }
+            }),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let attention = sanic::nn::functional::scaled_dot_product_attention(
+        input("Q", [query_heads, query_sequence, features], Dtype::F32),
+        input("K", [kv_heads, cache, features], Dtype::F32),
+        input("V", [kv_heads, cache, features], Dtype::F32),
+        Some(input("mask", [cache], Dtype::F32)),
+        0.0,
+        false,
+        None,
+        true,
+    );
+    let reference = eval(&attention, &env);
+    let schedule = partition(&attention, &profile);
+    let program = emit_schedule_metal_on(&profile, &schedule);
+
+    let Some(result) = run_schedule_on_gpu_tol("bf16-masked-gqa-decode", &program, &env, &reference, 2e-2) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    eprintln!("bf16 masked GQA decode attention: {}", result.trim());
+}
+
+// stored(dtype) is a VALUE, so three roads must meet at the same bits:
+// (1) the interpreter's CPU rounding twin, (2) a kernel computing
+// RoundTo(BF16) in-register under f32 storage, (3) an f32 value actually
+// written through bf16 storage and reloaded. Ties, ±inf, negative zero,
+// denormals, and near-overflow all included — bit equality, no tolerance.
+#[test]
+fn round_to_bf16_matches_storage_bit_for_bit() {
+    let values: Vec<f64> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        1.0 + 1.0 / 512.0, // ties to even at bf16's 8-bit mantissa
+        1.0 + 3.0 / 512.0, // rounds up
+        -1.0 - 1.0 / 512.0,
+        65504.0,
+        3.4e38, // above bf16 max: rounds to +inf
+        -3.4e38,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1e-40, // f32 subnormal
+        std::f64::consts::PI,
+        -std::f64::consts::E,
+        0.1,
+        123456789.0,
+    ];
+    let n = axis("n", values.len());
+    let env: Env = [("X", Value::from_shape_fn(&[values.len()], |i| values[i[0]]))]
+        .into_iter()
+        .collect();
+
+    let x = input("X", [n], Dtype::F32);
+    let rounded = map(MapOp::RoundTo(Dtype::BF16), vec![x.clone()]);
+    let oracle = eval(&rounded, &env);
+
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+
+    // road 2: RoundTo computed in-register, stored f32
+    let in_register = sanic::emit_metal::emit_pointwise_metal("round_reg", &rounded, Dtype::F32);
+    // road 3: the plain value written through bf16 storage
+    let through_storage =
+        sanic::emit_metal::emit_pointwise_metal("round_store", &map(MapOp::Mul, vec![x, konst(1.0)]), Dtype::BF16);
+
+    let run = |kernel: &sanic::emit_metal::MetalKernel, storage: Dtype| -> Vec<f32> {
+        let pipes = dev.compile(&kernel.msl);
+        let xbuf = dev.from_f64(&env["X"].data);
+        let out = dev.alloc_elems(values.len(), storage);
+        let dispatch = sanic::metal::Dispatch {
+            pipe: pipes.get(&kernel.name),
+            inputs: vec![xbuf],
+            output: out.clone(),
+            grid: kernel.grid_size,
+            argbuf: None,
+        };
+        dev.run(&[dispatch]);
+        dev.read_as_f32(&out, values.len(), storage)
+    };
+
+    let reg = run(&in_register, Dtype::F32);
+    let store = run(&through_storage, Dtype::BF16);
+    for (i, value) in values.iter().enumerate() {
+        let cpu = (oracle.data[i] as f32).to_bits();
+        assert_eq!(
+            reg[i].to_bits(),
+            cpu,
+            "value {value}: in-register RoundTo {:?} != CPU twin {:?}",
+            f32::from_bits(reg[i].to_bits()),
+            oracle.data[i],
+        );
+        assert_eq!(
+            store[i].to_bits(),
+            cpu,
+            "value {value}: bf16 storage round trip {:?} != CPU twin {:?}",
+            f32::from_bits(store[i].to_bits()),
+            oracle.data[i],
         );
     }
 }

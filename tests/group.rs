@@ -28,10 +28,7 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 /// The one tolerance policy (`verify::rel_tolerance`) at this file's chain
@@ -42,8 +39,7 @@ fn assert_close(x: &Value, y: &Value) {
     let y = y.permuted_to(&x.axes);
     assert_eq!(x.shape, y.shape);
     for (a, b) in x.data.iter().zip(&y.data) {
-        let tol =
-            sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + a.abs().max(b.abs()));
+        let tol = sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + a.abs().max(b.abs()));
         assert!((a - b).abs() <= tol, "{a} vs {b}");
     }
 }

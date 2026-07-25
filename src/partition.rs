@@ -36,12 +36,10 @@ use crate::cost::DeviceProfile;
 use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
-    self, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
-    ResolvedAffineIndex, all_axis_refs, input_axes, input_dtypes, leaf_names,
+    self, AxisRef, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ResolvedAffineIndex, all_axis_refs, input_axes,
+    input_dtypes, leaf_names,
 };
-use crate::plan::{
-    GroupCache, KernelSpec, SIMD, count_issue_ops, plan_axis_emitted, plan_axis_with_groups,
-};
+use crate::plan::{GroupCache, KernelSpec, SIMD, count_issue_ops, plan_axis_emitted, plan_axis_with_groups};
 
 /// One kernel in the schedule.
 pub enum Stage {
@@ -97,11 +95,7 @@ pub enum Stage {
     /// An axis derives here but the cut graph declines or no block structure
     /// fits the device — a real finding, reported with its reason instead of
     /// guessed around.
-    Infeasible {
-        axis: AxisRef,
-        output: String,
-        why: String,
-    },
+    Infeasible { axis: AxisRef, output: String, why: String },
 }
 
 /// A whole-graph schedule: kernels in execution order.
@@ -138,9 +132,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
     // node rebuilt while emitting (a spliced read, a rebuilt cut graph)
     // resolves to the original, so an already-cut value is read, not
     // re-emitted.
-    crate::verify::assert_valid_many(
-        &roots.iter().map(|(root, _)| root.clone()).collect::<Vec<_>>(),
-    );
+    crate::verify::assert_valid_many(&roots.iter().map(|(root, _)| root.clone()).collect::<Vec<_>>());
     let mut parents = HashMap::new();
     for (r, _) in roots {
         count_parents(r, &mut parents);
@@ -230,11 +222,7 @@ pub(crate) fn stage_output(s: &Stage) -> &str {
 /// (`epi_fold_read`) dropped — that is ordinary epilogue fusion, not an
 /// external read. The fold's output NAME is kept, so a caller that needs to spot
 /// a genuine in-place self-read (`w = f(w, …)`) still sees it.
-fn fused_leaf_reads(
-    fold_node: &Node,
-    epilogue_node: &Option<Node>,
-    epi_fold_read: &'static str,
-) -> Vec<&'static str> {
+fn fused_leaf_reads(fold_node: &Node, epilogue_node: &Option<Node>, epi_fold_read: &'static str) -> Vec<&'static str> {
     let mut reads = leaf_names(fold_node);
     if let Some(epi) = epilogue_node {
         for n in leaf_names(epi) {
@@ -262,9 +250,9 @@ fn stage_reads(s: &Stage) -> Vec<&'static str> {
             reads.retain(|n| *n != spec.output_name.as_str()); // its own output is not an external read
             reads
         }
-        Stage::Elementwise { inputs, .. }
-        | Stage::Gather { inputs, .. }
-        | Stage::Fallback { inputs, .. } => inputs.clone(),
+        Stage::Elementwise { inputs, .. } | Stage::Gather { inputs, .. } | Stage::Fallback { inputs, .. } => {
+            inputs.clone()
+        }
         Stage::Infeasible { .. } => Vec::new(),
     }
 }
@@ -284,9 +272,9 @@ fn stage_reads_self(s: &Stage) -> Vec<&'static str> {
             epi_fold_read,
             ..
         } => fused_leaf_reads(fold_node, epilogue_node, epi_fold_read),
-        Stage::Elementwise { inputs, .. }
-        | Stage::Gather { inputs, .. }
-        | Stage::Fallback { inputs, .. } => inputs.clone(),
+        Stage::Elementwise { inputs, .. } | Stage::Gather { inputs, .. } | Stage::Fallback { inputs, .. } => {
+            inputs.clone()
+        }
         Stage::Infeasible { .. } => Vec::new(),
     }
 }
@@ -308,10 +296,7 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
     // block(xd{l})`, the decode residual stream) is a genuine producer — dropping
     // its producer→reader edge would let a block read the stale cut buffer.
     let inplace: Vec<bool> = (0..n)
-        .map(|i| {
-            graph_inputs.contains(&out[i])
-                && stage_reads_self(&stages[i]).iter().any(|r| *r == out[i])
-        })
+        .map(|i| graph_inputs.contains(&out[i]) && stage_reads_self(&stages[i]).iter().any(|r| *r == out[i]))
         .collect();
     // producers of genuine intermediates only (an in-place writer's readers
     // read the external weight, so it must NOT create a producer→reader edge)
@@ -351,8 +336,7 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
     // input (no in-place aliasing) comes back byte-for-byte unchanged.
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let mut heap: BinaryHeap<Reverse<usize>> =
-        (0..n).filter(|&i| indeg[i] == 0).map(Reverse).collect();
+    let mut heap: BinaryHeap<Reverse<usize>> = (0..n).filter(|&i| indeg[i] == 0).map(Reverse).collect();
     let mut order = Vec::with_capacity(n);
     while let Some(Reverse(i)) = heap.pop() {
         order.push(i);
@@ -370,10 +354,7 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
          the other, so neither can run last — materialize one gradient to a temp to break it"
     );
     let mut slots: Vec<Option<Stage>> = stages.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .map(|i| slots[i].take().unwrap())
-        .collect()
+    order.into_iter().map(|i| slots[i].take().unwrap()).collect()
 }
 
 struct Partitioner<'a> {
@@ -448,9 +429,7 @@ fn contains_node(root: &Node, target: &Node) -> bool {
         | NodeKind::View { src, .. }
         | NodeKind::Reindex { src, .. } => contains_node(src, target),
         NodeKind::Map { inputs, .. } => inputs.iter().any(|input| contains_node(input, target)),
-        NodeKind::Gather { src, index, .. } => {
-            contains_node(src, target) || contains_node(index, target)
-        }
+        NodeKind::Gather { src, index, .. } => contains_node(src, target) || contains_node(index, target),
     }
 }
 
@@ -568,10 +547,7 @@ impl Partitioner<'_> {
                 self.emit(&rebuilt, out)
             }
 
-            NodeKind::Input { .. }
-            | NodeKind::Const { .. }
-            | NodeKind::Iota { .. }
-            | NodeKind::Coordinate { .. } => {
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {
                 unreachable!("handled above")
             }
         }
@@ -601,9 +577,7 @@ impl Partitioner<'_> {
     /// the contraction applies the view when it loads the buffer.
     fn cut_beneath_structure(&mut self, node: &Node, subs: &mut Vec<(Node, Node)>) {
         match node.as_ref() {
-            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-                self.cut_beneath_structure(src, subs)
-            }
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => self.cut_beneath_structure(src, subs),
             _ => {
                 self.cut(node);
                 subs.push((node.clone(), self.splice(node, false)));
@@ -636,12 +610,7 @@ impl Partitioner<'_> {
     /// deriver dedups leaves by pointer, and `done` is keyed by pointer, so
     /// a node another consumer will cut must keep its identity), and deep
     /// shared chains splice in linear time.
-    fn splice_memo(
-        &mut self,
-        node: &Node,
-        is_root: bool,
-        memo: &mut HashMap<*const NodeKind, Node>,
-    ) -> Node {
+    fn splice_memo(&mut self, node: &Node, is_root: bool, memo: &mut HashMap<*const NodeKind, Node>) -> Node {
         if !is_root {
             if is_free_source(node) {
                 return node.clone(); // read a raw input / const / index directly
@@ -670,19 +639,14 @@ impl Partitioner<'_> {
                 let out = if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::positional_reindex(
-                        s,
-                        shape.clone(),
-                        map.clone(),
-                        *padded,
-                    )
+                    crate::ir::positional_reindex(s, shape.clone(), map.clone(), *padded)
                 };
                 memo.insert(Arc::as_ptr(node), out.clone());
                 return out;
             }
             if let Some(&name) = self.done.get(&Arc::as_ptr(node)) {
                 // a materialized buffer read
-                let read = ir::input(name, node.shape(), Dtype::F32);
+                let read = ir::input(name, node.shape(), self.dev.storage);
                 memo.insert(Arc::as_ptr(node), read.clone());
                 return read;
             }
@@ -698,10 +662,7 @@ impl Partitioner<'_> {
                 }
             }
             NodeKind::Map { op, inputs } => {
-                let new: Vec<Node> = inputs
-                    .iter()
-                    .map(|i| self.splice_memo(i, false, memo))
-                    .collect();
+                let new: Vec<Node> = inputs.iter().map(|i| self.splice_memo(i, false, memo)).collect();
                 if new.iter().zip(inputs).all(|(a, b)| Arc::ptr_eq(a, b)) {
                     node.clone()
                 } else {
@@ -751,12 +712,7 @@ impl Partitioner<'_> {
                 if Arc::ptr_eq(&s, src) {
                     node.clone()
                 } else {
-                    crate::ir::positional_reindex(
-                        s,
-                        shape.clone(),
-                        map.clone(),
-                        *padded,
-                    )
+                    crate::ir::positional_reindex(s, shape.clone(), map.clone(), *padded)
                 }
             }
         };
@@ -803,14 +759,10 @@ impl Partitioner<'_> {
         // The launch is already paid; the volume bound keeps the lift from
         // ever writing a broadcast product.
         match node.as_ref() {
-            NodeKind::Input { .. }
-            | NodeKind::Const { .. }
-            | NodeKind::Iota { .. }
-            | NodeKind::Coordinate { .. } => {}
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
             NodeKind::Map { inputs, .. } if self.inline_pays(node, axes, pricing) => {
                 if let Some((hot_volume, hot_shape)) = self.hot_volume(node, axes)
-                    && (self.volume(node) < hot_volume
-                        || node.shape().iter().map(|axis| axis.extent()).eq(hot_shape))
+                    && (self.volume(node) < hot_volume || node.shape().iter().map(|axis| axis.extent()).eq(hot_shape))
                 {
                     push(node, out);
                     return;
@@ -829,12 +781,9 @@ impl Partitioner<'_> {
                 self.leaf_cuts(src, &stream_below_gather(axes, index, gathered), pricing, out);
                 self.leaf_cuts(index, axes, pricing, out);
             }
-            NodeKind::View { src, .. } => self.leaf_cuts(
-                src,
-                &stream_below_view(axes, &ir::view_groups(node)),
-                pricing,
-                out,
-            ),
+            NodeKind::View { src, .. } => {
+                self.leaf_cuts(src, &stream_below_view(axes, &ir::view_groups(node)), pricing, out)
+            }
             NodeKind::Reindex { src, .. } => self.leaf_cuts(
                 src,
                 &stream_below_reindex(axes, &ir::resolved_reindex(node)),
@@ -894,11 +843,9 @@ impl Partitioner<'_> {
             replicas = (replicas / sharable.clamp(1.0, SIMD as f64)).max(1.0);
         }
         let dev = self.dev;
-        let recompute_once = count_issue_ops(node) / dev.peak_flops
-            + subtree_read_bytes(node) / dev.hbm_bandwidth;
+        let recompute_once = count_issue_ops(node) / dev.peak_flops + subtree_read_bytes(node) / dev.hbm_bandwidth;
         let round_trip = volume * dev.dtype_bytes / dev.hbm_bandwidth;
-        (replicas - 1.0) * recompute_once
-            < (replicas + 1.0) * round_trip + dev.launch_overhead
+        (replicas - 1.0) * recompute_once < (replicas + 1.0) * round_trip + dev.launch_overhead
     }
 
     /// Elements this node materializes to (the product of its output axes'
@@ -937,10 +884,7 @@ impl Partitioner<'_> {
                     ))
                 };
                 for input in inputs {
-                    hot = max(
-                        hot,
-                        self.hot_volume(input, &map_input_axes(node, input, axes)),
-                    );
+                    hot = max(hot, self.hot_volume(input, &map_input_axes(node, input, axes)));
                 }
                 hot
             }
@@ -951,13 +895,10 @@ impl Partitioner<'_> {
                     self.hot_volume(index, axes),
                 )
             }
-            NodeKind::View { src, .. } => {
-                self.hot_volume(src, &stream_below_view(axes, &ir::view_groups(node)))
+            NodeKind::View { src, .. } => self.hot_volume(src, &stream_below_view(axes, &ir::view_groups(node))),
+            NodeKind::Reindex { src, .. } => {
+                self.hot_volume(src, &stream_below_reindex(axes, &ir::resolved_reindex(node)))
             }
-            NodeKind::Reindex { src, .. } => self.hot_volume(
-                src,
-                &stream_below_reindex(axes, &ir::resolved_reindex(node)),
-            ),
             // Fold-bearing subtrees are pushed whole by `leaf_cuts` — their
             // interior is not this cut's concern. Free sources carry no work.
             _ => None,
@@ -1017,9 +958,7 @@ impl Partitioner<'_> {
                 } // else: consumed below the reindex
                 return;
             }
-            NodeKind::Gather { src, index, dim }
-                if private && ir::source_axis(src, *dim) != axis =>
-            {
+            NodeKind::Gather { src, index, dim } if private && ir::source_axis(src, *dim) != axis => {
                 self.entanglers(src, axis, out);
                 self.entanglers(index, axis, out);
                 return;
@@ -1063,13 +1002,7 @@ impl Partitioner<'_> {
 
     /// One streaming kernel at `node` over `axis`: cut the carrier leaves the
     /// kernel cannot compute in-body, re-plan on the cut graph, push a stage.
-    fn emit_fold(
-        &mut self,
-        node: &Node,
-        axis: AxisRef,
-        carrier: &Carrier,
-        out: &str,
-    ) -> &'static str {
+    fn emit_fold(&mut self, node: &Node, axis: AxisRef, carrier: &Carrier, out: &str) -> &'static str {
         // The score contraction of an online-softmax coupling is computed
         // in-body (FlashAttention's QKᵀ): the leaves the coupled max reads.
         let in_body: Vec<usize> = carrier
@@ -1101,15 +1034,8 @@ impl Partitioner<'_> {
             // A carrier's leaf list intentionally omits structural nodes, so
             // its flat alias table cannot represent a split followed by a
             // flatten. Walking the path preserves that affine provenance.
-            let local_axes = stream_provenance
-                .get(&Arc::as_ptr(leaf))
-                .cloned()
-                .unwrap_or_default();
-            let local_axes = if local_axes.is_empty() {
-                vec![axis]
-            } else {
-                local_axes
-            };
+            let local_axes = stream_provenance.get(&Arc::as_ptr(leaf)).cloned().unwrap_or_default();
+            let local_axes = if local_axes.is_empty() { vec![axis] } else { local_axes };
             p.leaf_cuts(leaf, &local_axes, &pricing, &mut cuts);
             for c in cuts {
                 p.cut(&c);
@@ -1127,10 +1053,7 @@ impl Partitioner<'_> {
         // activation rather than as unrelated producer kernels.
         let mut structural_cuts = Vec::new();
         if let NodeKind::Reduce { src, .. } = node.as_ref()
-            && matches!(
-                src.as_ref(),
-                NodeKind::View { .. } | NodeKind::Reindex { .. }
-            )
+            && matches!(src.as_ref(), NodeKind::View { .. } | NodeKind::Reindex { .. })
         {
             self.leaf_cuts(src, &[axis], &pricing, &mut structural_cuts);
             for cut in &structural_cuts {
@@ -1150,10 +1073,7 @@ impl Partitioner<'_> {
             // already a live buffer (a logits GEMM demanded as an output, then
             // re-folded by a cross-entropy's logsumexp), reading it is strictly
             // cheaper — recomputing it is the cost-blind cut. Read it instead.
-            if in_body.contains(&idx)
-                && is_contraction(leaf)
-                && !self.done.contains_key(&Arc::as_ptr(leaf))
-            {
+            if in_body.contains(&idx) && is_contraction(leaf) && !self.done.contains_key(&Arc::as_ptr(leaf)) {
                 // Fuse the contraction in-body; cut its operands WHOLE. An
                 // in-body operand is re-read on every step of the streamed
                 // axis, so arithmetic left inline would be recomputed per
@@ -1217,23 +1137,12 @@ impl Partitioner<'_> {
                 // fusion. Each retry removes one Div, so the recursion
                 // terminates.
                 if let Some(div) = smallest_div(&cut_graph) {
-                    let probe = ir::input("«div»", div.shape(), Dtype::F32);
-                    let remainder = replace_many(
-                        &cut_graph,
-                        &[(div.clone(), probe)],
-                        &mut HashMap::new(),
-                    );
-                    let alt_axis = relocate_axis(&cut_graph, &remainder, cut_axis, &c2.aliases)
-                        .unwrap_or(cut_axis);
-                    if let Ok(alt_carrier) =
-                        derive_with_structure_cache(&remainder, alt_axis, &mut self.structures)
-                        && let Some(alt) = plan_axis_emitted(
-                            &remainder,
-                            alt_axis,
-                            &alt_carrier,
-                            self.dev,
-                            &mut self.plan_groups,
-                        )
+                    let probe = ir::input("«div»", div.shape(), self.dev.storage);
+                    let remainder = replace_many(&cut_graph, &[(div.clone(), probe)], &mut HashMap::new());
+                    let alt_axis = relocate_axis(&cut_graph, &remainder, cut_axis, &c2.aliases).unwrap_or(cut_axis);
+                    if let Ok(alt_carrier) = derive_with_structure_cache(&remainder, alt_axis, &mut self.structures)
+                        && let Some(alt) =
+                            plan_axis_emitted(&remainder, alt_axis, &alt_carrier, self.dev, &mut self.plan_groups)
                     {
                         let dev = self.dev;
                         let div_floor = count_issue_ops(&div) / dev.peak_flops
@@ -1246,17 +1155,17 @@ impl Partitioner<'_> {
                                 spec.cost,
                                 alt.cost,
                                 div_floor,
-                                if alt.cost + div_floor < spec.cost { "CUT" } else { "keep" }
+                                if alt.cost + div_floor < spec.cost {
+                                    "CUT"
+                                } else {
+                                    "keep"
+                                }
                             );
                         }
                         if alt.cost + div_floor < spec.cost {
                             self.cut(&div);
                             let spliced = self.splice(&div, false);
-                            let rebuilt = replace_many(
-                                &cut_graph,
-                                &[(div, spliced)],
-                                &mut HashMap::new(),
-                            );
+                            let rebuilt = replace_many(&cut_graph, &[(div, spliced)], &mut HashMap::new());
                             return self.emit(&rebuilt, out);
                         }
                     }
@@ -1283,11 +1192,7 @@ impl Partitioner<'_> {
                 if let Some(div) = smallest_div(&cut_graph) {
                     self.cut(&div);
                     let spliced = self.splice(&div, false);
-                    let rebuilt = replace_many(
-                        &cut_graph,
-                        &[(div, spliced)],
-                        &mut HashMap::new(),
-                    );
+                    let rebuilt = replace_many(&cut_graph, &[(div, spliced)], &mut HashMap::new());
                     return self.emit(&rebuilt, out);
                 }
                 self.stages.push(Stage::Infeasible {
@@ -1310,11 +1215,7 @@ impl Partitioner<'_> {
         let mut frontier: Vec<Node> = Vec::new();
         self.cone(node, &mut ops, &mut frontier, true);
 
-        let complex: Vec<Node> = frontier
-            .iter()
-            .filter(|n| !is_free_source(n))
-            .cloned()
-            .collect();
+        let complex: Vec<Node> = frontier.iter().filter(|n| !is_free_source(n)).cloned().collect();
         let plain_inputs: Vec<&'static str> = frontier
             .iter()
             .filter_map(|n| match n.as_ref() {
@@ -1332,11 +1233,7 @@ impl Partitioner<'_> {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, p)| {
-                !self.shared(p)
-                    && !self.done.contains_key(&Arc::as_ptr(p))
-                    && p.shape() == node.shape()
-            })
+            .find(|(_, p)| !self.shared(p) && !self.done.contains_key(&Arc::as_ptr(p)) && p.shape() == node.shape())
             .map(|(i, _)| i);
         if let Some(hi) = host {
             let producer = complex[hi].clone();
@@ -1347,7 +1244,7 @@ impl Partitioner<'_> {
                 if i != hi {
                     let name = self.cut(p);
                     extra.push(name);
-                    let read = ir::input(name, p.shape(), Dtype::F32);
+                    let read = ir::input(name, p.shape(), self.dev.storage);
                     subs.push((p.clone(), read));
                 }
             }
@@ -1381,7 +1278,7 @@ impl Partitioner<'_> {
                 };
                 subs.push((
                     producer.clone(),
-                    ir::input(sentinel, producer.shape(), Dtype::F32),
+                    ir::input(sentinel, producer.shape(), self.dev.storage),
                 ));
                 let epi = replace_many(node, &subs, &mut HashMap::new());
                 spec.output_name = out.to_string();
@@ -1435,9 +1332,7 @@ impl Partitioner<'_> {
             // A shared map joins the cone when its op is cheap — each
             // consumer recomputes a few ALU ops instead of forcing a
             // materialized stage. Shared transcendentals stay barriers.
-            NodeKind::Map { op, inputs }
-                if top || (live && (!self.shared(node) || cheap_op(*op))) =>
-            {
+            NodeKind::Map { op, inputs } if top || (live && (!self.shared(node) || cheap_op(*op))) => {
                 if !ops.contains(&op.name()) {
                     ops.push(op.name());
                 }
@@ -1494,12 +1389,7 @@ fn view_is_contiguous(src: &Node, dims: &[ir::ViewDim]) -> bool {
 /// rebuild. This is the compiler equivalent of source locations through an
 /// AST rewrite: identities are ephemeral, so a pass explicitly relocates the
 /// occurrence instead of storing a permanent node id or comparing labels.
-fn relocate_axis(
-    old: &Node,
-    new: &Node,
-    target: AxisRef,
-    aliases: &HashMap<AxisRef, AxisRef>,
-) -> Option<AxisRef> {
+fn relocate_axis(old: &Node, new: &Node, target: AxisRef, aliases: &HashMap<AxisRef, AxisRef>) -> Option<AxisRef> {
     for (old_axis, new_axis) in ir::axis_refs(old).into_iter().zip(ir::axis_refs(new)) {
         if aliases.get(&old_axis).copied().unwrap_or(old_axis) == target {
             return Some(new_axis);
@@ -1511,13 +1401,10 @@ fn relocate_axis(
         | (NodeKind::Reduce { src: a, .. }, NodeKind::Reduce { src: b, .. })
         | (NodeKind::Scan { src: a, .. }, NodeKind::Scan { src: b, .. })
         | (NodeKind::View { src: a, .. }, NodeKind::View { src: b, .. })
-        | (NodeKind::Reindex { src: a, .. }, NodeKind::Reindex { src: b, .. }) => {
-            relocate_axis(a, b, target, aliases)
+        | (NodeKind::Reindex { src: a, .. }, NodeKind::Reindex { src: b, .. }) => relocate_axis(a, b, target, aliases),
+        (NodeKind::Map { inputs: a, .. }, NodeKind::Map { inputs: b, .. }) => {
+            a.iter().zip(b).find_map(|(a, b)| relocate_axis(a, b, target, aliases))
         }
-        (NodeKind::Map { inputs: a, .. }, NodeKind::Map { inputs: b, .. }) => a
-            .iter()
-            .zip(b)
-            .find_map(|(a, b)| relocate_axis(a, b, target, aliases)),
         (
             NodeKind::Gather {
                 src: asrc,
@@ -1529,8 +1416,7 @@ fn relocate_axis(
                 index: bindex,
                 ..
             },
-        ) => relocate_axis(asrc, bsrc, target, aliases)
-            .or_else(|| relocate_axis(aindex, bindex, target, aliases)),
+        ) => relocate_axis(asrc, bsrc, target, aliases).or_else(|| relocate_axis(aindex, bindex, target, aliases)),
         _ => None,
     }
 }
@@ -1651,9 +1537,7 @@ fn nearest_fold_axes(node: &Node, done: &HashMap<*const NodeKind, &'static str>)
     ) {
         if depth > *nearest
             || (depth > 0 && done.contains_key(&Arc::as_ptr(node)))
-            || seen
-                .get(&Arc::as_ptr(node))
-                .is_some_and(|previous| *previous <= depth)
+            || seen.get(&Arc::as_ptr(node)).is_some_and(|previous| *previous <= depth)
         {
             return;
         }
@@ -1692,20 +1576,14 @@ fn nearest_fold_axes(node: &Node, done: &HashMap<*const NodeKind, &'static str>)
 }
 
 fn map_input_axes(node: &Node, input: &Node, axes: &[AxisRef]) -> Vec<AxisRef> {
-    axes.iter()
-        .map(|&axis| ir::map_input_axis(node, input, axis))
-        .collect()
+    axes.iter().map(|&axis| ir::map_input_axis(node, input, axis)).collect()
 }
 
 /// Translate a root stream to local occurrences at the requested leaves. This
 /// retains structural provenance that is absent from a carrier's flattened
 /// leaf list without walking into the producer history below the fusion
 /// boundary.
-fn stream_provenance(
-    root: &Node,
-    axes: &[AxisRef],
-    leaves: &[Node],
-) -> HashMap<*const NodeKind, Vec<AxisRef>> {
+fn stream_provenance(root: &Node, axes: &[AxisRef], leaves: &[Node]) -> HashMap<*const NodeKind, Vec<AxisRef>> {
     fn walk(
         node: &Node,
         axes: &[AxisRef],
@@ -1729,9 +1607,9 @@ fn stream_provenance(
         }
         match node.as_ref() {
             NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Coordinate { src, .. }
-            | NodeKind::Reduce { src, .. }
-            | NodeKind::Scan { src, .. } => walk(src, axes, leaves, local_axes, seen, resolver),
+            NodeKind::Coordinate { src, .. } | NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
+                walk(src, axes, leaves, local_axes, seen, resolver)
+            }
             NodeKind::Map { inputs, .. } => {
                 for input in inputs {
                     let input_axes = axes
@@ -1843,27 +1721,15 @@ fn smallest_div(node: &Node) -> Option<Node> {
     fn is_site(node: &Node) -> bool {
         match node.as_ref() {
             NodeKind::Map { op: MapOp::Div, .. } => true,
-            NodeKind::Map {
-                op: MapOp::Mul,
-                inputs,
-            } => inputs.iter().any(|i| {
-                matches!(
-                    i.as_ref(),
-                    NodeKind::Map {
-                        op: MapOp::Recip,
-                        ..
-                    }
-                )
-            }),
+            NodeKind::Map { op: MapOp::Mul, inputs } => inputs
+                .iter()
+                .any(|i| matches!(i.as_ref(), NodeKind::Map { op: MapOp::Recip, .. })),
             _ => false,
         }
     }
     fn walk(node: &Node, best: &mut Option<(f64, Node)>) {
         match node.as_ref() {
-            NodeKind::Input { .. }
-            | NodeKind::Const { .. }
-            | NodeKind::Iota { .. }
-            | NodeKind::Coordinate { .. } => {}
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
             NodeKind::Map { inputs, .. } => {
                 if is_site(node) {
                     let vol: f64 = node.shape().iter().map(|a| a.extent() as f64).product();
@@ -1894,10 +1760,7 @@ fn smallest_div(node: &Node) -> Option<Node> {
 /// index value — never something to materialize.
 fn is_free_source(node: &Node) -> bool {
     match node.as_ref() {
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => true,
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => true,
         NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => is_free_source(src),
         _ => false,
     }
@@ -1920,11 +1783,7 @@ fn is_contraction(node: &Node) -> bool {
 /// whose children came out unchanged collapses onto the ORIGINAL node — and
 /// two consumers substituting the same reads rebuild the SAME spine, which
 /// is what lets `done` deduplicate their cuts.
-fn replace_many(
-    node: &Node,
-    subs: &[(Node, Node)],
-    memo: &mut HashMap<*const NodeKind, Node>,
-) -> Node {
+fn replace_many(node: &Node, subs: &[(Node, Node)], memo: &mut HashMap<*const NodeKind, Node>) -> Node {
     if let Some((_, with)) = subs.iter().find(|(t, _)| Arc::ptr_eq(t, node)) {
         return with.clone();
     }
@@ -1934,41 +1793,22 @@ fn replace_many(
     }
     let rebuilt = match node.as_ref() {
         NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => node.clone(),
-        NodeKind::Coordinate { src, dim } => {
-            crate::ir::coordinate(replace_many(src, subs, memo), *dim)
+        NodeKind::Coordinate { src, dim } => crate::ir::coordinate(replace_many(src, subs, memo), *dim),
+        NodeKind::Map { op, inputs } => {
+            crate::ir::map(*op, inputs.iter().map(|i| replace_many(i, subs, memo)).collect())
         }
-        NodeKind::Map { op, inputs } => crate::ir::map(
-            *op,
-            inputs
-                .iter()
-                .map(|i| replace_many(i, subs, memo))
-                .collect(),
-        ),
-        NodeKind::Reduce { src, dim, op } => {
-            crate::ir::reduce(replace_many(src, subs, memo), *dim, *op)
+        NodeKind::Reduce { src, dim, op } => crate::ir::reduce(replace_many(src, subs, memo), *dim, *op),
+        NodeKind::Scan { src, dim, op } => crate::ir::scan(replace_many(src, subs, memo), *dim, *op),
+        NodeKind::Gather { src, index, dim } => {
+            crate::ir::gather(replace_many(src, subs, memo), replace_many(index, subs, memo), *dim)
         }
-        NodeKind::Scan { src, dim, op } => {
-            crate::ir::scan(replace_many(src, subs, memo), *dim, *op)
-        }
-        NodeKind::Gather { src, index, dim } => crate::ir::gather(
-            replace_many(src, subs, memo),
-            replace_many(index, subs, memo),
-            *dim,
-        ),
-        NodeKind::View { src, dims } => {
-            crate::ir::positional_view(replace_many(src, subs, memo), dims.clone())
-        }
+        NodeKind::View { src, dims } => crate::ir::positional_view(replace_many(src, subs, memo), dims.clone()),
         NodeKind::Reindex {
             src,
             shape,
             map,
             padded,
-        } => crate::ir::positional_reindex(
-            replace_many(src, subs, memo),
-            shape.clone(),
-            map.clone(),
-            *padded,
-        ),
+        } => crate::ir::positional_reindex(replace_many(src, subs, memo), shape.clone(), map.clone(), *padded),
     };
     memo.insert(key, rebuilt.clone());
     rebuilt
@@ -1984,8 +1824,7 @@ impl Schedule {
     /// and each entry carries its node and axis, so the probe can be pointed
     /// at any bucket next.
     pub fn decline_census(&self) -> String {
-        let mut buckets: std::collections::BTreeMap<&'static str, Vec<&Decline>> =
-            std::collections::BTreeMap::new();
+        let mut buckets: std::collections::BTreeMap<&'static str, Vec<&Decline>> = std::collections::BTreeMap::new();
         for d in &self.declines {
             buckets.entry(d.rule).or_default().push(d);
         }
@@ -2029,10 +1868,7 @@ impl Schedule {
     pub fn execute(&self, inputs: &Env) -> Value {
         let mut env: Env = inputs.clone();
         self.execute_env(&mut env);
-        let name = self
-            .outputs
-            .last()
-            .expect("cannot execute a schedule with no outputs");
+        let name = self.outputs.last().expect("cannot execute a schedule with no outputs");
         env.remove(name.as_str())
             .expect("schedule produced no tensor under its output name")
     }
@@ -2125,22 +1961,13 @@ impl Schedule {
                     Stage::Fallback { .. } => "fallback",
                     Stage::Infeasible { .. } => unreachable!(),
                 };
-                timings.push((
-                    name,
-                    kind,
-                    tensor.data.len(),
-                    started.elapsed().as_secs_f64(),
-                ));
+                timings.push((name, kind, tensor.data.len(), started.elapsed().as_secs_f64()));
             }
             env.insert(name, tensor);
         }
         if !timings.is_empty() {
             let total = timings.iter().map(|(_, _, _, s)| s).sum::<f64>().max(1e-12);
-            let slowest = timings
-                .iter()
-                .map(|(_, _, _, s)| *s)
-                .fold(0.0, f64::max)
-                .max(1e-12);
+            let slowest = timings.iter().map(|(_, _, _, s)| *s).fold(0.0, f64::max).max(1e-12);
             for (index, (name, kind, elements, seconds)) in timings.iter().enumerate() {
                 eprintln!(
                     "*** interp {index:4} {name:<12} {kind:<6} {:7.0}us {} {:4.1}%  {elements:>8} elems",
@@ -2149,11 +1976,7 @@ impl Schedule {
                     100.0 * seconds / total,
                 );
             }
-            eprintln!(
-                "*** interp step: {} stages {:.2}ms",
-                timings.len(),
-                total * 1e3,
-            );
+            eprintln!("*** interp step: {} stages {:.2}ms", timings.len(), total * 1e3,);
         }
     }
 
@@ -2171,11 +1994,7 @@ impl Schedule {
                     let epi = if epilogue.is_empty() {
                         String::new()
                     } else {
-                        format!(
-                            "  + epilogue {}({})",
-                            epilogue.join("·"),
-                            epilogue_inputs.join(", ")
-                        )
+                        format!("  + epilogue {}({})", epilogue.join("·"), epilogue_inputs.join(", "))
                     };
                     format!(
                         "{:<4} = fold `{}`({})  [{} slots: {}]{}",
@@ -2188,21 +2007,10 @@ impl Schedule {
                     )
                 }
                 Stage::Elementwise {
-                    ops,
-                    inputs,
-                    output,
-                    ..
-                } => format!(
-                    "{:<4} = map {}({})",
-                    output,
-                    ops.join("·"),
-                    inputs.join(", ")
-                ),
+                    ops, inputs, output, ..
+                } => format!("{:<4} = map {}({})", output, ops.join("·"), inputs.join(", ")),
                 Stage::Gather {
-                    axis,
-                    inputs,
-                    output,
-                    ..
+                    axis, inputs, output, ..
                 } => format!(
                     "{:<4} = gather over `{}`({})   [OPAQUE — indexed load]",
                     output,
@@ -2210,10 +2018,7 @@ impl Schedule {
                     inputs.join(", ")
                 ),
                 Stage::Fallback {
-                    axis,
-                    inputs,
-                    output,
-                    ..
+                    axis, inputs, output, ..
                 } => format!(
                     "{:<4} = scalar fold over `{}`({})   [carrier unavailable]",
                     output,
@@ -2263,11 +2068,7 @@ impl Schedule {
                     let epi = if epilogue.is_empty() {
                         String::new()
                     } else {
-                        format!(
-                            "  ▸then {}({})",
-                            epilogue.join("·"),
-                            epilogue_inputs.join(", ")
-                        )
+                        format!("  ▸then {}({})", epilogue.join("·"), epilogue_inputs.join(", "))
                     };
                     eprintln!(
                         "  [{i:>3}] {:<12} = fold `{}` [{}]  ⇐  {}{}",
@@ -2280,10 +2081,7 @@ impl Schedule {
                     eprintln!("        reads {}", spec.input_names.join(", "));
                 }
                 Stage::Elementwise {
-                    output,
-                    exec,
-                    inputs,
-                    ..
+                    output, exec, inputs, ..
                 } => {
                     let mut ops = Vec::new();
                     collect_ops(exec, &mut ops);
@@ -2291,10 +2089,7 @@ impl Schedule {
                     eprintln!("        reads {}", inputs.join(", "));
                 }
                 Stage::Gather {
-                    output,
-                    axis,
-                    inputs,
-                    ..
+                    output, axis, inputs, ..
                 } => {
                     eprintln!(
                         "  [{i:>3}] {output:<12} = gather `{}`   reads {}",
@@ -2303,10 +2098,7 @@ impl Schedule {
                     );
                 }
                 Stage::Fallback {
-                    output,
-                    axis,
-                    inputs,
-                    ..
+                    output, axis, inputs, ..
                 } => {
                     eprintln!(
                         "  [{i:>3}] {output:<12} = fallback fold over `{}`   reads {}",
@@ -2315,10 +2107,7 @@ impl Schedule {
                     );
                 }
                 Stage::Infeasible { output, axis, why } => {
-                    eprintln!(
-                        "  [{i:>3}] {output:<12} = fold `{}` — INFEASIBLE: {why}",
-                        axis.name
-                    );
+                    eprintln!("  [{i:>3}] {output:<12} = fold `{}` — INFEASIBLE: {why}", axis.name);
                 }
             }
         }
@@ -2333,10 +2122,7 @@ impl Schedule {
 /// are the fusion boundary, not ops.
 fn collect_ops(node: &Node, out: &mut Vec<String>) {
     match node.as_ref() {
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => {}
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
         NodeKind::Map { op, inputs } => {
             out.push(format!("{op:?}"));
             inputs.iter().for_each(|i| collect_ops(i, out));
@@ -2377,13 +2163,7 @@ fn op_bag(ops: &[String]) -> String {
         }
     }
     bag.iter()
-        .map(|(k, n)| {
-            if *n > 1 {
-                format!("{k}×{n}")
-            } else {
-                k.clone()
-            }
-        })
+        .map(|(k, n)| if *n > 1 { format!("{k}×{n}") } else { k.clone() })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2411,8 +2191,7 @@ mod tests {
 
         let stream = source_axis(&diamond, 0);
         assert_eq!(
-            stream_provenance(&diamond, &[stream], std::slice::from_ref(&source))
-                [&Arc::as_ptr(&source)],
+            stream_provenance(&diamond, &[stream], std::slice::from_ref(&source))[&Arc::as_ptr(&source)],
             vec![stream]
         );
         assert_eq!(input_dtypes(&diamond), vec![("X", Dtype::F32)]);
@@ -2447,12 +2226,7 @@ mod tests {
     // is exactly the regression this pins.
     #[test]
     fn decanonicalized_gemm_simplifies_to_the_canonical_schedule() {
-        let (s, k, d, e) = (
-            axis("s", 1024),
-            axis("k", 1024),
-            axis("d", 64),
-            axis("e", 64),
-        );
+        let (s, k, d, e) = (axis("s", 1024), axis("k", 1024), axis("d", 64), axis("e", 64));
         let q = input("Q", [s, d], Dtype::F32);
         let kk = input("K", [k, d], Dtype::F32);
         let v = input("V", [k, e], Dtype::F32);
@@ -2463,11 +2237,7 @@ mod tests {
             map(
                 MapOp::Mul,
                 vec![
-                    reduce(
-                        map(MapOp::Mul, vec![q.clone(), kk.clone()]),
-                        2usize,
-                        add_r(),
-                    ),
+                    reduce(map(MapOp::Mul, vec![q.clone(), kk.clone()]), 2usize, add_r()),
                     konst(0.125),
                 ],
             ),
@@ -2525,12 +2295,7 @@ mod tests {
     // Plain attention over raw tensors: nothing to cut → exactly one kernel.
     #[test]
     fn plain_attention_is_one_kernel() {
-        let (s, k, d, e) = (
-            axis("s", 1024),
-            axis("k", 1024),
-            axis("d", 64),
-            axis("e", 64),
-        );
+        let (s, k, d, e) = (axis("s", 1024), axis("k", 1024), axis("d", 64), axis("e", 64));
         let key = input("K", [k, d], Dtype::F32);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
@@ -2570,18 +2335,12 @@ mod tests {
         let query_stream = axis_refs(&x_q)[1];
         let kv_stream = axis_refs(&x_kv)[1];
         let key_axis = axis_refs(&x_kv)[0];
-        let q = matmul(
-            x_q,
-            transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize),
-        ); // [s, dq]
+        let q = matmul(x_q, transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize)); // [s, dq]
         let kk = matmul(
             x_kv.clone(),
             transpose(input("Wk", [dq, dm], Dtype::F32), 0usize, 1usize),
         ); // [k, dq]
-        let v = matmul(
-            x_kv,
-            transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
-        ); // [k, dv]
+        let v = matmul(x_kv, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [k, dv]
 
         let scores = matmul(q, transpose(kk, 0usize, 1usize));
         let out = matmul(softmax(scores, 1usize), v);
@@ -2590,10 +2349,7 @@ mod tests {
 
         // 3 GEMM producers + 1 flash kernel, producers first.
         assert_eq!(sched.stages.len(), 4);
-        for (st, expected) in sched.stages[..3]
-            .iter()
-            .zip([query_stream, kv_stream, kv_stream])
-        {
+        for (st, expected) in sched.stages[..3].iter().zip([query_stream, kv_stream, kv_stream]) {
             let Stage::Fused { spec, .. } = st else {
                 panic!("producers are fused folds")
             };
@@ -2607,13 +2363,7 @@ mod tests {
         assert_eq!(spec.streaming_axis.name, key_axis.name);
         assert_eq!(spec.carrier.slots, 3, "flash fold survives the cuts");
         // its inputs are the materialized intermediates
-        assert!(
-            spec.input_names
-                .iter()
-                .filter(|n| n.starts_with('t'))
-                .count()
-                >= 3
-        );
+        assert!(spec.input_names.iter().filter(|n| n.starts_with('t')).count() >= 3);
     }
 
     // RMSNorm with *runtime* scalar inputs splits into a sum-of-squares fold
@@ -2631,19 +2381,14 @@ mod tests {
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, inv_d]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
-        let norm = map(
-            MapOp::Div,
-            vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-        );
+        let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
 
         let sched = partition(&norm, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 2);
-        assert!(
-            matches!(&sched.stages[0], Stage::Fused { spec, epilogue, .. }
+        assert!(matches!(&sched.stages[0], Stage::Fused { spec, epilogue, .. }
             if spec.streaming_axis == stream
                 && spec.carrier.slots == 1
-                && epilogue.contains(&"sqrt"))
-        );
+                && epilogue.contains(&"sqrt")));
         assert!(matches!(&sched.stages[1], Stage::Elementwise { ops, .. }
             if ops.contains(&"div")));
     }
@@ -2659,14 +2404,8 @@ mod tests {
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-        let norm = map(
-            MapOp::Div,
-            vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-        );
-        let proj = matmul(
-            norm,
-            transpose(input("W", [f, d], Dtype::F32), 0usize, 1usize),
-        );
+        let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
+        let proj = matmul(norm, transpose(input("W", [f, d], Dtype::F32), 0usize, 1usize));
 
         let sched = partition(&proj, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "norm + GEMM = one kernel");
@@ -2693,10 +2432,7 @@ mod tests {
             MapOp::Mul,
             vec![sum_square.clone(), konst(1.0 / hidden.extent() as f64)],
         );
-        let denominator = map(
-            MapOp::Sqrt,
-            vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])],
-        );
+        let denominator = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean_square, konst(1e-5)])]);
         let norm = map(
             MapOp::Div,
             vec![
@@ -2773,21 +2509,12 @@ mod tests {
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-        let norm = map(
-            MapOp::Div,
-            vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-        );
-        let head = matmul(
-            norm,
-            transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize),
-        );
+        let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
+        let head = matmul(norm, transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize));
 
         let sched = partition(&head, &DeviceProfile::m1_pro());
         assert!(
-            !sched
-                .stages
-                .iter()
-                .any(|st| matches!(st, Stage::Infeasible { .. })),
+            !sched.stages.iter().any(|st| matches!(st, Stage::Infeasible { .. })),
             "the retry must find a feasible schedule, not report Infeasible"
         );
         let Stage::Fused { spec, .. } = sched.stages.last().unwrap() else {
@@ -2847,14 +2574,8 @@ mod tests {
     fn swiglu_activation_materializes_once_for_the_down_gemm() {
         let (s, dm, f) = (axis("s", 1024), axis("dm", 1024), axis("f", 4096));
         let x = input("Xn", [s, dm], Dtype::F32);
-        let gate = matmul(
-            x.clone(),
-            transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
-        ); // [s, f]
-        let up = matmul(
-            x,
-            transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
-        ); // [s, f]
+        let gate = matmul(x.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
+        let up = matmul(x, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let stream = axis_refs(&act)[1];
         let down = matmul(act, input("Wd", [f, dm], Dtype::F32));
@@ -2896,10 +2617,7 @@ mod tests {
         let sumexp = reduce(
             map(
                 MapOp::Exp,
-                vec![map(
-                    MapOp::Sub,
-                    vec![z.clone(), unsqueeze(m.clone(), 1usize)],
-                )],
+                vec![map(MapOp::Sub, vec![z.clone(), unsqueeze(m.clone(), 1usize)])],
             ),
             1usize,
             add_r(),
@@ -2963,10 +2681,7 @@ mod tests {
         };
         assert!(ops.contains(&"exp"), "the cone holds the silu: {ops:?}");
         assert!(ops.contains(&"mul"), "…and the gating multiply: {ops:?}");
-        let Stage::Fused {
-            spec, fold_node, ..
-        } = sched.stages.last().unwrap()
-        else {
+        let Stage::Fused { spec, fold_node, .. } = sched.stages.last().unwrap() else {
             panic!("last stage is the fused down fold")
         };
         assert_eq!(spec.streaming_axis.extent, stream.extent);
@@ -2980,10 +2695,7 @@ mod tests {
                 _ => false,
             }
         }
-        assert!(
-            !has_exp(fold_node),
-            "no exp recomputed in-body of the flattened fold"
-        );
+        assert!(!has_exp(fold_node), "no exp recomputed in-body of the flattened fold");
     }
 
     // When the sibling projections share their contraction axis, the whole
@@ -3002,21 +2714,12 @@ mod tests {
         );
         let x = input("Xn", [s, dm], Dtype::F32);
         let stream = axis_refs(&x)[1];
-        let gate = matmul(
-            x.clone(),
-            transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize),
-        ); // [s, f]
-        let up = matmul(
-            x,
-            transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize),
-        ); // [s, f]
+        let gate = matmul(x.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
+        let up = matmul(x, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let coupled = crate::derive::derive(&act, stream)
             .unwrap_or_else(|decline| panic!("shared activation did not derive: {decline:?}"));
-        assert!(
-            coupled.slots >= 2,
-            "both projections must share one carrier"
-        );
+        assert!(coupled.slots >= 2, "both projections must share one carrier");
         let xs = split(act, 1usize, gi, ri);
         let prod = map(
             MapOp::Mul,
@@ -3073,24 +2776,15 @@ mod tests {
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, inv]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
-        let xn = map(
-            MapOp::Div,
-            vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-        );
+        let xn = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
         let xn_t = rename(xn.clone(), 0usize, t); // the key/value view
 
-        let q = matmul(
-            xn,
-            transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize),
-        ); // [s, dq]
+        let q = matmul(xn, transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize)); // [s, dq]
         let k = matmul(
             xn_t.clone(),
             transpose(input("Wk", [dq, dm], Dtype::F32), 0usize, 1usize),
         ); // [t, dq]
-        let v = matmul(
-            xn_t,
-            transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
-        ); // [t, dv]
+        let v = matmul(xn_t, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [t, dv]
         let attn = matmul(softmax(matmul(q, transpose(k, 0usize, 1usize)), 1usize), v);
 
         let sched = partition(&attn, &DeviceProfile::toy());
@@ -3154,12 +2848,7 @@ mod tests {
     // lift: one kernel, no mask tensor, no mask traffic.
     #[test]
     fn computed_causal_mask_fuses_into_flash() {
-        let (s, t, dk, dv) = (
-            axis("s", 1024),
-            axis("t", 1024),
-            axis("dk", 64),
-            axis("dv", 64),
-        );
+        let (s, t, dk, dv) = (axis("s", 1024), axis("t", 1024), axis("dk", 64), axis("dv", 64));
         let scores = matmul(
             input("Q", [s, dk], Dtype::F32),
             transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
@@ -3178,10 +2867,6 @@ mod tests {
         };
         assert_eq!(spec.carrier.slots, 3);
         assert!(spec.carrier.rules.contains(&"fused-map"));
-        assert_eq!(
-            spec.input_names,
-            vec!["Q", "K", "V"],
-            "no mask tensor is read"
-        );
+        assert_eq!(spec.input_names, vec!["Q", "K", "V"], "no mask tensor is read");
     }
 }

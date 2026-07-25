@@ -30,15 +30,9 @@ fn scaled_dot_product_attention_uses_torch_layout_and_default_scale() {
     let cpu = CpuDevice::new();
     let program = output.compile(&cpu).unwrap();
     assert_eq!(program.kernel_count(), 1);
-    let q = cpu
-        .buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0])
-        .unwrap();
-    let k = cpu
-        .buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0])
-        .unwrap();
-    let v = cpu
-        .buffer([2, 2], Dtype::F32, [2.0, 3.0, 5.0, 7.0])
-        .unwrap();
+    let q = cpu.buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0]).unwrap();
+    let k = cpu.buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0]).unwrap();
+    let v = cpu.buffer([2, 2], Dtype::F32, [2.0, 3.0, 5.0, 7.0]).unwrap();
     let outputs = program.run([("q", q), ("k", k), ("v", v)]);
 
     let high = (1.0 / 2.0_f64.sqrt()).exp();
@@ -83,10 +77,7 @@ fn additive_mask_and_explicit_scale_match_torch_semantics() {
     let outputs = program.run([("q", q), ("k", k), ("v", v), ("mask", mask)]);
 
     let weight = 2.0_f64.exp() / (1.0 + 2.0_f64.exp());
-    assert_close(
-        outputs[0].data(),
-        &[10.0, 10.0 * (1.0 - weight) + 20.0 * weight],
-    );
+    assert_close(outputs[0].data(), &[10.0, 10.0 * (1.0 - weight) + 20.0 * weight]);
 }
 
 #[test]
@@ -109,12 +100,8 @@ fn causal_attention_uses_an_upper_left_mask_for_rectangular_inputs() {
     let cpu = CpuDevice::new();
     let program = output.compile(&cpu).unwrap();
     assert_eq!(program.kernel_count(), 1);
-    let q = cpu
-        .buffer([2, 2], Dtype::F32, [0.0, 0.0, 0.0, 0.0])
-        .unwrap();
-    let k = cpu
-        .buffer([3, 2], Dtype::F32, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        .unwrap();
+    let q = cpu.buffer([2, 2], Dtype::F32, [0.0, 0.0, 0.0, 0.0]).unwrap();
+    let k = cpu.buffer([3, 2], Dtype::F32, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap();
     let v = cpu.buffer([3, 1], Dtype::F32, [10.0, 20.0, 90.0]).unwrap();
     let outputs = program.run([("q", q), ("k", k), ("v", v)]);
 
@@ -140,9 +127,7 @@ fn enable_gqa_repeats_key_and_value_heads_like_torch() {
 
     let cpu = CpuDevice::new();
     let program = output.compile(&cpu).unwrap();
-    let q = cpu
-        .buffer([4, 1, 1], Dtype::F32, [1.0, 1.0, 1.0, 1.0])
-        .unwrap();
+    let q = cpu.buffer([4, 1, 1], Dtype::F32, [1.0, 1.0, 1.0, 1.0]).unwrap();
     let k = cpu.buffer([2, 1, 1], Dtype::F32, [1.0, 2.0]).unwrap();
     let v = cpu.buffer([2, 1, 1], Dtype::F32, [10.0, 20.0]).unwrap();
     let outputs = program.run([("q", q), ("k", k), ("v", v)]);

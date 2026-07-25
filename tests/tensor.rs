@@ -1,6 +1,4 @@
-use sanic::{
-    Compile, CompileError, CpuDevice, Dtype, MapOp, Monoid, RunError, axis, input, map, reduce,
-};
+use sanic::{Compile, CompileError, CpuDevice, Dtype, MapOp, Monoid, RunError, axis, input, map, reduce};
 
 fn add() -> Monoid {
     Monoid::Add
@@ -24,9 +22,7 @@ fn an_input_name_is_its_identity_within_the_compiled_roots() {
     let program = output.compile(&cpu).unwrap();
     assert_eq!(program.input_names().collect::<Vec<_>>(), ["x"]);
 
-    let x = cpu
-        .buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0])
-        .unwrap();
+    let x = cpu.buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
     let output = program.run([("x", &x)]);
     assert_eq!(output[0].data(), &[6.0, 14.0]);
 }

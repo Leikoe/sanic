@@ -17,14 +17,22 @@ pub struct DeviceProfile {
     pub peak_flops: f64,      // flop / second
     pub launch_overhead: f64, // seconds per kernel launch
     pub dtype_bytes: f64,
+    /// STORAGE precision at kernel boundaries: what a materialized
+    /// intermediate (and every output) is written as. One policy for the
+    /// whole schedule; kernels always accumulate wide in registers and
+    /// narrow only at the store. `dtype_bytes` follows it.
+    pub storage: crate::scalar::Dtype,
     /// Resident blocks needed to hide latency. Fewer than this and the kernel
     /// runs below peak (occupancy < 1).
     pub min_blocks: f64,
-    /// Total parallel lanes (blocks × lanes-per-block) needed to keep enough
-    /// loads in flight to saturate HBM. A 4-lane matvec cannot reach peak
-    /// bandwidth no matter how memory-bound it is; three fat flash blocks
-    /// can. This is what makes split reductions (GROUP) priceable.
-    pub mem_lanes: f64,
+    /// EFFECTIVE memory latency: the constant in Little's law. Sustained
+    /// bandwidth = bytes outstanding / latency, so a kernel saturates HBM
+    /// only when `lanes × bytes_in_flight_per_lane ≥ bandwidth × latency`.
+    /// A 4-lane matvec cannot reach peak no matter how memory-bound it is;
+    /// neither can 200k lanes holding one narrow load each. This is what
+    /// makes split reductions AND wide contiguous runs priceable. Fitted,
+    /// not read from a datasheet — it folds in queueing.
+    pub mem_latency_s: f64,
 }
 
 impl DeviceProfile {
@@ -37,16 +45,27 @@ impl DeviceProfile {
             peak_flops: 3.0e14,    // 300 TFLOP/s
             launch_overhead: 3.0e-6,
             dtype_bytes: 2.0,
+            storage: crate::scalar::Dtype::F32,
             min_blocks: 8.0,
-            mem_lanes: 2048.0,
+            // fitted so 4-byte-per-lane kernels keep the pre-Little's-law
+            // verdicts: 2048 lanes x 4 B saturate 2 TB/s.
+            mem_latency_s: 4.096e-9,
         }
+    }
+
+    /// The same device with a different boundary-storage precision; the
+    /// pricing width follows, so round trips get honestly cheaper.
+    pub fn with_storage(mut self, storage: crate::scalar::Dtype) -> Self {
+        self.storage = storage;
+        self.dtype_bytes = storage.bytes();
+        self
     }
 
     /// The Apple M1 Pro this repo measures on (16-core GPU, f32 compute).
     /// Two constants matter for schedule choice and are grounded in this
     /// machine's own measured kernels (weights/trinity_bench.log): the f32
     /// flop peak is ~60× below `toy`'s, so recompute-heavy folds really are
-    /// compute-bound here; and `mem_lanes` reflects that a 200k-lane scalar
+    /// compute-bound here; and `mem_latency_s` is fitted so that a 200k-lane scalar
     /// fold reaches the DRAM ceiling while a 2.3k-lane one reaches ~2% of
     /// it — saturation needs tens of thousands of scalar load streams.
     pub fn m1_pro() -> Self {
@@ -57,8 +76,11 @@ impl DeviceProfile {
             peak_flops: 5.0e12,    // 16 cores × 128 lanes × FMA × ~1.3 GHz
             launch_overhead: 2.0e-6,
             dtype_bytes: 4.0,
+            storage: crate::scalar::Dtype::F32,
             min_blocks: 32.0, // ~2 resident threadgroups per core to hide latency
-            mem_lanes: 32_768.0,
+            // fitted from this machine's own measured points (see above):
+            // 32768 lanes x 4 B / 200 GB/s = 655 ns effective.
+            mem_latency_s: 6.5536e-7,
         }
     }
 }
@@ -82,6 +104,12 @@ pub struct Kernel {
     /// with `parallel_blocks` this is the kernel's total memory-level
     /// parallelism — what decides whether HBM can be saturated.
     pub lanes_per_block: f64,
+    /// Bytes each lane keeps outstanding per loop iteration: storage width
+    /// of its streamed reads × independent loads in flight (a contiguous
+    /// `chunk` run counts every element). The other half of Little's law —
+    /// lane COUNT alone cannot distinguish one 2-byte load per lane from a
+    /// 16-byte run.
+    pub bytes_in_flight_per_lane: f64,
 }
 
 // ── feasibility ──────────────────────────────────────────────────────────────
@@ -103,14 +131,16 @@ pub fn occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
     (resident / dev.min_blocks).clamp(1.0 / 64.0, 1.0)
 }
 
-/// How much of peak HBM bandwidth the kernel's memory-level parallelism can
-/// sustain: total lanes against the device's saturation point. A fold with a
-/// tiny output grid (a matvec, a huge softmax denominator) cannot keep
-/// enough loads in flight — which is exactly why re-associating it into a
-/// split reduction pays even when it is memory-bound.
+/// How much of peak HBM bandwidth the kernel can sustain — Little's law:
+/// outstanding bytes over `bandwidth × latency`. A fold with a tiny output
+/// grid (a matvec, a huge softmax denominator) cannot keep enough bytes in
+/// flight — which is exactly why re-associating it into a split reduction
+/// pays even when it is memory-bound, and why a contiguous `chunk` run
+/// beats one narrow load per lane.
 pub fn mem_occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let lanes = (k.parallel_blocks * k.lanes_per_block).max(1.0);
-    (lanes / dev.mem_lanes).clamp(1.0 / 64.0, 1.0)
+    let outstanding = lanes * k.bytes_in_flight_per_lane.max(1.0);
+    (outstanding / (dev.hbm_bandwidth * dev.mem_latency_s)).clamp(1.0 / 64.0, 1.0)
 }
 
 /// Per-kernel time: the roofline (compute vs. bandwidth, whichever binds)
@@ -154,10 +184,7 @@ pub fn schedule_time(dev: &DeviceProfile, kernels: &[Kernel]) -> Option<f64> {
 
 /// Inner search: the cheapest feasible kernel from a family of candidates
 /// (typically one per tile size).
-pub fn best_tile<T>(
-    dev: &DeviceProfile,
-    candidates: impl IntoIterator<Item = (T, Kernel)>,
-) -> Option<(T, Kernel)> {
+pub fn best_tile<T>(dev: &DeviceProfile, candidates: impl IntoIterator<Item = (T, Kernel)>) -> Option<(T, Kernel)> {
     candidates
         .into_iter()
         .filter(|(_, k)| feasible(dev, k))
@@ -186,6 +213,7 @@ mod tests {
             regs_per_block: sram,
             parallel_blocks: blocks,
             lanes_per_block: 4096.0, // memory-parallel unless a test says otherwise
+            bytes_in_flight_per_lane: 4.0,
         }
     }
 

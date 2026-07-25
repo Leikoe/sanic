@@ -15,12 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use safetensors::SafeTensors;
-use sanic::nn::functional::scaled_dot_product_attention;
-use sanic::{
-    Axis, Compile, Dtype, MapOp, Monoid, Node, NodeRef, ViewDim, axis, coordinate, flatten, gather,
-    input, iota, konst, map, matmul, positional_reindex, positional_view, reduce, silu, split,
-    transpose,
-};
+use sanic::nn::ops::{attention, rms_norm, rope, update_cache};
+use sanic::{Axis, Dtype, Graph, Node, NodeRef, Tensor, axis};
 use tokenizers::Tokenizer;
 
 const EPS: f64 = 1e-5;
@@ -80,359 +76,110 @@ impl Axes {
     }
 }
 
-fn unary(op: MapOp, x: NodeRef) -> NodeRef {
-    map(op, vec![x])
+fn projection(x: &Tensor, name: String, input_dim: Axis, output_dim: Axis) -> Tensor {
+    let weight = Tensor::input(name, [output_dim, input_dim], Dtype::BF16);
+    x.matmul(weight.transpose(0usize, 1usize))
 }
 
-fn binary(op: MapOp, left: NodeRef, right: NodeRef) -> NodeRef {
-    map(op, vec![left, right])
-}
-
-fn add(left: NodeRef, right: NodeRef) -> NodeRef {
-    binary(MapOp::Add, left, right)
-}
-
-fn sub(left: NodeRef, right: NodeRef) -> NodeRef {
-    binary(MapOp::Sub, left, right)
-}
-
-fn mul(left: NodeRef, right: NodeRef) -> NodeRef {
-    binary(MapOp::Mul, left, right)
-}
-
-fn div(left: NodeRef, right: NodeRef) -> NodeRef {
-    binary(MapOp::Div, left, right)
-}
-
-fn unsqueeze(src: NodeRef, dim: usize) -> NodeRef {
-    let source = src.shape();
-    assert!(dim <= source.len());
-    let mut dims = Vec::with_capacity(source.len() + 1);
-    for output_dim in 0..=source.len() {
-        if output_dim == dim {
-            dims.push(ViewDim {
-                sources: Vec::new(),
-                axis: axis("singleton", 1),
-            });
-        } else {
-            let source_dim = if output_dim < dim {
-                output_dim
-            } else {
-                output_dim - 1
-            };
-            dims.push(ViewDim {
-                sources: vec![source_dim],
-                axis: source[source_dim],
-            });
-        }
-    }
-    positional_view(src, dims)
-}
-
-fn flip(src: NodeRef, dim: usize) -> NodeRef {
-    let shape = src.shape();
-    assert!(dim < shape.len());
-    let map = shape
-        .iter()
-        .enumerate()
-        .map(|(source_dim, source_axis)| {
-            if source_dim == dim {
-                (
-                    source_dim,
-                    vec![(-1, source_dim)],
-                    source_axis.extent() as i64 - 1,
-                )
-            } else {
-                (source_dim, vec![(1, source_dim)], 0)
-            }
-        })
-        .collect();
-    positional_reindex(src, shape, map, false)
-}
-
-fn rms_norm(x: NodeRef, weight: NodeRef, hidden_dim: usize) -> NodeRef {
-    let square = mul(x.clone(), x.clone());
-    let mean_square = mul(
-        reduce(square, -1isize, Monoid::Add),
-        konst(1.0 / hidden_dim as f64),
-    );
-    let denominator = unary(
-        MapOp::Sqrt,
-        add(unsqueeze(mean_square, x.shape().len() - 1), konst(EPS)),
-    );
-    div(mul(x, weight), denominator)
-}
-
-fn llama3_inv_freq(frequency: Axis) -> NodeRef {
-    let exponent = mul(
-        iota(frequency),
-        konst(-ROPE_THETA.ln() / frequency.extent() as f64),
-    );
-    let inv_freq = unary(MapOp::Exp, exponent);
-    let wave_length = div(konst(2.0 * std::f64::consts::PI), inv_freq.clone());
+/// Llama 3's long-context rope schedule: plain `θ^(-i/frequencies)` inverse
+/// frequencies, with low-frequency wavelengths scaled down and a smooth
+/// blend across the transition band. Model policy, so it lives here.
+fn llama3_inv_freq(frequency: Axis) -> Tensor {
+    let inv_freq = (Tensor::iota(frequency) * (-ROPE_THETA.ln() / frequency.extent() as f64)).exp();
+    let wave_length = 2.0 * std::f64::consts::PI / &inv_freq;
     let low_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_LOW_FREQ_FACTOR;
     let high_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_HIGH_FREQ_FACTOR;
-    let smooth = div(
-        sub(
-            div(konst(ROPE_ORIGINAL_CONTEXT), wave_length.clone()),
-            konst(ROPE_LOW_FREQ_FACTOR),
-        ),
-        konst(ROPE_HIGH_FREQ_FACTOR - ROPE_LOW_FREQ_FACTOR),
-    );
-    let scaled = div(inv_freq.clone(), konst(ROPE_FACTOR));
-    let blended = add(
-        mul(sub(konst(1.0), smooth.clone()), scaled.clone()),
-        mul(smooth, inv_freq.clone()),
-    );
-    map(
-        MapOp::Where,
-        vec![
-            binary(MapOp::Lt, konst(low_wave_length), wave_length.clone()),
-            scaled,
-            map(
-                MapOp::Where,
-                vec![
-                    binary(MapOp::Lt, wave_length, konst(high_wave_length)),
-                    inv_freq,
-                    blended,
-                ],
-            ),
-        ],
-    )
+    let smooth =
+        (ROPE_ORIGINAL_CONTEXT / &wave_length - ROPE_LOW_FREQ_FACTOR) / (ROPE_HIGH_FREQ_FACTOR - ROPE_LOW_FREQ_FACTOR);
+    let scaled = &inv_freq / ROPE_FACTOR;
+    let blended = (1.0 - &smooth) * &scaled + smooth * &inv_freq;
+    Tensor::scalar(low_wave_length)
+        .lt(&wave_length)
+        .select(scaled, wave_length.lt(high_wave_length).select(inv_freq, blended))
 }
 
-fn rope_at(x: NodeRef, position: NodeRef, sequence: Axis, head_dim: Axis) -> NodeRef {
-    let pair = axis("rope_pair", 2);
-    let frequency = axis("rope_frequency", head_dim.extent() / 2);
-    let x = split(x, -1isize, pair, frequency);
-
-    let position = add(mul(iota(sequence), konst(0.0)), position);
-    let position = unsqueeze(position, 1);
-    let angle = unsqueeze(mul(position, llama3_inv_freq(frequency)), 1);
-    let sign = unsqueeze(sub(mul(iota(pair), konst(2.0)), konst(1.0)), 1);
-    let rotated = mul(flip(x.clone(), x.shape().len() - 2), sign);
-    let result = add(
-        mul(x, unary(MapOp::Cos, angle.clone())),
-        mul(rotated, unary(MapOp::Sin, angle)),
-    );
-    let rank = result.shape().len();
-    flatten(result, &[rank - 2, rank - 1][..], head_dim)
-}
-
-fn update_cache(cache: NodeRef, current: NodeRef, position: NodeRef) -> NodeRef {
-    let cache_index = coordinate(cache.clone(), 1usize);
-    let at_position = mul(
-        binary(
-            MapOp::Lt,
-            cache_index.clone(),
-            add(position.clone(), konst(1.0)),
-        ),
-        binary(MapOp::Lt, position, add(cache_index, konst(1.0))),
-    );
-    map(MapOp::Where, vec![at_position, current, cache])
-}
-
-fn projection(x: NodeRef, name: String, input_dim: Axis, output_dim: Axis) -> NodeRef {
-    let checkpoint_weight = input(name, [output_dim, input_dim], Dtype::BF16);
-    matmul(x, transpose(checkpoint_weight, 0usize, 1usize))
-}
-
-struct DecodeBlock {
-    x: NodeRef,
-    key_cache: NodeRef,
-    value_cache: NodeRef,
-}
-
+/// One decoder layer. Cache state is declared on `graph`; the layer reads
+/// its updated value (this step's row is visible to this step's attention)
+/// and the declaration carries it to the next step.
 fn decode_block(
+    graph: &mut Graph,
     axes: &Axes,
     cache_sequence: Axis,
     layer: usize,
-    x: NodeRef,
-    position: NodeRef,
-) -> DecodeBlock {
+    x: Tensor,
+    position: &Tensor,
+    cache_dtype: Dtype,
+) -> Tensor {
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
-    let attn_input = rms_norm(
-        x.clone(),
-        input(name("input_layernorm.weight"), [axes.hidden], Dtype::BF16),
-        axes.hidden.extent(),
-    );
+    let norm_weight = |name: String| Tensor::input(name, [axes.hidden], Dtype::BF16);
+    let attn_input = rms_norm(&x, &norm_weight(name("input_layernorm.weight")), EPS);
 
-    let query_projection = axis(
-        "query_projection",
-        axes.query_heads.extent() * axes.head_dim.extent(),
-    );
+    let query_projection = axis("query_projection", axes.query_heads.extent() * axes.head_dim.extent());
+    let kv_projection = axis("kv_projection", axes.kv_heads.extent() * axes.head_dim.extent());
+
     let q = projection(
-        attn_input.clone(),
+        &attn_input,
         name("self_attn.q_proj.weight"),
         axes.hidden,
         query_projection,
-    );
-    let q = split(q, -1isize, axes.query_heads, axes.head_dim);
-    let q = rope_at(
-        transpose(q, 0usize, 1usize),
-        position.clone(),
-        axes.sequence,
-        axes.head_dim,
-    );
+    )
+    .split(-1isize, axes.query_heads, axes.head_dim)
+    .transpose(0usize, 1usize);
+    let q = rope(&q, position, axes.sequence, axes.head_dim, llama3_inv_freq);
 
-    let kv_projection = axis(
-        "kv_projection",
-        axes.kv_heads.extent() * axes.head_dim.extent(),
-    );
-    let k = projection(
-        attn_input.clone(),
-        name("self_attn.k_proj.weight"),
-        axes.hidden,
-        kv_projection,
-    );
-    let k = split(k, -1isize, axes.kv_heads, axes.head_dim);
-    let k = rope_at(
-        transpose(k, 0usize, 1usize),
-        position.clone(),
-        axes.sequence,
-        axes.head_dim,
-    );
+    let k = projection(&attn_input, name("self_attn.k_proj.weight"), axes.hidden, kv_projection)
+        .split(-1isize, axes.kv_heads, axes.head_dim)
+        .transpose(0usize, 1usize);
+    let k = rope(&k, position, axes.sequence, axes.head_dim, llama3_inv_freq);
 
-    let v = projection(
-        attn_input,
-        name("self_attn.v_proj.weight"),
-        axes.hidden,
-        kv_projection,
-    );
-    let v = transpose(
-        split(v, -1isize, axes.kv_heads, axes.head_dim),
-        0usize,
-        1usize,
-    );
+    let v = projection(&attn_input, name("self_attn.v_proj.weight"), axes.hidden, kv_projection)
+        .split(-1isize, axes.kv_heads, axes.head_dim)
+        .transpose(0usize, 1usize);
 
-    let key_name = format!("cache.{layer}.key");
-    let value_name = format!("cache.{layer}.value");
-    let key_cache = update_cache(
-        input(
-            key_name,
-            [axes.kv_heads, cache_sequence, axes.head_dim],
-            Dtype::F32,
-        ),
-        k,
-        position.clone(),
-    );
-    let value_cache = update_cache(
-        input(
-            value_name,
-            [axes.kv_heads, cache_sequence, axes.head_dim],
-            Dtype::F32,
-        ),
-        v,
-        position.clone(),
-    );
+    let cache_shape = [axes.kv_heads, cache_sequence, axes.head_dim];
+    let key_state = graph.state(format!("cache.{layer}.key"), cache_shape, cache_dtype);
+    let key_cache = update_cache(&key_state, &k, position);
+    graph.update(&key_state, key_cache.clone());
+    let value_state = graph.state(format!("cache.{layer}.value"), cache_shape, cache_dtype);
+    let value_cache = update_cache(&value_state, &v, position);
+    graph.update(&value_state, value_cache.clone());
 
-    let visible = binary(
-        MapOp::Lt,
-        iota(cache_sequence),
-        add(position.clone(), konst(1.0)),
-    );
-    let mask = map(
-        MapOp::Where,
-        vec![visible, konst(0.0), konst(f64::NEG_INFINITY)],
-    );
-    let attention = scaled_dot_product_attention(
-        q,
-        key_cache.clone(),
-        value_cache.clone(),
-        Some(mask),
-        0.0,
-        false,
-        None,
-        true,
-    );
-    let attention = transpose(attention, 0usize, 1usize);
-    let attention = flatten(attention, &[1usize, 2usize][..], axes.hidden);
-    let attention = projection(
-        attention,
-        name("self_attn.o_proj.weight"),
-        axes.hidden,
-        axes.hidden,
-    );
-    let residual = add(x, attention);
+    let visible = Tensor::iota(cache_sequence).lt(position + 1.0);
+    let mask = visible.select(0.0, f64::NEG_INFINITY);
+    let attended = attention(&q, &key_cache, &value_cache, Some(&mask), None, true)
+        .transpose(0usize, 1usize)
+        .flatten(&[1usize, 2usize][..], axes.hidden);
+    let attended = projection(&attended, name("self_attn.o_proj.weight"), axes.hidden, axes.hidden);
+    let residual = x + attended;
 
-    let mlp_input = rms_norm(
-        residual.clone(),
-        input(
-            name("post_attention_layernorm.weight"),
-            [axes.hidden],
-            Dtype::BF16,
-        ),
-        axes.hidden.extent(),
-    );
-    let gate = projection(
-        mlp_input.clone(),
-        name("mlp.gate_proj.weight"),
-        axes.hidden,
-        axes.intermediate,
-    );
-    let up = projection(
-        mlp_input,
-        name("mlp.up_proj.weight"),
-        axes.hidden,
-        axes.intermediate,
-    );
+    let mlp_input = rms_norm(&residual, &norm_weight(name("post_attention_layernorm.weight")), EPS);
+    let gate = projection(&mlp_input, name("mlp.gate_proj.weight"), axes.hidden, axes.intermediate);
+    let up = projection(&mlp_input, name("mlp.up_proj.weight"), axes.hidden, axes.intermediate);
     let down = projection(
-        mul(silu(gate), up),
+        &(gate.silu() * up),
         name("mlp.down_proj.weight"),
         axes.intermediate,
         axes.hidden,
     );
-
-    DecodeBlock {
-        x: add(residual, down),
-        key_cache,
-        value_cache,
-    }
+    residual + down
 }
 
-struct DecodeGraph {
-    roots: Vec<NodeRef>,
-    cache_names: Vec<String>,
-    logits_index: usize,
-}
-
-fn build_decode(config: Config, context_length: usize) -> DecodeGraph {
+fn build_decode(config: Config, context_length: usize, cache_dtype: Dtype) -> Graph {
     assert!(context_length > 0);
     let axes = Axes::new(config, 1);
     let cache_sequence = axis("cache_sequence", context_length);
-    let position = input("position", [], Dtype::F32);
-    let tokens = input("tokens", [axes.sequence], Dtype::F32);
-    let embedding = input(
-        "model.embed_tokens.weight",
-        [axes.vocab, axes.hidden],
-        Dtype::BF16,
-    );
+    let mut graph = Graph::new();
+    let position = Tensor::input("position", [], Dtype::F32);
+    let tokens = Tensor::input("tokens", [axes.sequence], Dtype::F32);
+    let embedding = Tensor::input("model.embed_tokens.weight", [axes.vocab, axes.hidden], Dtype::BF16);
 
-    let mut x = gather(embedding.clone(), tokens, 0usize);
-    let mut cache_roots = Vec::with_capacity(config.layers * 2);
-    let mut cache_names = Vec::with_capacity(config.layers * 2);
+    let mut x = embedding.gather(&tokens, 0usize);
     for layer in 0..config.layers {
-        let decoded = decode_block(&axes, cache_sequence, layer, x, position.clone());
-        x = decoded.x;
-        cache_roots.push(decoded.key_cache);
-        cache_names.push(format!("cache.{layer}.key"));
-        cache_roots.push(decoded.value_cache);
-        cache_names.push(format!("cache.{layer}.value"));
+        x = decode_block(&mut graph, &axes, cache_sequence, layer, x, &position, cache_dtype);
     }
-    let x = rms_norm(
-        x,
-        input("model.norm.weight", [axes.hidden], Dtype::BF16),
-        axes.hidden.extent(),
-    );
-    let logits = matmul(x, transpose(embedding, 0usize, 1usize));
-    let logits_index = cache_roots.len();
-    cache_roots.push(logits);
-
-    DecodeGraph {
-        roots: cache_roots,
-        cache_names,
-        logits_index,
-    }
+    let x = rms_norm(&x, &Tensor::input("model.norm.weight", [axes.hidden], Dtype::BF16), EPS);
+    graph.output("logits", x.matmul(embedding.transpose(0usize, 1usize)));
+    graph
 }
 
 fn cached_model_dir() -> Result<PathBuf, String> {
@@ -440,19 +187,14 @@ fn cached_model_dir() -> Result<PathBuf, String> {
         return Ok(path.into());
     }
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    let repository =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--meta-llama--Llama-3.2-1B");
+    let repository = PathBuf::from(home).join(".cache/huggingface/hub/models--meta-llama--Llama-3.2-1B");
     let revision = std::fs::read_to_string(repository.join("refs/main"))
         .map_err(|error| format!("Llama 3.2 is not in the Hugging Face cache: {error}"))?;
     Ok(repository.join("snapshots").join(revision.trim()))
 }
 
 fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
-    fn visit(
-        node: &NodeRef,
-        specs: &mut HashMap<String, (Vec<usize>, Dtype)>,
-        seen: &mut HashSet<*const Node>,
-    ) {
+    fn visit(node: &NodeRef, specs: &mut HashMap<String, (Vec<usize>, Dtype)>, seen: &mut HashSet<*const Node>) {
         if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
@@ -471,10 +213,9 @@ fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
                     visit(input, specs, seen);
                 }
             }
-            Node::Reduce { src, .. }
-            | Node::Scan { src, .. }
-            | Node::View { src, .. }
-            | Node::Reindex { src, .. } => visit(src, specs, seen),
+            Node::Reduce { src, .. } | Node::Scan { src, .. } | Node::View { src, .. } | Node::Reindex { src, .. } => {
+                visit(src, specs, seen)
+            }
             Node::Gather { src, index, .. } => {
                 visit(src, specs, seen);
                 visit(index, specs, seen);
@@ -512,9 +253,7 @@ fn validate_checkpoint(
             Dtype::BF16 => safetensors::Dtype::BF16,
             Dtype::F32 => safetensors::Dtype::F32,
             other => {
-                return Err(format!(
-                    "unsupported checkpoint dtype {other:?} for `{name}`"
-                ));
+                return Err(format!("unsupported checkpoint dtype {other:?} for `{name}`"));
             }
         };
         if tensor.dtype() != expected_dtype {
@@ -538,8 +277,7 @@ fn validate_checkpoint(
 fn open_checkpoint_zero_copy(path: &Path) -> Result<(SafeTensors<'static>, &'static [u8]), String> {
     use std::io::Read;
 
-    let mut file =
-        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut file = std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let mut header_length = [0u8; 8];
     file.read_exact(&mut header_length)
         .map_err(|error| format!("read {} header: {error}", path.display()))?;
@@ -547,12 +285,9 @@ fn open_checkpoint_zero_copy(path: &Path) -> Result<(SafeTensors<'static>, &'sta
     let pad = data_start.next_multiple_of(4) - data_start;
 
     const PAGE: usize = 16384;
-    let file_length = std::fs::metadata(path)
-        .map_err(|error| error.to_string())?
-        .len() as usize;
+    let file_length = std::fs::metadata(path).map_err(|error| error.to_string())?.len() as usize;
     let capacity = (pad + file_length).div_ceil(PAGE).max(1) * PAGE;
-    let layout =
-        std::alloc::Layout::from_size_align(capacity, PAGE).map_err(|error| error.to_string())?;
+    let layout = std::alloc::Layout::from_size_align(capacity, PAGE).map_err(|error| error.to_string())?;
     let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
     if pointer.is_null() {
         return Err("page-aligned checkpoint allocation failed".into());
@@ -570,15 +305,17 @@ fn open_checkpoint_zero_copy(path: &Path) -> Result<(SafeTensors<'static>, &'sta
 struct Arguments {
     prompt: String,
     new_tokens: usize,
+    bf16_storage: bool,
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run --release --example llama3_2 -- \"prompt\" -n <tokens>"
+    "usage: cargo run --release --example llama3_2 -- \"prompt\" -n <tokens> [--bf16]"
 }
 
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Arguments, String> {
     let mut prompt = None;
     let mut new_tokens = None;
+    let mut bf16_storage = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -594,6 +331,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
                     return Err(format!("token count was provided twice\n{}", usage()));
                 }
             }
+            "--bf16" => bf16_storage = true,
             option if option.starts_with('-') => {
                 return Err(format!("unknown option `{option}`\n{}", usage()));
             }
@@ -607,6 +345,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
     Ok(Arguments {
         prompt: prompt.ok_or_else(|| format!("prompt is required\n{}", usage()))?,
         new_tokens: new_tokens.ok_or_else(|| format!("-n is required\n{}", usage()))?,
+        bf16_storage,
     })
 }
 
@@ -630,8 +369,8 @@ fn run_metal() -> Result<(), String> {
     let arguments = parse_arguments(std::env::args().skip(1))?;
     let model_dir = cached_model_dir()?;
     let checkpoint = model_dir.join("model.safetensors");
-    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
-        .map_err(|error| format!("load tokenizer: {error}"))?;
+    let tokenizer =
+        Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|error| format!("load tokenizer: {error}"))?;
     let encoding = tokenizer
         .encode(arguments.prompt.as_str(), true)
         .map_err(|error| format!("tokenize prompt: {error}"))?;
@@ -651,26 +390,31 @@ fn run_metal() -> Result<(), String> {
         prompt_tokens.len(),
         arguments.new_tokens
     );
-    let graph = build_decode(Config::LLAMA_3_2_1B, context_length);
+    let storage = if arguments.bf16_storage {
+        Dtype::BF16
+    } else {
+        Dtype::F32
+    };
+    let graph = build_decode(Config::LLAMA_3_2_1B, context_length, storage);
     eprintln!("built graph in {:.2}s", started.elapsed().as_secs_f32());
 
     let started = std::time::Instant::now();
     eprintln!("reading cached BF16 checkpoint...");
     let (checkpoint_tensors, region) = open_checkpoint_zero_copy(&checkpoint)?;
-    let specs = validate_checkpoint(&graph.roots, &checkpoint_tensors)
+    let roots = graph.roots();
+    let specs = validate_checkpoint(&roots, &checkpoint_tensors)
         .map_err(|error| format!("invalid cached checkpoint: {error}"))?;
     eprintln!(
         "read and validated checkpoint in {:.2}s",
         started.elapsed().as_secs_f32()
     );
 
-    let device = sanic::MetalDevice::open().ok_or("no Metal device is available")?;
+    let device = sanic::MetalDevice::open()
+        .ok_or("no Metal device is available")?
+        .with_storage(storage);
     let started = std::time::Instant::now();
     eprintln!("compiling decode program...");
-    let program = graph
-        .roots
-        .compile(&device)
-        .map_err(|error| error.to_string())?;
+    let program = graph.compile_for(&device).map_err(|error| error.to_string())?;
     eprintln!(
         "compiled {} kernels in {:.2}s",
         program.kernel_count(),
@@ -685,21 +429,16 @@ fn run_metal() -> Result<(), String> {
     let mut buffers = HashMap::new();
     let mut zero_copy_bytes = 0usize;
     for name in program.input_names() {
+        if name.starts_with("cache.") {
+            continue; // state buffers belong to the machine
+        }
         let (shape, dtype) = specs
             .get(name)
             .ok_or_else(|| format!("compiled input `{name}` has no graph declaration"))?;
         let buffer = if name == "tokens" || name == "position" {
             device
                 .tensor_from_raw(
-                    device.alloc_f32(shape.iter().product()),
-                    shape.clone(),
-                    *dtype,
-                )
-                .map_err(|error| error.to_string())?
-        } else if name.starts_with("cache.") {
-            device
-                .tensor_from_raw(
-                    device.alloc_f32(shape.iter().product()),
+                    device.alloc_elems(shape.iter().product(), *dtype),
                     shape.clone(),
                     *dtype,
                 )
@@ -726,38 +465,18 @@ fn run_metal() -> Result<(), String> {
         "bound {} tensors ({:.2} GB zero-copy) in {:.2}s",
         specs
             .keys()
-            .filter(|name| {
-                *name != "tokens" && *name != "position" && !name.starts_with("cache.")
-            })
+            .filter(|name| { *name != "tokens" && *name != "position" && !name.starts_with("cache.") })
             .count(),
         zero_copy_bytes as f64 / 1e9,
         started.elapsed().as_secs_f32()
     );
 
-    // Freeze both cache-binding parities for repeated execution: each cache
-    // output is the NEXT step's cache input.
-    let feedback = graph
-        .cache_names
-        .iter()
-        .enumerate()
-        .map(|(cache, name)| {
-            let output = if cache < graph.logits_index {
-                cache
-            } else {
-                cache + 1
-            };
-            (output, name.as_str())
-        })
-        .collect::<Vec<_>>();
     let started = std::time::Instant::now();
-    let mut replay = program
-        .capture(
-            buffers.iter().map(|(name, buffer)| (name.as_str(), buffer)),
-            &feedback,
-        )
+    let mut machine = program
+        .instantiate(&device, buffers.iter().map(|(name, buffer)| (name.as_str(), buffer)))
         .map_err(|error| error.to_string())?;
     eprintln!(
-        "prepared {} dispatches for two replay bindings in {:.2}s",
+        "instantiated {} dispatches in {:.2}s",
         program.kernel_count(),
         started.elapsed().as_secs_f32()
     );
@@ -767,8 +486,8 @@ fn run_metal() -> Result<(), String> {
     let mut step = |token: u32, position: usize| -> Result<(sanic::MetalBuffer, f64), String> {
         device.write_f64(tokens_buffer.raw(), &[token as f64]);
         device.write_f64(position_buffer.raw(), &[position as f64]);
-        let (outputs, seconds) = replay.step_timed().map_err(|error| error.to_string())?;
-        Ok((outputs[graph.logits_index].clone(), seconds))
+        let seconds = machine.step().map_err(|error| error.to_string())?;
+        Ok((machine.output("logits"), seconds))
     };
 
     eprintln!("prefilling {} tokens...", prompt_tokens.len());
@@ -803,9 +522,7 @@ fn run_metal() -> Result<(), String> {
     let mut emit = |text: &str| -> Result<(), String> {
         if streaming {
             print!("{text}");
-            std::io::stdout()
-                .flush()
-                .map_err(|error| error.to_string())?;
+            std::io::stdout().flush().map_err(|error| error.to_string())?;
         } else {
             held_back.push_str(text);
         }
@@ -874,8 +591,8 @@ fn run_metal() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sanic::CpuDevice;
     use sanic::interp::{Env, eval};
+    use sanic::{Compile, CpuDevice};
 
     #[test]
     fn rope_frequencies_use_even_head_coordinates() {
@@ -901,25 +618,18 @@ mod tests {
             head_dim: 2,
             intermediate_dim: 16,
         };
-        let graph = build_decode(config, 3);
+        let graph = build_decode(config, 3, Dtype::F32);
         assert_eq!(
             graph
-                .roots
+                .roots()
                 .iter()
-                .map(|root| root
-                    .shape()
-                    .into_iter()
-                    .map(Axis::extent)
-                    .collect::<Vec<_>>())
+                .map(|root| root.shape().into_iter().map(Axis::extent).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             [vec![2, 3, 2], vec![2, 3, 2], vec![1, 16]]
         );
 
-        let program = graph.roots.compile(&CpuDevice::new()).unwrap();
-        assert_eq!(
-            program.output_shapes(),
-            &[vec![2, 3, 2], vec![2, 3, 2], vec![1, 16]]
-        );
+        let program = graph.roots().compile(&CpuDevice::new()).unwrap();
+        assert_eq!(program.output_shapes(), &[vec![2, 3, 2], vec![2, 3, 2], vec![1, 16]]);
         assert_eq!(program.input_names().len(), 15);
     }
 

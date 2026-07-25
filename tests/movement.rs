@@ -26,10 +26,7 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 fn assert_close(x: &Value, y: &Value) {
@@ -73,11 +70,7 @@ fn pad_reads_zero_outside() {
     let pd = pad(input("X", [n], Dtype::F32), 0usize, p, 2);
     let got = eval(&pd, &env);
     for i in 0..9usize {
-        let want = if (2..7).contains(&i) {
-            x.data[i - 2]
-        } else {
-            0.0
-        };
+        let want = if (2..7).contains(&i) { x.data[i - 2] } else { 0.0 };
         assert_eq!(got.data[i], want, "position {i}");
     }
 }
@@ -91,12 +84,7 @@ fn split_is_the_inverse_of_flatten() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     // flatten [h,w] → f, then split f → (h2, w2): the identity, relabeled.
-    let round = split(
-        flatten(input("X", [h, w], Dtype::F32), &[0, 1][..], f),
-        0usize,
-        h2,
-        w2,
-    );
+    let round = split(flatten(input("X", [h, w], Dtype::F32), &[0, 1][..], f), 0usize, h2, w2);
     let got = eval(&round, &env);
     assert_eq!(got.shape, vec![3, 4]);
     assert_eq!(got.data, x.data, "split ∘ flatten must be the identity");
@@ -147,8 +135,7 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
         let mut acc = 0.0;
         for c_i in 0..3 {
             for k_i in 0..3 {
-                acc += x.at_index(&[c_i, coordinate[0] + k_i])
-                    * w.at_index(&[coordinate[1], c_i, k_i]);
+                acc += x.at_index(&[c_i, coordinate[0] + k_i]) * w.at_index(&[coordinate[1], c_i, k_i]);
             }
         }
         acc
@@ -158,19 +145,11 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
     // it partitions to ONE fused kernel (implicit GEMM over the flattened
     // reduction axis), and the schedule reproduces the reference
     let sched = partition(&conv, &DeviceProfile::toy());
-    assert_eq!(
-        sched.stages.len(),
-        1,
-        "conv must be one kernel:\n{}",
-        sched.render()
-    );
+    assert_eq!(sched.stages.len(), 1, "conv must be one kernel:\n{}", sched.render());
     let Stage::Fused { spec, .. } = &sched.stages[0] else {
         panic!("expected a fused stage")
     };
-    assert_eq!(
-        spec.streaming_axis, stream,
-        "streams the flattened (ci,k) axis"
-    );
+    assert_eq!(spec.streaming_axis, stream, "streams the flattened (ci,k) axis");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }
@@ -227,12 +206,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     assert_close(&got, &hand);
 
     let sched = partition(&conv, &DeviceProfile::toy());
-    assert_eq!(
-        sched.stages.len(),
-        1,
-        "conv2d must be one kernel:\n{}",
-        sched.render()
-    );
+    assert_eq!(sched.stages.len(), 1, "conv2d must be one kernel:\n{}", sched.render());
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }
@@ -320,13 +294,7 @@ fn maxpool_is_one_kernel_and_matches_hand() {
 #[test]
 fn sliding_window_attention_is_one_flash_kernel() {
     let (ns, w) = (10usize, 4usize);
-    let (s, t, j, d, e) = (
-        axis("s", ns),
-        axis("t", ns),
-        axis("j", w),
-        axis("d", 5),
-        axis("e", 6),
-    );
+    let (s, t, j, d, e) = (axis("s", ns), axis("t", ns), axis("j", w), axis("d", 5), axis("e", 6));
     let mut rng = Lcg(0x51D3);
     let q = rand_tensor(&[s, d], &mut rng);
     let k = rand_tensor(&[t, d], &mut rng);
@@ -352,10 +320,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
     ); // [s, j, e]
 
     let scores = reduce(
-        map(
-            MapOp::Mul,
-            vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw],
-        ),
+        map(MapOp::Mul, vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw]),
         2usize,
         Monoid::Add,
     ); // [s, j]
@@ -365,26 +330,17 @@ fn sliding_window_attention_is_one_flash_kernel() {
         vec![
             map(
                 MapOp::Add,
-                vec![
-                    coordinate(scores.clone(), 0usize),
-                    coordinate(scores.clone(), 1usize),
-                ],
+                vec![coordinate(scores.clone(), 0usize), coordinate(scores.clone(), 1usize)],
             ),
             konst((w - 1) as f64),
         ],
     );
     let masked = map(
         MapOp::Add,
-        vec![
-            scores,
-            map(MapOp::Where, vec![invalid, konst(-1e30), konst(0.0)]),
-        ],
+        vec![scores, map(MapOp::Where, vec![invalid, konst(-1e30), konst(0.0)])],
     );
     let attn = reduce(
-        map(
-            MapOp::Mul,
-            vec![unsqueeze(softmax(masked, 1usize), 2usize), vw],
-        ),
+        map(MapOp::Mul, vec![unsqueeze(softmax(masked, 1usize), 2usize), vw]),
         1usize,
         Monoid::Add,
     ); // [s, e]
@@ -396,11 +352,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
         let positions: Vec<usize> = (lo.max(0)..=si as i64).map(|p| p as usize).collect();
         let dots: Vec<f64> = positions
             .iter()
-            .map(|&p| {
-                (0..5)
-                    .map(|di| q.at_index(&[si, di]) * k.at_index(&[p, di]))
-                    .sum()
-            })
+            .map(|&p| (0..5).map(|di| q.at_index(&[si, di]) * k.at_index(&[p, di])).sum())
             .collect();
         let m = dots.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let exps: Vec<f64> = dots.iter().map(|x| (x - m).exp()).collect();
@@ -426,14 +378,8 @@ fn sliding_window_attention_is_one_flash_kernel() {
     let Stage::Fused { spec, .. } = &sched.stages[0] else {
         panic!("expected a fused stage")
     };
-    assert_eq!(
-        spec.streaming_axis, stream,
-        "streams the window axis, not the sequence"
-    );
-    assert_eq!(
-        spec.carrier.slots, 3,
-        "the online-softmax (m, ℓ, o) carrier"
-    );
+    assert_eq!(spec.streaming_axis, stream, "streams the window axis, not the sequence");
+    assert_eq!(spec.carrier.slots, 3, "the online-softmax (m, ℓ, o) carrier");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }

@@ -17,7 +17,7 @@
 //! * broadcast (a `Map` over a smaller operand) ⟵ reduce the extra axes
 //! * `Reduce(Add)` ⟵ broadcast (implicit in an axis-set IR)
 //! * `Reduce(Max/Min)` ⟵ a computed winner mask (subgradient; ties split
-//!   nothing — they double-count, a measure-zero event on continuous data)
+//!   the mass evenly, conserving the cotangent)
 //! * `Reduce(LogSumExp)` ⟵ `exp(src − result)` — the softmax Jacobian
 //! * `Gather` ⟵ [`scatter_add`] — the adjoint of an indexed read is an
 //!   add-combined indexed write
@@ -30,17 +30,64 @@
 //! reindex patterns whose transpose is not affine (strided *and* dilated
 //! windows). Each panics with a message naming the gap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ir::{
-    self, AffineIndex, Axis, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ViewDim,
-    konst, map, positional_reindex, positional_view, reduce, scan, split,
+    self, AffineIndex, Axis, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ViewDim, konst, map,
+    positional_reindex, positional_view, reduce, scan, split,
 };
 
 /// d(loss)/d(each named input), as graphs. `loss` must be a scalar (no free
 /// axes). Inputs that the loss does not depend on are absent from the result.
+///
+/// A name-keyed convenience over [`grad_nodes`]: distinct `Input` nodes with
+/// the same name are the same buffer read under (possibly) different axis
+/// labels, so their adjoints sum after relabeling to the first-seen
+/// declaration.
 pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
+    let mut order: Vec<Node> = Vec::new();
+    let mut seen: Vec<*const NodeKind> = Vec::new();
+    postorder(loss, &mut seen, &mut order);
+    let targets: Vec<Node> = order
+        .iter()
+        .filter(|node| matches!(node.as_ref(), NodeKind::Input { name, .. } if wrt.contains(name)))
+        .cloned()
+        .collect();
+
+    let mut by_name: HashMap<&'static str, (Vec<Axis>, Node)> = HashMap::new();
+    for (target, gradient) in targets.iter().zip(grad_nodes(loss, &targets, &[])) {
+        let Some(gradient) = gradient else { continue };
+        let NodeKind::Input { name, shape, .. } = target.as_ref() else {
+            unreachable!("targets are input nodes")
+        };
+        let contrib = reduce_to(gradient, shape);
+        match by_name.get_mut(name) {
+            None => {
+                by_name.insert(name, (shape.clone(), contrib));
+            }
+            Some((canon, acc)) => {
+                assert_eq!(
+                    canon.len(),
+                    shape.len(),
+                    "grad: input `{name}` declared with different ranks"
+                );
+                *acc = map(MapOp::Add, vec![acc.clone(), contrib]);
+            }
+        }
+    }
+    by_name.into_iter().map(|(n, (_, g))| (n, g)).collect()
+}
+
+/// d(loss)/d(each target NODE), one entry per target — `None` when the loss
+/// does not depend on it. Targets may be any node, interior or leaf.
+///
+/// `stop` nodes are gradient BOUNDARIES: the gradient flows *to* a stopped
+/// node (it can itself be a target) but never through it to its inputs.
+/// Stop-gradient is a property of the QUESTION, not of the graph — an IR
+/// marker would make two structurally identical subtrees, one detached,
+/// refuse to intern to one node.
+pub fn grad_nodes(loss: &Node, targets: &[Node], stop: &[Node]) -> Vec<Option<Node>> {
     crate::verify::assert_valid(loss);
     assert!(
         loss.shape().is_empty(),
@@ -53,19 +100,35 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
     let mut seen: Vec<*const NodeKind> = Vec::new();
     postorder(loss, &mut seen, &mut order);
 
+    // Only nodes from which a target is reachable need adjoints. Pruning is
+    // lossless: any consumer of an on-path node reaches the same target, so
+    // it is on-path itself and no contribution is dropped.
+    let target_ptrs: HashSet<*const NodeKind> = targets.iter().map(Arc::as_ptr).collect();
+    let stop_ptrs: HashSet<*const NodeKind> = stop.iter().map(Arc::as_ptr).collect();
+    let mut on_path: HashSet<*const NodeKind> = HashSet::new();
+    for node in &order {
+        // postorder: children are decided before their consumers
+        let reaches = target_ptrs.contains(&Arc::as_ptr(node))
+            || ir::children(node).iter().any(|c| on_path.contains(&Arc::as_ptr(c)));
+        if reaches {
+            on_path.insert(Arc::as_ptr(node));
+        }
+    }
+
     // cotangent per node, accumulated across consumers
     let mut adj: HashMap<*const NodeKind, Node> = HashMap::new();
     adj.insert(Arc::as_ptr(loss), konst(1.0));
 
-    // gradient per input NAME: distinct `Input` nodes with the same name are
-    // the same buffer read under (possibly) different axis labels, so their
-    // adjoints sum after relabeling to the first-seen declaration.
-    let mut by_name: HashMap<&'static str, (Vec<Axis>, Node)> = HashMap::new();
-
     for node in order.iter().rev() {
+        if !on_path.contains(&Arc::as_ptr(node)) {
+            continue; // no target below this node
+        }
         let Some(g) = adj.get(&Arc::as_ptr(node)).cloned() else {
             continue; // the loss does not depend on this node
         };
+        if stop_ptrs.contains(&Arc::as_ptr(node)) {
+            continue; // a gradient boundary: keep the adjoint, propagate nothing
+        }
         // A map can consume a broadcastable cotangent directly. Keeping the
         // singleton form produced by a reduction avoids manufacturing an
         // affine expansion that hides ordinary algebra from simplification.
@@ -77,26 +140,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
             broadcast_to(g, &node.shape())
         };
         match node.as_ref() {
-            NodeKind::Input { name, shape, .. } => {
-                if !wrt.contains(name) {
-                    continue;
-                }
-                let contrib = reduce_to(g, shape);
-                match by_name.get_mut(name) {
-                    None => {
-                        by_name.insert(name, (shape.clone(), contrib));
-                    }
-                    Some((canon, acc)) => {
-                        assert_eq!(
-                            canon.len(),
-                            shape.len(),
-                            "grad: input `{name}` declared with different ranks"
-                        );
-                        *acc = map(MapOp::Add, vec![acc.clone(), contrib]);
-                    }
-                }
-            }
-            NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
+            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {}
 
             NodeKind::Map { op, inputs } => {
                 for (contrib, child) in map_backward(*op, inputs, &g) {
@@ -111,16 +155,18 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
                 let contrib = match op {
                     Monoid::Add => expanded_g,
                     Monoid::Max | Monoid::Min => {
-                        // winner mask: 1 where src equals the reduced result
+                        // winner mask, with the mass split evenly across
+                        // ties: the subgradient must conserve g, and the
+                        // winner count is ≥ 1 wherever the result is
+                        // attained, so the division is total.
                         let hit = winner_mask(src, &expanded_result);
-                        map(MapOp::Mul, vec![expanded_g, hit])
+                        let count = ir::unsqueeze(reduce(hit.clone(), *dim, Monoid::Add), *dim);
+                        let share = map(MapOp::Div, vec![hit, count]);
+                        map(MapOp::Mul, vec![expanded_g, share])
                     }
                     Monoid::LogSumExp => {
                         // ∂LSE/∂src = exp(src − LSE) — the softmax Jacobian row
-                        let sm = map(
-                            MapOp::Exp,
-                            vec![map(MapOp::Sub, vec![src.clone(), expanded_result])],
-                        );
+                        let sm = map(MapOp::Exp, vec![map(MapOp::Sub, vec![src.clone(), expanded_result])]);
                         map(MapOp::Mul, vec![expanded_g, sm])
                     }
                     Monoid::Mul => panic!(
@@ -142,11 +188,7 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
             }
 
             NodeKind::Reindex { src, map: rmap, .. } => {
-                add_adj(
-                    &mut adj,
-                    src,
-                    transpose_reindex(g, &src.shape(), &node.shape(), rmap),
-                );
+                add_adj(&mut adj, src, transpose_reindex(g, &src.shape(), &node.shape(), rmap));
             }
 
             // A prefix SUM's adjoint is the reversed prefix sum of the
@@ -186,7 +228,13 @@ pub fn grad(loss: &Node, wrt: &[&'static str]) -> HashMap<&'static str, Node> {
         }
     }
 
-    by_name.into_iter().map(|(n, (_, g))| (n, g)).collect()
+    targets
+        .iter()
+        .map(|target| {
+            adj.get(&Arc::as_ptr(target))
+                .map(|g| broadcast_to(g.clone(), &target.shape()))
+        })
+        .collect()
 }
 
 fn equal(left: Node, right: Node) -> Node {
@@ -298,12 +346,7 @@ fn invert_view(mut g: Node, source_shape: &[Axis], dims: &[ViewDim]) -> Node {
 /// every output coordinate against equality masks for all source dimensions.
 /// This is intentionally dense but correct for slices, pads, windows, splits,
 /// and arbitrary affine maps; later fusion can recover an efficient kernel.
-fn transpose_reindex(
-    g: Node,
-    source_shape: &[Axis],
-    output_shape: &[Axis],
-    reindex: &[AffineIndex],
-) -> Node {
+fn transpose_reindex(g: Node, source_shape: &[Axis], output_shape: &[Axis], reindex: &[AffineIndex]) -> Node {
     let output_rank = output_shape.len();
     let mut iteration = output_shape.to_vec();
     iteration.extend_from_slice(source_shape);
@@ -320,10 +363,7 @@ fn transpose_reindex(
                     target,
                     map(
                         MapOp::Mul,
-                        vec![
-                            konst(*coefficient as f64),
-                            ir::coordinate(lifted.clone(), *output_dim),
-                        ],
+                        vec![konst(*coefficient as f64), ir::coordinate(lifted.clone(), *output_dim)],
                     ),
                 ],
             );
@@ -338,23 +378,18 @@ fn transpose_reindex(
 }
 
 /// `1` where `src` equals the reduced `result` (its running max/min), else
-/// `0` — the subgradient mask. Exact for a unique winner; ties double-count.
+/// `0` — the subgradient mask. The caller divides by the winner count, so
+/// ties share the mass instead of double-counting it.
 fn winner_mask(src: &Node, result: &Node) -> Node {
     // [src == r] as (1 − [src < r]) · (1 − [r < src]) — max needs only the
     // first factor, min only the second, but the product is correct for both.
     let a = map(
         MapOp::Sub,
-        vec![
-            konst(1.0),
-            map(MapOp::Lt, vec![src.clone(), result.clone()]),
-        ],
+        vec![konst(1.0), map(MapOp::Lt, vec![src.clone(), result.clone()])],
     );
     let b = map(
         MapOp::Sub,
-        vec![
-            konst(1.0),
-            map(MapOp::Lt, vec![result.clone(), src.clone()]),
-        ],
+        vec![konst(1.0), map(MapOp::Lt, vec![result.clone(), src.clone()])],
     );
     map(MapOp::Mul, vec![a, b])
 }
@@ -366,19 +401,10 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
     let m = |op, v| map(op, v);
     match op {
         MapOp::Add => vec![(g.clone(), &inputs[0]), (g.clone(), &inputs[1])],
-        MapOp::Sub => vec![
-            (g.clone(), &inputs[0]),
-            (m(MapOp::Neg, vec![g.clone()]), &inputs[1]),
-        ],
+        MapOp::Sub => vec![(g.clone(), &inputs[0]), (m(MapOp::Neg, vec![g.clone()]), &inputs[1])],
         MapOp::Mul => vec![
-            (
-                m(MapOp::Mul, vec![g.clone(), inputs[1].clone()]),
-                &inputs[0],
-            ),
-            (
-                m(MapOp::Mul, vec![g.clone(), inputs[0].clone()]),
-                &inputs[1],
-            ),
+            (m(MapOp::Mul, vec![g.clone(), inputs[1].clone()]), &inputs[0]),
+            (m(MapOp::Mul, vec![g.clone(), inputs[0].clone()]), &inputs[1]),
         ],
         MapOp::Div => {
             let (a, b) = (&inputs[0], &inputs[1]);
@@ -399,19 +425,13 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
             let (a, b) = (&inputs[0], &inputs[1]);
             // subgradient: the winner takes g; ties go to `a` for Max's
             // first operand convention (1 − [a<b] vs [a<b])
-            let a_wins = m(
-                MapOp::Sub,
-                vec![konst(1.0), m(MapOp::Lt, vec![a.clone(), b.clone()])],
-            );
+            let a_wins = m(MapOp::Sub, vec![konst(1.0), m(MapOp::Lt, vec![a.clone(), b.clone()])]);
             let (wa, wb) = if op == MapOp::Max {
                 (a_wins.clone(), m(MapOp::Lt, vec![a.clone(), b.clone()]))
             } else {
                 (
                     m(MapOp::Lt, vec![a.clone(), b.clone()]),
-                    m(
-                        MapOp::Sub,
-                        vec![konst(1.0), m(MapOp::Lt, vec![a.clone(), b.clone()])],
-                    ),
+                    m(MapOp::Sub, vec![konst(1.0), m(MapOp::Lt, vec![a.clone(), b.clone()])]),
                 )
             };
             vec![
@@ -420,6 +440,9 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
             ]
         }
         MapOp::Lt => vec![], // piecewise constant
+        // straight-through: rounding is the identity almost everywhere, and
+        // training through a declared storage boundary wants the estimator
+        MapOp::RoundTo(_) => vec![(g.clone(), &inputs[0])],
         MapOp::Neg => vec![(m(MapOp::Neg, vec![g.clone()]), &inputs[0])],
         MapOp::Recip => {
             let x = &inputs[0];
@@ -435,26 +458,17 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
         MapOp::Exp => vec![(
             // reuse the forward node when the caller shares it; rebuilding is
             // equal by value
-            m(
-                MapOp::Mul,
-                vec![g.clone(), m(MapOp::Exp, vec![inputs[0].clone()])],
-            ),
+            m(MapOp::Mul, vec![g.clone(), m(MapOp::Exp, vec![inputs[0].clone()])]),
             &inputs[0],
         )],
-        MapOp::Log => vec![(
-            m(MapOp::Div, vec![g.clone(), inputs[0].clone()]),
-            &inputs[0],
-        )],
+        MapOp::Log => vec![(m(MapOp::Div, vec![g.clone(), inputs[0].clone()]), &inputs[0])],
         MapOp::Sqrt => {
             let x = &inputs[0];
             let d = m(
                 MapOp::Div,
                 vec![
                     g.clone(),
-                    m(
-                        MapOp::Mul,
-                        vec![konst(2.0), m(MapOp::Sqrt, vec![x.clone()])],
-                    ),
+                    m(MapOp::Mul, vec![konst(2.0), m(MapOp::Sqrt, vec![x.clone()])]),
                 ],
             );
             vec![(d, x)]
@@ -465,28 +479,19 @@ fn map_backward<'a>(op: MapOp, inputs: &'a [Node], g: &Node) -> Vec<(Node, &'a N
                 MapOp::Mul,
                 vec![
                     g.clone(),
-                    m(
-                        MapOp::Sub,
-                        vec![konst(1.0), m(MapOp::Mul, vec![t.clone(), t])],
-                    ),
+                    m(MapOp::Sub, vec![konst(1.0), m(MapOp::Mul, vec![t.clone(), t])]),
                 ],
             );
             vec![(d, &inputs[0])]
         }
         MapOp::Sin => vec![(
-            m(
-                MapOp::Mul,
-                vec![g.clone(), m(MapOp::Cos, vec![inputs[0].clone()])],
-            ),
+            m(MapOp::Mul, vec![g.clone(), m(MapOp::Cos, vec![inputs[0].clone()])]),
             &inputs[0],
         )],
         MapOp::Cos => vec![(
             m(
                 MapOp::Neg,
-                vec![m(
-                    MapOp::Mul,
-                    vec![g.clone(), m(MapOp::Sin, vec![inputs[0].clone()])],
-                )],
+                vec![m(MapOp::Mul, vec![g.clone(), m(MapOp::Sin, vec![inputs[0].clone()])])],
             ),
             &inputs[0],
         )],
@@ -507,12 +512,7 @@ fn broadcast_to(n: Node, target: &[Axis]) -> Node {
     }
 
     let leading = target.len() - source.len();
-    if leading == 0
-        && source
-            .iter()
-            .zip(target)
-            .all(|(from, to)| from.extent == to.extent)
-    {
+    if leading == 0 && source.iter().zip(target).all(|(from, to)| from.extent == to.extent) {
         let dims = target
             .iter()
             .enumerate()
@@ -557,8 +557,7 @@ fn reduce_to(n: Node, target: &[Axis]) -> Node {
     let mut reduced = (0..leading).collect::<Vec<_>>();
     for (target_dim, target_axis) in target.iter().enumerate() {
         let source_dim = leading + target_dim;
-        if target_axis.extent == Extent::Static(1) && source[source_dim].extent != Extent::Static(1)
-        {
+        if target_axis.extent == Extent::Static(1) && source[source_dim].extent != Extent::Static(1) {
             reduced.push(source_dim);
         }
     }
@@ -598,10 +597,7 @@ fn add_adj(adj: &mut HashMap<*const NodeKind, Node>, child: &Node, contrib: Node
             adj.insert(Arc::as_ptr(child), contrib);
         }
         Some(prev) => {
-            adj.insert(
-                Arc::as_ptr(child),
-                map(MapOp::Add, vec![prev.clone(), contrib]),
-            );
+            adj.insert(Arc::as_ptr(child), map(MapOp::Add, vec![prev.clone(), contrib]));
         }
     }
 }

@@ -66,6 +66,8 @@ pub mod emit_metal;
 #[doc(hidden)]
 pub mod grad;
 #[doc(hidden)]
+pub mod graph;
+#[doc(hidden)]
 pub mod interp;
 pub mod ir;
 #[doc(hidden)]
@@ -81,17 +83,16 @@ pub mod runtime;
 #[doc(hidden)]
 pub mod rustgen;
 mod scalar;
-#[doc(hidden)]
 pub mod simplify;
+pub mod tensor;
 #[doc(hidden)]
 pub mod verify;
 
-pub use compile::{
-    Backend, Buffer, Compile, CompileError, CpuBuffer, CpuDevice, Program, RootItem, Roots,
-    RunError,
-};
+pub use compile::{Backend, Buffer, Compile, CompileError, CpuBuffer, CpuDevice, Program, RootItem, Roots, RunError};
 #[cfg(target_os = "macos")]
 pub use compile::{MetalBuffer, MetalReplay};
+pub use graph::Graph;
 pub use ir::*;
 #[cfg(target_os = "macos")]
 pub use metal::MetalDevice;
+pub use tensor::Tensor;

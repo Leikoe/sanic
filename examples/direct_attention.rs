@@ -13,15 +13,9 @@ fn main() {
     let cpu = CpuDevice::new();
     let program = output.compile(&cpu).expect("attention should compile");
     println!("compiled to {} kernel", program.kernel_count());
-    let q = cpu
-        .buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0])
-        .unwrap();
-    let k = cpu
-        .buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0])
-        .unwrap();
-    let v = cpu
-        .buffer([2, 2], Dtype::F32, [2.0, 3.0, 5.0, 7.0])
-        .unwrap();
+    let q = cpu.buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0]).unwrap();
+    let k = cpu.buffer([2, 2], Dtype::F32, [1.0, 0.0, 0.0, 1.0]).unwrap();
+    let v = cpu.buffer([2, 2], Dtype::F32, [2.0, 3.0, 5.0, 7.0]).unwrap();
 
     let outputs = program.run([("q", q), ("k", k), ("v", v)]);
     println!("{:?}: {:?}", outputs[0].shape(), outputs[0].data());

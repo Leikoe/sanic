@@ -10,10 +10,7 @@ use std::sync::Arc;
 
 use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{
-    self, AxisRef, AxisSelector, Dtype, Node as NodeKind, NodeRef as Node, input_axes,
-    input_dtypes, leaf_names,
-};
+use crate::ir::{self, AxisRef, AxisSelector, Node as NodeKind, NodeRef as Node, input_axes, input_dtypes, leaf_names};
 
 /// Elements streamed per step along the folded axis.
 const TILE_N: usize = 64;
@@ -40,13 +37,7 @@ pub fn plan_axis(
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> Option<KernelSpec> {
-    plan_axis_with_groups(
-        node,
-        streaming_axis,
-        carrier,
-        dev,
-        &mut GroupCache::default(),
-    )
+    plan_axis_with_groups(node, streaming_axis, carrier, dev, &mut GroupCache::default())
 }
 
 /// Flatten-group membership across a retained DAG, collected once per node:
@@ -143,16 +134,17 @@ fn plan_axis_costed(
     // slot are row/batch/col-tile candidates; axes on only some slots are
     // per-slot columns (attention: m, ℓ span {sq}; o spans {sq, e} → shared
     // sq, column e).
-    let span_union: Vec<AxisRef> = carrier
-        .spans
-        .iter()
-        .flat_map(|span| span.iter().copied())
-        .fold(Vec::new(), |mut axes, axis| {
-            if !axes.contains(&axis) {
-                axes.push(axis);
-            }
-            axes
-        });
+    let span_union: Vec<AxisRef> =
+        carrier
+            .spans
+            .iter()
+            .flat_map(|span| span.iter().copied())
+            .fold(Vec::new(), |mut axes, axis| {
+                if !axes.contains(&axis) {
+                    axes.push(axis);
+                }
+                axes
+            });
     let span_intersection: HashSet<AxisRef> = {
         let mut inter: HashSet<AxisRef> = span_union.iter().copied().collect();
         for s in &carrier.spans {
@@ -200,10 +192,7 @@ fn plan_axis_costed(
     // Per-input storage bytes. Every input declares its representation, so
     // int8/int4 weights earn their bandwidth win without a device-dependent
     // fallback.
-    let declared: HashMap<&'static str, f64> = input_dtypes(node)
-        .into_iter()
-        .map(|(n, d)| (n, d.bytes()))
-        .collect();
+    let declared: HashMap<&'static str, f64> = input_dtypes(node).into_iter().map(|(n, d)| (n, d.bytes())).collect();
     let in_bytes = |name: &'static str| {
         declared
             .get(name)
@@ -256,17 +245,11 @@ fn plan_axis_costed(
 
     let mut best_cost: Option<f64> = None;
 
-    let row_options: Vec<Option<AxisRef>> =
-        by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
+    let row_options: Vec<Option<AxisRef>> = by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
     for &row in &row_options {
         let col_options: Vec<Option<AxisRef>> = [None]
             .into_iter()
-            .chain(
-                by_extent
-                    .iter()
-                    .filter(|&&a| Some(a) != row)
-                    .map(|&a| Some(a)),
-            )
+            .chain(by_extent.iter().filter(|&&a| Some(a) != row).map(|&a| Some(a)))
             .collect();
         for &col in &col_options {
             let rest: Vec<AxisRef> = span_schedulable
@@ -358,9 +341,7 @@ fn plan_axis_costed(
                         let carries = |axes: &[AxisRef], scheduled: AxisRef| -> bool {
                             axes.iter().any(|&ax| {
                                 ax == scheduled
-                                    || group_member
-                                        .get(&ax)
-                                        .is_some_and(|&(grouped, _)| grouped == scheduled)
+                                    || group_member.get(&ax).is_some_and(|&(grouped, _)| grouped == scheduled)
                             })
                         };
                         let mut hbm = output_vol * b_bytes;
@@ -389,9 +370,7 @@ fn plan_axis_costed(
                         // area times the col span held resident in it
                         let resident_cols: f64 = col_axes
                             .iter()
-                            .filter(|&&ax| {
-                                Some(ax) != row && Some(ax) != col && !batch.contains(&ax)
-                            })
+                            .filter(|&&ax| Some(ax) != row && Some(ax) != col && !batch.contains(&ax))
                             .map(|&ax| ext(ax))
                             .product();
                         let k = Kernel {
@@ -402,6 +381,10 @@ fn plan_axis_costed(
                             regs_per_block: sram,
                             parallel_blocks: batch_volume * row_blocks * col_blocks,
                             lanes_per_block: tm * tc * resident_cols,
+                            // the cooperative-tile fiction is a feasibility
+                            // gate, not a committed cost: keep it at the
+                            // pre-Little's-law 4 B so its verdicts are stable
+                            bytes_in_flight_per_lane: 4.0,
                         };
                         if !feasible(dev, &k) {
                             continue;
@@ -502,12 +485,7 @@ fn expr_ops(e: &Expr) -> f64 {
         | Expr::Max(a, b)
         | Expr::Min(a, b)
         | Expr::Lt(a, b) => 1.0 + expr_ops(a) + expr_ops(b),
-        Expr::Exp(a)
-        | Expr::Log(a)
-        | Expr::Sqrt(a)
-        | Expr::Tanh(a)
-        | Expr::Sin(a)
-        | Expr::Cos(a) => 1.0 + expr_ops(a),
+        Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Tanh(a) | Expr::Sin(a) | Expr::Cos(a) => 1.0 + expr_ops(a),
         Expr::Where(c, a, b) => 1.0 + expr_ops(c) + expr_ops(a) + expr_ops(b),
     }
 }
@@ -525,12 +503,8 @@ pub(crate) fn count_issue_ops(node: &Node) -> f64 {
         NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => vol(node),
         NodeKind::Input { shape, .. } => (1.0 + shape.len() as f64) * vol(node),
         NodeKind::Map { inputs, .. } => inputs.iter().map(count_issue_ops).sum::<f64>() + vol(node),
-        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
-            count_issue_ops(src) + vol(src)
-        }
-        NodeKind::Gather { src, index, .. } => {
-            count_issue_ops(src) + count_issue_ops(index) + 2.0 * vol(node)
-        }
+        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => count_issue_ops(src) + vol(src),
+        NodeKind::Gather { src, index, .. } => count_issue_ops(src) + count_issue_ops(index) + 2.0 * vol(node),
         NodeKind::View { src, dims } => {
             let split_ops: f64 = dims
                 .iter()
@@ -544,9 +518,7 @@ pub(crate) fn count_issue_ops(node: &Node) -> f64 {
                 .sum();
             count_issue_ops(src) + split_ops * vol(node)
         }
-        NodeKind::Reindex {
-            src, map, padded, ..
-        } => {
+        NodeKind::Reindex { src, map, padded, .. } => {
             let per = map.len() as f64 * 2.0 + if *padded { 2.0 } else { 0.0 };
             count_issue_ops(src) + per * vol(node)
         }
@@ -558,18 +530,11 @@ pub(crate) fn count_issue_ops(node: &Node) -> f64 {
 /// instead of being issued redundantly by each.
 fn has_simd_reduce(node: &Node) -> bool {
     match node.as_ref() {
-        NodeKind::Reduce { src, dim, .. } => {
-            ir::source_axis(src, *dim).extent() % SIMD == 0 || has_simd_reduce(src)
-        }
+        NodeKind::Reduce { src, dim, .. } => ir::source_axis(src, *dim).extent() % SIMD == 0 || has_simd_reduce(src),
         NodeKind::Map { inputs, .. } => inputs.iter().any(has_simd_reduce),
         NodeKind::Gather { src, index, .. } => has_simd_reduce(src) || has_simd_reduce(index),
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } | NodeKind::Scan { src, .. } => {
-            has_simd_reduce(src)
-        }
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => false,
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } | NodeKind::Scan { src, .. } => has_simd_reduce(src),
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => false,
     }
 }
 
@@ -582,12 +547,7 @@ fn has_simd_reduce(node: &Node) -> bool {
 /// lanes. Traffic is schedule-invariant; parallelism and merge scratch are
 /// per-candidate. Scalar wins ties, so a fold that already fills the
 /// machine (a 200k-row head) keeps today's kernel.
-pub fn fold_sched(
-    fold_node: &Node,
-    streaming_axis: AxisRef,
-    carrier: &Carrier,
-    dev: &DeviceProfile,
-) -> FoldSched {
+pub fn fold_sched(fold_node: &Node, streaming_axis: AxisRef, carrier: &Carrier, dev: &DeviceProfile) -> FoldSched {
     best_fold_sched(fold_node, streaming_axis, carrier, dev).0
 }
 
@@ -633,6 +593,22 @@ fn best_fold_sched(
         .sum::<f64>()
         + out_vol * b_bytes;
 
+    // Bytes a lane loads per stream step: the storage widths of the inputs
+    // that carry the streamed axis. With a contiguous `chunk` run each of
+    // those loads is `chunk` independent elements in flight — the
+    // bytes-outstanding half of Little's law.
+    let mut streamed_seen = HashSet::new();
+    let streamed_bytes_per_lane: f64 = input_axes(fold_node)
+        .into_iter()
+        .filter(|(n, _)| streamed_seen.insert(*n))
+        .filter(|(_, axes)| {
+            axes.iter()
+                .any(|a| carrier.aliases.get(a).copied().unwrap_or(*a) == streaming_axis)
+        })
+        .map(|(n, _)| declared[n])
+        .sum::<f64>()
+        .max(1.0);
+
     // Per-leaf stats: issue cost of one evaluation, and which axes it reads.
     let leaf_stats: Vec<(f64, Vec<AxisRef>, bool)> = carrier
         .leaves
@@ -676,9 +652,7 @@ fn best_fold_sched(
             flops += issues * per_eval * s_ext;
         }
         for (j, ops) in slot_ops.iter().enumerate() {
-            let sliced = sched
-                .lane_axis
-                .is_some_and(|a| carrier.spans[j].contains(&a));
+            let sliced = sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a));
             let issues = if sched.lane_axis.is_some() && !sliced {
                 groups * simd
             } else {
@@ -698,10 +672,7 @@ fn best_fold_sched(
         // scratch: the threadgroup partial arrays
         let sliced_scratch: f64 = (0..carrier.slots)
             .map(|j| {
-                if sched
-                    .lane_axis
-                    .is_some_and(|a| carrier.spans[j].contains(&a))
-                {
+                if sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a)) {
                     lane_vol
                 } else {
                     1.0
@@ -720,6 +691,7 @@ fn best_fold_sched(
             regs_per_block: (sched.tg_threads() * carrier.slots) as f64 * b_bytes,
             parallel_blocks: if sched.is_scalar() { out_vol } else { groups },
             lanes_per_block: sched.tg_threads() as f64,
+            bytes_in_flight_per_lane: streamed_bytes_per_lane * sched.chunk as f64,
         };
         feasible(dev, &k).then(|| {
             (
@@ -738,8 +710,15 @@ fn best_fold_sched(
     let mut best_flops = count_flops(fold_node);
     let mut best_add = f64::INFINITY;
     for c in cands {
+        // A tie-break the roofline cannot make: at equal price, a
+        // lane-stream split beats the scalar schedule. Scalar hands each
+        // thread its own output point, so a warp's 32 loads land whole rows
+        // apart — one DRAM transaction per element. Lanes splitting the
+        // STREAM read consecutive elements — one transaction serves the
+        // warp. Contiguity is invisible to the cost model (same bytes, same
+        // lane count), so this is a stated rule, not a priced choice.
         if let Some((t, flops, add)) = price(&c)
-            && t < best_t
+            && (t < best_t || (t == best_t && c.lane_stream && best.is_scalar()))
         {
             best = c;
             best_t = t;
@@ -747,22 +726,23 @@ fn best_fold_sched(
             best_add = add;
         }
     }
-    // A refinement of the winner, not a candidate: when the fold reads a
-    // PACKED input, each lane folds contiguous 8-element runs instead of
-    // striding — consecutive nibbles share bytes and cache lines, and the
-    // unrolled run's index chains constant-fold. Pure re-association
+    // A refinement of the winner, not a candidate: each lane folds a
+    // CONTIGUOUS `chunk`-element run of the stream instead of striding.
+    // Consecutive elements share cache lines (nibbles even share bytes),
+    // the unrolled run's index chains constant-fold, and each lane keeps
+    // `chunk` independent loads in flight instead of one — bytes
+    // outstanding per issued load is what sustains DRAM bandwidth, for
+    // EVERY storage width, not just packed ones. Pure re-association
     // (legal for exactly the carriers the lane split already requires);
     // the roofline cannot see load contiguity, so this is a stated rule,
     // not a priced choice.
-    if best.lane_stream
-        && best.lane_axis.is_none()
-        && input_dtypes(fold_node)
-            .iter()
-            .any(|(_, d)| matches!(d, Dtype::I4))
-    {
+    if best.lane_stream && best.lane_axis.is_none() {
         let f_split = SIMD * best.sgs;
-        if (s_ext as usize) % (f_split * 8) == 0 {
-            best.chunk = 8;
+        if let Some(chunk) = [8usize, 4, 2]
+            .into_iter()
+            .find(|chunk| (s_ext as usize) % (f_split * chunk) == 0)
+        {
+            best.chunk = chunk;
         }
     }
     (best, best_flops, best_add)
@@ -772,11 +752,7 @@ fn best_fold_sched(
 /// analytical chooser prices, exposed so a measured tuner can time the same
 /// set on the real device and overrule the model (`--tune`). Order-sensitive
 /// carriers get only the scalar entry, exactly as the chooser treats them.
-fn fold_sched_candidates(
-    fold_node: &Node,
-    streaming_axis: AxisRef,
-    carrier: &Carrier,
-) -> Vec<FoldSched> {
+fn fold_sched_candidates(fold_node: &Node, streaming_axis: AxisRef, carrier: &Carrier) -> Vec<FoldSched> {
     let mut cands = vec![FoldSched::scalar()];
     if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return cands;
@@ -784,9 +760,6 @@ fn fold_sched_candidates(
     let ext = |ax: AxisRef| ax.extent() as f64;
     let s_ext = ext(streaming_axis) as usize;
     let out_axes = ir::axis_refs(fold_node);
-    let packed = input_dtypes(fold_node)
-        .iter()
-        .any(|(_, d)| matches!(d, Dtype::I4));
     for sgs in [1usize, 2, 4, 8, 16, 32] {
         cands.push(FoldSched {
             lane_axis: None,
@@ -794,16 +767,18 @@ fn fold_sched_candidates(
             lane_stream: true,
             chunk: 1,
         });
-        // the chunked twin prices identically (the roofline cannot see load
-        // contiguity), so it never changes the analytic choice; it exists
+        // the chunked twins price identically (the roofline cannot see load
+        // contiguity), so they never change the analytic choice; they exist
         // for the measured tuner
-        if packed && s_ext % (SIMD * sgs * 8) == 0 {
-            cands.push(FoldSched {
-                lane_axis: None,
-                sgs,
-                lane_stream: true,
-                chunk: 8,
-            });
+        for chunk in [2usize, 4, 8] {
+            if s_ext % (SIMD * sgs * chunk) == 0 {
+                cands.push(FoldSched {
+                    lane_axis: None,
+                    sgs,
+                    lane_stream: true,
+                    chunk,
+                });
+            }
         }
         for &a in &out_axes {
             if ext(a) as usize % SIMD == 0 && ext(a) >= SIMD as f64 {
@@ -828,23 +803,15 @@ fn has_contraction(node: &Node, streaming: AxisRef, out_set: &HashSet<AxisRef>) 
     match node.as_ref() {
         NodeKind::Reduce { src, dim, .. } => {
             let axis = ir::source_axis(src, *dim);
-            (axis != streaming && !out_set.contains(&axis))
-                || has_contraction(src, streaming, out_set)
+            (axis != streaming && !out_set.contains(&axis)) || has_contraction(src, streaming, out_set)
         }
-        NodeKind::Map { inputs, .. } => inputs
-            .iter()
-            .any(|i| has_contraction(i, streaming, out_set)),
+        NodeKind::Map { inputs, .. } => inputs.iter().any(|i| has_contraction(i, streaming, out_set)),
         NodeKind::Scan { src, .. } => has_contraction(src, streaming, out_set),
         NodeKind::Gather { src, index, .. } => {
             has_contraction(src, streaming, out_set) || has_contraction(index, streaming, out_set)
         }
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-            has_contraction(src, streaming, out_set)
-        }
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => false,
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => has_contraction(src, streaming, out_set),
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => false,
     }
 }
 
@@ -857,32 +824,18 @@ fn count_flops(node: &Node) -> f64 {
     count_flops_memo(node, &mut ir::Resolver::default(), &mut HashMap::new())
 }
 
-fn count_flops_memo(
-    node: &Node,
-    resolver: &mut ir::Resolver,
-    fc: &mut HashMap<*const NodeKind, f64>,
-) -> f64 {
+fn count_flops_memo(node: &Node, resolver: &mut ir::Resolver, fc: &mut HashMap<*const NodeKind, f64>) -> f64 {
     let key = std::sync::Arc::as_ptr(node);
     if let Some(f) = fc.get(&key) {
         return *f;
     }
     let vol = |n: &Node, resolver: &mut ir::Resolver| -> f64 {
-        resolver
-            .axes(n)
-            .iter()
-            .map(|ax| ax.extent() as f64)
-            .product()
+        resolver.axes(n).iter().map(|ax| ax.extent() as f64).product()
     };
     let f = match node.as_ref() {
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => 0.0,
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => 0.0,
         NodeKind::Map { inputs, .. } => {
-            let child: f64 = inputs
-                .iter()
-                .map(|i| count_flops_memo(i, resolver, fc))
-                .sum();
+            let child: f64 = inputs.iter().map(|i| count_flops_memo(i, resolver, fc)).sum();
             child + vol(node, resolver)
         }
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => {
@@ -892,9 +845,7 @@ fn count_flops_memo(
             count_flops_memo(src, resolver, fc) + count_flops_memo(index, resolver, fc)
         }
         // Reindexing costs nothing.
-        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
-            count_flops_memo(src, resolver, fc)
-        }
+        NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => count_flops_memo(src, resolver, fc),
     };
     fc.insert(key, f);
     f
@@ -956,11 +907,7 @@ mod tests {
 
     #[test]
     fn a_partial_span_axis_can_still_be_tiled() {
-        let (stream, singleton, output) = (
-            axis("stream", 2048),
-            axis("singleton", 1),
-            axis("output", 2048),
-        );
+        let (stream, singleton, output) = (axis("stream", 2048), axis("singleton", 1), axis("output", 2048));
         let x = input("X", [stream, singleton], Dtype::F32);
         let stream_axis = axis_refs(&x)[0];
         let dot = matmul(
@@ -998,10 +945,7 @@ mod tests {
         let full = cost_of(input("W", [f, d], Dtype::F32));
         let int8 = cost_of(input("W8", [f, d], Dtype::I8));
         let int4 = cost_of(input("W4", [f, d], Dtype::I4));
-        assert!(
-            int8 < full,
-            "int8 weights must price below f32: {int8} vs {full}"
-        );
+        assert!(int8 < full, "int8 weights must price below f32: {int8} vs {full}");
         assert!(int4 < int8, "int4 must price below int8: {int4} vs {int8}");
     }
 }

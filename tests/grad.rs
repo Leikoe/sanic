@@ -125,10 +125,7 @@ fn softmax_cross_entropy() {
         MapOp::Mul,
         vec![input("T", [s, v], Dtype::F32), map(MapOp::Log, vec![p])],
     );
-    let loss = map(
-        MapOp::Neg,
-        vec![reduce(reduce(ll, 1usize, add_r()), 0usize, add_r())],
-    );
+    let loss = map(MapOp::Neg, vec![reduce(reduce(ll, 1usize, add_r()), 0usize, add_r())]);
     check_grads(&loss, &env, &["X", "W"]);
 }
 
@@ -149,10 +146,7 @@ fn rmsnorm_gain_and_input() {
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 5.0)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-    let y = map(
-        MapOp::Div,
-        vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-    );
+    let y = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
     let sq = map(MapOp::Mul, vec![y.clone(), y]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
     check_grads(&loss, &env, &["X", "G"]);
@@ -208,11 +202,7 @@ fn conv1d_input_and_filter() {
     let xw = window(input("X", [ci, w0], Dtype::F32), 1usize, o, kk, 1, 1);
     let xf = transpose(flatten(xw, &[0usize, 2usize][..], r), 0usize, 1usize);
     let wf = transpose(
-        flatten(
-            input("W", [co, ci, kk], Dtype::F32),
-            &[1usize, 2usize][..],
-            r,
-        ),
+        flatten(input("W", [co, ci, kk], Dtype::F32), &[1usize, 2usize][..], r),
         0usize,
         1usize,
     );
@@ -237,11 +227,7 @@ fn embedding_table_gradient() {
     .into_iter()
     .collect();
 
-    let emb = embedding(
-        input("E", [v, d], Dtype::F32),
-        input("ids", [s], Dtype::F32),
-        0usize,
-    ); // [s, d]
+    let emb = embedding(input("E", [v, d], Dtype::F32), input("ids", [s], Dtype::F32), 0usize); // [s, d]
     let err = map(MapOp::Sub, vec![emb, input("Y", [s, d], Dtype::F32)]);
     let sq = map(MapOp::Mul, vec![err.clone(), err]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
@@ -270,19 +256,12 @@ fn shared_input_through_a_rename() {
         vec![
             map(
                 MapOp::Mul,
-                vec![
-                    unsqueeze(input("A", [s, t], Dtype::F32), 2usize),
-                    unsqueeze(xt, 0usize),
-                ],
+                vec![unsqueeze(input("A", [s, t], Dtype::F32), 2usize), unsqueeze(xt, 0usize)],
             ),
             unsqueeze(x, 1usize),
         ],
     );
-    let loss = reduce(
-        reduce(reduce(y, 2usize, add_r()), 1usize, add_r()),
-        0usize,
-        add_r(),
-    );
+    let loss = reduce(reduce(reduce(y, 2usize, add_r()), 1usize, add_r()), 0usize, add_r());
     let loss = map(MapOp::Mul, vec![loss.clone(), loss]);
     check_grads(&loss, &env, &["X"]);
 }
@@ -347,9 +326,7 @@ fn sgd_training_loop_converges() {
     // targets from a hidden true weight vector — learnable exactly
     let w_true = rand_tensor(&[d], &mut rng);
     let targets = Value::from_shape_fn(&[s.extent()], |c| {
-        (0..4)
-            .map(|di| xs.at_index(&[c[0], di]) * w_true.at_index(&[di]))
-            .sum()
+        (0..4).map(|di| xs.at_index(&[c[0], di]) * w_true.at_index(&[di])).sum()
     });
 
     // loss(w) = Σ_s (X·w − t)²
@@ -374,10 +351,8 @@ fn sgd_training_loop_converges() {
     );
 
     // one schedule computes the loss AND the updated weights
-    let sched = sanic::partition::partition_many(
-        &[(loss_node.clone(), "loss"), (step, "w_next")],
-        &DeviceProfile::toy(),
-    );
+    let sched =
+        sanic::partition::partition_many(&[(loss_node.clone(), "loss"), (step, "w_next")], &DeviceProfile::toy());
 
     let mut sess = sanic::runtime::Session::new();
     sess.bind("X", xs);
@@ -428,20 +403,177 @@ fn strided_dilated_conv_backward() {
     // stride 2, dilation 2: input width 2·(o−1) + 2·(k−1) + 1 ≤ 11
     let (w0, o, kk) = (axis("w0", 11), axis("o", 4), axis("k", 3));
     let mut rng = Lcg(0x5D5D);
-    let env: Env = [
-        ("X", rand_tensor(&[w0], &mut rng)),
-        ("W", rand_tensor(&[kk], &mut rng)),
-    ]
-    .into_iter()
-    .collect();
+    let env: Env = [("X", rand_tensor(&[w0], &mut rng)), ("W", rand_tensor(&[kk], &mut rng))]
+        .into_iter()
+        .collect();
 
     let xw = window(input("X", [w0], Dtype::F32), 0usize, o, kk, 2, 2); // [o, k]
-    let conv = reduce(
-        map(MapOp::Mul, vec![xw, input("W", [kk], Dtype::F32)]),
-        1usize,
-        add_r(),
-    ); // [o]
+    let conv = reduce(map(MapOp::Mul, vec![xw, input("W", [kk], Dtype::F32)]), 1usize, add_r()); // [o]
     let sq = map(MapOp::Mul, vec![conv.clone(), conv]);
     let loss = reduce(sq, 0usize, add_r());
     check_grads(&loss, &env, &["X", "W"]);
+}
+
+// Gradient targets are NODES, not just input names: an interior value (the
+// normalizer of a softmax-like cone) gets its accumulated adjoint, and the
+// same call returns the leaf gradient — matching the name-keyed API.
+#[test]
+fn tensor_targets_reach_interior_nodes() {
+    use sanic::Tensor;
+    let d = axis("d", 6);
+    let x = Tensor::input("x", [d], Dtype::F32);
+    let interior = (&x * &x).sum(0usize); // s = Σx²
+    let loss = interior.log();
+
+    let grads = loss.gradient(&[&interior, &x], &[]);
+    let mut rng = Lcg(0x9d5);
+    let env: Env = [("x", rand_tensor(&[d], &mut rng))].into_iter().collect();
+
+    // dL/ds = 1/s
+    let s = eval(interior.node(), &env).data[0];
+    let ds = eval(grads[0].as_ref().unwrap().node(), &env).data[0];
+    assert!((ds - 1.0 / s).abs() < 1e-12);
+
+    // dL/dx matches the name-keyed grad
+    let by_name = grad(loss.node(), &["x"]);
+    let via_names = eval(&by_name["x"], &env);
+    let via_nodes = eval(grads[1].as_ref().unwrap().node(), &env);
+    assert_eq!(via_nodes.data, via_names.data);
+}
+
+// A stop tensor is a gradient boundary: the gradient reaches it, but its
+// inputs see nothing through it. loss = x·detach(x) must give d/dx = detach(x),
+// not 2x.
+#[test]
+fn stop_gradients_block_flow_without_blocking_targets() {
+    use sanic::Tensor;
+    let d = axis("d", 4);
+    let x = Tensor::input("x", [d], Dtype::F32);
+    let weight = (&x * &x).sum(0usize); // pretend-weighting we want frozen
+    let loss = (&x * (&x * 0.0 + weight.clone())).sum(0usize);
+
+    let mut rng = Lcg(0xde7ac);
+    let env: Env = [("x", rand_tensor(&[d], &mut rng))].into_iter().collect();
+
+    // stopped: d/dx = the frozen factor alone (weight, broadcast), plus the
+    // adjoint still REACHES the stopped node as a target
+    let grads = loss.gradient(&[&x, &weight], &[&weight]);
+    let got = eval(grads[0].as_ref().unwrap().node(), &env);
+    let w = eval(weight.node(), &env).data[0];
+    for v in &got.data {
+        assert!((v - w).abs() < 1e-9, "stopped gradient must be the frozen factor");
+    }
+    let at_stop = eval(grads[1].as_ref().unwrap().node(), &env).data[0];
+    let x_sum: f64 = env["x"].data.iter().sum();
+    assert!(
+        (at_stop - x_sum).abs() < 1e-9,
+        "the boundary itself still gets its adjoint"
+    );
+}
+
+// Ties split the mass: max over [t, t] must give each element g/2, and the
+// shares must sum to g exactly.
+#[test]
+fn max_reduce_ties_share_the_gradient_mass() {
+    let d = axis("d", 4);
+    let x = input("x", [d], Dtype::F32);
+    let loss = reduce(x.clone(), 0usize, Monoid::Max);
+    let grads = grad(&loss, &["x"]);
+
+    let env: Env = [("x", Value::from_shape_fn(&[4], |i| if i[0] < 2 { 7.0 } else { 1.0 }))]
+        .into_iter()
+        .collect();
+    let g = eval(&grads["x"], &env);
+    assert_eq!(g.data, vec![0.5, 0.5, 0.0, 0.0]);
+}
+
+// Measurement harness, not a pin (run with --ignored --nocapture): the
+// stage census of a llama-shaped decoder block's backward pass. This gates
+// the reindex fiber-law work: if the dense affine transposes already fuse,
+// that rewrite is optimization without a measurement.
+#[test]
+#[ignore]
+fn backward_schedule_census() {
+    use sanic::Tensor;
+    use sanic::nn::ops::{attention, rms_norm, rope, rope_inv_freq, update_cache};
+    use sanic::partition::{Stage, partition_many};
+
+    let (hidden, heads, kv_heads, hd, ctx, ff) = (
+        axis("hidden", 64),
+        axis("heads", 4),
+        axis("kv_heads", 2),
+        axis("hd", 16),
+        axis("ctx", 8),
+        axis("ff", 128),
+    );
+    let seq = axis("sequence", 1);
+    let position = Tensor::input("position", [], Dtype::F32);
+    let x = Tensor::input("x", [seq, hidden], Dtype::F32);
+    let w = |n: &str, o: Axis, i: Axis| Tensor::input(n, [o, i], Dtype::F32);
+
+    let attn_in = rms_norm(&x, &Tensor::input("g1", [hidden], Dtype::F32), 1e-5);
+    let project = |t: &Tensor, w: &Tensor, h: Axis| {
+        t.matmul(w.transpose(0usize, 1usize))
+            .split(-1isize, h, hd)
+            .transpose(0usize, 1usize)
+    };
+    let q = project(&attn_in, &w("wq", axis("q_proj", 64), hidden), heads);
+    let q = rope(&q, &position, seq, hd, rope_inv_freq(10_000.0));
+    let k = project(&attn_in, &w("wk", axis("kv_proj", 32), hidden), kv_heads);
+    let k = rope(&k, &position, seq, hd, rope_inv_freq(10_000.0));
+    let v = project(&attn_in, &w("wv", axis("kv_proj", 32), hidden), kv_heads);
+    let cache_shape = [kv_heads, ctx, hd];
+    let kc = update_cache(&Tensor::input("ck", cache_shape, Dtype::F32), &k, &position);
+    let vc = update_cache(&Tensor::input("cv", cache_shape, Dtype::F32), &v, &position);
+    let mask = Tensor::iota(ctx).lt(&position + 1.0).select(0.0, f64::NEG_INFINITY);
+    let attended = attention(&q, &kc, &vc, Some(&mask), None, true)
+        .transpose(0usize, 1usize)
+        .flatten(&[1usize, 2usize][..], hidden);
+    let attended = attended.matmul(w("wo", hidden, hidden).transpose(0usize, 1usize));
+    let res = &x + attended;
+    let mlp_in = rms_norm(&res, &Tensor::input("g2", [hidden], Dtype::F32), 1e-5);
+    let gate = mlp_in.matmul(w("wg", ff, hidden).transpose(0usize, 1usize));
+    let up = mlp_in.matmul(w("wu", ff, hidden).transpose(0usize, 1usize));
+    let out = &res + (gate.silu() * up).matmul(w("wd", hidden, ff).transpose(0usize, 1usize));
+    let loss = (&out * &out).sum(1usize).sum(0usize);
+
+    let weights = ["wq", "wk", "wv", "wo", "wg", "wu", "wd", "g1", "g2"];
+    let grads = grad(loss.node(), &weights);
+    let grad_names = ["d_wq", "d_wk", "d_wv", "d_wo", "d_wg", "d_wu", "d_wd", "d_g1", "d_g2"];
+    let roots: Vec<(NodeRef, &'static str)> = weights
+        .iter()
+        .zip(grad_names)
+        .filter_map(|(name, out)| grads.get(name).map(|g| (g.clone(), out)))
+        .collect();
+    let schedule = partition_many(&roots, &DeviceProfile::m1_pro());
+
+    let mut census: std::collections::HashMap<&str, usize> = Default::default();
+    for stage in &schedule.stages {
+        let kind = match stage {
+            Stage::Fused { .. } => "fold",
+            Stage::Elementwise { .. } => "map",
+            Stage::Gather { .. } => "gather",
+            Stage::Fallback { .. } => "FALLBACK",
+            Stage::Infeasible { .. } => "INFEASIBLE",
+        };
+        *census.entry(kind).or_default() += 1;
+    }
+    eprintln!("backward census ({} stages): {census:?}", schedule.stages.len());
+    eprintln!("{}", schedule.decline_census());
+}
+
+// stored() boundaries are transparent to gradients: the estimator is
+// straight-through, so d/dx of sum(2 · stored_bf16(x)) is exactly 2.
+#[test]
+fn stored_boundaries_pass_gradients_straight_through() {
+    use sanic::Tensor;
+    let d = axis("d", 4);
+    let x = Tensor::input("x", [d], Dtype::F32);
+    let loss = (x.stored(Dtype::BF16) * 2.0).sum(0usize);
+    let grads = loss.gradient(&[&x], &[]);
+
+    let mut rng = Lcg(0x570);
+    let env: Env = [("x", rand_tensor(&[d], &mut rng))].into_iter().collect();
+    let g = eval(grads[0].as_ref().unwrap().node(), &env);
+    assert_eq!(g.data, vec![2.0; 4]);
 }

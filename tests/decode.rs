@@ -63,38 +63,24 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
     let cache_k = input("cache_k", [t, dk], Dtype::F32);
     let ck = map(
         MapOp::Where,
-        vec![
-            one_hot_like(cache_k.clone(), 0usize, pos.clone()),
-            new_k,
-            cache_k,
-        ],
+        vec![one_hot_like(cache_k.clone(), 0usize, pos.clone()), new_k, cache_k],
     ); // [t, dk]
     let cache_v = input("cache_v", [t, dv], Dtype::F32);
     let cv = map(
         MapOp::Where,
-        vec![
-            one_hot_like(cache_v.clone(), 0usize, pos.clone()),
-            new_v,
-            cache_v,
-        ],
+        vec![one_hot_like(cache_v.clone(), 0usize, pos.clone()), new_v, cache_v],
     ); // [t, dv]
 
     // attention over the updated cache; positions beyond `pos` masked out
     let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(
         MapOp::Mul,
-        vec![
-            reduce(map(MapOp::Mul, vec![ck.clone(), q]), 1usize, Monoid::Add),
-            scale,
-        ],
+        vec![reduce(map(MapOp::Mul, vec![ck.clone(), q]), 1usize, Monoid::Add), scale],
     ); // [t]
     let future = map(MapOp::Lt, vec![pos, iota(t)]); // t > pos
     let masked = map(
         MapOp::Add,
-        vec![
-            scores,
-            map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)]),
-        ],
+        vec![scores, map(MapOp::Where, vec![future, konst(-1e30), konst(0.0)])],
     );
     let att = softmax(masked, 0usize);
     let out = reduce(
@@ -116,33 +102,18 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
 fn prefill_logits(s: Axis, t2: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis, env: &Env) -> Value {
     let x = input("X", [s, dm], Dtype::F32);
     let xt = rename(x.clone(), 0usize, t2);
-    let q = matmul(
-        x,
-        transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize),
-    ); // [s, dk]
-    let k = matmul(
-        xt.clone(),
-        transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize),
-    ); // [t2, dk]
-    let vv = matmul(
-        xt,
-        transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize),
-    ); // [t2, dv]
+    let q = matmul(x, transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize)); // [s, dk]
+    let k = matmul(xt.clone(), transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize)); // [t2, dk]
+    let vv = matmul(xt, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [t2, dv]
     let scale = konst(1.0 / (dk.extent() as f64).sqrt());
-    let scores = map(
-        MapOp::Mul,
-        vec![matmul(q, transpose(k, 0usize, 1usize)), scale],
-    );
+    let scores = map(MapOp::Mul, vec![matmul(q, transpose(k, 0usize, 1usize)), scale]);
     let masked = map(
         MapOp::Add,
         vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
     );
     let att = softmax(masked, 1usize);
     let out = matmul(att, vv); // [s, dv]
-    let logits = matmul(
-        out,
-        transpose(input("Wl", [v, dv], Dtype::F32), 0usize, 1usize),
-    ); // [s, v]
+    let logits = matmul(out, transpose(input("Wl", [v, dv], Dtype::F32), 0usize, 1usize)); // [s, v]
     eval(&logits, env)
 }
 
@@ -191,14 +162,8 @@ fn incremental_decode_equals_prefill() {
     sess.bind("Wk", wk);
     sess.bind("Wv", wv);
     sess.bind("Wl", wl);
-    sess.bind(
-        "cache_k",
-        Value::from_shape_fn(&[t.extent(), dk.extent()], |_| 0.0),
-    );
-    sess.bind(
-        "cache_v",
-        Value::from_shape_fn(&[t.extent(), dv.extent()], |_| 0.0),
-    );
+    sess.bind("cache_k", Value::from_shape_fn(&[t.extent(), dk.extent()], |_| 0.0));
+    sess.bind("cache_v", Value::from_shape_fn(&[t.extent(), dv.extent()], |_| 0.0));
 
     for p in 0..steps {
         let row = Value::from_shape_fn(&[dm.extent()], |c| xs.at_index(&[p, c[0]]));
@@ -210,8 +175,7 @@ fn incremental_decode_equals_prefill() {
         for vi in 0..v.extent() {
             let got = logits.at_index(&[vi]);
             let want = reference.at_index(&[p, vi]);
-            let tol = sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS)
-                * (1.0 + got.abs().max(want.abs()));
+            let tol = sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + got.abs().max(want.abs()));
             assert!(
                 (got - want).abs() <= tol,
                 "step {p}, vocab {vi}: decode {got} vs prefill {want}"
@@ -232,8 +196,7 @@ fn incremental_decode_equals_prefill() {
         for ki in 0..dk.extent() {
             let (a, b) = (ck.at_index(&[ti, ki]), k_ref.at_index(&[ti, ki]));
             assert!(
-                (a - b).abs()
-                    <= sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + a.abs()),
+                (a - b).abs() <= sanic::verify::rel_tolerance(Dtype::F64, CHAIN_TERMS) * (1.0 + a.abs()),
                 "cache_k[{ti},{ki}]"
             );
         }
@@ -281,22 +244,13 @@ fn incremental_decode_compiles_and_equals_prefill() {
     let sched = decode_step(t, dm, dk, dv, v);
     let program = emit_schedule(&sched);
     assert_eq!(
-        program
-            .outputs
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .collect::<Vec<_>>(),
+        program.outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         vec!["ck_new", "cv_new", "logits"],
         "run must return the cache updates and the logits"
     );
 
     // weights (baked), caches (mutable, persistent), x/pos (per step)
-    let bake = |data: &[f64]| {
-        data.iter()
-            .map(|v| format!("{v:?}f64"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let bake = |data: &[f64]| data.iter().map(|v| format!("{v:?}f64")).collect::<Vec<_>>().join(", ");
     let mut main = String::from("\nfn main() {\n");
     for (name, tensor) in [("Wq", &wq), ("Wk", &wk), ("Wv", &wv), ("Wl", &wl)] {
         let axes: Vec<AxisRef> = program
@@ -314,14 +268,8 @@ fn incremental_decode_compiles_and_equals_prefill() {
             bake(&tensor.data)
         }));
     }
-    main.push_str(&format!(
-        "    let xs: Vec<f64> = vec![{}];\n",
-        bake(&xs.data)
-    ));
-    main.push_str(&format!(
-        "    let expected: Vec<f64> = vec![{}];\n",
-        bake(&expected)
-    ));
+    main.push_str(&format!("    let xs: Vec<f64> = vec![{}];\n", bake(&xs.data)));
+    main.push_str(&format!("    let expected: Vec<f64> = vec![{}];\n", bake(&expected)));
     main.push_str(&format!(
         "    let mut b_cache_k: Vec<f64> = vec![0.0; {}];\n",
         steps * dk.extent()
@@ -337,15 +285,8 @@ fn incremental_decode_compiles_and_equals_prefill() {
         dm_n = dm.extent()
     ));
     main.push_str("        let b_pos: Vec<f64> = vec![p as f64];\n");
-    let args: Vec<String> = program
-        .inputs
-        .iter()
-        .map(|(n, _)| format!("&b_{n}[..]"))
-        .collect();
-    main.push_str(&format!(
-        "        let (ck, cv, lg) = run({});\n",
-        args.join(", ")
-    ));
+    let args: Vec<String> = program.inputs.iter().map(|(n, _)| format!("&b_{n}[..]")).collect();
+    main.push_str(&format!("        let (ck, cv, lg) = run({});\n", args.join(", ")));
     main.push_str("        b_cache_k = ck;\n        b_cache_v = cv;\n");
     main.push_str("        got.extend(lg);\n    }\n");
     main.push_str(

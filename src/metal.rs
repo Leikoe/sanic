@@ -32,17 +32,31 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLFunction, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
-    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLPipelineOption,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLResourceUsage,
-    MTLSize,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction,
+    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
+    MTLLibrary, MTLPipelineOption, MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions,
+    MTLResourceUsage, MTLSize,
 };
 
 use crate::emit_metal::MetalProgram;
+use crate::scalar::Dtype;
 
 /// A pipeline for one compiled kernel.
 pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// IEEE 754 half → f32: sign through, exponent rebiased, subnormals scaled.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let frac = (h & 0x3FF) as u32;
+    let bits = match (exp, frac) {
+        (0, 0) => sign << 31,
+        (0, f) => return if sign == 1 { -1.0 } else { 1.0 } * f as f32 * 2f32.powi(-24),
+        (0x1F, f) => (sign << 31) | 0x7F80_0000 | (f << 13),
+        (e, f) => (sign << 31) | ((e + 112) << 23) | (f << 13),
+    };
+    f32::from_bits(bits)
+}
 
 /// A device buffer in shared (unified) memory, with a byte OFFSET into the
 /// underlying allocation: several logical buffers can alias one `MTLBuffer`
@@ -116,6 +130,8 @@ pub struct Dispatch {
 pub struct MetalDevice {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// Boundary storage the compiled schedule writes at kernel boundaries.
+    storage: Dtype,
 }
 
 impl MetalDevice {
@@ -123,7 +139,22 @@ impl MetalDevice {
     pub fn open() -> Option<MetalDevice> {
         let dev = MTLCreateSystemDefaultDevice()?;
         let queue = dev.newCommandQueue().expect("command queue");
-        Some(MetalDevice { dev, queue })
+        Some(MetalDevice {
+            dev,
+            queue,
+            storage: Dtype::F32,
+        })
+    }
+
+    /// The same device compiling schedules that store intermediates and
+    /// outputs at `storage` precision (kernels still accumulate f32).
+    pub fn with_storage(mut self, storage: Dtype) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    pub fn storage(&self) -> Dtype {
+        self.storage
     }
 
     // ── compiler ─────────────────────────────────────────────────────────────
@@ -158,11 +189,7 @@ impl MetalDevice {
         desc.setComputeFunction(Some(f));
         desc.setSupportIndirectCommandBuffers(true);
         self.dev
-            .newComputePipelineStateWithDescriptor_options_reflection_error(
-                &desc,
-                MTLPipelineOption::empty(),
-                None,
-            )
+            .newComputePipelineStateWithDescriptor_options_reflection_error(&desc, MTLPipelineOption::empty(), None)
             .unwrap_or_else(|e| panic!("pipeline `{name}`: {e}"))
     }
 
@@ -171,6 +198,30 @@ impl MetalDevice {
     /// A zeroed buffer of `count` f32 elements.
     pub fn alloc_f32(&self, count: usize) -> MetalBuf {
         self.alloc_bytes(count.max(1) * 4)
+    }
+
+    /// A zeroed buffer of `count` elements at a storage dtype's width.
+    pub fn alloc_elems(&self, count: usize, dtype: Dtype) -> MetalBuf {
+        self.alloc_bytes((count.max(1) as f64 * dtype.bytes()).ceil() as usize)
+    }
+
+    /// Read `count` elements stored as `dtype`, widened to f32. The bf16
+    /// widen mirrors the kernels' load: high 16 bits of the f32 pattern.
+    pub fn read_as_f32(&self, buf: &MetalBuf, count: usize, dtype: Dtype) -> Vec<f32> {
+        match dtype {
+            Dtype::F32 => self.read_f32(buf, count),
+            Dtype::BF16 => {
+                let ptr = buf.contents() as *const u16;
+                (0..count)
+                    .map(|i| f32::from_bits((unsafe { *ptr.add(i) } as u32) << 16))
+                    .collect()
+            }
+            Dtype::F16 => {
+                let ptr = buf.contents() as *const u16;
+                (0..count).map(|i| half_to_f32(unsafe { *ptr.add(i) })).collect()
+            }
+            other => panic!("{other:?} is not a boundary storage dtype"),
+        }
     }
 
     /// A zeroed buffer of raw bytes.
@@ -210,13 +261,12 @@ impl MetalDevice {
         }
         let ptr = std::ptr::NonNull::new(data.as_ptr() as *mut std::ffi::c_void)?;
         let buf = unsafe {
-            self.dev
-                .newBufferWithBytesNoCopy_length_options_deallocator(
-                    ptr,
-                    data.len(),
-                    MTLResourceOptions::StorageModeShared,
-                    None, // caller-owned ('static): no deallocator
-                )
+            self.dev.newBufferWithBytesNoCopy_length_options_deallocator(
+                ptr,
+                data.len(),
+                MTLResourceOptions::StorageModeShared,
+                None, // caller-owned ('static): no deallocator
+            )
         }?;
         Some(MetalBuf(buf, 0))
     }
@@ -413,23 +463,16 @@ impl MetalDevice {
         desc.setInheritBuffers(false);
         let max_bufs = dispatches
             .iter()
-            .map(|d| {
-                if d.argbuf.is_some() {
-                    2
-                } else {
-                    d.inputs.len() + 1
-                }
-            })
+            .map(|d| if d.argbuf.is_some() { 2 } else { d.inputs.len() + 1 })
             .max()
             .unwrap_or(1);
         desc.setMaxKernelBufferBindCount(max_bufs);
         let icb = unsafe {
-            self.dev
-                .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
-                    &desc,
-                    dispatches.len(),
-                    MTLResourceOptions::StorageModeShared,
-                )
+            self.dev.newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
+                &desc,
+                dispatches.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
         }
         .expect("indirect command buffer");
 
@@ -451,9 +494,7 @@ impl MetalDevice {
                 for (bi, b) in d.inputs.iter().enumerate() {
                     unsafe { cmd.setKernelBuffer_offset_atIndex(&b.0, b.1, bi) };
                 }
-                unsafe {
-                    cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, d.inputs.len())
-                };
+                unsafe { cmd.setKernelBuffer_offset_atIndex(&d.output.0, d.output.1, d.inputs.len()) };
             }
             let input_allocations = d
                 .inputs
@@ -461,12 +502,7 @@ impl MetalDevice {
                 .map(|buffer| Retained::as_ptr(&buffer.0) as usize)
                 .collect::<Vec<_>>();
             let output_allocation = Retained::as_ptr(&d.output.0) as usize;
-            let hazard = icb_command_needs_barrier(
-                &input_allocations,
-                output_allocation,
-                &mut accessed,
-                &mut written,
-            );
+            let hazard = icb_command_needs_barrier(&input_allocations, output_allocation, &mut accessed, &mut written);
             if hazard {
                 cmd.setBarrier();
             }
@@ -504,19 +540,14 @@ impl MetalDevice {
     /// our own, or "Discarded (victim of GPU error/recovery)" when something
     /// ELSE faults the GPU mid-flight — is an `Err`: the step's writes are
     /// untrustworthy and a decode loop must not continue on them.
-    fn replay_checked(
-        &self,
-        g: &MetalGraph,
-    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+    fn replay_checked(&self, g: &MetalGraph) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let cb = self.queue.commandBuffer().expect("command buffer");
         let commands = match &g.execution {
             MetalGraphExecution::Direct(dispatches) => dispatches.len(),
             MetalGraphExecution::Indirect { command_buffer, .. } => command_buffer.len,
         };
         // Name the step for Instruments/Xcode GPU captures.
-        cb.setLabel(Some(&NSString::from_str(&format!(
-            "sanic batched {commands}"
-        ))));
+        cb.setLabel(Some(&NSString::from_str(&format!("sanic batched {commands}"))));
         match &g.execution {
             MetalGraphExecution::Direct(dispatches) => {
                 for dispatch in dispatches {
@@ -530,8 +561,7 @@ impl MetalDevice {
                 cb.useResidencySet(residency);
                 let enc = cb.computeCommandEncoder().expect("compute encoder");
                 for (buffer, usage) in &command_buffer.resources {
-                    let resource: &ProtocolObject<dyn MTLResource> =
-                        ProtocolObject::from_ref(&*buffer.0);
+                    let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*buffer.0);
                     enc.useResource_usage(resource, *usage);
                 }
                 // objc2-metal 0.3 has no binding for the compute encoder's
@@ -540,9 +570,8 @@ impl MetalDevice {
                     location: 0,
                     length: command_buffer.len,
                 };
-                let _: () = unsafe {
-                    msg_send![&*enc, executeCommandsInBuffer: &*command_buffer.icb, withRange: range]
-                };
+                let _: () =
+                    unsafe { msg_send![&*enc, executeCommandsInBuffer: &*command_buffer.icb, withRange: range] };
                 enc.endEncoding();
             }
         }
@@ -578,19 +607,9 @@ fn icb_resource_usages(dispatches: &[Dispatch]) -> Vec<(MetalBuf, MTLResourceUsa
             record(&mut resources, &mut indices, input, MTLResourceUsage::Read);
         }
         if let Some(argument_buffer) = &dispatch.argbuf {
-            record(
-                &mut resources,
-                &mut indices,
-                argument_buffer,
-                MTLResourceUsage::Read,
-            );
+            record(&mut resources, &mut indices, argument_buffer, MTLResourceUsage::Read);
         }
-        record(
-            &mut resources,
-            &mut indices,
-            &dispatch.output,
-            MTLResourceUsage::Write,
-        );
+        record(&mut resources, &mut indices, &dispatch.output, MTLResourceUsage::Write);
     }
     resources
 }
@@ -669,18 +688,8 @@ mod tests {
         let mut accessed = HashSet::new();
         let mut written = HashSet::new();
 
-        assert!(!icb_command_needs_barrier(
-            &[],
-            1,
-            &mut accessed,
-            &mut written
-        ));
-        assert!(icb_command_needs_barrier(
-            &[1],
-            2,
-            &mut accessed,
-            &mut written
-        ));
+        assert!(!icb_command_needs_barrier(&[], 1, &mut accessed, &mut written));
+        assert!(icb_command_needs_barrier(&[1], 2, &mut accessed, &mut written));
         assert!(
             icb_command_needs_barrier(&[1], 3, &mut accessed, &mut written),
             "a barrier on the first consumer does not fence the second consumer"
@@ -688,12 +697,7 @@ mod tests {
 
         let mut accessed = HashSet::new();
         let mut written = HashSet::new();
-        assert!(!icb_command_needs_barrier(
-            &[4],
-            5,
-            &mut accessed,
-            &mut written
-        ));
+        assert!(!icb_command_needs_barrier(&[4], 5, &mut accessed, &mut written));
         assert!(
             icb_command_needs_barrier(&[], 4, &mut accessed, &mut written),
             "an in-place writer must wait for earlier readers"

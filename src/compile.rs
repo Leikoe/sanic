@@ -28,9 +28,7 @@ impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompileError::EmptyOutputs => f.write_str("cannot compile an empty output set"),
-            CompileError::DynamicShapesNotYetSupported => {
-                f.write_str("compiling dynamic shapes is not supported yet")
-            }
+            CompileError::DynamicShapesNotYetSupported => f.write_str("compiling dynamic shapes is not supported yet"),
             CompileError::InvalidInput(reason) => write!(f, "invalid input declaration: {reason}"),
             CompileError::InvalidGraph(reason) => write!(f, "invalid graph: {reason}"),
             CompileError::Backend(reason) => write!(f, "backend compilation failed: {reason}"),
@@ -65,22 +63,12 @@ impl fmt::Display for RunError {
             RunError::MissingInput(name) => write!(f, "input `{name}` was not bound"),
             RunError::UnknownInput(name) => write!(f, "program has no input named `{name}`"),
             RunError::DuplicateInput(name) => write!(f, "input `{name}` was bound more than once"),
-            RunError::Shape {
-                name,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "input `{name}` has shape {actual:?}; expected {expected:?}"
-            ),
-            RunError::Dtype {
-                name,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "input `{name}` has dtype {actual:?}; expected {expected:?}"
-            ),
+            RunError::Shape { name, expected, actual } => {
+                write!(f, "input `{name}` has shape {actual:?}; expected {expected:?}")
+            }
+            RunError::Dtype { name, expected, actual } => {
+                write!(f, "input `{name}` has dtype {actual:?}; expected {expected:?}")
+            }
             RunError::Feedback(reason) => write!(f, "feedback wiring: {reason}"),
             RunError::Backend(reason) => write!(f, "backend execution failed: {reason}"),
         }
@@ -101,11 +89,7 @@ pub trait Backend: Clone + private::Sealed + 'static {
     type Executable;
 
     fn profile(&self) -> cost::DeviceProfile;
-    fn prepare(
-        &self,
-        schedule: &Schedule,
-        output_shapes: &[Vec<usize>],
-    ) -> Result<Self::Executable, CompileError>;
+    fn prepare(&self, schedule: &Schedule, output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError>;
     fn execute(
         &self,
         executable: &Self::Executable,
@@ -297,6 +281,42 @@ impl RootItem for &NodeRef {
     }
 }
 
+impl RootItem for crate::tensor::Tensor {
+    fn root(&self) -> NodeRef {
+        self.node().clone()
+    }
+}
+
+impl RootItem for &crate::tensor::Tensor {
+    fn root(&self) -> NodeRef {
+        self.node().clone()
+    }
+}
+
+impl Roots for crate::tensor::Tensor {
+    fn roots(&self) -> Vec<NodeRef> {
+        vec![self.node().clone()]
+    }
+}
+
+impl Roots for &crate::tensor::Tensor {
+    fn roots(&self) -> Vec<NodeRef> {
+        vec![self.node().clone()]
+    }
+}
+
+impl Roots for Vec<crate::tensor::Tensor> {
+    fn roots(&self) -> Vec<NodeRef> {
+        self.iter().map(|tensor| tensor.node().clone()).collect()
+    }
+}
+
+impl Roots for &[crate::tensor::Tensor] {
+    fn roots(&self) -> Vec<NodeRef> {
+        self.iter().map(|tensor| tensor.node().clone()).collect()
+    }
+}
+
 tuple_roots!(
     (A, B),
     (A, B, C),
@@ -332,8 +352,7 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         .map(|root| root.shape().into_iter().map(Axis::extent).collect())
         .collect::<Vec<Vec<usize>>>();
 
-    crate::verify::verify_many(&roots)
-        .map_err(|error| CompileError::InvalidGraph(error.to_string()))?;
+    crate::verify::verify_many(&roots).map_err(|error| CompileError::InvalidGraph(error.to_string()))?;
 
     let output_names = (0..roots.len())
         .map(|index| leak(format!("Out{index}")))
@@ -360,21 +379,16 @@ fn contains_dynamic(roots: &[NodeRef]) -> bool {
         if !seen.insert(Arc::as_ptr(node)) {
             return false;
         }
-        if node
-            .shape()
-            .iter()
-            .any(|axis| axis.extent == Extent::Dynamic)
-        {
+        if node.shape().iter().any(|axis| axis.extent == Extent::Dynamic) {
             return true;
         }
         match node.as_ref() {
             Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => false,
             Node::Coordinate { src, .. } => visit(src, seen),
             Node::Map { inputs, .. } => inputs.iter().any(|input| visit(input, seen)),
-            Node::Reduce { src, .. }
-            | Node::Scan { src, .. }
-            | Node::View { src, .. }
-            | Node::Reindex { src, .. } => visit(src, seen),
+            Node::Reduce { src, .. } | Node::Scan { src, .. } | Node::View { src, .. } | Node::Reindex { src, .. } => {
+                visit(src, seen)
+            }
             Node::Gather { src, index, .. } => visit(src, seen) || visit(index, seen),
         }
     }
@@ -383,27 +397,17 @@ fn contains_dynamic(roots: &[NodeRef]) -> bool {
 }
 
 fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
-    fn visit(
-        node: &NodeRef,
-        seen: &mut HashSet<*const Node>,
-        inputs: &mut Vec<InputSpec>,
-    ) -> Result<(), CompileError> {
+    fn visit(node: &NodeRef, seen: &mut HashSet<*const Node>, inputs: &mut Vec<InputSpec>) -> Result<(), CompileError> {
         if !seen.insert(Arc::as_ptr(node)) {
             return Ok(());
         }
         match node.as_ref() {
             Node::Input { name, shape, dtype } => {
                 if name.is_empty() {
-                    return Err(CompileError::InvalidInput(
-                        "input names cannot be empty".into(),
-                    ));
+                    return Err(CompileError::InvalidInput("input names cannot be empty".into()));
                 }
                 if let Some(previous) = inputs.iter().find(|input| input.name == *name) {
-                    let previous_extents = previous
-                        .shape
-                        .iter()
-                        .map(|axis| axis.extent)
-                        .collect::<Vec<_>>();
+                    let previous_extents = previous.shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
                     let extents = shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
                     if previous_extents != extents || previous.dtype != *dtype {
                         return Err(CompileError::InvalidInput(format!(
@@ -426,9 +430,7 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
             | Node::Scan { src, .. }
             | Node::View { src, .. }
             | Node::Reindex { src, .. } => visit(src, seen, inputs)?,
-            Node::Map {
-                inputs: children, ..
-            } => {
+            Node::Map { inputs: children, .. } => {
                 for child in children {
                     visit(child, seen, inputs)?;
                 }
@@ -515,11 +517,7 @@ impl Backend for CpuDevice {
         cost::DeviceProfile::toy()
     }
 
-    fn prepare(
-        &self,
-        _schedule: &Schedule,
-        _output_shapes: &[Vec<usize>],
-    ) -> Result<Self::Executable, CompileError> {
+    fn prepare(&self, _schedule: &Schedule, _output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError> {
         Ok(())
     }
 
@@ -549,9 +547,9 @@ impl Backend for CpuDevice {
             .iter()
             .zip(output_shapes)
             .map(|(name, shape)| {
-                let value = env.remove(name.as_str()).ok_or_else(|| {
-                    RunError::Backend(format!("schedule did not produce `{name}`"))
-                })?;
+                let value = env
+                    .remove(name.as_str())
+                    .ok_or_else(|| RunError::Backend(format!("schedule did not produce `{name}`")))?;
                 Ok(CpuBuffer {
                     shape: shape.clone(),
                     dtype: Dtype::F64,
@@ -568,9 +566,7 @@ impl Backend for CpuDevice {
 mod metal_backend {
     use super::*;
     use crate::emit_metal::{MetalProgram, emit_schedule_metal_on};
-    use crate::metal::{
-        Dispatch, MetalBuf, MetalDevice, MetalGraph, Pipelines, program_dispatches,
-    };
+    use crate::metal::{Dispatch, MetalBuf, MetalDevice, MetalGraph, Pipelines, program_dispatches};
 
     pub struct MetalExecutable {
         program: MetalProgram,
@@ -607,7 +603,7 @@ mod metal_backend {
         type Executable = MetalExecutable;
 
         fn profile(&self) -> cost::DeviceProfile {
-            cost::DeviceProfile::m1_pro()
+            cost::DeviceProfile::m1_pro().with_storage(self.storage())
         }
 
         fn prepare(
@@ -643,10 +639,9 @@ mod metal_backend {
                 buffers.insert(input.lowered_name.to_string(), buffer.raw.clone());
             }
             for (name, size) in &executable.program.buffers {
-                buffers.insert(name.clone(), self.alloc_f32(*size));
+                buffers.insert(name.clone(), alloc_scratch(self, &executable.program, name, *size));
             }
-            let dispatches =
-                program_dispatches(&executable.program, &buffers, &executable.pipelines);
+            let dispatches = program_dispatches(&executable.program, &buffers, &executable.pipelines);
             if crate::debug_level() >= 2 {
                 run_debug(self, &executable.program, schedule, &dispatches);
             } else {
@@ -657,13 +652,14 @@ mod metal_backend {
                 .iter()
                 .zip(output_shapes)
                 .map(|(name, shape)| {
-                    let raw = buffers.get(name).cloned().ok_or_else(|| {
-                        RunError::Backend(format!("Metal schedule did not produce `{name}`"))
-                    })?;
+                    let raw = buffers
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| RunError::Backend(format!("Metal schedule did not produce `{name}`")))?;
                     Ok(MetalBuffer {
                         raw,
                         shape: shape.clone(),
-                        dtype: Dtype::F32,
+                        dtype: executable.program.storage,
                     })
                 })
                 .collect()
@@ -724,9 +720,7 @@ mod metal_backend {
                     .inputs
                     .iter()
                     .find(|input| input.name == input_name)
-                    .ok_or_else(|| {
-                        RunError::Feedback(format!("program has no input named `{input_name}`"))
-                    })?;
+                    .ok_or_else(|| RunError::Feedback(format!("program has no input named `{input_name}`")))?;
                 if self.output_shapes[output] != input.concrete_shape() {
                     return Err(RunError::Feedback(format!(
                         "output {output} has shape {:?}; input `{input_name}` expects {:?}",
@@ -734,10 +728,10 @@ mod metal_backend {
                         input.concrete_shape()
                     )));
                 }
-                if input.dtype != Dtype::F32 {
+                if input.dtype != self.executable.program.storage {
                     return Err(RunError::Feedback(format!(
-                        "input `{input_name}` is {:?}; outputs are F32",
-                        input.dtype
+                        "input `{input_name}` is {:?}; outputs are stored {:?}",
+                        input.dtype, self.executable.program.storage
                     )));
                 }
                 if !fed_outputs.insert(output) {
@@ -760,7 +754,7 @@ mod metal_backend {
                 base.insert(input.lowered_name.to_string(), buffer.raw.clone());
             }
             for (name, size) in &executable.program.buffers {
-                base.insert(name.clone(), device.alloc_f32(*size));
+                base.insert(name.clone(), alloc_scratch(device, &executable.program, name, *size));
             }
 
             let parities = if feedback.is_empty() { 1 } else { 2 };
@@ -792,8 +786,7 @@ mod metal_backend {
                         }
                     }
                 }
-                let dispatch_list =
-                    program_dispatches(&executable.program, &buffers, &executable.pipelines);
+                let dispatch_list = program_dispatches(&executable.program, &buffers, &executable.pipelines);
                 graphs.push(device.capture(&dispatch_list));
                 dispatches.push(dispatch_list);
                 outputs.push(
@@ -802,15 +795,14 @@ mod metal_backend {
                         .iter()
                         .zip(&self.output_shapes)
                         .map(|(name, shape)| {
-                            let raw = buffers.get(name).cloned().ok_or_else(|| {
-                                RunError::Backend(format!(
-                                    "Metal schedule did not produce `{name}`"
-                                ))
-                            })?;
+                            let raw = buffers
+                                .get(name)
+                                .cloned()
+                                .ok_or_else(|| RunError::Backend(format!("Metal schedule did not produce `{name}`")))?;
                             Ok(MetalBuffer {
                                 raw,
                                 shape: shape.clone(),
-                                dtype: Dtype::F32,
+                                dtype: executable.program.storage,
                             })
                         })
                         .collect::<Result<Vec<_>, RunError>>()?,
@@ -864,8 +856,7 @@ mod metal_backend {
                 .run_graph_timed(&self.graphs[parity])
                 .map_err(RunError::Backend)?;
             if crate::debug_level() >= 2 {
-                if crate::debug_level() >= 3 && !std::mem::replace(&mut self.dumped[parity], true)
-                {
+                if crate::debug_level() >= 3 && !std::mem::replace(&mut self.dumped[parity], true) {
                     dump_graph(
                         &self.program.executable.program,
                         &self.program.schedule,
@@ -888,6 +879,12 @@ mod metal_backend {
             self.parity = (parity + 1) % self.graphs.len();
             parity
         }
+
+        /// The outputs of the last completed step.
+        pub fn last_outputs(&self) -> &[MetalBuffer] {
+            let last = (self.parity + self.graphs.len() - 1) % self.graphs.len();
+            &self.outputs[last]
+        }
     }
 
     /// The `SANIC_DEBUG=2` runtime dump. One line per launch, printed after
@@ -909,13 +906,31 @@ mod metal_backend {
     /// Times come from one command buffer per dispatch — accurate per
     /// kernel, but the submits add overhead: the SUM is a debug number, and
     /// `MetalDevice::run_timed` measures the production step.
+    /// Allocate one scratch buffer from `program.buffers`. Tensor
+    /// intermediates are sized at the boundary storage width; an ARGUMENT
+    /// BUFFER is a table of 64-bit GPU addresses counted in f32 elements —
+    /// its byte size never narrows with the tensor storage.
+    fn alloc_scratch(
+        device: &MetalDevice,
+        program: &MetalProgram,
+        name: &str,
+        elements: usize,
+    ) -> crate::metal::MetalBuf {
+        let is_argbuf = program.stages.iter().any(|stage| stage.argbuf.as_deref() == Some(name));
+        if is_argbuf {
+            device.alloc_f32(elements)
+        } else {
+            device.alloc_elems(elements, program.storage)
+        }
+    }
+
     /// Logical bytes per buffer name. An allocation's `byte_len` would
     /// overcount: a zero-copy checkpoint tensor is a SLICE of the whole
     /// weights file.
     fn logical_byte_table(program: &MetalProgram) -> HashMap<&str, f64> {
         let mut logical_bytes = HashMap::<&str, f64>::new();
         for (name, elements) in &program.buffers {
-            logical_bytes.insert(name, *elements as f64 * 4.0);
+            logical_bytes.insert(name, *elements as f64 * program.storage.bytes());
         }
         for (name, axes) in &program.inputs {
             let elements: usize = axes.iter().map(|a| a.extent()).product();
@@ -943,10 +958,7 @@ mod metal_backend {
     }
 
     /// Logical DRAM traffic of one dispatch: its stage's inputs plus output.
-    fn stage_bytes(
-        stage: &crate::emit_metal::MetalStageInfo,
-        logical_bytes: &HashMap<&str, f64>,
-    ) -> f64 {
+    fn stage_bytes(stage: &crate::emit_metal::MetalStageInfo, logical_bytes: &HashMap<&str, f64>) -> f64 {
         stage
             .inputs
             .iter()
@@ -961,12 +973,7 @@ mod metal_backend {
     /// fold total, and the step's aggregate DRAM position. Unplanned stages
     /// and inter-dispatch bubbles land in the ratio on purpose: it is the
     /// end-to-end honesty number, not per-kernel calibration.
-    fn print_step_line(
-        device: &MetalDevice,
-        program: &MetalProgram,
-        schedule: &Schedule,
-        seconds: f64,
-    ) {
+    fn print_step_line(device: &MetalDevice, program: &MetalProgram, schedule: &Schedule, seconds: f64) {
         let logical_bytes = logical_byte_table(program);
         let plans = stage_plans(schedule);
         let mut planned = 0.0f64;
@@ -997,12 +1004,7 @@ mod metal_backend {
     /// plan. Plan-side only — Metal exposes no per-kernel time inside one
     /// command buffer and we do not fake one; `SANIC_DEBUG=4` re-times each
     /// kernel solo instead (a different execution regime).
-    fn dump_graph(
-        program: &MetalProgram,
-        schedule: &Schedule,
-        dispatches: &[Dispatch],
-        parity: usize,
-    ) {
+    fn dump_graph(program: &MetalProgram, schedule: &Schedule, dispatches: &[Dispatch], parity: usize) {
         let logical_bytes = logical_byte_table(program);
         let plans = stage_plans(schedule);
         let plan_total = program
@@ -1017,10 +1019,7 @@ mod metal_backend {
             plan_total * 1e3,
         );
         for (index, (stage, dispatch)) in program.stages.iter().zip(dispatches).enumerate() {
-            let (kind, planned) = plans
-                .get(stage.output.as_str())
-                .copied()
-                .unwrap_or(("?", None));
+            let (kind, planned) = plans.get(stage.output.as_str()).copied().unwrap_or(("?", None));
             let plan = match planned {
                 Some(cost) if cost > 0.0 => format!(
                     "plan {:7.0}us {} {:4.1}%",
@@ -1039,31 +1038,32 @@ mod metal_backend {
         }
     }
 
-    fn run_debug(
-        device: &MetalDevice,
-        program: &MetalProgram,
-        schedule: &Schedule,
-        dispatches: &[Dispatch],
-    ) -> f64 {
+    fn run_debug(device: &MetalDevice, program: &MetalProgram, schedule: &Schedule, dispatches: &[Dispatch]) -> f64 {
         let logical_bytes = logical_byte_table(program);
         let stage_info = stage_plans(schedule);
 
         let times = device.run_each_timed(dispatches);
+        if std::env::var_os("SANIC_NANSCAN").is_some() {
+            for (stage, dispatch) in program.stages.iter().zip(dispatches) {
+                let width = program.storage.bytes();
+                let count = (dispatch.output.byte_len() as f64 / width) as usize;
+                let data = device.read_as_f32(&dispatch.output, count, program.storage);
+                if let Some(at) = data.iter().position(|v| !v.is_finite()) {
+                    eprintln!(
+                        "*** nanscan: `{}` is the first stage with a non-finite output \
+                         ({} at element {at} of {count})",
+                        stage.output, data[at],
+                    );
+                    break;
+                }
+            }
+        }
         let total = times.iter().sum::<f64>().max(1e-12);
         let slowest = times.iter().copied().fold(0.0, f64::max).max(1e-12);
         let (mut fused_measured, mut fused_planned) = (0.0f64, 0.0f64);
-        for (index, ((stage, dispatch), &seconds)) in program
-            .stages
-            .iter()
-            .zip(dispatches)
-            .zip(&times)
-            .enumerate()
-        {
+        for (index, ((stage, dispatch), &seconds)) in program.stages.iter().zip(dispatches).zip(&times).enumerate() {
             let bytes = stage_bytes(stage, &logical_bytes);
-            let (kind, planned) = stage_info
-                .get(stage.output.as_str())
-                .copied()
-                .unwrap_or(("?", None));
+            let (kind, planned) = stage_info.get(stage.output.as_str()).copied().unwrap_or(("?", None));
             let micros = seconds * 1e6;
             let time = if micros >= 1000.0 {
                 format!("\x1b[33m{micros:7.0}us\x1b[0m") // slow launch: yellow
@@ -1180,7 +1180,7 @@ mod metal_backend {
         }
 
         pub fn read_tensor_f32(&self, buffer: &MetalBuffer) -> Vec<f32> {
-            self.read_f32(&buffer.raw, buffer.shape.iter().product::<usize>().max(1))
+            self.read_as_f32(&buffer.raw, buffer.shape.iter().product::<usize>().max(1), buffer.dtype)
         }
     }
 

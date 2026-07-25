@@ -33,10 +33,7 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 // ── argmax: a generic extremal-key/payload product fold ─────────────────────
@@ -52,10 +49,7 @@ fn argmax_is_one_generic_product_fold() {
     let node = argmax(x, 0usize);
 
     let carrier = derive(&node, stream).expect("argmax composition should derive");
-    assert_eq!(
-        carrier.slots, 2,
-        "Acc = (maximum value, minimum tied index)"
-    );
+    assert_eq!(carrier.slots, 2, "Acc = (maximum value, minimum tied index)");
     assert!(carrier.rules.contains(&"extremum-filter"));
     assert!(matches!(
         carrier.kinds.as_slice(),
@@ -165,11 +159,7 @@ fn topk_all_composition_matches_and_schedules() {
             expected_index as f64,
             "index at rank {r}"
         );
-        assert_eq!(
-            expected_values.at_index(&[r]),
-            expected_value,
-            "value at rank {r}"
-        );
+        assert_eq!(expected_values.at_index(&[r]), expected_value, "value at rank {r}");
     }
 
     // The generic graph still runs through the ordinary partitioned pipeline.
@@ -183,11 +173,7 @@ fn topk_all_composition_matches_and_schedules() {
     let indices = &run_env["indices"];
     for (r, &(expected_value, expected_index)) in order.iter().take(k).enumerate() {
         assert_eq!(values.at_index(&[r]), expected_value, "scheduled value {r}");
-        assert_eq!(
-            indices.at_index(&[r]),
-            expected_index as f64,
-            "scheduled index {r}"
-        );
+        assert_eq!(indices.at_index(&[r]), expected_index as f64, "scheduled index {r}");
     }
 }
 
@@ -207,11 +193,7 @@ fn topk_all_ties_match_per_rank_folds() {
     let got = eval(&all, &env);
     let pairs = topk(input("X", [n], Dtype::F32), 0usize, k);
     for (r, (_, i)) in pairs.iter().enumerate() {
-        assert_eq!(
-            got.at_index(&[r]),
-            eval(i, &env).data[0],
-            "rank {r} under ties"
-        );
+        assert_eq!(got.at_index(&[r]), eval(i, &env).data[0], "rank {r} under ties");
     }
     assert_eq!(got.at_index(&[0]), 1.0);
     assert_eq!(got.at_index(&[1]), 2.0);
@@ -268,12 +250,7 @@ fn scatter_add_matches_hand_with_collisions() {
     let idx = Value::from_shape_fn(&[7], |coordinate| idx_vals[coordinate[0]] as f64);
     let env: Env = [("S", src.clone()), ("idx", idx)].into_iter().collect();
 
-    let sc = scatter_add(
-        input("S", [i, d], Dtype::F32),
-        input("idx", [i], Dtype::F32),
-        0usize,
-        j,
-    );
+    let sc = scatter_add(input("S", [i, d], Dtype::F32), input("idx", [i], Dtype::F32), 0usize, j);
     let got = eval(&sc, &env);
 
     let hand = Value::from_shape_fn(&[4, 3], |coordinate| {
@@ -291,12 +268,7 @@ fn scatter_add_matches_hand_with_collisions() {
 
     // and through the pipeline: one fused kernel (a one-hot contraction)
     let sched = partition(&sc, &DeviceProfile::toy());
-    assert_eq!(
-        sched.stages.len(),
-        1,
-        "scatter-add is one fold:\n{}",
-        sched.render()
-    );
+    assert_eq!(sched.stages.len(), 1, "scatter-add is one fold:\n{}", sched.render());
     let executed = sched.execute(&env);
     let exec_p = executed.permuted_to(&got.axes);
     for (a, b) in got.data.iter().zip(&exec_p.data) {
@@ -315,11 +287,7 @@ fn scatter_add_inverts_a_permutation_gather() {
     let ids = Value::from_shape_fn(&[5], |coordinate| perm[coordinate[0]] as f64);
     let env: Env = [("T", table.clone()), ("ids", ids)].into_iter().collect();
 
-    let gathered = gather(
-        input("T", [v, d], Dtype::F32),
-        input("ids", [s], Dtype::F32),
-        0usize,
-    ); // [s, d]
+    let gathered = gather(input("T", [v, d], Dtype::F32), input("ids", [s], Dtype::F32), 0usize); // [s, d]
     let back = scatter_add(gathered, input("ids", [s], Dtype::F32), 0usize, v2); // [v2, d]
     let got = eval(&back, &env);
     for vi in 0..5 {

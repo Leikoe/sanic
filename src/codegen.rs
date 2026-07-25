@@ -82,13 +82,7 @@ impl Gen {
         coord
             .iter()
             .find_map(|(candidate, value)| {
-                (self
-                    .axis_aliases
-                    .get(candidate)
-                    .copied()
-                    .unwrap_or(*candidate)
-                    == target)
-                    .then_some(value)
+                (self.axis_aliases.get(candidate).copied().unwrap_or(*candidate) == target).then_some(value)
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -276,9 +270,7 @@ pub fn value<L: Lang>(
     match node.as_ref() {
         NodeKind::Const { v } => lang.lit(*v),
         NodeKind::Iota { .. } => lang.iota_val(g.coordinate(coord, ir::axis_refs(node)[0])),
-        NodeKind::Coordinate { src, dim } => {
-            lang.iota_val(g.coordinate(coord, ir::axis_refs(src)[*dim]))
-        }
+        NodeKind::Coordinate { src, dim } => lang.iota_val(g.coordinate(coord, ir::axis_refs(src)[*dim])),
         NodeKind::Input { name, dtype, .. } => {
             if let Some(v) = g.local_inputs.get(*name) {
                 return v.clone();
@@ -293,8 +285,7 @@ pub fn value<L: Lang>(
                     for output_axis in ir::axis_refs(node) {
                         let input_axis = ir::map_input_axis(node, input, output_axis);
                         if input_axis != output_axis {
-                            input_coord
-                                .insert(input_axis, g.coordinate(coord, output_axis).clone());
+                            input_coord.insert(input_axis, g.coordinate(coord, output_axis).clone());
                         }
                     }
                     value(lang, input, &input_coord, g, out)
@@ -319,15 +310,9 @@ pub fn value<L: Lang>(
             // the lane-distributed axis).
             let lane_split = g.lane_body.and_then(|lb| {
                 let lane = lang.lane_var()?;
-                let uniform = lb
-                    .avoid_axis
-                    .is_none_or(|a| !ir::axis_refs(src).contains(&a));
+                let uniform = lb.avoid_axis.is_none_or(|a| !ir::axis_refs(src).contains(&a));
                 let merge = lang.simd_lane_merge(&acc, m, lb.simd_width)?;
-                (axis.extent() % lb.simd_width == 0 && uniform).then_some((
-                    lane,
-                    lb.simd_width,
-                    merge,
-                ))
+                (axis.extent() % lb.simd_width == 0 && uniform).then_some((lane, lb.simd_width, merge))
             });
             match lane_split {
                 Some((lane, w, merge)) => {
@@ -386,11 +371,7 @@ pub fn value<L: Lang>(
                     .iter()
                     .map(|(coef, a)| {
                         let iv = lang.to_signed(g.coordinate(coord, *a));
-                        if *coef == 1 {
-                            iv
-                        } else {
-                            format!("{coef}*{iv}")
-                        }
+                        if *coef == 1 { iv } else { format!("{coef}*{iv}") }
                     })
                     .collect();
                 if off != 0 {
@@ -448,13 +429,9 @@ pub fn value<L: Lang>(
 /// `acc[i]`, `B(i)` → `el[i]` (identical in both targets); operators route
 /// through the language's [`Lang::map_op`].
 pub fn carrier_expr<L: Lang>(lang: &L, e: &Expr) -> String {
-    carrier_expr_map(
-        lang,
-        e,
-        &|i| format!("x[{i}]"),
-        &|i| format!("acc[{i}]"),
-        &|i| format!("el[{i}]"),
-    )
+    carrier_expr_map(lang, e, &|i| format!("x[{i}]"), &|i| format!("acc[{i}]"), &|i| {
+        format!("el[{i}]")
+    })
 }
 
 /// [`carrier_expr`] with the leaf renderers supplied by the caller — a
@@ -520,10 +497,7 @@ pub fn thread_grid_decode_from<L: Lang>(
         if stride == 1 {
             out.push(format!("uint {iv} = {gid_var} % {};", a.extent()));
         } else {
-            out.push(format!(
-                "uint {iv} = ({gid_var} / {stride}) % {};",
-                a.extent()
-            ));
+            out.push(format!("uint {iv} = ({gid_var} / {stride}) % {};", a.extent()));
         }
         coord.insert(a, iv);
     }
@@ -534,11 +508,7 @@ pub fn thread_grid_decode_from<L: Lang>(
 pub fn grid_of(node: &Node) -> (Vec<AxisRef>, usize) {
     (
         ir::axis_refs(node),
-        node.shape()
-            .iter()
-            .map(|axis| axis.extent())
-            .product::<usize>()
-            .max(1),
+        node.shape().iter().map(|axis| axis.extent()).product::<usize>().max(1),
     )
 }
 

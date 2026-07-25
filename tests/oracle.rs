@@ -23,20 +23,14 @@ use sanic::nn::scaled_dot_product_attention;
 /// rotates each (q[p,0], q[p,1]) pair, which is exactly RoPE.
 fn rope_rotation(pos: Axis, p: Axis, j: Axis, i: Axis, c: f64) -> NodeRef {
     let freq = map(MapOp::Exp, vec![map(MapOp::Mul, vec![iota(p), konst(c)])]);
-    let theta = map(
-        MapOp::Mul,
-        vec![unsqueeze(iota(pos), 1usize), unsqueeze(freq, 0usize)],
-    ); // [pos, p]
+    let theta = map(MapOp::Mul, vec![unsqueeze(iota(pos), 1usize), unsqueeze(freq, 0usize)]); // [pos, p]
     let i_coord = unsqueeze(iota(i), 0usize);
     let j_coord = unsqueeze(iota(j), 1usize);
     let lt_ij = map(MapOp::Lt, vec![i_coord.clone(), j_coord.clone()]);
     let lt_ji = map(MapOp::Lt, vec![j_coord, i_coord]);
     let eq = map(
         MapOp::Sub,
-        vec![
-            map(MapOp::Sub, vec![konst(1.0), lt_ij.clone()]),
-            lt_ji.clone(),
-        ],
+        vec![map(MapOp::Sub, vec![konst(1.0), lt_ij.clone()]), lt_ji.clone()],
     );
     let offdiag = map(MapOp::Sub, vec![lt_ij, lt_ji]); // (i<j) − (j<i)
     let theta = unsqueeze(unsqueeze(theta, 2usize), 3usize);
@@ -73,11 +67,7 @@ fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
 /// `verify::rel_tolerance`; `terms` = the folded extent), regardless of axis
 /// storage order.
 fn assert_close(x: &Value, y: &Value, terms: usize) {
-    assert_eq!(
-        x.shape, y.shape,
-        "shape mismatch: {:?} vs {:?}",
-        x.axes, y.axes
-    );
+    assert_eq!(x.shape, y.shape, "shape mismatch: {:?} vs {:?}", x.axes, y.axes);
     for (i, (a, b)) in x.data.iter().zip(&y.data).enumerate() {
         let tol = sanic::verify::rel_tolerance(Dtype::F64, terms) * (1.0 + a.abs().max(b.abs()));
         assert!((a - b).abs() <= tol, "cell {i}: {a} vs {b}");
@@ -154,25 +144,15 @@ fn rmsnorm_fused_projection_matches_naive() {
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
-    let xn = map(
-        MapOp::Div,
-        vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)],
-    );
-    let q = matmul(
-        xn,
-        transpose(input("W", [f, dm], Dtype::F32), 0usize, 1usize),
-    );
+    let xn = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
+    let q = matmul(xn, transpose(input("W", [f, dm], Dtype::F32), 0usize, 1usize));
 
     assert_kernel_matches_reference(&q, stream, &env);
 }
 
 #[test]
 fn standalone_broadcast_denominator_keeps_the_stream_axis() {
-    let (sequence, singleton, hidden) = (
-        axis("sequence", 1),
-        axis("singleton", 1),
-        axis("hidden", 16),
-    );
+    let (sequence, singleton, hidden) = (axis("sequence", 1), axis("singleton", 1), axis("hidden", 16));
     let mut rng = Lcg(0x51A6_1E70);
     let env: Env = [
         ("a", rand_tensor(&[sequence, hidden], &mut rng)),
@@ -195,20 +175,13 @@ fn standalone_broadcast_denominator_keeps_the_stream_axis() {
         ],
     );
     let stream = axis_refs(&residual)[1];
-    let sum_square = reduce(
-        map(MapOp::Mul, vec![residual.clone(), residual]),
-        1usize,
-        Monoid::Add,
-    );
+    let sum_square = reduce(map(MapOp::Mul, vec![residual.clone(), residual]), 1usize, Monoid::Add);
     let denominator = unsqueeze(
         map(
             MapOp::Sqrt,
             vec![map(
                 MapOp::Add,
-                vec![
-                    map(MapOp::Mul, vec![sum_square, konst(1.0 / 16.0)]),
-                    konst(1e-5),
-                ],
+                vec![map(MapOp::Mul, vec![sum_square, konst(1.0 / 16.0)]), konst(1e-5)],
             )],
         ),
         1usize,
@@ -222,9 +195,7 @@ fn standalone_broadcast_denominator_keeps_the_stream_axis() {
 fn logsumexp_matches_naive() {
     let (r, k) = (axis("r", 4), axis("k", 9));
     let mut rng = Lcg(0x15E);
-    let env: Env = [("X", rand_tensor(&[r, k], &mut rng))]
-        .into_iter()
-        .collect();
+    let env: Env = [("X", rand_tensor(&[r, k], &mut rng))].into_iter().collect();
     let x = input("X", [r, k], Dtype::F32);
     let stream = axis_refs(&x)[1];
     let lse = reduce(x, 1usize, Monoid::LogSumExp);
@@ -245,10 +216,7 @@ fn quantized_matmul_dequant_fuses() {
     let env: Env = [
         ("X", rand_tensor(&[s, dm], &mut rng)),
         ("qW", qw),
-        (
-            "scale",
-            Value::from_shape_fn(&[o.extent()], |_| 0.05 * (rng.f() + 1.5)),
-        ),
+        ("scale", Value::from_shape_fn(&[o.extent()], |_| 0.05 * (rng.f() + 1.5))),
     ]
     .into_iter()
     .collect();
@@ -345,10 +313,7 @@ fn kv_cache_write_matches_hand() {
     let cache_node = input("cache", [t, d], Dtype::F32);
     let pos_in = input("pos", [], Dtype::F32);
     let is_pos = one_hot_like(cache_node.clone(), 0usize, pos_in);
-    let updated = map(
-        MapOp::Where,
-        vec![is_pos, input("new_k", [d], Dtype::F32), cache_node],
-    );
+    let updated = map(MapOp::Where, vec![is_pos, input("new_k", [d], Dtype::F32), cache_node]);
     let got = eval(&updated, &env);
 
     let want = Value::from_shape_fn(&[t.extent(), d.extent()], |c| {
@@ -428,26 +393,15 @@ fn rope_flash_attention_matches_naive() {
     let key_axis = axis_refs(&k_input)[0];
     let rq = rope_rotation(s, p, j, i, c);
     let rk = rope_rotation(t, p, j, i, c);
-    let qr = reduce(
-        map(MapOp::Mul, vec![unsqueeze(q, 2usize), rq]),
-        3usize,
-        add_r(),
-    ); // [s, p, j]
-    let kr = reduce(
-        map(MapOp::Mul, vec![unsqueeze(k_input, 2usize), rk]),
-        3usize,
-        add_r(),
-    ); // [t, p, j]
+    let qr = reduce(map(MapOp::Mul, vec![unsqueeze(q, 2usize), rq]), 3usize, add_r()); // [s, p, j]
+    let kr = reduce(map(MapOp::Mul, vec![unsqueeze(k_input, 2usize), rk]), 3usize, add_r()); // [t, p, j]
     let qr = flatten(qr, &[1usize, 2usize][..], dk);
     let kr = flatten(kr, &[1usize, 2usize][..], dk);
     let scores = matmul(qr, transpose(kr, 0usize, 1usize)); // [s, t]
     let attn = matmul(softmax(scores, 1usize), input("V", [t, e], Dtype::F32));
 
     let carrier = derive(&attn, key_axis).expect("RoPE flash derives");
-    assert!(
-        carrier.rules.contains(&"rescale"),
-        "online-softmax coupling present"
-    );
+    assert!(carrier.rules.contains(&"rescale"), "online-softmax coupling present");
     assert_kernel_matches_reference(&attn, key_axis, &env);
 }
 
@@ -470,16 +424,10 @@ fn cosine_relative_bias_attention_matches_naive() {
 
     let key = input("K", [t, dk], Dtype::F32);
     let key_axis = axis_refs(&key)[0];
-    let scores = matmul(
-        input("Q", [s, dk], Dtype::F32),
-        transpose(key, 0usize, 1usize),
-    );
+    let scores = matmul(input("Q", [s, dk], Dtype::F32), transpose(key, 0usize, 1usize));
     let rel = map(
         MapOp::Sub,
-        vec![
-            coordinate(scores.clone(), 0usize),
-            coordinate(scores.clone(), 1usize),
-        ],
+        vec![coordinate(scores.clone(), 0usize), coordinate(scores.clone(), 1usize)],
     );
     let bias = map(MapOp::Cos, vec![map(MapOp::Mul, vec![rel, konst(0.1)])]);
     let biased = map(MapOp::Add, vec![scores, bias]);

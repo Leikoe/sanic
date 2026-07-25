@@ -124,12 +124,9 @@ fn run_h(build: Build, xs: &[f64]) -> f64 {
     let n = axis("n", xs.len());
     let g = build(input("X", [n], Dtype::F32), 0);
     let x = xs.to_vec();
-    let env: Env = [(
-        "X",
-        Value::from_shape_fn(&[xs.len()], |coordinate| x[coordinate[0]]),
-    )]
-    .into_iter()
-    .collect();
+    let env: Env = [("X", Value::from_shape_fn(&[xs.len()], |coordinate| x[coordinate[0]]))]
+        .into_iter()
+        .collect();
     eval(&g, &env).data[0]
 }
 
@@ -141,9 +138,7 @@ const POOL: &[(&str, Sketch)] = &[
     ("len", |xs| xs.len() as f64),
     ("sum", |xs| xs.iter().sum()),
     ("sumsq", |xs| xs.iter().map(|v| v * v).sum()),
-    ("max", |xs| {
-        xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-    }),
+    ("max", |xs| xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
     ("min", |xs| xs.iter().cloned().fold(f64::INFINITY, f64::min)),
     ("argmax", |xs| {
         let mut best = (f64::NEG_INFINITY, 0usize);
@@ -166,9 +161,7 @@ const POOL: &[(&str, Sketch)] = &[
         }
         b
     }),
-    ("dot_iota", |xs| {
-        xs.iter().enumerate().map(|(i, &v)| i as f64 * v).sum()
-    }),
+    ("dot_iota", |xs| xs.iter().enumerate().map(|(i, &v)| i as f64 * v).sum()),
     ("last", |xs| *xs.last().unwrap()),
 ];
 
@@ -273,8 +266,7 @@ fn probe_with(build: Build, seed: u64, n_pres: usize, n_sufs: usize) -> Verdict 
                 for (s, (&fa, &fb)) in futures[a].iter().zip(&futures[b]).enumerate() {
                     // Separation at the semantics-quotient tolerance (theory
                     // §5.4): the one policy, at the probe's stream length.
-                    let tol = sanic::verify::rel_tolerance(Dtype::F64, 12)
-                        * (1.0 + fa.abs().max(fb.abs()));
+                    let tol = sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()));
                     if (fa - fb).abs() > tol {
                         last_witness = Some((a, b, s, names.clone()));
                         continue 'sigma; // separated — next candidate
@@ -289,21 +281,10 @@ fn probe_with(build: Build, seed: u64, n_pres: usize, n_sufs: usize) -> Verdict 
         }
         // too few conclusive collisions: this σ proves nothing either way
     }
-    let (a, b, s, sigma) = last_witness
-        .expect("no candidate sketch ever produced a conclusive collision — alphabet too fine?");
-    let (p, q, suffix) = shrink_witness(
-        build,
-        &sigma,
-        pres[a].clone(),
-        pres[b].clone(),
-        sufs[s].clone(),
-    );
-    Verdict::Separated {
-        p,
-        q,
-        suffix,
-        sigma,
-    }
+    let (a, b, s, sigma) =
+        last_witness.expect("no candidate sketch ever produced a conclusive collision — alphabet too fine?");
+    let (p, q, suffix) = shrink_witness(build, &sigma, pres[a].clone(), pres[b].clone(), sufs[s].clone());
+    Verdict::Separated { p, q, suffix, sigma }
 }
 
 /// §3.3: QuickCheck-style shrinking — the shortest (p, q, suffix) that still
@@ -337,8 +318,7 @@ fn shrink_witness(
             v
         };
         let (fa, fb) = (run_h(build, &cat(p)), run_h(build, &cat(q)));
-        (fa - fb).abs()
-            > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
+        (fa - fb).abs() > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
     };
     loop {
         let mut shrunk = false;
@@ -438,10 +418,7 @@ fn median_graph(x: NodeRef, n: usize) -> NodeRef {
         MapOp::Mul,
         vec![map(MapOp::Sub, vec![len.clone(), konst(1.0)]), konst(0.5)],
     );
-    let hi_bound = map(
-        MapOp::Sub,
-        vec![len, map(MapOp::Add, vec![m_lo.clone(), konst(0.5)])],
-    );
+    let hi_bound = map(MapOp::Sub, vec![len, map(MapOp::Add, vec![m_lo.clone(), konst(0.5)])]);
     let ok_lo = indicator_lt(n_less, map(MapOp::Add, vec![m_lo, konst(0.5)]));
     let ok_hi = indicator_lt(n_greater, map(MapOp::Add, vec![hi_bound, konst(0.5)]));
     let hit = map(MapOp::Mul, vec![ok_lo, ok_hi]);
@@ -459,13 +436,7 @@ fn median_graph(x: NodeRef, n: usize) -> NodeRef {
 /// is a concrete evaluated counterexample and certifies itself.)
 fn confirm_carrier_across_seeds(name: &str, build: Build, failures: &mut Vec<String>) {
     for seed in [0xACE1u64, 0xBEEF] {
-        if let Verdict::Separated {
-            p,
-            q,
-            suffix,
-            sigma,
-        } = probe_with(build, seed, 2000, 23)
-        {
+        if let Verdict::Separated { p, q, suffix, sigma } = probe_with(build, seed, 2000, 23) {
             failures.push(format!(
                 "{name}: probe found a carrier under the primary seed, but seed {seed:#x} \
                  separated every sketch — e.g. σ = ({}) on {p:?} / {q:?} via {suffix:?}",
@@ -514,16 +485,7 @@ fn every_decline_is_justified_or_pinned() {
                     sigma.join(", ")
                 )
             }
-            (
-                None,
-                Verdict::Separated {
-                    p,
-                    q,
-                    suffix,
-                    sigma,
-                },
-                Expect::JustifiedDecline,
-            ) => format!(
+            (None, Verdict::Separated { p, q, suffix, sigma }, Expect::JustifiedDecline) => format!(
                 "  JUSTIFIED   {name:22} every sketch separated — minimal witness: \
                  σ = ({}) collides on {p:?} / {q:?}, split by {suffix:?}\n",
                 sigma.join(", ")
@@ -531,10 +493,7 @@ fn every_decline_is_justified_or_pinned() {
             (d, v, e) => {
                 let got = match (d.is_some(), v) {
                     (true, Verdict::Carrier(comps, s)) => {
-                        format!(
-                            "derives; probe agrees via ({}), ≤ {comps} slots",
-                            s.join(", ")
-                        )
+                        format!("derives; probe agrees via ({}), ≤ {comps} slots", s.join(", "))
                     }
                     (true, Verdict::Separated { .. }) => {
                         "derives, but the probe separated every sketch (pool too weak)".into()
@@ -696,11 +655,7 @@ fn inspect_flagged_seeds() {
         let x = input("X", [n], Dtype::F32);
         let stream = axis_refs(&x)[0];
         let g = build(x, 0);
-        println!(
-            "seed {seed}: derives={} {:?}\n",
-            derive(&g, stream).is_ok(),
-            g
-        );
+        println!("seed {seed}: derives={} {:?}\n", derive(&g, stream).is_ok(), g);
     }
 }
 
@@ -723,9 +678,7 @@ fn inspect_flagged_seeds() {
 /// window around the middle and the family would plateau spuriously.
 fn fooling_family(build: Build, plen: usize, seed: u64) -> Vec<Vec<f64>> {
     let mut rng = Lcg(seed);
-    let pres: Vec<Vec<f64>> = (0..800)
-        .map(|_| (0..plen).map(|_| rng.q()).collect())
-        .collect();
+    let pres: Vec<Vec<f64>> = (0..800).map(|_| (0..plen).map(|_| rng.q()).collect()).collect();
     let mut sufs: Vec<Vec<f64>> = vec![Vec::new()];
     for _ in 0..25 {
         let len = 1 + (rng.next() >> 40) as usize % plen;
@@ -745,8 +698,7 @@ fn fooling_family(build: Build, plen: usize, seed: u64) -> Vec<Vec<f64>> {
         .collect();
     let separated = |a: usize, b: usize| {
         futures[a].iter().zip(&futures[b]).any(|(&fa, &fb)| {
-            (fa - fb).abs()
-                > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
+            (fa - fb).abs() > sanic::verify::rel_tolerance(Dtype::F64, 12) * (1.0 + fa.abs().max(fb.abs()))
         })
     };
     // bucket by the answer, grow the family greedily inside each h-class
@@ -788,10 +740,7 @@ fn fooling_families_grow_only_at_true_walls() {
         ("median", median_graph as Build, 16usize),
         ("count_above_half_max", cahm, 4),
     ] {
-        let sizes: Vec<usize> = [4usize, 6, 8]
-            .iter()
-            .map(|&l| same_answer_family(build, l))
-            .collect();
+        let sizes: Vec<usize> = [4usize, 6, 8].iter().map(|&l| same_answer_family(build, l)).collect();
         println!(
             "{name}: same-answer fooling family {sizes:?} at lengths [4, 6, 8] \
              → state ≥ {:.1} bits and growing",
@@ -817,10 +766,7 @@ fn fooling_families_grow_only_at_true_walls() {
     for (name, build) in [("sum", sum), ("max", mx), ("lse", lse)] {
         for plen in [5usize, 9] {
             let k = same_answer_family(build, plen);
-            assert_eq!(
-                k, 1,
-                "{name} at length {plen}: family of {k} — the answer IS the state"
-            );
+            assert_eq!(k, 1, "{name} at length {plen}: family of {k} — the answer IS the state");
         }
     }
 }
@@ -858,12 +804,8 @@ fn futures_matrix(
     seed: u64,
 ) -> Vec<Vec<f64>> {
     let mut rng = Lcg(seed);
-    let pres: Vec<Vec<f64>> = (0..rows)
-        .map(|_| (0..plen).map(|_| rng.c()).collect())
-        .collect();
-    let sufs: Vec<Vec<f64>> = (0..n_sufs)
-        .map(|_| (0..3).map(|_| rng.c()).collect())
-        .collect();
+    let pres: Vec<Vec<f64>> = (0..rows).map(|_| (0..plen).map(|_| rng.c()).collect()).collect();
+    let sufs: Vec<Vec<f64>> = (0..n_sufs).map(|_| (0..3).map(|_| rng.c()).collect()).collect();
     pres.iter()
         .map(|p| {
             let mut row = Vec::new();
@@ -886,9 +828,7 @@ fn futures_matrix(
 fn singular_values(mut a: Vec<Vec<f64>>) -> Vec<f64> {
     // orthogonalize columns; needs rows ≥ cols, so transpose if wider
     if a[0].len() > a.len() {
-        a = (0..a[0].len())
-            .map(|j| a.iter().map(|r| r[j]).collect())
-            .collect();
+        a = (0..a[0].len()).map(|j| a.iter().map(|r| r[j]).collect()).collect();
     }
     let n = a[0].len();
     for _ in 0..60 {
@@ -969,11 +909,7 @@ fn rank_oracle_measures_small_carriers() {
     // Σx², same shape, different lift — still one measured slot.
     let sumsq: Build = |x, n| reduce(map(MapOp::Mul, vec![x.clone(), x]), n, Monoid::Add);
     let spec = relative_spectrum(futures_matrix(&[sumsq], 6, 40, 12, false, 0xB0B));
-    assert_eq!(
-        rank_with_gap(&spec, 1e-8),
-        Some(1),
-        "Σx² spectrum: {spec:?}"
-    );
+    assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σx² spectrum: {spec:?}");
 }
 
 #[test]
@@ -1043,14 +979,7 @@ fn rank_oracle_corroborates_the_median_wall() {
     // separating witness and the fooling family settle the claim; this
     // corroborates it from a second, independent instrument.
     let effective_rank = |n_sufs: usize| {
-        let spec = relative_spectrum(futures_matrix(
-            &[median_graph],
-            8,
-            n_sufs + 8,
-            n_sufs,
-            false,
-            0x3D1A,
-        ));
+        let spec = relative_spectrum(futures_matrix(&[median_graph], 8, n_sufs + 8, n_sufs, false, 0x3D1A));
         spec.iter().take_while(|&&v| v > 1e-8).count()
     };
     for n_sufs in [8usize, 16, 24] {

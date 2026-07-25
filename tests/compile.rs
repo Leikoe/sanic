@@ -2,8 +2,8 @@ use sanic::cost::DeviceProfile;
 use sanic::derive::{SlotKind, derive};
 use sanic::partition::{Stage, partition, partition_many};
 use sanic::{
-    Buffer, Compile, CompileError, CpuDevice, Dtype, Extent, MapOp, Monoid, ViewDim, argmax, axis,
-    axis_refs, input, map, matmul, positional_view, reduce, topk,
+    Buffer, Compile, CompileError, CpuDevice, Dtype, Extent, MapOp, Monoid, ViewDim, argmax, axis, axis_refs, input,
+    map, matmul, positional_view, reduce, topk,
 };
 
 fn add() -> Monoid {
@@ -18,9 +18,7 @@ fn positional_dimensions_do_not_alias_equal_metadata() {
 
     let cpu = CpuDevice::new();
     let program = rows.compile(&cpu).unwrap();
-    let x = cpu
-        .buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0])
-        .unwrap();
+    let x = cpu.buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
     let outputs = program.run([("x", x)]);
 
     assert_eq!(outputs.len(), 1);
@@ -38,9 +36,7 @@ fn tuple_roots_share_named_inputs_and_return_a_vec_in_order() {
 
     let cpu = CpuDevice::new();
     let program = (&by_row, &by_col).compile(&cpu).unwrap();
-    let x = cpu
-        .buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0])
-        .unwrap();
+    let x = cpu.buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
     let outputs = program.run([("x", &x)]);
 
     assert_eq!(outputs.len(), 2);
@@ -78,9 +74,7 @@ fn broadcasting_preserves_output_order_when_the_short_operand_is_first() {
     let cpu = CpuDevice::new();
     let program = y.compile(&cpu).unwrap();
     let b = cpu.buffer([3], Dtype::F32, [10.0, 20.0, 30.0]).unwrap();
-    let x = cpu
-        .buffer([2, 3], Dtype::F32, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-        .unwrap();
+    let x = cpu.buffer([2, 3], Dtype::F32, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let outputs = program.run([("b", &b), ("x", &x)]);
 
     assert_eq!(outputs[0].shape(), &[2, 3]);
@@ -108,9 +102,7 @@ fn positional_view_can_permute_storage_order() {
 
     let cpu = CpuDevice::new();
     let program = transposed.compile(&cpu).unwrap();
-    let x = cpu
-        .buffer([2, 3], Dtype::F32, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-        .unwrap();
+    let x = cpu.buffer([2, 3], Dtype::F32, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let outputs = program.run([("x", x)]);
 
     assert_eq!(outputs[0].shape(), &[3, 2]);
@@ -135,12 +127,8 @@ fn matmul_contracts_by_position_even_when_axis_metadata_repeats() {
 
     let cpu = CpuDevice::new();
     let program = output.compile(&cpu).unwrap();
-    let left = cpu
-        .buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0])
-        .unwrap();
-    let right = cpu
-        .buffer([2, 2], Dtype::F32, vec![5.0, 6.0, 7.0, 8.0])
-        .unwrap();
+    let left = cpu.buffer([2, 2], Dtype::F32, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let right = cpu.buffer([2, 2], Dtype::F32, vec![5.0, 6.0, 7.0, 8.0]).unwrap();
     let outputs = program.run([("left", &left), ("right", &right)]);
 
     assert_eq!(outputs[0].shape(), &[2, 2]);
@@ -215,10 +203,7 @@ fn positional_topk_composition_returns_descending_values_and_indices() {
         .buffer([8], Dtype::F32, [2.0, 9.0, 5.0, 7.0, 3.0, 6.0, 1.0, 4.0])
         .unwrap();
     let outputs = program.run([("x", x)]);
-    let got = outputs
-        .iter()
-        .map(|output| output.data()[0])
-        .collect::<Vec<_>>();
+    let got = outputs.iter().map(|output| output.data()[0]).collect::<Vec<_>>();
     assert_eq!(got, [9.0, 1.0, 7.0, 3.0, 6.0, 5.0]);
 }
 
@@ -270,16 +255,10 @@ fn direct_attention_is_one_metal_kernel() {
     let actual = metal.read_tensor_f32(&outputs[0]);
     let expected = [2.990_715, 4.320_953_4, 4.009_285, 5.679_046_6];
     // the f32-Metal-vs-reference comparison reads the one policy in F32
-    assert!(
-        actual
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected): (&f32, f32)| {
-                let tol =
-                    sanic::verify::rel_tolerance(Dtype::F32, 2) * (1.0 + expected.abs() as f64);
-                ((actual - expected).abs() as f64) < tol
-            })
-    );
+    assert!(actual.iter().zip(expected).all(|(actual, expected): (&f32, f32)| {
+        let tol = sanic::verify::rel_tolerance(Dtype::F32, 2) * (1.0 + expected.abs() as f64);
+        ((actual - expected).abs() as f64) < tol
+    }));
 }
 
 #[cfg(target_os = "macos")]
@@ -293,9 +272,7 @@ fn captured_replay_feeds_outputs_back_as_inputs() {
     let delta = input("delta", [d], Dtype::F32);
     let program = map(MapOp::Add, vec![state, delta]).compile(&metal).unwrap();
 
-    let state = metal
-        .tensor_from_f64([4], Dtype::F32, &[1.0, 2.0, 3.0, 4.0])
-        .unwrap();
+    let state = metal.tensor_from_f64([4], Dtype::F32, &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let delta = metal
         .tensor_from_f64([4], Dtype::F32, &[10.0, 10.0, 10.0, 10.0])
         .unwrap();
@@ -335,19 +312,10 @@ fn captured_replay_without_feedback_reruns_one_graph_over_live_bindings() {
         .unwrap();
     let mut replay = program.capture([("x", &x)], &[]).unwrap();
 
-    assert_eq!(
-        metal.read_tensor_f32(&replay.step().unwrap()[0]),
-        [3.0, 7.0]
-    );
-    assert_eq!(
-        metal.read_tensor_f32(&replay.step().unwrap()[0]),
-        [3.0, 7.0]
-    );
+    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [3.0, 7.0]);
+    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [3.0, 7.0]);
     metal.write_f64(x.raw(), &[10.0, 20.0, 30.0, 40.0]);
-    assert_eq!(
-        metal.read_tensor_f32(&replay.step().unwrap()[0]),
-        [30.0, 70.0]
-    );
+    assert_eq!(metal.read_tensor_f32(&replay.step().unwrap()[0]), [30.0, 70.0]);
 }
 
 #[cfg(target_os = "macos")]

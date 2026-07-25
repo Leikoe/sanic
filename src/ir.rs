@@ -196,6 +196,12 @@ impl AxisSelector for usize {
     }
 }
 
+impl AxisSelector for &str {
+    fn resolve_axis(self, node: &NodeRef, op: &str) -> Option<AxisRef> {
+        Some(axis_refs(node)[self.resolve(&node.shape(), op)])
+    }
+}
+
 impl AxisSelector for isize {
     fn resolve_axis(self, node: &NodeRef, op: &str) -> Option<AxisRef> {
         Some(axis_refs(node)[self.resolve(&node.shape(), op)])
@@ -209,17 +215,11 @@ impl Node {
     }
 }
 
-fn shape_memo(
-    node: &Node,
-    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
-) -> Vec<Axis> {
+fn shape_memo(node: &Node, cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>) -> Vec<Axis> {
     (*shape_rc(node, cache)).clone()
 }
 
-fn shape_rc(
-    node: &Node,
-    cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>,
-) -> Rc<Vec<Axis>> {
+fn shape_rc(node: &Node, cache: &mut std::collections::HashMap<*const Node, Rc<Vec<Axis>>>) -> Rc<Vec<Axis>> {
     let key = std::ptr::from_ref(node);
     if let Some(shape) = cache.get(&key) {
         return shape.clone();
@@ -234,10 +234,7 @@ fn shape_rc(
             shape
         }
         Node::Map { inputs, .. } => broadcast_shapes(
-            &inputs
-                .iter()
-                .map(|input| shape_memo(input, cache))
-                .collect::<Vec<_>>(),
+            &inputs.iter().map(|input| shape_memo(input, cache)).collect::<Vec<_>>(),
             "map",
         ),
         Node::Reduce { src, dim, .. } => {
@@ -305,12 +302,7 @@ impl Resolver {
         self.axes(src)[dim]
     }
 
-    pub(crate) fn map_input_axis(
-        &mut self,
-        map_node: &NodeRef,
-        input: &NodeRef,
-        axis: AxisRef,
-    ) -> AxisRef {
+    pub(crate) fn map_input_axis(&mut self, map_node: &NodeRef, input: &NodeRef, axis: AxisRef) -> AxisRef {
         let output_axes = self.axes(map_node);
         let Some(output_dim) = output_axes.iter().position(|candidate| *candidate == axis) else {
             return axis;
@@ -320,9 +312,7 @@ impl Resolver {
         let Some(input_dim) = output_dim.checked_sub(output_shape.len() - input_shape.len()) else {
             return axis;
         };
-        if input_shape[input_dim].extent == Extent::Static(1)
-            && output_shape[output_dim].extent != Extent::Static(1)
-        {
+        if input_shape[input_dim].extent == Extent::Static(1) && output_shape[output_dim].extent != Extent::Static(1) {
             axis
         } else {
             self.axes(input)[input_dim]
@@ -344,10 +334,7 @@ impl Resolver {
             })
             .map(|(output_dim, dim)| {
                 (
-                    dim.sources
-                        .iter()
-                        .map(|&source_dim| source[source_dim])
-                        .collect(),
+                    dim.sources.iter().map(|&source_dim| source[source_dim]).collect(),
                     output[output_dim],
                 )
             })
@@ -412,9 +399,7 @@ fn axis_refs_rc(
                     let mut fallback = None;
                     for input in inputs {
                         let input_shape = shape_memo(input, shape_cache);
-                        let Some(input_dim) =
-                            output_dim.checked_sub(rank.saturating_sub(input_shape.len()))
-                        else {
+                        let Some(input_dim) = output_dim.checked_sub(rank.saturating_sub(input_shape.len())) else {
                             continue;
                         };
                         let candidate = axis_refs_rc(input, cache, shape_cache)[input_dim];
@@ -435,10 +420,7 @@ fn axis_refs_rc(
         Node::Scan { src, .. } => (*axis_refs_rc(src, cache, shape_cache)).clone(),
         Node::Gather { src, index, dim } => {
             let mut axes = (*axis_refs_rc(src, cache, shape_cache)).clone();
-            axes.splice(
-                *dim..=*dim,
-                axis_refs_rc(index, cache, shape_cache).iter().copied(),
-            );
+            axes.splice(*dim..=*dim, axis_refs_rc(index, cache, shape_cache).iter().copied());
             axes
         }
         Node::View { src, dims } => {
@@ -447,16 +429,12 @@ fn axis_refs_rc(
             dims.iter()
                 .enumerate()
                 .map(|(output_dim, view_dim)| match view_dim.sources.as_slice() {
-                    [source_dim] if view_dim.axis == source_shape[*source_dim] => {
-                        source_axes[*source_dim]
-                    }
+                    [source_dim] if view_dim.axis == source_shape[*source_dim] => source_axes[*source_dim],
                     _ => own_axis(node, output_dim, view_dim.axis),
                 })
                 .collect()
         }
-        Node::Reindex {
-            src, shape, map, ..
-        } => {
+        Node::Reindex { src, shape, map, .. } => {
             let source_axes = axis_refs_rc(src, cache, shape_cache);
             let source_shape = shape_memo(src, shape_cache);
             shape
@@ -473,8 +451,7 @@ fn axis_refs_rc(
                         .filter(|(_, terms, _)| terms.iter().any(|(_, dim)| *dim == output_dim));
                     match (readers.next(), readers.next()) {
                         (Some((source_dim, terms, 0)), None)
-                            if terms.as_slice() == [(1, output_dim)]
-                                && *axis == source_shape[*source_dim] =>
+                            if terms.as_slice() == [(1, output_dim)] && *axis == source_shape[*source_dim] =>
                         {
                             source_axes[*source_dim]
                         }
@@ -624,6 +601,20 @@ impl Dimension for isize {
     }
 }
 
+/// Dimensions by NAME: any op taking `impl Dimension` accepts the axis's
+/// display name. Names identify a dimension only within one tensor's shape,
+/// and only when unambiguous there — the graph itself stays positional.
+impl Dimension for &str {
+    fn resolve(self, shape: &[Axis], op: &str) -> usize {
+        let mut hits = shape.iter().enumerate().filter(|(_, axis)| axis.name == self);
+        match (hits.next(), hits.next()) {
+            (Some((dim, _)), None) => dim,
+            (None, _) => panic!("{op}: no axis named `{self}` in {shape:?}"),
+            _ => panic!("{op}: axis name `{self}` is ambiguous in {shape:?}"),
+        }
+    }
+}
+
 pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> NodeRef {
     let name = Box::leak(name.into().into_boxed_str());
     intern(Node::Input {
@@ -640,10 +631,7 @@ pub fn konst(v: f64) -> NodeRef {
 /// A tensor of ones with the same positional shape as `source`, expressed
 /// from scalar maps so it preserves the source dimension occurrences.
 pub fn ones_like(source: NodeRef) -> NodeRef {
-    map(
-        MapOp::Add,
-        vec![map(MapOp::Mul, vec![source, konst(0.0)]), konst(1.0)],
-    )
+    map(MapOp::Add, vec![map(MapOp::Mul, vec![source, konst(0.0)]), konst(1.0)])
 }
 
 pub fn iota(axis: Axis) -> NodeRef {
@@ -659,10 +647,7 @@ pub fn coordinate(src: NodeRef, dim: impl Dimension) -> NodeRef {
 pub fn map(op: MapOp, inputs: Vec<NodeRef>) -> NodeRef {
     assert_eq!(op.arity(), inputs.len(), "{op:?} arity");
     // Validate broadcasting at construction so malformed graphs fail locally.
-    let _ = broadcast_shapes(
-        &inputs.iter().map(|input| input.shape()).collect::<Vec<_>>(),
-        op.name(),
-    );
+    let _ = broadcast_shapes(&inputs.iter().map(|input| input.shape()).collect::<Vec<_>>(), op.name());
     intern(Node::Map { op, inputs })
 }
 
@@ -773,12 +758,7 @@ pub fn flatten<G: Dimensions>(src: NodeRef, group: G, to: Axis) -> NodeRef {
     positional_view(src, dims)
 }
 
-pub fn positional_reindex(
-    src: NodeRef,
-    shape: Vec<Axis>,
-    map: Vec<AffineIndex>,
-    padded: bool,
-) -> NodeRef {
+pub fn positional_reindex(src: NodeRef, shape: Vec<Axis>, map: Vec<AffineIndex>, padded: bool) -> NodeRef {
     let source = src.shape();
     assert_eq!(
         map.len(),
@@ -804,6 +784,24 @@ pub fn positional_reindex(
     })
 }
 
+/// Reverse one dimension: `out[…, i, …] = src[…, extent-1-i, …]`.
+pub fn flip(src: NodeRef, dim: impl Dimension) -> NodeRef {
+    let shape = src.shape();
+    let dim = dim.resolve(&shape, "flip");
+    let map = shape
+        .iter()
+        .enumerate()
+        .map(|(source_dim, source_axis)| {
+            if source_dim == dim {
+                (source_dim, vec![(-1, source_dim)], source_axis.extent() as i64 - 1)
+            } else {
+                (source_dim, vec![(1, source_dim)], 0)
+            }
+        })
+        .collect();
+    positional_reindex(src, shape, map, false)
+}
+
 pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> NodeRef {
     let source = src.shape();
     let from = from.resolve(&source, "split");
@@ -814,17 +812,9 @@ pub fn split(src: NodeRef, from: impl Dimension, outer: Axis, inner: Axis) -> No
         .enumerate()
         .map(|(source_dim, _)| {
             if source_dim == from {
-                (
-                    source_dim,
-                    vec![(inner.extent() as i64, from), (1, from + 1)],
-                    0,
-                )
+                (source_dim, vec![(inner.extent() as i64, from), (1, from + 1)], 0)
             } else {
-                let output_dim = if source_dim < from {
-                    source_dim
-                } else {
-                    source_dim + 1
-                };
+                let output_dim = if source_dim < from { source_dim } else { source_dim + 1 };
                 (source_dim, vec![(1, output_dim)], 0)
             }
         })
@@ -928,11 +918,7 @@ pub fn children(node: &NodeRef) -> Vec<NodeRef> {
 
 /// Number of elements in a materialized output (`1` for a scalar).
 pub fn volume(node: &NodeRef) -> usize {
-    node.shape()
-        .iter()
-        .map(|axis| axis.extent())
-        .product::<usize>()
-        .max(1)
+    node.shape().iter().map(|axis| axis.extent()).product::<usize>().max(1)
 }
 
 /// Input declarations and their resolved storage dimensions.
@@ -1091,11 +1077,7 @@ pub fn unsqueeze(src: NodeRef, dim: impl Dimension) -> NodeRef {
                 axis: singleton,
             });
         } else {
-            let source_dim = if output_dim < dim {
-                output_dim
-            } else {
-                output_dim - 1
-            };
+            let source_dim = if output_dim < dim { output_dim } else { output_dim - 1 };
             dims.push(ViewDim {
                 sources: vec![source_dim],
                 axis: source[source_dim],
@@ -1200,14 +1182,7 @@ pub fn pad(src: NodeRef, dim: impl Dimension, to: Axis, low: usize) -> NodeRef {
 
 /// Sliding windows along one dimension. The selected source dimension is
 /// replaced by `(out, kernel)`.
-pub fn window(
-    src: NodeRef,
-    dim: impl Dimension,
-    out: Axis,
-    kernel: Axis,
-    stride: usize,
-    dilation: usize,
-) -> NodeRef {
+pub fn window(src: NodeRef, dim: impl Dimension, out: Axis, kernel: Axis, stride: usize, dilation: usize) -> NodeRef {
     let source = src.shape();
     let dim = dim.resolve(&source, "window");
     let mut shape = source.clone();
@@ -1217,11 +1192,7 @@ pub fn window(
         .enumerate()
         .map(|(source_dim, _)| {
             if source_dim == dim {
-                (
-                    source_dim,
-                    vec![(stride as i64, dim), (dilation as i64, dim + 1)],
-                    0,
-                )
+                (source_dim, vec![(stride as i64, dim), (dilation as i64, dim + 1)], 0)
             } else {
                 let output_dim = source_dim + usize::from(source_dim > dim);
                 (source_dim, vec![(1, output_dim)], 0)
@@ -1239,12 +1210,7 @@ pub fn embedding(table: NodeRef, ids: NodeRef, dim: impl Dimension) -> NodeRef {
 /// Add-combine rows according to a one-dimensional index tensor. This is the
 /// positional adjoint of gathering along `dim`, expressed from reindexing,
 /// coordinates, maps, and one reduction.
-pub fn scatter_add(
-    src: NodeRef,
-    index: NodeRef,
-    dim: impl Dimension,
-    output_axis: Axis,
-) -> NodeRef {
+pub fn scatter_add(src: NodeRef, index: NodeRef, dim: impl Dimension, output_axis: Axis) -> NodeRef {
     let source = src.shape();
     let dim = dim.resolve(&source, "scatter_add");
     let index_shape = index.shape();
@@ -1267,11 +1233,7 @@ pub fn scatter_add(
     let lifted_source = positional_reindex(src, iteration.clone(), source_map, false);
     let lifted_index = positional_reindex(index, iteration, vec![(0, vec![(1, dim)], 0)], false);
     let selected = one_hot_like(lifted_source.clone(), dim + 1, lifted_index);
-    reduce(
-        map(MapOp::Mul, vec![selected, lifted_source]),
-        dim,
-        Monoid::Add,
-    )
+    reduce(map(MapOp::Mul, vec![selected, lifted_source]), dim, Monoid::Add)
 }
 
 /// `1` where the coordinate of `template` along `dim` equals `value`.
@@ -1283,10 +1245,7 @@ pub fn one_hot_like(template: NodeRef, dim: impl Dimension, value: NodeRef) -> N
         vec![
             map(
                 MapOp::Sub,
-                vec![
-                    konst(1.0),
-                    map(MapOp::Lt, vec![coordinate.clone(), value.clone()]),
-                ],
+                vec![konst(1.0), map(MapOp::Lt, vec![coordinate.clone(), value.clone()])],
             ),
             map(MapOp::Lt, vec![value, coordinate]),
         ],
@@ -1337,13 +1296,7 @@ pub fn topk(x: NodeRef, dim: impl Dimension, k: usize) -> Vec<(NodeRef, NodeRef)
 }
 
 /// Stack every selected rank in a new trailing dimension.
-pub fn topk_all(
-    x: NodeRef,
-    dim: impl Dimension,
-    k: usize,
-    rank: Axis,
-    return_indices: bool,
-) -> NodeRef {
+pub fn topk_all(x: NodeRef, dim: impl Dimension, k: usize, rank: Axis, return_indices: bool) -> NodeRef {
     assert_eq!(rank.extent(), k, "topk_all rank axis extent must equal k");
     let mut sum = None;
     for (rank_index, (value, index)) in topk(x, dim, k).into_iter().enumerate() {
@@ -1369,10 +1322,7 @@ pub fn topk_all(
                     MapOp::Sub,
                     vec![
                         konst(1.0),
-                        map(
-                            MapOp::Lt,
-                            vec![rank_coordinate.clone(), konst(rank_index as f64)],
-                        ),
+                        map(MapOp::Lt, vec![rank_coordinate.clone(), konst(rank_index as f64)]),
                     ],
                 ),
                 map(MapOp::Lt, vec![konst(rank_index as f64), rank_coordinate]),
@@ -1392,20 +1342,13 @@ pub fn silu(x: NodeRef) -> NodeRef {
         MapOp::Recip,
         vec![map(
             MapOp::Add,
-            vec![
-                konst(1.0),
-                map(MapOp::Exp, vec![map(MapOp::Neg, vec![x.clone()])]),
-            ],
+            vec![konst(1.0), map(MapOp::Exp, vec![map(MapOp::Neg, vec![x.clone()])])],
         )],
     );
     map(MapOp::Mul, vec![x, sigmoid])
 }
 
-pub fn causal_mask_like(
-    scores: NodeRef,
-    query_dim: impl Dimension,
-    key_dim: impl Dimension,
-) -> NodeRef {
+pub fn causal_mask_like(scores: NodeRef, query_dim: impl Dimension, key_dim: impl Dimension) -> NodeRef {
     let shape = scores.shape();
     let query_dim = query_dim.resolve(&shape, "causal_mask query");
     let key_dim = key_dim.resolve(&shape, "causal_mask key");
@@ -1414,10 +1357,7 @@ pub fn causal_mask_like(
         vec![
             map(
                 MapOp::Lt,
-                vec![
-                    coordinate(scores.clone(), query_dim),
-                    coordinate(scores, key_dim),
-                ],
+                vec![coordinate(scores.clone(), query_dim), coordinate(scores, key_dim)],
             ),
             konst(-1e30),
             konst(0.0),

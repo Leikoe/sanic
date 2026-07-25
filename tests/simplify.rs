@@ -23,10 +23,7 @@ impl Lcg {
     }
 }
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 /// Softmax cross-entropy over `[b, c]`, `logsumexp − logit[y]`. `primitive`
@@ -38,10 +35,7 @@ fn cross_entropy(logits: &NodeRef, primitive: bool) -> NodeRef {
         let m = reduce(logits.clone(), 1usize, Monoid::Max);
         let sh = map(
             MapOp::Exp,
-            vec![map(
-                MapOp::Sub,
-                vec![logits.clone(), unsqueeze(m.clone(), 1usize)],
-            )],
+            vec![map(MapOp::Sub, vec![logits.clone(), unsqueeze(m.clone(), 1usize)])],
         );
         map(
             MapOp::Add,
@@ -75,10 +69,7 @@ fn simplify_preserves_the_gradient() {
     let mut rng = Lcg(0x5117);
     let env: Env = [
         ("Z", rand_tensor(&[b, c], &mut rng)),
-        (
-            "y",
-            Value::from_shape_fn(&[8], |coordinate| (coordinate[0] % 5) as f64),
-        ),
+        ("y", Value::from_shape_fn(&[8], |coordinate| (coordinate[0] % 5) as f64)),
     ]
     .into_iter()
     .collect();
@@ -132,13 +123,7 @@ fn composed_logsumexp_backward_matches_the_primitive() {
 fn interned_construction_merges_structural_duplicates() {
     let (b, c) = (axis("b", 4), axis("c", 6));
     let x = input("x", [b, c], Dtype::F32);
-    let row_energy = |x: &NodeRef| {
-        reduce(
-            map(MapOp::Mul, vec![x.clone(), x.clone()]),
-            1usize,
-            Monoid::Add,
-        )
-    };
+    let row_energy = |x: &NodeRef| reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, Monoid::Add);
     // Built twice on purpose: equal structure interns to the same node.
     let once = row_energy(&x);
     let again = row_energy(&x);
@@ -174,12 +159,8 @@ fn partition_computes_a_structural_duplicate_once() {
     let row_energy = |x: NodeRef| reduce(map(MapOp::Mul, vec![x.clone(), x]), 1usize, Monoid::Add);
     // One fold consumed by two different parents — written once with the
     // node shared, once with the fold rebuilt from scratch.
-    let combine = |e1: NodeRef, e2: NodeRef| {
-        map(
-            MapOp::Add,
-            vec![map(MapOp::Exp, vec![e1]), map(MapOp::Sqrt, vec![e2])],
-        )
-    };
+    let combine =
+        |e1: NodeRef, e2: NodeRef| map(MapOp::Add, vec![map(MapOp::Exp, vec![e1]), map(MapOp::Sqrt, vec![e2])]);
     let shared_fold = row_energy(x());
     let shared = combine(shared_fold.clone(), shared_fold);
     let duplicated = combine(row_energy(x()), row_energy(x()));
@@ -194,9 +175,7 @@ fn partition_computes_a_structural_duplicate_once() {
     );
 
     let mut rng = Lcg(0xD00D);
-    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))]
-        .into_iter()
-        .collect();
+    let env: Env = [("x", rand_tensor(&[b, c], &mut rng))].into_iter().collect();
     let executed = duplicated_schedule.execute(&env);
     let reference = eval(&duplicated, &env);
     assert_eq!(executed.shape, reference.shape);

@@ -33,9 +33,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::derive::Carrier;
-use crate::ir::{
-    self, AxisRef, AxisSelector, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node,
-};
+use crate::ir::{self, AxisRef, AxisSelector, Extent, MapOp, Monoid, Node as NodeKind, NodeRef as Node};
 
 /// Input tensors by leaf name.
 pub type Env = HashMap<&'static str, Value>;
@@ -378,10 +376,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
                     index_coord.insert(axis, c[&oaxes[*dim + index_dim]]);
                 }
                 let i = idx.at(&index_coord).round() as usize;
-                assert!(
-                    i < bound,
-                    "gather index {i} out of bounds for dimension {dim}"
-                );
+                assert!(i < bound, "gather index {i} out of bounds for dimension {dim}");
 
                 let mut source_coord = HashMap::new();
                 for (source_dim, axis) in s.axes.iter().copied().enumerate() {
@@ -407,9 +402,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
         // source index of every mapped axis; out-of-range is 0.0 when padded,
         // an error otherwise. Pure index arithmetic — the definition the
         // emitters must reproduce.
-        NodeKind::Reindex {
-            src, map, padded, ..
-        } => {
+        NodeKind::Reindex { src, map, padded, .. } => {
             let s = eval_rc(src, env, cache);
             let oaxes = ir::axis_refs(node);
             Value::from_ref_fn(&oaxes, |c| {
@@ -437,13 +430,7 @@ fn eval_node(node: &Node, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Val
 }
 
 /// An inclusive prefix fold. The output shares the source's shape.
-fn eval_scan(
-    src: &Node,
-    dim: usize,
-    op: Monoid,
-    env: &Env,
-    cache: &mut HashMap<*const NodeKind, Rc<Value>>,
-) -> Value {
+fn eval_scan(src: &Node, dim: usize, op: Monoid, env: &Env, cache: &mut HashMap<*const NodeKind, Rc<Value>>) -> Value {
     let s = eval_rc(src, env, cache);
     let axis = ir::source_axis(src, dim);
     Value::from_ref_fn(&s.axes.clone(), |c| {
@@ -491,6 +478,7 @@ fn apply_map(op: MapOp, a: &[f64]) -> f64 {
         MapOp::Max => a[0].max(a[1]),
         MapOp::Min => a[0].min(a[1]),
         MapOp::Lt => (a[0] < a[1]) as u8 as f64,
+        MapOp::RoundTo(dtype) => crate::scalar::round_to(dtype, a[0]),
         MapOp::Neg => -a[0],
         MapOp::Recip => 1.0 / a[0],
         MapOp::Exp => a[0].exp(),
@@ -564,13 +552,7 @@ pub fn run_carrier(node: &Node, axis: impl AxisSelector, carrier: &Carrier, env:
 /// causal masking documents. Keeping every chunk non-empty keeps
 /// the whole computation in the finite domain, exactly as real split-K flash
 /// kernels do.
-pub fn run_carrier_split(
-    node: &Node,
-    axis: impl AxisSelector,
-    carrier: &Carrier,
-    blocks: usize,
-    env: &Env,
-) -> Value {
+pub fn run_carrier_split(node: &Node, axis: impl AxisSelector, carrier: &Carrier, blocks: usize, env: &Env) -> Value {
     let axis = axis
         .resolve_axis(node, "run_carrier")
         .expect("carrier axis is absent from the selected node");
@@ -633,11 +615,7 @@ pub fn run_carrier_split(
                                 let value = if local_axis.extent == Extent::Static(1) {
                                     0
                                 } else {
-                                    let canonical = carrier
-                                        .aliases
-                                        .get(&local_axis)
-                                        .copied()
-                                        .unwrap_or(local_axis);
+                                    let canonical = carrier.aliases.get(&local_axis).copied().unwrap_or(local_axis);
                                     coord[&canonical]
                                 };
                                 (local_axis, value)
@@ -684,10 +662,7 @@ mod tests {
     }
 
     fn rand_tensor(name_axes: &[Axis], rng: &mut Lcg) -> Value {
-        let shape = name_axes
-            .iter()
-            .map(|axis| axis.extent())
-            .collect::<Vec<_>>();
+        let shape = name_axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>();
         Value::from_shape_fn(&shape, |_| rng.f())
     }
 
@@ -713,16 +688,11 @@ mod tests {
         let b = rand_tensor(&[k, j], &mut rng);
         let env: Env = [("A", a.clone()), ("B", b.clone())].into_iter().collect();
 
-        let mm = matmul(
-            input("A", [i, k], Dtype::F32),
-            input("B", [k, j], Dtype::F32),
-        );
+        let mm = matmul(input("A", [i, k], Dtype::F32), input("B", [k, j], Dtype::F32));
         let got = eval(&mm, &env);
 
         let want = Value::from_shape_fn(&[i.extent(), j.extent()], |c| {
-            (0..5)
-                .map(|kk| a.data[c[0] * 5 + kk] * b.data[kk * 4 + c[1]])
-                .sum()
+            (0..5).map(|kk| a.data[c[0] * 5 + kk] * b.data[kk * 4 + c[1]]).sum()
         });
         assert_eq!(got.shape, want.shape);
         for (actual, expected) in got.data.iter().zip(&want.data) {
@@ -819,11 +789,7 @@ mod tests {
         let ids = Value::from_shape_fn(&[s.extent()], |c| [2.0, 7.0, 0.0][c[0]]);
         let env: Env = [("E", table.clone()), ("ids", ids)].into_iter().collect();
 
-        let emb = embedding(
-            input("E", [v, dm], Dtype::F32),
-            input("ids", [s], Dtype::F32),
-            0usize,
-        );
+        let emb = embedding(input("E", [v, dm], Dtype::F32), input("ids", [s], Dtype::F32), 0usize);
         let got = eval(&emb, &env);
         // Gather replaces the selected source dimension with the index shape.
         for (row, &id) in [2usize, 7, 0].iter().enumerate() {
@@ -840,10 +806,7 @@ mod tests {
         let mut rng = Lcg(3);
         let x = rand_tensor(&[h, dv], &mut rng);
         let env: Env = [("X", x.clone())].into_iter().collect();
-        let flat = eval(
-            &flatten(input("X", [h, dv], Dtype::F32), &[0, 1][..], dmv),
-            &env,
-        );
+        let flat = eval(&flatten(input("X", [h, dv], Dtype::F32), &[0, 1][..], dmv), &env);
         assert_eq!(flat.shape, vec![6]);
         for hh in 0..2 {
             for dd in 0..3 {

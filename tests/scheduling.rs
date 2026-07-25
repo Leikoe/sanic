@@ -58,6 +58,7 @@ fn fused(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Option<(usize, Kernel)
                 regs_per_block: per_tile * t,
                 parallel_blocks: blocks,
                 lanes_per_block: t * d, // t query rows × d value outputs
+                bytes_in_flight_per_lane: 4.0,
             },
         ));
         t *= 2.0;
@@ -77,6 +78,7 @@ fn cut(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
             regs_per_block: mm_sram,
             parallel_blocks: (sq / 64.0).ceil() * (k / 64.0).ceil(),
             lanes_per_block: 64.0 * 64.0, // one lane per output point of the tile
+            bytes_in_flight_per_lane: 4.0,
         },
         Kernel {
             flops: 2.0 * sq * k * d + sq * k,
@@ -85,6 +87,7 @@ fn cut(dev: &DeviceProfile, sq: f64, k: f64, d: f64) -> Vec<Kernel> {
             regs_per_block: mm_sram,
             parallel_blocks: (sq / 64.0).ceil() * (d / 64.0).ceil(),
             lanes_per_block: 64.0 * 64.0,
+            bytes_in_flight_per_lane: 4.0,
         },
     ]
 }
@@ -124,10 +127,7 @@ fn fuse_cut_crossover_is_monotone() {
     let decisions: Vec<bool> = ds.iter().map(|&d| fuses(&dev, 2048.0, 2048.0, d)).collect();
     let first_cut = decisions.iter().position(|f| !f).unwrap();
     assert!(first_cut > 0, "must fuse at the smallest d");
-    assert!(
-        decisions[first_cut..].iter().all(|f| !f),
-        "no flip back to fuse"
-    );
+    assert!(decisions[first_cut..].iter().all(|f| !f), "no flip back to fuse");
 }
 
 // feasibility forces a correct fallback: huge d can't fuse at any tile → cut.

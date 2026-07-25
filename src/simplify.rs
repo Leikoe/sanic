@@ -47,8 +47,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ir::{
-    MapOp, Monoid, Node as NodeKind, NodeRef as Node, coordinate, gather, konst, map,
-    positional_reindex, positional_view, reduce, scan,
+    MapOp, Monoid, Node as NodeKind, NodeRef as Node, coordinate, gather, konst, map, positional_reindex,
+    positional_view, reduce, scan,
 };
 
 /// Simplify several roots TOGETHER, in two phases, each to a fixpoint.
@@ -85,12 +85,7 @@ pub fn simplify_many(roots: &[Node]) -> Vec<Node> {
 
 /// One bottom-up pass: rewrite children, then apply a local rule. Interned
 /// construction keeps the result maximally shared as a side effect.
-fn pass(
-    node: &Node,
-    reconstruct: bool,
-    memo: &mut HashMap<*const NodeKind, Node>,
-    changed: &mut bool,
-) -> Node {
+fn pass(node: &Node, reconstruct: bool, memo: &mut HashMap<*const NodeKind, Node>, changed: &mut bool) -> Node {
     let ptr = Arc::as_ptr(node);
     if let Some(n) = memo.get(&ptr) {
         return n.clone();
@@ -113,10 +108,7 @@ fn pass(
         NodeKind::Map { op, inputs } => {
             let output_shape = node.shape();
             let output_axes = crate::ir::axis_refs(node);
-            let ins: Vec<Node> = inputs
-                .iter()
-                .map(|i| pass(i, reconstruct, memo, changed))
-                .collect();
+            let ins: Vec<Node> = inputs.iter().map(|i| pass(i, reconstruct, memo, changed)).collect();
             match map_rule(*op, &ins, reconstruct) {
                 Some(r) => {
                     *changed = true;
@@ -159,9 +151,10 @@ fn pass(
         NodeKind::View { src, dims } => {
             let s = pass(src, reconstruct, memo, changed);
             let identity = dims.len() == s.shape().len()
-                && dims.iter().enumerate().all(|(output_dim, dim)| {
-                    dim.sources == [output_dim] && dim.axis == s.shape()[output_dim]
-                });
+                && dims
+                    .iter()
+                    .enumerate()
+                    .all(|(output_dim, dim)| dim.sources == [output_dim] && dim.axis == s.shape()[output_dim]);
             if identity {
                 *changed = true;
                 s
@@ -252,9 +245,10 @@ fn cancel_view_reindex(
             axis,
         })
         .collect::<Vec<_>>();
-    let identity = view_dims.iter().enumerate().all(|(output_dim, dim)| {
-        dim.sources == [output_dim] && dim.axis == src.shape()[output_dim]
-    });
+    let identity = view_dims
+        .iter()
+        .enumerate()
+        .all(|(output_dim, dim)| dim.sources == [output_dim] && dim.axis == src.shape()[output_dim]);
     Some(if identity {
         src.clone()
     } else {
@@ -262,11 +256,7 @@ fn cancel_view_reindex(
     })
 }
 
-fn preserve_shape(
-    mut node: Node,
-    target: &[crate::ir::Axis],
-    target_axes: &[crate::ir::AxisRef],
-) -> Node {
+fn preserve_shape(mut node: Node, target: &[crate::ir::Axis], target_axes: &[crate::ir::AxisRef]) -> Node {
     let mut source = node.shape();
     if source == target {
         return node;
@@ -277,8 +267,7 @@ fn preserve_shape(
             .iter()
             .enumerate()
             .position(|(dim, axis)| {
-                axis.extent == crate::ir::Extent::Static(1)
-                    && !target_axes.contains(&source_axes[dim])
+                axis.extent == crate::ir::Extent::Static(1) && !target_axes.contains(&source_axes[dim])
             })
             .or_else(|| {
                 source
@@ -324,8 +313,7 @@ fn preserve_shape(
                 .find(|(dim, axis)| !used[*dim] && **axis == source_axes[source_dim])
                 .map(|(dim, _)| dim);
             let trailing = target.len() - source.len() + source_dim;
-            let positional = (!used[trailing] && target[trailing].extent == source_axis.extent)
-                .then_some(trailing);
+            let positional = (!used[trailing] && target[trailing].extent == source_axis.extent).then_some(trailing);
             let same_extent = target
                 .iter()
                 .enumerate()
@@ -388,8 +376,7 @@ fn factor_common_view(op: MapOp, inputs: &[Node]) -> Option<Node> {
     }
     let inner = map(op, sources);
     // The view's source positions describe the common inner output too.
-    (inner.shape().len() == first_src.shape().len())
-        .then(|| positional_view(inner, first_dims.clone()))
+    (inner.shape().len() == first_src.shape().len()).then(|| positional_view(inner, first_dims.clone()))
 }
 
 /// Recognize a division either directly or under one shared positional
@@ -479,10 +466,7 @@ fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
                 if let Some(inner) = as_map(a, MapOp::Sub) {
                     return Some(map(
                         MapOp::Sub,
-                        vec![
-                            inner[0].clone(),
-                            map(MapOp::Add, vec![inner[1].clone(), b.clone()]),
-                        ],
+                        vec![inner[0].clone(), map(MapOp::Add, vec![inner[1].clone(), b.clone()])],
                     ));
                 }
             }
@@ -525,22 +509,15 @@ fn map_rule(op: MapOp, ins: &[Node], reconstruct: bool) -> Option<Node> {
                             numerator,
                             map(
                                 MapOp::Exp,
-                                vec![map(
-                                    MapOp::Sub,
-                                    vec![e[0].clone(), map(MapOp::Log, vec![denominator])],
-                                )],
+                                vec![map(MapOp::Sub, vec![e[0].clone(), map(MapOp::Log, vec![denominator])])],
                             ),
                         ],
                     )
                 };
-                if let (Some((numerator, denominator)), Some(e)) =
-                    (division_parts(a), as_map(b, MapOp::Exp))
-                {
+                if let (Some((numerator, denominator)), Some(e)) = (division_parts(a), as_map(b, MapOp::Exp)) {
                     return Some(fold_into_exp(numerator, denominator, e));
                 }
-                if let (Some(e), Some((numerator, denominator))) =
-                    (as_map(a, MapOp::Exp), division_parts(b))
-                {
+                if let (Some(e), Some((numerator, denominator))) = (as_map(a, MapOp::Exp), division_parts(b)) {
                     return Some(fold_into_exp(numerator, denominator, e));
                 }
             }
@@ -591,18 +568,10 @@ fn reduce_rule(s: &Node, dim: usize, op: Monoid) -> Option<Node> {
         let (mut inv, mut var) = (Vec::new(), Vec::new());
         split_product(s, Some(dim), &mut inv, &mut var);
         if !inv.is_empty() && !var.is_empty() {
-            let product = |factors: Vec<Node>| {
-                factors
-                    .into_iter()
-                    .reduce(|a, b| map(MapOp::Mul, vec![a, b]))
-                    .unwrap()
-            };
+            let product = |factors: Vec<Node>| factors.into_iter().reduce(|a, b| map(MapOp::Mul, vec![a, b])).unwrap();
             let variant = product(var);
             let variant_dim = variant.shape().len() - (s.shape().len() - dim);
-            return Some(map(
-                MapOp::Mul,
-                vec![product(inv), reduce(variant, variant_dim, op)],
-            ));
+            return Some(map(MapOp::Mul, vec![product(inv), reduce(variant, variant_dim, op)]));
         }
     }
     // Σ(−x) → −Σx
@@ -663,9 +632,8 @@ fn split_product(n: &Node, dim: Option<usize>, inv: &mut Vec<Node>, var: &mut Ve
 
     if let Some(m) = as_map(n, MapOp::Mul) {
         for input in m {
-            let input_dim = dim.and_then(|output_dim| {
-                output_dim.checked_sub(n.shape().len().saturating_sub(input.shape().len()))
-            });
+            let input_dim =
+                dim.and_then(|output_dim| output_dim.checked_sub(n.shape().len().saturating_sub(input.shape().len())));
             if input_dim.is_some_and(|dim| depends_on_dimension(input, dim)) {
                 split_product(input, input_dim, inv, var);
             } else {
@@ -710,24 +678,19 @@ fn depends_on_dimension(node: &Node, dim: usize) -> bool {
         NodeKind::Input { .. } | NodeKind::Iota { .. } => true,
         NodeKind::Const { .. } => false,
         NodeKind::Coordinate {
-            dim: coordinate_dim,
-            ..
+            dim: coordinate_dim, ..
         } => dim == *coordinate_dim,
         NodeKind::Map { inputs, .. } => inputs.iter().any(|input| {
             dim.checked_sub(shape.len() - input.shape().len())
                 .is_some_and(|input_dim| depends_on_dimension(input, input_dim))
         }),
         NodeKind::Reduce {
-            src,
-            dim: reduced_dim,
-            ..
+            src, dim: reduced_dim, ..
         } => {
             let source_dim = dim + usize::from(dim >= *reduced_dim);
             depends_on_dimension(src, source_dim)
         }
-        NodeKind::Scan {
-            src, dim: scan_dim, ..
-        } => dim == *scan_dim || depends_on_dimension(src, dim),
+        NodeKind::Scan { src, dim: scan_dim, .. } => dim == *scan_dim || depends_on_dimension(src, dim),
         NodeKind::Gather {
             src,
             index,
@@ -746,9 +709,7 @@ fn depends_on_dimension(node: &Node, dim: usize) -> bool {
             .sources
             .iter()
             .any(|&source_dim| depends_on_dimension(src, source_dim)),
-        NodeKind::Reindex {
-            src, map, padded, ..
-        } => map.iter().any(|(source_dim, terms, _)| {
+        NodeKind::Reindex { src, map, padded, .. } => map.iter().any(|(source_dim, terms, _)| {
             let coordinate_depends = terms
                 .iter()
                 .any(|(coefficient, output_dim)| *coefficient != 0 && *output_dim == dim);
@@ -812,9 +773,7 @@ fn drop_dimension(node: Node, dim: usize) -> Node {
                     *source_dim,
                     terms
                         .iter()
-                        .map(|(coefficient, output_dim)| {
-                            (*coefficient, output_dim - usize::from(*output_dim > dim))
-                        })
+                        .map(|(coefficient, output_dim)| (*coefficient, output_dim - usize::from(*output_dim > dim)))
                         .collect(),
                     *offset,
                 )

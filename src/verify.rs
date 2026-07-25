@@ -107,11 +107,7 @@ impl Verifier {
         let node_index = self.next_node;
         self.next_node += 1;
         let op = op_name(node);
-        let fail = |reason: String| VerifyError {
-            node_index,
-            op,
-            reason,
-        };
+        let fail = |reason: String| VerifyError { node_index, op, reason };
 
         let shape = match node.as_ref() {
             NodeKind::Input { name, shape, dtype } => {
@@ -188,9 +184,7 @@ impl Verifier {
                 check_view(&child_shapes[0], dims).map_err(&fail)?;
                 dims.iter().map(|dim| dim.axis).collect()
             }
-            NodeKind::Reindex {
-                shape, map, padded, ..
-            } => {
+            NodeKind::Reindex { shape, map, padded, .. } => {
                 check_reindex(&child_shapes[0], shape, map, *padded).map_err(&fail)?;
                 shape.clone()
             }
@@ -205,10 +199,7 @@ impl Verifier {
 
 fn check_dim(dim: usize, shape: &[Axis], op: &str) -> Result<(), String> {
     if dim >= shape.len() {
-        Err(format!(
-            "{op} dimension {dim} is out of range for rank {}",
-            shape.len()
-        ))
+        Err(format!("{op} dimension {dim} is out of range for rank {}", shape.len()))
     } else {
         Ok(())
     }
@@ -254,9 +245,7 @@ fn check_view(source: &[Axis], dims: &[ViewDim]) -> Result<(), String> {
         for &source_dim in &dim.sources {
             check_dim(source_dim, source, "view source")?;
             if std::mem::replace(&mut consumed[source_dim], true) {
-                return Err(format!(
-                    "view source dimension {source_dim} is consumed more than once"
-                ));
+                return Err(format!("view source dimension {source_dim} is consumed more than once"));
             }
             product = match (product, source[source_dim].extent) {
                 (Some(acc), Extent::Static(extent)) => acc.checked_mul(extent),
@@ -277,12 +266,7 @@ fn check_view(source: &[Axis], dims: &[ViewDim]) -> Result<(), String> {
     Ok(())
 }
 
-fn check_reindex(
-    source: &[Axis],
-    output: &[Axis],
-    map: &[AffineIndex],
-    padded: bool,
-) -> Result<(), String> {
+fn check_reindex(source: &[Axis], output: &[Axis], map: &[AffineIndex], padded: bool) -> Result<(), String> {
     if map.len() != source.len() {
         return Err(format!(
             "reindex maps {} source dimensions; expected {}",
@@ -314,11 +298,7 @@ fn check_reindex(
     Ok(())
 }
 
-fn affine_bounds(
-    terms: &[(i64, usize)],
-    offset: i64,
-    output: &[Axis],
-) -> Result<Option<(i128, i128)>, String> {
+fn affine_bounds(terms: &[(i64, usize)], offset: i64, output: &[Axis]) -> Result<Option<(i128, i128)>, String> {
     let (mut minimum, mut maximum) = (offset as i128, offset as i128);
     let mut coefficients = HashMap::<usize, i128>::new();
     for &(coefficient, output_dim) in terms {
@@ -355,9 +335,9 @@ fn check_shape(shape: &[Axis]) -> Result<(), String> {
                 return Err(format!("dimension {dim} has zero extent"));
             }
             Extent::Static(extent) => {
-                volume = volume.checked_mul(extent).ok_or_else(|| {
-                    format!("static output volume overflows usize at dimension {dim}")
-                })?;
+                volume = volume
+                    .checked_mul(extent)
+                    .ok_or_else(|| format!("static output volume overflows usize at dimension {dim}"))?;
             }
             Extent::Dynamic => {}
         }
@@ -391,12 +371,7 @@ mod tests {
             op: MapOp::Add,
             inputs: vec![konst(1.0)],
         });
-        assert!(
-            verify(&invalid)
-                .unwrap_err()
-                .reason
-                .contains("expects 2 inputs")
-        );
+        assert!(verify(&invalid).unwrap_err().reason.contains("expects 2 inputs"));
     }
 
     #[test]
@@ -413,11 +388,6 @@ mod tests {
             dim: 1,
             op: crate::ir::Monoid::Add,
         });
-        assert!(
-            verify(&invalid)
-                .unwrap_err()
-                .reason
-                .contains("out of range")
-        );
+        assert!(verify(&invalid).unwrap_err().reason.contains("out of range"));
     }
 }

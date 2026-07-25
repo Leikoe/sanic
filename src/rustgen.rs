@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::codegen::{Gen, Lang, buffers, carrier_expr, carrier_expr_map, offset, san, value};
 use crate::derive::Carrier;
-use crate::ir::{self, AxisRef, MapOp, Monoid, NodeRef as Node};
+use crate::ir::{self, AxisRef, Dtype, MapOp, Monoid, NodeRef as Node};
 use crate::partition::{Schedule, Stage};
 
 // ── the Rust target ──────────────────────────────────────────────────────────
@@ -88,6 +88,16 @@ impl Lang for RustLang {
             MapOp::Sin => format!("({}).sin()", a[0]),
             MapOp::Cos => format!("({}).cos()", a[0]),
             MapOp::Where => format!("(if ({}) != 0.0 {{ {} }} else {{ {} }})", a[0], a[1], a[2]),
+            // f64 → f32 → storage width, matching scalar::round_to bit-for-bit
+            MapOp::RoundTo(Dtype::F64) => a[0].clone(),
+            MapOp::RoundTo(Dtype::F32) => format!("((({}) as f32) as f64)", a[0]),
+            MapOp::RoundTo(Dtype::BF16) => format!(
+                "{{ let v = ({}) as f32; let b = v.to_bits(); (if v.is_nan() {{ \
+                 f32::from_bits(((b >> 16) | 0x0040) << 16) }} else {{ \
+                 f32::from_bits(((b.wrapping_add(0x7FFF).wrapping_add((b >> 16) & 1)) >> 16) << 16) }}) as f64 }}",
+                a[0]
+            ),
+            MapOp::RoundTo(d) => panic!("RoundTo({d:?}) is not emitted for the Rust backend"),
         }
     }
     fn monoid(&self, m: Monoid, acc: &str, ev: &str) -> String {
@@ -118,11 +128,7 @@ fn params_and_args(node: &Node) -> (String, Vec<&'static str>) {
 }
 
 /// Nested `for` headers opening the CPU grid, and the matching closers.
-fn grid_loops(
-    grid: &[AxisRef],
-    coord: &mut HashMap<AxisRef, String>,
-    g: &mut Gen,
-) -> (Vec<String>, Vec<String>) {
+fn grid_loops(grid: &[AxisRef], coord: &mut HashMap<AxisRef, String>, g: &mut Gen) -> (Vec<String>, Vec<String>) {
     let mut open = Vec::new();
     for &a in grid {
         let iv = g.fresh("i");
@@ -135,12 +141,7 @@ fn grid_loops(
 /// A fused streaming kernel: grid over the free axes, stream the folded axis,
 /// lift each element from the carrier's leaves (via [`value`], so in-body
 /// contractions like QKᵀ become inner loops), combine, project.
-fn emit_fused(
-    fname: &str,
-    carrier: &Carrier,
-    stream: AxisRef,
-    fold_node: &Node,
-) -> (String, Vec<&'static str>) {
+fn emit_fused(fname: &str, carrier: &Carrier, stream: AxisRef, fold_node: &Node) -> (String, Vec<&'static str>) {
     assert_eq!(
         carrier.project.len(),
         1,
@@ -286,14 +287,13 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
     let mut driver: Vec<String> = Vec::new();
     let mut produced: Vec<&'static str> = Vec::new();
     let mut inputs: Vec<(&'static str, Vec<AxisRef>)> = Vec::new();
-    let note_inputs =
-        |node: &Node, produced: &[&'static str], inputs: &mut Vec<(&'static str, Vec<AxisRef>)>| {
-            for (n, axes) in buffers(node) {
-                if !produced.contains(&n) && !inputs.iter().any(|(m, _)| *m == n) {
-                    inputs.push((n, axes));
-                }
+    let note_inputs = |node: &Node, produced: &[&'static str], inputs: &mut Vec<(&'static str, Vec<AxisRef>)>| {
+        for (n, axes) in buffers(node) {
+            if !produced.contains(&n) && !inputs.iter().any(|(m, _)| *m == n) {
+                inputs.push((n, axes));
             }
-        };
+        }
+    };
 
     let mut produced_axes: HashMap<String, Vec<AxisRef>> = HashMap::new();
     // every buffer is an owned `Vec<f64>`; call args are `&name[..]`, slicing a
@@ -316,30 +316,18 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
                 note_inputs(fold_node, &produced, &mut inputs);
                 let out = spec.output_name.clone();
                 let raw_fn = format!("k_{}_fold", san(&out));
-                let (code, args) =
-                    emit_fused(&raw_fn, &spec.carrier, spec.streaming_axis, fold_node);
+                let (code, args) = emit_fused(&raw_fn, &spec.carrier, spec.streaming_axis, fold_node);
                 fns.push(code);
-                driver.push(format!(
-                    "    let {} = {raw_fn}({});",
-                    san(&out),
-                    arglist(&args)
-                ));
+                driver.push(format!("    let {} = {raw_fn}({});", san(&out), arglist(&args)));
                 produced.push(leak(&out));
                 if let Some(epi) = epilogue_node {
                     note_inputs(epi, &produced, &mut inputs);
                     let epi_fn = format!("k_{}_epi", san(&out));
                     let (code, args) = emit_pointwise(&epi_fn, epi);
                     fns.push(code);
-                    driver.push(format!(
-                        "    let {} = {epi_fn}({});",
-                        san(&out),
-                        arglist(&args)
-                    ));
+                    driver.push(format!("    let {} = {epi_fn}({});", san(&out), arglist(&args)));
                 }
-                produced_axes.insert(
-                    out.clone(),
-                    ir::axis_refs(epilogue_node.as_ref().unwrap_or(fold_node)),
-                );
+                produced_axes.insert(out.clone(), ir::axis_refs(epilogue_node.as_ref().unwrap_or(fold_node)));
             }
             Stage::Elementwise { output, exec, .. }
             | Stage::Gather { output, exec, .. }
@@ -348,11 +336,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
                 let fname = format!("k_{}", san(output));
                 let (code, args) = emit_pointwise(&fname, exec);
                 fns.push(code);
-                driver.push(format!(
-                    "    let {} = {fname}({});",
-                    san(output),
-                    arglist(&args)
-                ));
+                driver.push(format!("    let {} = {fname}({});", san(output), arglist(&args)));
                 produced.push(leak(output));
                 produced_axes.insert(output.clone(), ir::axis_refs(exec));
             }
@@ -387,11 +371,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
             format!("({})", vec!["Vec<f64>"; outputs.len()].join(", ")),
             format!(
                 "({})",
-                outputs
-                    .iter()
-                    .map(|(n, _)| san(n))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                outputs.iter().map(|(n, _)| san(n)).collect::<Vec<_>>().join(", ")
             ),
         )
     };
@@ -400,8 +380,7 @@ pub fn emit_schedule(sched: &Schedule) -> Program {
     run.push(format!("    {ret_val}"));
     run.push("}".into());
 
-    let mut source =
-        String::from("#![allow(unused_parens, unused_variables, dead_code, clippy::all)]\n\n");
+    let mut source = String::from("#![allow(unused_parens, unused_variables, dead_code, clippy::all)]\n\n");
     source.push_str(&fns.join("\n\n"));
     source.push_str("\n\n");
     source.push_str(&run.join("\n"));

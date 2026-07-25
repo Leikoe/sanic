@@ -16,9 +16,8 @@ use std::collections::HashMap;
 use sanic::interp::{Env, Value, eval};
 use sanic::nn::functional::scaled_dot_product_attention;
 use sanic::{
-    Axis, Compile, Dtype, MapOp, Monoid, NodeRef, ViewDim, axis, coordinate, flatten, gather,
-    input, iota, konst, map, matmul, positional_reindex, positional_view, reduce, silu, split,
-    transpose,
+    Axis, Compile, Dtype, MapOp, Monoid, NodeRef, ViewDim, axis, coordinate, flatten, gather, input, iota, konst, map,
+    matmul, positional_reindex, positional_view, reduce, silu, split, transpose,
 };
 
 const EPS: f64 = 1e-5;
@@ -108,11 +107,7 @@ fn unsqueeze(src: NodeRef, dim: usize) -> NodeRef {
                 axis: axis("singleton", 1),
             });
         } else {
-            let source_dim = if output_dim < dim {
-                output_dim
-            } else {
-                output_dim - 1
-            };
+            let source_dim = if output_dim < dim { output_dim } else { output_dim - 1 };
             dims.push(ViewDim {
                 sources: vec![source_dim],
                 axis: source[source_dim],
@@ -129,11 +124,7 @@ fn flip(src: NodeRef, dim: usize) -> NodeRef {
         .enumerate()
         .map(|(source_dim, source_axis)| {
             if source_dim == dim {
-                (
-                    source_dim,
-                    vec![(-1, source_dim)],
-                    source_axis.extent() as i64 - 1,
-                )
+                (source_dim, vec![(-1, source_dim)], source_axis.extent() as i64 - 1)
             } else {
                 (source_dim, vec![(1, source_dim)], 0)
             }
@@ -144,10 +135,7 @@ fn flip(src: NodeRef, dim: usize) -> NodeRef {
 
 fn rms_norm(x: NodeRef, weight: NodeRef, hidden_dim: usize) -> NodeRef {
     let square = mul(x.clone(), x.clone());
-    let mean_square = mul(
-        reduce(square, -1isize, Monoid::Add),
-        konst(1.0 / hidden_dim as f64),
-    );
+    let mean_square = mul(reduce(square, -1isize, Monoid::Add), konst(1.0 / hidden_dim as f64));
     let denominator = unary(
         MapOp::Sqrt,
         add(unsqueeze(mean_square, x.shape().len() - 1), konst(EPS)),
@@ -156,10 +144,7 @@ fn rms_norm(x: NodeRef, weight: NodeRef, hidden_dim: usize) -> NodeRef {
 }
 
 fn llama3_inv_freq(frequency: Axis) -> NodeRef {
-    let exponent = mul(
-        iota(frequency),
-        konst(-ROPE_THETA.ln() / frequency.extent() as f64),
-    );
+    let exponent = mul(iota(frequency), konst(-ROPE_THETA.ln() / frequency.extent() as f64));
     let inv_freq = unary(MapOp::Exp, exponent);
     let wave_length = div(konst(2.0 * std::f64::consts::PI), inv_freq.clone());
     let low_wave_length = ROPE_ORIGINAL_CONTEXT / ROPE_LOW_FREQ_FACTOR;
@@ -214,11 +199,7 @@ fn rope_at(x: NodeRef, position: NodeRef, sequence: Axis, head_dim: Axis) -> Nod
 fn update_cache(cache: NodeRef, current: NodeRef, position: NodeRef) -> NodeRef {
     let cache_index = coordinate(cache.clone(), 1usize);
     let at_position = mul(
-        binary(
-            MapOp::Lt,
-            cache_index.clone(),
-            add(position.clone(), konst(1.0)),
-        ),
+        binary(MapOp::Lt, cache_index.clone(), add(position.clone(), konst(1.0))),
         binary(MapOp::Lt, position, add(cache_index, konst(1.0))),
     );
     map(MapOp::Where, vec![at_position, current, cache])
@@ -239,28 +220,15 @@ struct DecodeBlock {
     value_cache: NodeRef,
 }
 
-fn decode_block(
-    axes: &Axes,
-    cache_sequence: Axis,
-    layer: usize,
-    x: NodeRef,
-    position: NodeRef,
-) -> DecodeBlock {
+fn decode_block(axes: &Axes, cache_sequence: Axis, layer: usize, x: NodeRef, position: NodeRef) -> DecodeBlock {
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     let attn_input = rms_norm(
         x.clone(),
-        input(
-            leak(name("input_layernorm.weight")),
-            [axes.hidden],
-            Dtype::F32,
-        ),
+        input(leak(name("input_layernorm.weight")), [axes.hidden], Dtype::F32),
         axes.hidden.extent(),
     );
 
-    let query_projection = axis(
-        "query_projection",
-        axes.query_heads.extent() * axes.head_dim.extent(),
-    );
+    let query_projection = axis("query_projection", axes.query_heads.extent() * axes.head_dim.extent());
     let q = projection(
         attn_input.clone(),
         name("self_attn.q_proj.weight"),
@@ -275,10 +243,7 @@ fn decode_block(
         axes.head_dim,
     );
 
-    let kv_projection = axis(
-        "kv_projection",
-        axes.kv_heads.extent() * axes.head_dim.extent(),
-    );
+    let kv_projection = axis("kv_projection", axes.kv_heads.extent() * axes.head_dim.extent());
     let k = projection(
         attn_input.clone(),
         name("self_attn.k_proj.weight"),
@@ -293,17 +258,8 @@ fn decode_block(
         axes.head_dim,
     );
 
-    let v = projection(
-        attn_input,
-        name("self_attn.v_proj.weight"),
-        axes.hidden,
-        kv_projection,
-    );
-    let v = transpose(
-        split(v, -1isize, axes.kv_heads, axes.head_dim),
-        0usize,
-        1usize,
-    );
+    let v = projection(attn_input, name("self_attn.v_proj.weight"), axes.hidden, kv_projection);
+    let v = transpose(split(v, -1isize, axes.kv_heads, axes.head_dim), 0usize, 1usize);
 
     let key_cache = update_cache(
         input(
@@ -324,15 +280,8 @@ fn decode_block(
         position.clone(),
     );
 
-    let visible = binary(
-        MapOp::Lt,
-        iota(cache_sequence),
-        add(position.clone(), konst(1.0)),
-    );
-    let mask = map(
-        MapOp::Where,
-        vec![visible, konst(0.0), konst(f64::NEG_INFINITY)],
-    );
+    let visible = binary(MapOp::Lt, iota(cache_sequence), add(position.clone(), konst(1.0)));
+    let mask = map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)]);
     let attention = scaled_dot_product_attention(
         q,
         key_cache.clone(),
@@ -345,21 +294,12 @@ fn decode_block(
     );
     let attention = transpose(attention, 0usize, 1usize);
     let attention = flatten(attention, &[1usize, 2usize][..], axes.hidden);
-    let attention = projection(
-        attention,
-        name("self_attn.o_proj.weight"),
-        axes.hidden,
-        axes.hidden,
-    );
+    let attention = projection(attention, name("self_attn.o_proj.weight"), axes.hidden, axes.hidden);
     let residual = add(x, attention);
 
     let mlp_input = rms_norm(
         residual.clone(),
-        input(
-            leak(name("post_attention_layernorm.weight")),
-            [axes.hidden],
-            Dtype::F32,
-        ),
+        input(leak(name("post_attention_layernorm.weight")), [axes.hidden], Dtype::F32),
         axes.hidden.extent(),
     );
     let gate = projection(
@@ -368,12 +308,7 @@ fn decode_block(
         axes.hidden,
         axes.intermediate,
     );
-    let up = projection(
-        mlp_input,
-        name("mlp.up_proj.weight"),
-        axes.hidden,
-        axes.intermediate,
-    );
+    let up = projection(mlp_input, name("mlp.up_proj.weight"), axes.hidden, axes.intermediate);
     let down = projection(
         mul(silu(gate), up),
         name("mlp.down_proj.weight"),
@@ -399,11 +334,7 @@ fn build_decode(config: Config, context_length: usize) -> DecodeGraph {
     let cache_sequence = axis("cache_sequence", context_length);
     let position = input("position", [], Dtype::F32);
     let tokens = input("tokens", [axes.sequence], Dtype::F32);
-    let embedding = input(
-        "model.embed_tokens.weight",
-        [axes.vocab, axes.hidden],
-        Dtype::F32,
-    );
+    let embedding = input("model.embed_tokens.weight", [axes.vocab, axes.hidden], Dtype::F32);
 
     let mut x = gather(embedding.clone(), tokens, 0usize);
     let mut cache_roots = Vec::with_capacity(config.layers * 2);
@@ -445,10 +376,7 @@ impl Lcg {
 }
 
 fn rand_tensor(axes: &[Axis], rng: &mut Lcg) -> Value {
-    Value::from_shape_fn(
-        &axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(),
-        |_| rng.f(),
-    )
+    Value::from_shape_fn(&axes.iter().map(|axis| axis.extent()).collect::<Vec<_>>(), |_| rng.f())
 }
 
 /// Weights seeded per input NAME, so every reserved extent binds identical
@@ -494,11 +422,7 @@ fn weight_env(graph: &DecodeGraph, context_length: usize, config: Config) -> Env
 fn input_names(roots: &[NodeRef]) -> Vec<&'static str> {
     use std::collections::HashSet;
     use std::sync::Arc;
-    fn visit(
-        node: &NodeRef,
-        names: &mut Vec<&'static str>,
-        seen: &mut HashSet<*const sanic::Node>,
-    ) {
+    fn visit(node: &NodeRef, names: &mut Vec<&'static str>, seen: &mut HashSet<*const sanic::Node>) {
         use sanic::Node;
         if !seen.insert(Arc::as_ptr(node)) {
             return;
@@ -550,12 +474,7 @@ fn interp_prefill(graph: &DecodeGraph, env: &mut Env, tokens: &[f64]) -> Vec<Vec
 
 /// Prefill the same tokens through the compiled Metal replay path the real
 /// example uses, and return every root's value at every step.
-fn metal_prefill(
-    graph: &DecodeGraph,
-    env: &Env,
-    tokens: &[f64],
-    device: &sanic::MetalDevice,
-) -> Vec<Vec<Vec<f32>>> {
+fn metal_prefill(graph: &DecodeGraph, env: &Env, tokens: &[f64], device: &sanic::MetalDevice) -> Vec<Vec<Vec<f32>>> {
     let program = graph.roots.compile(device).expect("Metal compile");
     let mut buffers = HashMap::new();
     for name in program.input_names() {
@@ -573,10 +492,7 @@ fn metal_prefill(
         .map(|(cache, name)| (cache, *name))
         .collect::<Vec<_>>();
     let mut replay = program
-        .capture(
-            buffers.iter().map(|(name, buffer)| (name.as_str(), buffer)),
-            &feedback,
-        )
+        .capture(buffers.iter().map(|(name, buffer)| (name.as_str(), buffer)), &feedback)
         .expect("capture");
     let tokens_buffer = buffers["tokens"].clone();
     let position_buffer = buffers["position"].clone();
@@ -585,12 +501,7 @@ fn metal_prefill(
         device.write_f64(tokens_buffer.raw(), &[token]);
         device.write_f64(position_buffer.raw(), &[position as f64]);
         let outputs = replay.step().expect("replay step");
-        steps.push(
-            outputs
-                .iter()
-                .map(|output| device.read_tensor_f32(output))
-                .collect(),
-        );
+        steps.push(outputs.iter().map(|output| device.read_tensor_f32(output)).collect());
     }
     steps
 }
@@ -621,10 +532,7 @@ fn computed_iota_mask_reaches_the_fused_attention_fold() {
 
     let position = input("position", [], Dtype::F32);
     let visible = binary(MapOp::Lt, iota(cache), add(position, konst(1.0)));
-    let mask = map(
-        MapOp::Where,
-        vec![visible, konst(0.0), konst(f64::NEG_INFINITY)],
-    );
+    let mask = map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)]);
     let attention = scaled_dot_product_attention(
         input("q", [heads, sequence, features], Dtype::F32),
         input("k", [heads, cache, features], Dtype::F32),
@@ -658,9 +566,7 @@ fn computed_iota_mask_reaches_the_fused_attention_fold() {
         .iter()
         .zip(&reference.data)
         .map(|(got, expected)| (*got as f64 - expected).abs() / (1.0 + expected.abs()))
-        .fold(0.0f64, |worst, e| {
-            std::cmp::max_by(worst, e, f64::total_cmp)
-        });
+        .fold(0.0f64, |worst, e| std::cmp::max_by(worst, e, f64::total_cmp));
     assert!(error < 2e-3, "computed-mask attention off by {error:e}");
 }
 
@@ -689,9 +595,7 @@ fn reserved_cache_extent_does_not_change_decode_logits() {
                 .iter()
                 .zip(final_logits)
                 .map(|(a, b)| (a - b).abs())
-                .fold(0.0f64, |worst, e| {
-                    std::cmp::max_by(worst, e, f64::total_cmp)
-                });
+                .fold(0.0f64, |worst, e| std::cmp::max_by(worst, e, f64::total_cmp));
             if drift > 1e-9 {
                 failures.push(format!("interp drift {drift:e} at extent {context_length}"));
             }
@@ -708,9 +612,7 @@ fn reserved_cache_extent_does_not_change_decode_logits() {
                     .iter()
                     .zip(got)
                     .map(|(expected, got)| (*got as f64 - expected).abs() / (1.0 + expected.abs()))
-                    .fold(0.0f64, |worst, e| {
-                        std::cmp::max_by(worst, e, f64::total_cmp)
-                    });
+                    .fold(0.0f64, |worst, e| std::cmp::max_by(worst, e, f64::total_cmp));
                 worst = std::cmp::max_by(worst, error, f64::total_cmp);
                 if error > 2e-3 {
                     let name = graph.cache_names.get(root).copied().unwrap_or("logits");
@@ -720,9 +622,7 @@ fn reserved_cache_extent_does_not_change_decode_logits() {
         }
         eprintln!("extent {context_length}: metal-vs-interp max rel err = {worst:e}");
         if worst > 2e-3 {
-            failures.push(format!(
-                "metal mismatch {worst:e} at extent {context_length}"
-            ));
+            failures.push(format!("metal mismatch {worst:e} at extent {context_length}"));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

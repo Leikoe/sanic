@@ -3,8 +3,8 @@
 /// Stateless neural-network operations.
 pub mod functional {
     use crate::ir::{
-        Axis, Extent, MapOp, NodeRef, causal_mask_like, flatten, konst, map, matmul,
-        positional_reindex, softmax, transpose,
+        Axis, Extent, MapOp, NodeRef, causal_mask_like, flatten, konst, map, matmul, positional_reindex, softmax,
+        transpose,
     };
 
     /// Scaled dot-product attention with the same argument order and tensor
@@ -86,9 +86,7 @@ pub mod functional {
 
         let scale = scale.unwrap_or_else(|| match query_features.extent {
             Extent::Static(features) => 1.0 / (features as f64).sqrt(),
-            Extent::Dynamic => panic!(
-                "scaled_dot_product_attention: default scale requires a static feature extent"
-            ),
+            Extent::Dynamic => panic!("scaled_dot_product_attention: default scale requires a static feature extent"),
         });
 
         let key = transpose(key, -2isize, -1isize);
@@ -154,3 +152,81 @@ pub mod functional {
 }
 
 pub use functional::scaled_dot_product_attention;
+
+/// Stateless neural-network operations over [`crate::Tensor`] — the public
+/// face of the layer library. Model-specific policy (a rope frequency
+/// schedule, a norm's epsilon) stays in model code; these are the shared
+/// mechanisms.
+pub mod ops {
+    use crate::Tensor;
+    use crate::ir::{Axis, axis};
+
+    /// RMS normalization: `x·weight / sqrt(mean(x², last) + eps)`.
+    pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
+        let rank = x.shape().len();
+        let denominator = ((x * x).mean(-1isize) + eps).sqrt().unsqueeze(rank - 1);
+        x * weight / denominator
+    }
+
+    /// Rotary position embedding over the trailing `head_dim`, at a scalar
+    /// `position` offset broadcast along `sequence`. `inv_freq` maps the
+    /// frequency axis this function mints to per-pair inverse frequencies —
+    /// the schedule (plain `θ^(-2i/d)`, llama's wavelength blend, …) is the
+    /// caller's policy.
+    pub fn rope(
+        x: &Tensor,
+        position: &Tensor,
+        sequence: Axis,
+        head_dim: Axis,
+        inv_freq: impl FnOnce(Axis) -> Tensor,
+    ) -> Tensor {
+        let pair = axis("rope_pair", 2);
+        let frequency = axis("rope_frequency", head_dim.extent() / 2);
+        let x = x.split(-1isize, pair, frequency);
+        let rank = x.shape().len();
+
+        let position = Tensor::iota(sequence) * 0.0 + position;
+        let angle = (position.unsqueeze(1usize) * inv_freq(frequency)).unsqueeze(1usize);
+        let sign = (Tensor::iota(pair) * 2.0 - 1.0).unsqueeze(1usize);
+        let rotated = x.flip(rank - 2) * sign;
+        let out = &x * angle.cos() + rotated * angle.sin();
+        out.flatten(&[rank - 2, rank - 1][..], head_dim)
+    }
+
+    /// The standard rope schedule: `inv_freq(i) = θ^(-i/frequencies)`.
+    pub fn rope_inv_freq(theta: f64) -> impl FnOnce(Axis) -> Tensor {
+        move |frequency: Axis| (Tensor::iota(frequency) * (-theta.ln() / frequency.extent() as f64)).exp()
+    }
+
+    /// A functional cache write: the whole cache tensor with the row at
+    /// `position` (along dimension 1) replaced by `current`. Pure — the
+    /// runtime decides whether the write lands in place.
+    pub fn update_cache(cache: &Tensor, current: &Tensor, position: &Tensor) -> Tensor {
+        let index = cache.coordinate(1usize);
+        let at_position = index.lt(position + 1.0) * position.lt(&index + 1.0);
+        at_position.select(current, cache)
+    }
+
+    /// [`super::functional::scaled_dot_product_attention`] over tensors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention(
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        mask: Option<&Tensor>,
+        scale: Option<f64>,
+        enable_gqa: bool,
+    ) -> Tensor {
+        super::functional::scaled_dot_product_attention(
+            query.node().clone(),
+            key.node().clone(),
+            value.node().clone(),
+            mask.map(|m| m.node().clone()),
+            0.0,
+            false,
+            scale,
+            enable_gqa,
+        )
+        .into()
+    }
+}

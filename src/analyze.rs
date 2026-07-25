@@ -105,10 +105,9 @@ fn structure_uncached(node: &Node, axis: AxisRef, cache: &mut StructureCache) ->
         // Raw data, literals and index values depend on no axis (an Iota
         // varies *with* its axis, but elementwise — no cross-element
         // dependence, which is what FREE means).
-        NodeKind::Input { .. }
-        | NodeKind::Const { .. }
-        | NodeKind::Iota { .. }
-        | NodeKind::Coordinate { .. } => Structure::FREE,
+        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => {
+            Structure::FREE
+        }
 
         // Elementwise: pass the joined input structure through. Linearity
         // survives only if the op itself preserves it.
@@ -195,10 +194,7 @@ fn structure_uncached(node: &Node, axis: AxisRef, cache: &mut StructureCache) ->
 
 /// Can this axis be folded in one pass? Yes iff FREE or MONOIDAL.
 pub fn streamable(node: &Node, axis: impl AxisSelector) -> bool {
-    matches!(
-        structure(node, axis).level,
-        Parallelism::Free | Parallelism::Monoidal
-    )
+    matches!(structure(node, axis).level, Parallelism::Free | Parallelism::Monoidal)
 }
 
 // ── the structure map ────────────────────────────────────────────────────────
@@ -233,12 +229,10 @@ pub fn analyze<A: AxisSelector>(node: &Node, axes: &[A]) -> Report {
                 .expect("analyze axis is absent from the selected node");
             let structure = structures.classify(node, a);
             let (carrier, decline) = match structure.level {
-                Parallelism::Monoidal => {
-                    match derive::derive_with_structure_cache(node, a, &mut structures) {
-                        Ok(c) => (Some(c), None),
-                        Err(d) => (None, Some(d)),
-                    }
-                }
+                Parallelism::Monoidal => match derive::derive_with_structure_cache(node, a, &mut structures) {
+                    Ok(c) => (Some(c), None),
+                    Err(d) => (None, Some(d)),
+                },
                 _ => (None, None),
             };
             AxisReport {
