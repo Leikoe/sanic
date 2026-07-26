@@ -138,9 +138,19 @@ pub fn occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
 /// pays even when it is memory-bound, and why a contiguous `chunk` run
 /// beats one narrow load per lane.
 pub fn mem_occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
-    let lanes = (k.parallel_blocks * k.lanes_per_block).max(1.0);
-    let outstanding = lanes * k.bytes_in_flight_per_lane.max(1.0);
-    (outstanding / (dev.hbm_bandwidth * dev.mem_latency_s)).clamp(1.0 / 64.0, 1.0)
+    let lanes = k.parallel_blocks * k.lanes_per_block;
+    sustainable_bandwidth(dev, lanes, k.bytes_in_flight_per_lane) / dev.hbm_bandwidth
+}
+
+/// The same law as [`mem_occupancy`], stated as the physical quantity it is:
+/// the bandwidth a kernel of this shape can actually reach. `hbm_bandwidth` is
+/// what a grid wide enough to saturate the machine gets; a fold whose output is
+/// a scalar keeps one threadgroup of loads in flight and sees the floor, which
+/// is 3 GB/s on an M1 Pro rather than 200. Anyone pricing traffic a kernel
+/// issues wants this, not the peak.
+pub fn sustainable_bandwidth(dev: &DeviceProfile, lanes: f64, bytes_in_flight_per_lane: f64) -> f64 {
+    let outstanding = lanes.max(1.0) * bytes_in_flight_per_lane.max(1.0);
+    dev.hbm_bandwidth * (outstanding / (dev.hbm_bandwidth * dev.mem_latency_s)).clamp(1.0 / 64.0, 1.0)
 }
 
 /// Per-kernel time: the roofline (compute vs. bandwidth, whichever binds)

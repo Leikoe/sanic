@@ -843,8 +843,17 @@ impl Partitioner<'_> {
             replicas = (replicas / sharable.clamp(1.0, SIMD as f64)).max(1.0);
         }
         let dev = self.dev;
-        let recompute_once = count_issue_ops(node) / dev.peak_flops + subtree_read_bytes(node) / dev.hbm_bandwidth;
-        let round_trip = volume * dev.dtype_bytes / dev.hbm_bandwidth;
+        // Traffic is priced at the rate THIS kernel can sustain, not at peak.
+        // Both sides of the inequality are traffic issued by this consumer —
+        // the leaves it re-reads when the subtree stays in-body, or the one
+        // value it reads when the subtree is cut — and a fold whose output is
+        // small keeps too few loads in flight to reach `hbm_bandwidth`
+        // (Little's law, [`cost::sustainable_bandwidth`]). At peak, re-reading
+        // a residual history into a scalar-output norm prices at ~100 ns
+        // against a 2 µs launch and every recompute looks free.
+        let sustained = crate::cost::sustainable_bandwidth(dev, pricing.out_vol, dev.dtype_bytes);
+        let recompute_once = count_issue_ops(node) / dev.peak_flops + subtree_read_bytes(node) / sustained;
+        let round_trip = volume * dev.dtype_bytes / sustained;
         (replicas - 1.0) * recompute_once < (replicas + 1.0) * round_trip + dev.launch_overhead
     }
 
