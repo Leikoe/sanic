@@ -676,8 +676,46 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       So 7a needs a CAPABILITY, not a number: hoisting a shared
       sub-expression out of fold bodies into its own stage. That is the
       same move for any shared body expression, so it stays a general law
-      rather than a residual-stream rule — but it is a new mechanism in
-      the partitioner, and it should be designed before it is priced.
+      rather than a residual-stream rule.
+
+      **Built to the decision point 2026-07-26, not landed. WIP is stash
+      `4cf2a61`.** Four things are now established, and the last one is
+      what stopped it:
+
+      1. **The cut position is a pre-pass at partition entry**, walking
+         each root BOTTOM-UP (children first) and pricing every shared
+         `Map`. Bottom-up matters: by the time layer N is priced, layer
+         N−1 is already a buffer read, so a chain materializes once per
+         link instead of once per prefix.
+      2. **Price the SPLICED view, not the raw node.** `subtree_read_bytes`
+         on the raw node charges for work no consumer redoes, and on a
+         graph this shared it does not terminate in reasonable time.
+      3. **Price against ATTAINABLE bandwidth, not peak — this is the
+         whole result.** At `hbm_bandwidth` the residual re-sum costs
+         ~100 ns against a 2 µs launch and never pays to cut, which is
+         exactly why nothing was hoisting. At the rate a scalar-output
+         fold actually sustains (Little's law floor, 1/64 of peak ≈
+         3 GB/s here) the same re-sum is tens of µs — matching both the
+         measured 6→31 µs slope and the probe. `cost::mem_occupancy`
+         already IS this law; it just needed factoring out so a caller
+         holding a lane count can use it. With that in place **64 nodes
+         price as worth hoisting**, in 7 s.
+      4. **`plan::count_issue_ops` is exponential on shared DAGs** — it
+         re-descends every parent edge, which is right for a tree and
+         fatal on a residual stream (200 s on llama before it was
+         replaced). It is also the wrong count for a kernel BODY, where
+         the emitter names a value once: a memoized walk counting each
+         distinct node once is both linear and more correct. This is a
+         latent bug on the existing callers too, not just this pass.
+
+      **What stopped it:** with the 64 cuts actually taken, compile time
+      blows past 400 s (it is fast in dry-run, so the cost is in
+      `cut`→`emit` re-planning, not in the pricing). That is the next
+      thing to diagnose — probably that cutting inside a fold body forces
+      the enclosing fold to re-plan, and cascades. Not a design flaw
+      found so far; a wiring problem, and one that wants a fresh session
+      rather than the tail of a long one.
+
       The probe stands; the 0.43 ms is still there to collect.
 
       The original derivation of the same number:
