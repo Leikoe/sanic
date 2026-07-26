@@ -14,6 +14,9 @@
 //! output buffer becomes the NEXT step's input, ping-ponged internally.
 //! No capture/replay staircase in sight; [`Machine::step`] just runs.
 
+// Only the Metal-gated half of this module compiles a graph or runs one, so
+// off macOS these are dead and `-D warnings` fails the linux CI leg.
+#[cfg(target_os = "macos")]
 use crate::compile::{CompileError, Program, RunError};
 use crate::ir::{Axis, Dtype};
 use crate::tensor::Tensor;
