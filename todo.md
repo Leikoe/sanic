@@ -642,7 +642,22 @@ bubbles no prior mode could see. Four work items fall out, in value order:
 
    Work items, in measured value order:
 
-   a. **Materialize the residual stream — ~0.4 ms/step, measured cause.**
+   a. **Materialize the residual stream — ~0.43 ms/step, CONFIRMED by
+      probe 2026-07-26 (`tests/residual_stream_probe.rs`), not yet built.**
+      Hand-built both shapes at llama's geometry — 33 norms whose arity
+      grows with depth, against 32 adds plus 33 arity-1 norms:
+
+      > re-sum (today)  66 dispatches  1489.7 µs
+      > materialize     98 dispatches   311.7 µs   **4.78×**
+
+      The probe's absolutes run ~1.6× hot against a real step (its norms
+      have no big matmuls beside them to hide behind), so scale by the
+      ratio: real norms cost 0.951 ms, arity-1 would be 0.363, and 32
+      adds at the ~5 µs our other 2048-wide maps take is ~0.16 — so
+      **0.951 → ~0.52 ms, saving ~0.43**. Note the extra 32 dispatches
+      are FREE in the ledger: more dispatches, less total work, which is
+      the opposite of every fusion this project has tried. The original
+      derivation of the same number:
       Norms cost 0.951 ms; held at arity 1 they would cost 0.363. The
       0.588 ms difference is the re-sum: with the residual never
       materialized, each norm re-adds every prior layer, reduce climbing
