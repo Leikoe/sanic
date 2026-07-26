@@ -653,10 +653,24 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       codegen, 15× fewer output lanes. More bytes in flight per lane is
       the lever.
 
-   c. **Merge q/k/v into one projection — ~0.19 ms.** k/v at 120 GB/s is
-      not a codegen fault: a 2 MB read cannot keep enough bytes in
-      flight. One [3072, 2048] stream fixes it by construction. Neither
-      sanic nor mlx-lm does this today.
+   c. **Get q, k and v into ONE phase — and note item 4's theory 4 is
+      half wrong.** k/v at 120 GB/s is not a codegen fault: a 2 MB read
+      cannot keep enough bytes in flight. Theory 4 dismissed sideways
+      fusion of q|k|v because "those kernels ALREADY run concurrently".
+      Measured over the emitted barrier schedule, they do not: the only
+      projection pair that ever shares a phase is gate|up, 16 times, one
+      per layer. **q, k and v each sit in a phase alone**, though the DAG
+      makes them mutually independent (the 31 width-3 levels of the ideal
+      schedule are exactly these). So theory 4 holds for gate|up and is
+      untested for q|k|v.
+
+      Two ways in, cheapest first. (i) REORDER: emit the three adjacent
+      so one phase covers them — no fusion, no new kernel, and it is the
+      cheapest possible test of the ramp-filling hypothesis item 4 raised
+      with `barriers=none`. (ii) MERGE: one [3072, 2048] stream, which
+      also RAISES thread count (3072 output lanes against 2048/512/512)
+      and so sits on the right side of the block-rows law. Measure (i)
+      before building (ii).
 
    d. **Fuse the small ops into the streams they ride — up to 1.43 ms.**
       Norms, rope, cache writes, sdpa and silu touch ~5 MB total, i.e.
