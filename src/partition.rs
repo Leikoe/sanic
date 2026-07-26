@@ -417,20 +417,30 @@ fn count_parents(node: &Node, out: &mut HashMap<*const NodeKind, usize>) {
     }
 }
 
-fn contains_node(root: &Node, target: &Node) -> bool {
-    if Arc::ptr_eq(root, target) {
-        return true;
+/// The nodes still reachable from `node` once `cut` values are read from their
+/// buffers instead of computed — what this kernel is left to evaluate. A cut
+/// stops the descent, but only along the paths that go through it: a value the
+/// graph also reaches another way (an attention score under the max AND under
+/// the exp) stays reachable, and stays this kernel's to place. Visited-keyed —
+/// the graph is a DAG whose diamonds make an unmemoized descent exponential.
+fn reachable_past_cuts(node: &Node, cut: &HashSet<*const NodeKind>, out: &mut HashSet<*const NodeKind>) {
+    if cut.contains(&Arc::as_ptr(node)) || !out.insert(Arc::as_ptr(node)) {
+        return;
     }
-    match root.as_ref() {
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
-        NodeKind::Coordinate { src, .. }
-        | NodeKind::Reduce { src, .. }
-        | NodeKind::Scan { src, .. }
-        | NodeKind::View { src, .. }
-        | NodeKind::Reindex { src, .. } => contains_node(src, target),
-        NodeKind::Map { inputs, .. } => inputs.iter().any(|input| contains_node(input, target)),
-        NodeKind::Gather { src, index, .. } => contains_node(src, target) || contains_node(index, target),
+    for child in ir::children(node) {
+        reachable_past_cuts(&child, cut, out);
     }
+}
+
+/// One kernel's body, as [`Partitioner::shared_body_cuts`] walks it: the fold
+/// root it belongs to, the carrier leaves that bound it, how many of each
+/// node's parent edges are inside it, and the pricing to cut by. Invariant for
+/// the whole walk — only the node and its stream axes change.
+struct Body<'a, 'c> {
+    root: &'a Node,
+    leaves: &'a [Node],
+    edges: &'a HashMap<*const NodeKind, usize>,
+    pricing: &'a CutPricing<'c>,
 }
 
 impl Partitioner<'_> {
@@ -740,6 +750,96 @@ impl Partitioner<'_> {
     /// under a flattened fold looks stream-invariant, and a SwiGLU's exp
     /// stays in-body of the down projection — recomputed once per output
     /// row instead of evaluated once per element.
+    /// Parent edges that live inside one fold's body, per node.
+    ///
+    /// The second number [`Partitioner::shared_body_cuts`] needs. A value two
+    /// slots of the same carrier reference is emitted ONCE — the generator
+    /// names it and reuses the name — so being referenced twice here is free.
+    /// What makes a rebuild real is a parent in ANOTHER kernel, which is
+    /// `parents[n] > body_edges[n]`. Counting graph parents alone cannot tell
+    /// the two apart, and flash attention is the case that proves it: its
+    /// score contraction has two parents, the max slot and the exp slot, and
+    /// both are this kernel.
+    fn body_edges(
+        &self,
+        node: &Node,
+        leaves: &[Node],
+        edges: &mut HashMap<*const NodeKind, usize>,
+        walked: &mut HashSet<*const NodeKind>,
+    ) {
+        if leaves.iter().any(|leaf| Arc::ptr_eq(leaf, node)) || !walked.insert(Arc::as_ptr(node)) {
+            return;
+        }
+        // Every edge counts, but each node is descended once: `walked` has to
+        // be separate from `edges`, or recording a child would mark it visited
+        // and the walk would stop one level down.
+        for child in ir::children(node) {
+            *edges.entry(Arc::as_ptr(&child)).or_insert(0) += 1;
+            self.body_edges(&child, leaves, edges, walked);
+        }
+    }
+
+    /// The values in this fold's BODY that another kernel rebuilds too.
+    ///
+    /// Everything but the node it stands on travels in [`Body`].
+    ///
+    /// A carrier's leaves are where derivation stopped, so everything between
+    /// the fold's root and those leaves is body: legal to compute in-body, and
+    /// free to do so only if this is the one kernel computing it.
+    /// [`Partitioner::leaf_cuts`] walks DOWNWARD from a leaf and so can never
+    /// see it — which is why llama's residual stream was re-added by all 33
+    /// norms and every projection rather than stored once. Nothing was
+    /// mispriced; there was no position at which to price it.
+    ///
+    /// Same descent and the same stream translation as `leaf_cuts`; this walk
+    /// differs only in where it starts and what it looks for. The SHALLOWEST
+    /// value on each path wins — storing a residual chain's tip turns the rest
+    /// of the chain into one buffer read, so the links below stop being shared
+    /// work at all.
+    fn shared_body_cuts(&self, node: &Node, body: &Body, axes: &[AxisRef], out: &mut Vec<Node>) {
+        let (root, leaves, edges, pricing) = (body.root, body.leaves, body.edges, body.pricing);
+        if leaves.iter().any(|leaf| Arc::ptr_eq(leaf, node)) {
+            return;
+        }
+        // Already materialized: READ it, exactly as `leaf_cuts` does at the same
+        // question. Returning instead leaves it inline, and the kernel rebuilds
+        // it from the links below — the very sharing this walk exists to find.
+        // The root is exempt: it is the value this kernel computes.
+        if self.done.contains_key(&Arc::as_ptr(node)) && !Arc::ptr_eq(node, root) {
+            if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
+                out.push(node.clone()); // splices to its buffer read
+            }
+            return;
+        }
+        let descend =
+            |p: &Self, src: &Node, axes: Vec<AxisRef>, out: &mut Vec<Node>| p.shared_body_cuts(src, body, &axes, out);
+        match node.as_ref() {
+            NodeKind::Map { inputs, .. } => {
+                let inside = edges.get(&Arc::as_ptr(node)).copied().unwrap_or(0);
+                let total = self.parents.get(&Arc::as_ptr(node)).copied().unwrap_or(1);
+                // the root is this kernel's own output, never a value to store
+                let rebuilt_elsewhere = !Arc::ptr_eq(node, root) && total > inside;
+                if rebuilt_elsewhere && !self.inline_pays(node, axes, pricing) {
+                    if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
+                        out.push(node.clone());
+                    }
+                    return;
+                }
+                for input in inputs {
+                    descend(self, input, map_input_axes(node, input, axes), out);
+                }
+            }
+            // the fold's own root, and any reduction in its body: the streamed
+            // axis is unchanged beneath them
+            NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => descend(self, src, axes.to_vec(), out),
+            NodeKind::View { src, .. } => descend(self, src, stream_below_view(axes, &ir::view_groups(node)), out),
+            NodeKind::Reindex { src, .. } => {
+                descend(self, src, stream_below_reindex(axes, &ir::resolved_reindex(node)), out)
+            }
+            _ => {}
+        }
+    }
+
     fn leaf_cuts(&self, node: &Node, axes: &[AxisRef], pricing: &CutPricing, out: &mut Vec<Node>) {
         let push = |node: &Node, out: &mut Vec<Node>| {
             if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
@@ -1060,6 +1160,24 @@ impl Partitioner<'_> {
         // while that structural path is still present, so sibling folds such
         // as the two projections feeding SwiGLU materialize as one derived
         // activation rather than as unrelated producer kernels.
+        // Body values another kernel rebuilds too, before the leaf walk:
+        // storing one turns the subtree under it into a single read, which is
+        // what the leaves should then see.
+        let mut body_edges = HashMap::new();
+        self.body_edges(node, &carrier.leaves, &mut body_edges, &mut HashSet::new());
+        let body = Body {
+            root: node,
+            leaves: &carrier.leaves,
+            edges: &body_edges,
+            pricing: &pricing,
+        };
+        let mut body_cuts = Vec::new();
+        self.shared_body_cuts(node, &body, &[axis], &mut body_cuts);
+        for cut in &body_cuts {
+            self.cut(cut);
+            subs.push((cut.clone(), self.splice(cut, false)));
+        }
+
         let mut structural_cuts = Vec::new();
         if let NodeKind::Reduce { src, .. } = node.as_ref()
             && matches!(src.as_ref(), NodeKind::View { .. } | NodeKind::Reindex { .. })
@@ -1071,8 +1189,14 @@ impl Partitioner<'_> {
             }
         }
 
+        // A leaf this kernel no longer reaches is not this kernel's to cut: the
+        // value it belonged to is a buffer read now, so cutting it materializes
+        // a producer nothing reads.
+        let cut_here: HashSet<*const NodeKind> = body_cuts.iter().chain(&structural_cuts).map(Arc::as_ptr).collect();
+        let mut live = HashSet::new();
+        reachable_past_cuts(node, &cut_here, &mut live);
         for (idx, leaf) in carrier.leaves.iter().enumerate() {
-            if structural_cuts.iter().any(|cut| contains_node(cut, leaf)) {
+            if !live.contains(&Arc::as_ptr(leaf)) {
                 continue;
             }
             // Fuse the online-softmax score contraction in-body (FlashAttention's
@@ -1257,9 +1381,20 @@ impl Partitioner<'_> {
                     subs.push((p.clone(), read));
                 }
             }
-            let t = self.fresh();
+            // Cutting the other producers can materialize the host too — they
+            // share the graph below. The host was chosen before that happened,
+            // so ask `done` again: emitting it a second time is a whole kernel
+            // recomputed. A materialized host cannot carry the epilogue (its
+            // buffer holds the host's own value, which other stages read), so
+            // this falls through to the map stage that reads it.
             let before = self.stages.len();
-            let landed = self.emit(&producer, t);
+            let landed = match self.done.get(&Arc::as_ptr(&producer)).copied() {
+                Some(name) => name,
+                None => {
+                    let t = self.fresh();
+                    self.emit(&producer, t)
+                }
+            };
             if self.stages.len() > before
                 && let Some(Stage::Fused {
                     spec,
