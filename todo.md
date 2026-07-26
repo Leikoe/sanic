@@ -292,8 +292,11 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    all N+2 prior residual contributions in-register (growing arity, so
    layers genuinely aren't isomorphic and dedup is correct). At batch-1
    decode re-reading k×4KB beats a materialize round-trip — the right
-   call. (WRONG, measured in item 7a: the re-reads cost 0.588 ms/step at
-   16 layers — norms are 0.951 ms where arity 1 would be 0.363.) At long-context prefill the re-reads grow ~quadratically with
+   call. (Annotated WRONG on 2026-07-26 and then RE-CONFIRMED RIGHT the
+   same day: materializing really was built, and decode went 15.9 → 19.3
+   ms/step. The 0.588 ms of re-sum is real but hides behind the matmuls
+   beside it. See item 7a. The prefill half of this note stands and is
+   where the mechanism should be re-measured.) At long-context prefill the re-reads grow ~quadratically with
    depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
    decision to revisit when prefill matters.
 
@@ -642,106 +645,52 @@ bubbles no prior mode could see. Four work items fall out, in value order:
 
    Work items, in measured value order:
 
-   a. **Materialize the residual stream — ~0.43 ms/step, CONFIRMED by
-      probe 2026-07-26 (`tests/residual_stream_probe.rs`), not yet built.**
-      Hand-built both shapes at llama's geometry — 33 norms whose arity
-      grows with depth, against 32 adds plus 33 arity-1 norms:
+   a. **Materialize the residual stream — MECHANISM BUILT AND CORRECT,
+      OPTIMIZATION REFUTED (2026-07-26).** Mechanism preserved at stash
+      `47bd695`; all 222 tests pass with it in.
 
-      > re-sum (today)  66 dispatches  1489.7 µs
-      > materialize     98 dispatches   311.7 µs   **4.78×**
+      The position: `leaf_cuts` walks DOWNWARD from a fold's leaves, so a
+      value combining several already-materialized leaves — llama's
+      residual stream — lives in the body where no walk reaches it.
+      Nothing was mispriced; there was no position to price. The fix is
+      one more cut-collection step in `emit_fold`, which is already
+      documented as *cut the leaves the kernel cannot compute in-body,
+      re-plan on the cut graph, push a stage*, walking root→leaves with
+      the same stream translation `leaf_cuts` uses. It belongs there and
+      NOT in `derive`: fusing a shared value is perfectly legal, so
+      sharing is a profitability question, and the file's law is that
+      algebra settles legality while the cost model ranks what remains.
 
-      The probe's absolutes run ~1.6× hot against a real step (its norms
-      have no big matmuls beside them to hide behind), so scale by the
-      ratio: real norms cost 0.951 ms, arity-1 would be 0.363, and 32
-      adds at the ~5 µs our other 2048-wide maps take is ~0.16 — so
-      **0.951 → ~0.52 ms, saving ~0.43**. Note the extra 32 dispatches
-      are FREE in the ledger: more dispatches, less total work, which is
-      the opposite of every fusion this project has tried.
+      The predicate took two goes and the second is the interesting one.
+      "More than one parent in the graph" cuts flash attention's score
+      contraction, whose two parents — the max slot and the exp slot —
+      are BOTH this kernel; `projected_attention_cuts_the_gemms` catches
+      it. What makes a rebuild real is a parent in ANOTHER kernel, so the
+      rule is `parents[n] > body_edges[n]`, counting the parent edges
+      inside this fold's own cone. With that, the cuts land exactly on
+      shape `inside=3 total=4` — the residual, read three times in a body
+      and once by the next layer — and every test passes.
 
-      **Attempted 2026-07-26, and the blocker is structural, not a
-      price.** The obvious fix — teach Prop 4.1 that a shared subtree is
-      recomputed once per CONSUMING KERNEL, not just once per replica
-      within one — is a one-line change to `inline_pays` (scale `replicas`
-      by the node's parent count). It changes nothing, and instrumenting
-      says why: **`inline_pays` is never called on the residual sum at
-      all.** The parent-count histogram over llama's graph shows the
-      sharing plainly (`{1: 1739, 2: 198, 3: 50, 4: 33, 16: 2, 32: 3,
-      33: 3, 34: 1, 52: 1}`, and the heavy entries are `Map/Add`), but
-      `leaf_cuts` never visits those nodes: what it visits at parents ≥ 4
-      is already `done`. The layer CONTRIBUTIONS (t1, t7, t13, …) are
-      materialized; the Add TREE that combines them is not a fold leaf —
-      it lives in the fold's BODY, and `leaf_cuts` only walks downward
-      from leaves. There is no cut position there to price.
+      **And then it loses.** llama 263 → 324 kernels, **15.9 → 19.3
+      ms/step**. The probe (`tests/residual_stream_probe.rs`, 4.78×) was
+      measuring norms with nothing beside them; in the real schedule those
+      re-sums overlap with the big matmuls and cost nothing to hide, while
+      the extra stages and the round trip are paid in full. Same regime
+      error as reading `SANIC_DEBUG=4` per-class rates as production —
+      made twice in one day, once with each instrument.
 
-      So 7a needs a CAPABILITY, not a number: hoisting a shared
-      sub-expression out of fold bodies into its own stage. That is the
-      same move for any shared body expression, so it stays a general law
-      rather than a residual-stream rule.
+      **So item 2's original call was RIGHT and my annotation on it was
+      wrong:** at batch-1 decode, re-reading k×4KB really does beat a
+      materialize round-trip. The annotation is corrected in place. The
+      re-sum still grows quadratically with depth, so the mechanism is
+      worth keeping for PREFILL, where item 2 always said the arithmetic
+      flips — that is the workload to re-measure it on, not decode.
 
-      **Designed and tried properly 2026-07-26. Two halves landed, the
-      third found its real bug.**
-
-      The architecture was the thing I had wrong. `partition.rs` states its
-      own law — *the derive frontier is the fusion boundary*, algebra
-      settles legality and the cost model ranks what is left. Sharing is
-      not a legality question (fusing a shared value is perfectly legal),
-      so `derive` must NOT learn about it. It belongs where profitability
-      already acts, and `emit_fold` is documented as doing exactly this
-      shape of thing: *cut the carrier leaves the kernel cannot compute
-      in-body, re-plan on the cut graph, push a stage.* The addition is
-      one more cut-collection step there, walking root→leaves (the body)
-      with the SAME stream translation `leaf_cuts` uses. An earlier
-      attempt cut in a pre-pass BEFORE derivation instead, which is why
-      compile time blew to 400 s: every fold re-derived from a graph that
-      had changed under it.
-
-      LANDED, each measured alone: (i) traffic priced at
-      `cost::sustainable_bandwidth` rather than peak — a scalar-output
-      fold sees Little's law's floor, 3 GB/s not 200, so re-reading into a
-      small fold priced at ~100 ns against a 2 µs launch and every
-      recompute looked free; (ii) `count_issue_ops` counts each distinct
-      node once — it re-descended every parent edge, exponential on a
-      shared DAG (200 s on a llama step) and the wrong number for a kernel
-      body anyway, since the emitter names a value once. Compile 5.3 →
-      4.6 s, schedule and text unchanged.
-
-      NOT LANDED — the body walk works and its predicate is wrong. With
-      `shared(node)` = "more than one parent in the graph" it cuts, and
-      llama goes 263 → 391 kernels, 15.7 → 19.3 ms, and
-      `projected_attention_cuts_the_gemms` fails. That failure is the
-      useful part: **in flash attention the score contraction has two
-      parents — the max slot and the exp slot — and BOTH are inside the
-      same kernel.** The carrier deliberately recomputes it in-body, and
-      the rule materialized it, destroying the fusion.
-
-      So the predicate is measured at the wrong granularity. What makes
-      recompute cost real is being rebuilt by several KERNELS; a value
-      referenced twice inside one body is emitted once (that is exactly
-      what (ii) above establishes). The rule wants *parents outside this
-      fold's cone*, not parents in the graph — countable during the same
-      walk, since the walk already has the cone. Worth noting it also
-      changes NUMERICS: materializing stores at boundary precision, so a
-      bf16 residual rounds where an in-register f32 chain did not, and
-      llama's text moved to match its own f32 output. MLX has the same
-      rounding, so this is a real property to decide rather than a bug —
-      but it should be decided, not discovered.
-
-      The probe stands; the 0.43 ms is still there to collect.
-
-      The original derivation of the same number:
-      Norms cost 0.951 ms; held at arity 1 they would cost 0.363. The
-      0.588 ms difference is the re-sum: with the residual never
-      materialized, each norm re-adds every prior layer, reduce climbing
-      6 → 31 µs and apply 5 → 12 µs across the 16 layers, the fold's
-      `Add` count growing by exactly two per layer (1, 3, 5, …, 65).
-      Cost of the fix is ~32 small adds (~0.16 ms by analogy with our
-      other 2048-wide maps), or zero if the add lands in the producing
-      matmul's epilogue. NOTE this contradicts item 2's standing line
-      that "at batch-1 decode re-reading k×4KB beats a materialize
-      round-trip — the right call": that was reasoned, not timed.
-      It does NOT contradict `fused_rms_against_reduce_then_apply`
-      (8.00 vs 7.71 µs, 1.04×) — that probe is correct and runs at arity
-      ONE, which is exactly the regime the re-sum leaves.
+      It also changes NUMERICS: materializing stores at boundary
+      precision, so a bf16 residual rounds where the in-register f32 chain
+      did not (llama's text moved to match its own f32 output). MLX rounds
+      the same way, so it is a property to choose deliberately if this is
+      ever turned on.
 
    b. **Wide/vectorized loads — BUILT, MEASURED, REFUTED (2026-07-26).**
       The fold fetches 16 contiguous bytes with eight separate 2-byte
