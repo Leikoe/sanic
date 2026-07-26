@@ -392,15 +392,39 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    It also NaN'd `attention_backward_runs_on_gpu` (dq), so the
    coordinate mapping is not yet right for gradient folds.
 
-   What a next attempt needs: the two-pass kernel's threadgroup count
-   must be sized by the ROW it writes, not by the fold's output — which
-   means a split (two-stage) reduction across threadgroups, or a
-   schedule search that raises `sgs` far enough that one threadgroup
-   covers the row (`sgs=32` gives 1024 threads; `SANIC_TUNE` would find
-   it if the candidate were legal here). Until then the separate map
-   kernel is genuinely the better shape, and item 4's ~0.8 ms estimate
-   for this fusion should be read as an upper bound that the geometry
-   does not currently allow collecting.
+   **Second attempt, and the law it found (`tests/block_rows_probe.rs`).**
+   The reasoned fix for the geometry problem was: give a threadgroup a
+   BLOCK of output rows, stage the activation row in threadgroup memory,
+   fold `Σx²` once during that staging — so the normalizer amortizes over
+   the block instead of being recomputed per output point. Hand-written
+   MSL, both shapes checked equal, then timed:
+
+   > three kernels 132 µs · block-rows fused **218 µs** · **0.61×**
+
+   Blocking rows is the one thing batch-1 decode cannot afford, because
+   it trades away THREADS. Per-point runs 2048 threadgroups — 524k
+   threads, 8 elements each. Block-rows runs 256 — 65k threads, 64 each.
+   Sustained bandwidth is outstanding bytes over latency, so 8× fewer
+   threads is 8× fewer loads in flight, and 8 KB of staged activation
+   caps residency per core on top of that. The projection is DRAM-bound;
+   parallelism is the whole game and amortized arithmetic buys nothing.
+
+   **The law, which now governs this whole item: on this machine a
+   fusion that reduces thread count is a regression, even when it
+   removes a kernel and a barrier.** That kills block-rows (and P2
+   rows-per-thread with it, for a second and better reason than "the
+   kernels are already at peak"). It also explains attempt one: making
+   the apply ride the reduce inherited a ONE-threadgroup geometry.
+
+   Where that leaves the ~1.5 ms of starved kernels: every fusion that
+   would remove them shrinks the thread count of whatever absorbs them,
+   so the two known directions are both closed. What is NOT yet tried is
+   fusing SIDEWAYS — merging kernels that are independent and equally
+   parallel rather than dependent: q|k|v into one dispatch, gate|up into
+   one, the two rope halves, the kv-cache writes. Those keep every
+   thread and delete a phase each (~48 dispatches, ~48 barriers by the
+   count above). That is the next thing to measure, and unlike the two
+   attempts above it has no mechanism working against it.
 
 5. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
