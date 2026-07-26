@@ -78,6 +78,15 @@ cargo run --example direct_attention
 cargo test
 ```
 
+Once per clone, so CI's checks run at commit time rather than fourteen minutes
+later — the linux target matters, because everything Metal is `cfg`'d out there
+and macOS-only code turns into dead-code errors a host-only clippy cannot see:
+
+```
+git config core.hooksPath .githooks
+rustup target add x86_64-unknown-linux-gnu
+```
+
 The current frontend constructs immutable nodes directly and compiles one or
 more output roots; no explicit graph builder is required. Larger historical
 model fixtures are parked in `examples/attic/` while they migrate to this
