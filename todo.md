@@ -341,11 +341,13 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    rows-per-thread and any further wide-load work are therefore dead
    ends; do not spend time there.** The whole remaining gap is phase
    count, and the only lever on phase count is FUSION.
-   (SUPERSEDED by item 7: the 97% is an AGGREGATE measured with barriers
-   off, where neighbours fill each other's ramps. Per class, in
-   isolation, the MLP folds run at 83-90% of the 184 GB/s our own
-   lm_head demonstrates with the same codegen. Wide loads are alive;
-   only P2, which REDUCES thread count, is dead.)
+   (Challenged by item 7 on 2026-07-25, and the challenge was WRONG —
+   corrected 2026-07-26. A hand probe of the emitted fold shape measures
+   183.6 GB/s on gate/up and 167.6 on down, back-to-back over cold
+   weights: this line is right, the kernels ARE essentially optimal, and
+   wide loads measure 1.01×. P1 is dead alongside P2. The one exception
+   is grid WIDTH — down runs identical code 9% slower on a quarter of the
+   grid — see item 7b.)
 
    The graph is 263 dispatches in 213 serial phases (`SANIC_DEBUG=3`
    prints this). 134 of the 263 are STARVED — ≤8 of the M1 Pro's 16
@@ -479,11 +481,15 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    tokens per pass), batching (>1 sequence makes every GEMV a GEMM), or
    quantization (fewer bytes, the only lever on the floor itself).
    Further single-step kernel work on this workload is not worth doing.
-   (SUPERSEDED by item 7 — and note the goal is the ROOFLINE, not the
-   fastest number, so all three levers named just above are out of
-   scope: each moves the floor instead of reaching it. There is 3.12 ms
-   between the measured step and the traffic floor, itemized per class
-   in item 7.)
+   (PARTLY superseded by item 7, and note the goal is the ROOFLINE, not
+   the fastest number, so all three levers named just above are out of
+   scope: each moves the floor instead of reaching it. ~3 ms still sits
+   between the measured step and the traffic floor — but after item 7b
+   and 7c both came back refuted, that gap is NOT slow kernels and NOT
+   unexploited concurrency, which is what this paragraph was right about.
+   What is left of it: the residual re-sum (7a), grid width on
+   narrow-output projections (7b), the small-op tail (7d), and host-side
+   submission (7e).)
 
 5. **What the GPU will actually tell us (asked and answered 2026-07-25).**
    Apple exposes 150+ counters — performance LIMITERS (ALU, buffer
@@ -596,13 +602,23 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    batching all move the floor instead of reaching it, and are out of
    scope for this item by construction.
 
-   Item 4 measured `barriers=none` at 13.87 ms against a 13.48 ms traffic
-   floor and concluded 97% of practical peak, hence "the generated kernels
-   are essentially optimal" and "any further wide-load work is a dead end;
-   do not spend time there". **That conclusion does not survive a per-class
-   look.** `SANIC_DEBUG=4` times each kernel in ISOLATION (encoder per
-   kernel, no neighbour to overlap with), and isolated rates are not
-   uniform — llama-3.2-1B bf16, warm run, Σ 16.57 ms:
+   **CORRECTED 2026-07-26, and the correction is mine: item 4 was right
+   about the kernels.** This item originally read the per-class table below
+   as 1.69 ms of codegen slack and challenged item 4's "the generated
+   kernels are essentially optimal". A hand probe
+   (`tests/wide_loads_probe.rs`) then measured the emitted fold shape
+   directly, 8 dispatches over 8 distinct cold weights in one command
+   buffer: **gate/up sustains 183.6 GB/s and down 167.6** — at or near the
+   184 practical peak, not the 166/153 the table says. The table is a
+   `SANIC_DEBUG=4` measurement, which gives every kernel its own encoder and
+   therefore charges each one a ramp that production hides. I read an
+   isolated-regime number as if it were production, which is the same class
+   of error I accused item 4 of making with its aggregate. The slack below
+   is a REGIME ARTIFACT, not codegen headroom; read the table as relative
+   class weights, not as achievable rates.
+
+   The original per-class table, kept because the SHARES are still right —
+   llama-3.2-1B bf16, warm run, Σ 16.57 ms:
 
    | class | MB | ms | GB/s | at 184 | slack |
    |---|---|---|---|---|---|
@@ -615,21 +631,14 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    | small ops (norms, rope, sdpa, silu, cache) | ~5 | 1.43 | — | 0.00 | 1.43 |
    | **total** | **2474** | **16.57** | | **13.45** | **3.12** |
 
-   The lm_head row is the control: the SAME one-thread-per-output fold
-   reaches 184 GB/s when the grid is 128k wide, and 153–166 when it is
-   8k. So 184 is demonstrably reachable by our own codegen, and the big
-   MLP folds run at 83–90% of it. **Weight-class slack alone is 1.69 ms**
-   — against the 1.68 ms item 4 attributes to the serial dependency
-   chain. Those are not two problems; they are one problem seen from two
-   sides. A fold that cannot saturate DRAM alone either gets its ramp
-   filled by a concurrent neighbour (`barriers=none` → aggregate 97%) or
-   runs below peak in isolation (real schedule → 83–90%). Item 4 closed
-   BOTH doors: the chain is irreducible AND the kernels are optimal. At
-   most one of those can be true, and the per-class table says it is the
-   first. **The open door is raising the isolated per-kernel rate**, and
-   the lever is bytes in flight (Little's law, already in `cost.rs`), so
-   P1 chunk+wide-loads is alive; only P2 rows-per-thread, which REDUCES
-   thread count, is dead. Do not cite item 4 to skip this.
+   What the probe leaves standing is narrower and real: **down sustains
+   167.6 GB/s where gate/up sustains 183.6, with identical code and a
+   quarter of the grid** (2048 threadgroups against 8192). That is grid
+   WIDTH — Little's law, already in `cost.rs` — and it is the only
+   kernel-rate lever these probes have not killed. Closing it on the down
+   class is worth ~0.28 ms (537.6 MB at 167.6 → 183.6), plus something
+   smaller on q/o and k/v, whose grids are narrower still. Call it
+   ~0.4–0.5 ms, not 1.69.
 
    Work items, in measured value order:
 
@@ -648,12 +657,30 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       (8.00 vs 7.71 µs, 1.04×) — that probe is correct and runs at arity
       ONE, which is exactly the regime the re-sum leaves.
 
-   b. **Wide/vectorized loads on the MLP folds — ~1.2 ms of the 1.69,
-      and after 7c the ONLY door left.** gate/up 166 and down 153 against
-      lm_head's demonstrated 184, same codegen, 15× fewer output lanes.
-      More bytes in flight PER LANE is the lever — 7c measured that more
-      bytes in flight per *neighbour* is not one, since a saturating grid
-      leaves no slots. Start here.
+   b. **Wide/vectorized loads — BUILT, MEASURED, REFUTED (2026-07-26).**
+      The fold fetches 16 contiguous bytes with eight separate 2-byte
+      loads, and P1's standing theory was a per-load-instruction byte
+      ceiling. Hand-probed both MLP geometries against a `uint4` (16-byte)
+      and a `uint2` (8-byte) rewrite of the same sweep,
+      `tests/wide_loads_probe.rs`, 8 dispatches over 8 distinct cold
+      weights:
+
+      > gate/up 2048→8192, 8192 tgs:  scalar **183.6**  uint2 185.6  uint4 185.0 GB/s
+      > down    8192→2048, 2048 tgs:  scalar **167.6**  uint4 167.1 GB/s
+
+      **1.01× and 1.00×.** Widening the load instruction is worth nothing;
+      P1 is dead for this shape, alongside P2. Pinned by
+      `wide_loads_stay_worth_nothing`, which fails if a future machine or
+      dtype flips it.
+
+      The probe's real yield was the regime correction in this item's
+      header — the emitted shape was already at peak — plus one surviving
+      lever: **grid width.** down and gate/up run identical code at 167.6
+      and 183.6 GB/s, differing only in threadgroup count (2048 vs 8192).
+      Splitting a narrow-output projection's reduction across more
+      threadgroups (split-k, then combine) RAISES thread count, so unlike
+      block-rows it sits on the right side of the law. Worth ~0.28 ms on
+      down, less on q/o and k/v. This is now the only kernel-rate item.
 
    c. **Get q, k and v into ONE phase — BUILT, MEASURED, REFUTED
       (2026-07-25).** k/v runs at 120 GB/s and theory 4 had dismissed
