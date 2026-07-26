@@ -10,6 +10,12 @@
 //! cargo run --release --example llama3_2 -- "The capital of France is" -n 16
 //! ```
 
+// Off macOS everything below is unreachable — `main` is the stub at the foot of
+// the file — so its model definition is dead by construction, not by mistake.
+// A file-level `cfg` like the Metal tests use would leave the target with no
+// `main` at all.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
