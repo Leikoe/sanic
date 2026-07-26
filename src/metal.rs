@@ -734,3 +734,278 @@ mod tests {
         );
     }
 }
+
+// ── what the GPU's clock actually did ────────────────────────────────────────
+
+/// The GPU's DVFS behaviour over a measured window.
+///
+/// Apple GPUs do not run at one speed: they sit in discrete (frequency,
+/// voltage) P-states and drop down when idle, warm, or sharing the package
+/// power budget. A run that lands a state below peak is ~25% slower for
+/// reasons that have nothing to do with the code — which is exactly the
+/// drift that made this crate's tuner re-measure a baseline beside every
+/// candidate. This is how a benchmark can tell instead of guess.
+#[derive(Debug, Clone, Copy)]
+pub struct Clock {
+    /// Fraction of the window the GPU was not in the OFF state.
+    pub busy: f64,
+    /// Mean MHz *while busy* — the speed the work in this window ran at.
+    pub mhz: f64,
+    /// The device's top DVFS state.
+    pub peak_mhz: f64,
+}
+
+impl Clock {
+    /// Did this window run at full speed? A measurement taken when this is
+    /// false is not comparable to one taken when it is true.
+    ///
+    /// The state can be MEASURED but not pinned — Instruments' own
+    /// minimum/medium/maximum settings all leave an M1 Pro at its top state
+    /// — so the only honest response to `false` is to discard the sample.
+    pub fn at_peak(&self) -> bool {
+        self.busy > 0.0 && self.mhz >= 0.98 * self.peak_mhz
+    }
+}
+
+impl std::fmt::Display for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.0} MHz, {:.0}% busy", self.mhz, 100.0 * self.busy)
+    }
+}
+
+/// An open DVFS measurement. Residency is a DELTA between two IOReport
+/// samples, so this measures a WINDOW, never an instant: open it before the
+/// work and [`ClockWatch::read`] after.
+///
+/// Device-wide, not process-wide — the channel reports the accelerator, so
+/// another process's load lands in the number. That is worth knowing rather
+/// than hiding: it is also how "something else was using the GPU during my
+/// benchmark" becomes visible.
+pub struct ClockWatch {
+    subscription: clock_report::Subscription,
+    opened: clock_report::Sample,
+    peak_mhz: f64,
+}
+
+impl ClockWatch {
+    /// Busy fraction and mean clock since this watch was opened.
+    pub fn read(&self) -> Option<Clock> {
+        let now = self.subscription.sample()?;
+        let (busy, mhz) = self.subscription.residency(&self.opened, &now)?;
+        Some(Clock {
+            busy,
+            mhz,
+            peak_mhz: self.peak_mhz,
+        })
+    }
+}
+
+impl MetalDevice {
+    /// Open a [`ClockWatch`] over this GPU's DVFS states. `None` where the
+    /// IOReport channels are unavailable.
+    ///
+    /// ```no_run
+    /// # let device = sanic::MetalDevice::open().unwrap();
+    /// # let graph = unimplemented!();
+    /// let watch = device.clock();
+    /// let seconds = device.run_graph_timed(&graph)?;
+    /// // a number measured below peak is not comparable to one measured at it
+    /// let trustworthy = watch.as_ref().and_then(|w| w.read()).is_none_or(|c| c.at_peak());
+    /// # Ok::<(), String>(())
+    /// ```
+    pub fn clock(&self) -> Option<ClockWatch> {
+        let subscription = clock_report::Subscription::open()?;
+        let opened = subscription.sample()?;
+        Some(ClockWatch {
+            subscription,
+            opened,
+            peak_mhz: clock_report::peak_mhz()?,
+        })
+    }
+}
+
+/// IOReport, the unprivileged path to the GPU's DVFS residency.
+///
+/// The counters worth having (ALU/buffer/cache limiters, occupancy,
+/// bandwidth) are NOT reachable in-process: the private AGX raw-counter
+/// session refuses without an Apple-only entitlement, and Instruments
+/// collects them out-of-process in an entitled daemon (`SANIC_GPUTRACE`
+/// captures a trace for it instead). DVFS residency is the exception — it
+/// is a plain IOReport channel any process may subscribe to.
+mod clock_report {
+    use std::ffi::{CStr, CString, c_char, c_void};
+
+    type Ref = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFAllocatorDefault: Ref;
+        fn CFStringCreateWithCString(allocator: Ref, text: *const c_char, encoding: u32) -> Ref;
+        fn CFStringGetCString(text: Ref, buffer: *mut c_char, len: isize, encoding: u32) -> bool;
+        fn CFDictionaryGetValue(dictionary: Ref, key: Ref) -> Ref;
+        fn CFArrayGetCount(array: Ref) -> isize;
+        fn CFArrayGetValueAtIndex(array: Ref, index: isize) -> Ref;
+        fn CFDataGetLength(data: Ref) -> isize;
+        fn CFDataGetBytePtr(data: Ref) -> *const u8;
+        fn CFRelease(object: Ref);
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryFromPath(port: u32, path: *const c_char) -> u32;
+        fn IORegistryEntryCreateCFProperty(entry: u32, key: Ref, allocator: Ref, options: u32) -> Ref;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+
+    #[link(name = "IOReport")]
+    unsafe extern "C" {
+        fn IOReportCopyChannelsInGroup(group: Ref, subgroup: Ref, a: u64, b: u64, c: u64) -> Ref;
+        fn IOReportCreateSubscription(a: *mut c_void, channels: Ref, out: *mut Ref, id: u64, x: Ref) -> Ref;
+        fn IOReportCreateSamples(subscription: Ref, channels: Ref, x: Ref) -> Ref;
+        fn IOReportCreateSamplesDelta(first: Ref, second: Ref, x: Ref) -> Ref;
+        fn IOReportChannelGetChannelName(channel: Ref) -> Ref;
+        fn IOReportStateGetCount(channel: Ref) -> i32;
+        fn IOReportStateGetNameForIndex(channel: Ref, index: i32) -> Ref;
+        fn IOReportStateGetResidency(channel: Ref, index: i32) -> i64;
+    }
+
+    const UTF8: u32 = 0x0800_0100;
+    /// The GPU's DVFS residency channel, in ticks of a 24 MHz counter.
+    const GPU_STATE_CHANNEL: &str = "GPUPH";
+
+    /// A CoreFoundation object released on drop.
+    struct Owned(Ref);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn string(text: &str) -> Owned {
+        let c = CString::new(text).expect("no interior nul");
+        Owned(unsafe { CFStringCreateWithCString(kCFAllocatorDefault, c.as_ptr(), UTF8) })
+    }
+
+    fn read_string(text: Ref) -> String {
+        let mut buffer = [0 as c_char; 128];
+        unsafe {
+            if text.is_null() || !CFStringGetCString(text, buffer.as_mut_ptr(), 128, UTF8) {
+                return String::new();
+            }
+            CStr::from_ptr(buffer.as_ptr()).to_string_lossy().into_owned()
+        }
+    }
+
+    /// The GPU's DVFS frequency table, state index → MHz, from the device
+    /// tree rather than the accelerator: `voltage-states9` is a run of
+    /// little-endian `(hertz: u32, millivolts: u32)` pairs whose order lines
+    /// up with the residency channel's states (index 0 = OFF = 0 Hz).
+    fn dvfs_table() -> Option<Vec<f64>> {
+        let path = CString::new("IODeviceTree:/arm-io/pmgr").expect("no interior nul");
+        let entry = unsafe { IORegistryEntryFromPath(0, path.as_ptr()) };
+        if entry == 0 {
+            return None;
+        }
+        let key = string("voltage-states9");
+        let data = Owned(unsafe { IORegistryEntryCreateCFProperty(entry, key.0, kCFAllocatorDefault, 0) });
+        unsafe { IOObjectRelease(entry) };
+        if data.0.is_null() {
+            return None;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(data.0), CFDataGetLength(data.0).max(0) as usize) };
+        Some(
+            bytes
+                .chunks_exact(8)
+                .map(|pair| u32::from_le_bytes(pair[..4].try_into().expect("4 bytes")) as f64 / 1e6)
+                .collect(),
+        )
+    }
+
+    /// The device's top DVFS state, in MHz.
+    pub fn peak_mhz() -> Option<f64> {
+        dvfs_table()?
+            .into_iter()
+            .fold(None, |top: Option<f64>, mhz| Some(top.map_or(mhz, |t| t.max(mhz))))
+    }
+
+    pub struct Sample(Owned);
+
+    pub struct Subscription {
+        subscription: Owned,
+        channels: Owned,
+        mhz: Vec<f64>,
+    }
+
+    impl Subscription {
+        pub fn open() -> Option<Subscription> {
+            let (group, subgroup) = (string("GPU Stats"), string("GPU Performance States"));
+            let channels = Owned(unsafe { IOReportCopyChannelsInGroup(group.0, subgroup.0, 0, 0, 0) });
+            if channels.0.is_null() {
+                return None;
+            }
+            let mut subscribed: Ref = std::ptr::null();
+            let subscription = Owned(unsafe {
+                IOReportCreateSubscription(std::ptr::null_mut(), channels.0, &mut subscribed, 0, std::ptr::null())
+            });
+            if subscription.0.is_null() {
+                return None;
+            }
+            Some(Subscription {
+                subscription,
+                channels: Owned(subscribed),
+                mhz: dvfs_table()?,
+            })
+        }
+
+        pub fn sample(&self) -> Option<Sample> {
+            let sample =
+                Owned(unsafe { IOReportCreateSamples(self.subscription.0, self.channels.0, std::ptr::null()) });
+            (!sample.0.is_null()).then_some(Sample(sample))
+        }
+
+        /// Busy fraction and mean MHz while busy, between two samples.
+        pub fn residency(&self, from: &Sample, to: &Sample) -> Option<(f64, f64)> {
+            let delta = Owned(unsafe { IOReportCreateSamplesDelta(from.0.0, to.0.0, std::ptr::null()) });
+            if delta.0.is_null() {
+                return None;
+            }
+            let key = string("IOReportChannels");
+            let channels = unsafe { CFDictionaryGetValue(delta.0, key.0) };
+            if channels.is_null() {
+                return None;
+            }
+            for index in 0..unsafe { CFArrayGetCount(channels) } {
+                let channel = unsafe { CFArrayGetValueAtIndex(channels, index) };
+                if read_string(unsafe { IOReportChannelGetChannelName(channel) }) != GPU_STATE_CHANNEL {
+                    continue;
+                }
+                let states = unsafe { IOReportStateGetCount(channel) };
+                let ticks: Vec<i64> = (0..states)
+                    .map(|state| unsafe { IOReportStateGetResidency(channel, state) })
+                    .collect();
+                let total: i64 = ticks.iter().sum();
+                if total <= 0 {
+                    return None;
+                }
+                let (mut busy, mut weighted_mhz) = (0.0, 0.0);
+                for (state, &residency) in ticks.iter().enumerate() {
+                    if residency == 0 {
+                        continue;
+                    }
+                    let share = residency as f64 / total as f64;
+                    let off = read_string(unsafe { IOReportStateGetNameForIndex(channel, state as i32) }) == "OFF";
+                    if !off {
+                        busy += share;
+                        weighted_mhz += share * self.mhz.get(state).copied().unwrap_or(0.0);
+                    }
+                }
+                return Some((busy, if busy > 0.0 { weighted_mhz / busy } else { 0.0 }));
+            }
+            None
+        }
+    }
+}

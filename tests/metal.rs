@@ -2339,3 +2339,43 @@ fn kernel_times_sampled_inside_one_command_buffer() {
         );
     }
 }
+
+// ── the GPU's clock, so a benchmark can tell peak from throttled ─────────────
+#[test]
+fn clock_reports_the_dvfs_state_a_workload_ran_at() {
+    let Some(dev) = MetalDevice::open() else {
+        println!("SKIP: no Metal device");
+        return;
+    };
+    let Some(watch) = dev.clock() else {
+        println!("SKIP: no IOReport GPU channels");
+        return;
+    };
+    // real work, so the GPU leaves its idle state
+    let msl = "#include <metal_stdlib>\nusing namespace metal;\n\
+        kernel void spin(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],\n\
+                         uint i [[thread_position_in_grid]]) {\n\
+            float a = x[i];\n for (uint k = 0; k < 4096u; k++) a = fma(a, 1.000001f, 1e-7f);\n y[i] = a; }";
+    let pipes = dev.compile(msl);
+    let n = 1 << 20;
+    let x = dev.from_f64(&vec![1.0; n]);
+    let y = dev.alloc_f32(n);
+    let dispatch = sanic::metal::Dispatch {
+        pipe: pipes.get("spin"),
+        inputs: vec![x],
+        output: y,
+        grid: n,
+        argbuf: None,
+    };
+    for _ in 0..4 {
+        dev.run(std::slice::from_ref(&dispatch));
+    }
+    let clock = watch.read().expect("a window with GPU work in it has residency");
+    println!("{clock}  peak {:.0} MHz  at_peak={}", clock.peak_mhz, clock.at_peak());
+    assert!(clock.peak_mhz > 0.0, "no DVFS table");
+    assert!(clock.busy > 0.0, "the GPU was busy but reported idle");
+    assert!(
+        clock.mhz > 0.0 && clock.mhz <= clock.peak_mhz * 1.01,
+        "clock {clock} outside the DVFS table"
+    );
+}
