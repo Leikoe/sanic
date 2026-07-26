@@ -656,8 +656,31 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       adds at the ~5 µs our other 2048-wide maps take is ~0.16 — so
       **0.951 → ~0.52 ms, saving ~0.43**. Note the extra 32 dispatches
       are FREE in the ledger: more dispatches, less total work, which is
-      the opposite of every fusion this project has tried. The original
-      derivation of the same number:
+      the opposite of every fusion this project has tried.
+
+      **Attempted 2026-07-26, and the blocker is structural, not a
+      price.** The obvious fix — teach Prop 4.1 that a shared subtree is
+      recomputed once per CONSUMING KERNEL, not just once per replica
+      within one — is a one-line change to `inline_pays` (scale `replicas`
+      by the node's parent count). It changes nothing, and instrumenting
+      says why: **`inline_pays` is never called on the residual sum at
+      all.** The parent-count histogram over llama's graph shows the
+      sharing plainly (`{1: 1739, 2: 198, 3: 50, 4: 33, 16: 2, 32: 3,
+      33: 3, 34: 1, 52: 1}`, and the heavy entries are `Map/Add`), but
+      `leaf_cuts` never visits those nodes: what it visits at parents ≥ 4
+      is already `done`. The layer CONTRIBUTIONS (t1, t7, t13, …) are
+      materialized; the Add TREE that combines them is not a fold leaf —
+      it lives in the fold's BODY, and `leaf_cuts` only walks downward
+      from leaves. There is no cut position there to price.
+
+      So 7a needs a CAPABILITY, not a number: hoisting a shared
+      sub-expression out of fold bodies into its own stage. That is the
+      same move for any shared body expression, so it stays a general law
+      rather than a residual-stream rule — but it is a new mechanism in
+      the partitioner, and it should be designed before it is priced.
+      The probe stands; the 0.43 ms is still there to collect.
+
+      The original derivation of the same number:
       Norms cost 0.951 ms; held at arity 1 they would cost 0.363. The
       0.588 ms difference is the re-sum: with the residual never
       materialized, each norm re-adds every prior layer, reduce climbing
