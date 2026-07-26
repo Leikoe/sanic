@@ -82,6 +82,31 @@ kernel void rms_apply(
     xn[gid] = to_bf(bf(x[gid]) * bf(w[gid]) / denom[0]);
 }
 
+// MLX's shape (mlx/backend/metal/kernels/rms_norm.metal): ONE kernel, one
+// threadgroup per row — accumulate the sum of squares, reduce it across the
+// threadgroup, then a second pass writes the whole row.
+[[max_total_threads_per_threadgroup(256)]]
+kernel void rms_fused(
+    device const ushort* x [[buffer(0)]],
+    device const ushort* w [[buffer(1)]],
+    device ushort* xn [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float partial[8];
+    float acc = 0.0f;
+    for (uint h = tid; h < 2048u; h += 256u) { float v = bf(x[h]); acc += v * v; }
+    acc = simd_sum(acc);
+    if (lane == 0) partial[sgid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.0f;
+    for (uint i = 0; i < 8u; i++) s += partial[i];
+    float denom = sqrt(s / 2048.0f + 1e-5f);
+    for (uint h = tid; h < 2048u; h += 256u)
+        xn[h] = to_bf(bf(x[h]) * bf(w[h]) / denom);
+}
+
 // one threadgroup per output row; the 256 threads split the contraction —
 // exactly the shape `sgs=8, lane_stream` produces today
 [[max_total_threads_per_threadgroup(256)]]
@@ -254,4 +279,78 @@ fn block_rows_trades_away_the_threads_dram_bandwidth_needs() {
 fn bytemuck_cast(values: &[u16]) -> &[u8] {
     // SAFETY: u16 has no padding and any bit pattern is a valid u8 pair
     unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values)) }
+}
+
+/// Does MLX's fused RMSNorm — one kernel, two passes over the row — beat the
+/// reduce-then-apply pair sanic emits? This isolates the NORMALIZER, with no
+/// projection involved, so the answer is about the shape itself.
+#[test]
+fn fused_rms_against_reduce_then_apply() {
+    let Some(device) = MetalDevice::open() else {
+        println!("SKIP: no Metal device");
+        return;
+    };
+    let pipes = device.compile(MSL);
+    let activation: Vec<u16> = (0..HIDDEN).map(|i| bf16(((i % 17) as f64 - 8.0) / 32.0)).collect();
+    let norm_weight: Vec<u16> = (0..HIDDEN).map(|i| bf16(1.0 + (i % 5) as f64 / 64.0)).collect();
+    let x = device.from_bytes(bytemuck_cast(&activation));
+    let w = device.from_bytes(bytemuck_cast(&norm_weight));
+    let denom = device.alloc_f32(1);
+    let out_pair = device.alloc_elems(HIDDEN, sanic::ir::Dtype::BF16);
+    let out_fused = device.alloc_elems(HIDDEN, sanic::ir::Dtype::BF16);
+
+    let pair = vec![
+        Dispatch {
+            pipe: pipes.get("rms_reduce"),
+            inputs: vec![x.clone()],
+            output: denom.clone(),
+            grid: THREADS,
+            argbuf: None,
+        },
+        Dispatch {
+            pipe: pipes.get("rms_apply"),
+            inputs: vec![x.clone(), w.clone(), denom.clone()],
+            output: out_pair.clone(),
+            grid: HIDDEN,
+            argbuf: None,
+        },
+    ];
+    let fused = vec![Dispatch {
+        pipe: pipes.get("rms_fused"),
+        inputs: vec![x.clone(), w.clone()],
+        output: out_fused.clone(),
+        grid: THREADS,
+        argbuf: None,
+    }];
+
+    device.run(&pair);
+    device.run(&fused);
+    let (a, b) = (
+        device.read_as_f32(&out_pair, HIDDEN, sanic::ir::Dtype::BF16),
+        device.read_as_f32(&out_fused, HIDDEN, sanic::ir::Dtype::BF16),
+    );
+    let worst = a
+        .iter()
+        .zip(&b)
+        .map(|(l, r)| (*l as f64 - *r as f64).abs() / (1.0 + l.abs() as f64))
+        .fold(0.0, f64::max);
+    assert!(worst < 2e-3, "the two shapes disagree: {worst:e}");
+
+    let time = |dispatches: &[Dispatch]| -> f64 {
+        let graph = device.capture(dispatches);
+        (0..50)
+            .filter_map(|_| device.run_graph_timed(&graph).ok())
+            .fold(f64::INFINITY, f64::min)
+    };
+    let (mut pair_seconds, mut fused_seconds) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..3 {
+        pair_seconds = pair_seconds.min(time(&pair));
+        fused_seconds = fused_seconds.min(time(&fused));
+    }
+    println!(
+        "reduce+apply {:7.2}us   fused (MLX shape) {:7.2}us   {:.2}x",
+        pair_seconds * 1e6,
+        fused_seconds * 1e6,
+        pair_seconds / fused_seconds,
+    );
 }

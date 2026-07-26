@@ -435,19 +435,44 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    - producer absorbed into consumer → trades away threads (the law)
    - independent kernels merged → already concurrent
 
-   What remains is not a fusion but a different execution model: keep
-   threadgroups RESIDENT across phases and synchronize inside the kernel
-   instead of at kernel boundaries — the persistent/"megakernel" shape,
-   which is what CUDA-graph decoders reach for and the only known way to
-   avoid drain-and-refill on a serial chain. One kernel per graph, grid
-   sized to what the device can hold resident, phases separated by a
-   device-scope barrier. Risky (a spin barrier deadlocks if the
-   occupancy assumption is ever wrong) and it forfeits the scheduler's
-   freedom to size each kernel's grid, so it wants its own probe first:
-   hand-write two dependent GEMVs as one persistent kernel vs two
-   dispatches, and see whether a device-scope barrier actually costs
-   less than 7.9 µs on Apple silicon. If it does not, then 15.5 ms IS
-   the floor for this decomposition and the honest move is to say so.
+   **What MLX does, and the correction it forces (2026-07-25).** MLX's
+   `rms_norm.metal` IS the two-pass row-resident kernel — accumulate
+   Σx², threadgroup-reduce, second pass writes the row; one kernel where
+   sanic emits two. So the shape is right and attempt one was a bad
+   implementation of a good idea. But timed head to head
+   (`fused_rms_against_reduce_then_apply`):
+
+   > reduce+apply 8.00 µs · fused, MLX's shape 7.71 µs · **1.04×**
+
+   **0.29 µs per norm — 9 µs per step, 0.06%.** The whole normalizer
+   fusion is worth nothing measurable, and that retires item 4's ~0.8 ms
+   estimate for good.
+
+   It also corrects the "7.9 µs per barrier" figure above, which was
+   `(15.55 − 13.87)/212` — an average that assumed the entire gap was
+   barrier overhead. A barrier between two dependent kernels actually
+   costs ~0.3 µs. What `barriers=none` really buys is letting the SEVEN
+   BIG DRAM-BOUND MATMULS of a layer run concurrently, filling each
+   other's ramp. **The 1.68 ms is the cost of a serial dependency chain,
+   not of synchronization** — and no fusion of small kernels recovers
+   it, which is exactly what all three closed directions were failing to
+   find.
+
+   A persistent/megakernel would not recover it either: keeping
+   threadgroups resident removes drain-and-refill, but layer N+1's
+   matmul still cannot start before layer N's output exists. The
+   serialization is in the model, not the runtime.
+
+   **Conclusion: ~15.5 ms is the floor for batch-1 decode of this model
+   on this machine with this decomposition, and MLX sits at the same
+   floor for the same reason** (same serial chain, same seven GEMVs, its
+   own kernels at the same 184 GB/s ceiling). Parity is not a
+   coincidence; both implementations are bandwidth-bound on identical
+   traffic with identical dependencies. Going faster requires breaking
+   the serialization, not the kernels: speculative decoding (verify k
+   tokens per pass), batching (>1 sequence makes every GEMV a GEMM), or
+   quantization (fewer bytes, the only lever on the floor itself).
+   Further single-step kernel work on this workload is not worth doing.
 
 5. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
