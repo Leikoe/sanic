@@ -292,12 +292,19 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    all N+2 prior residual contributions in-register (growing arity, so
    layers genuinely aren't isomorphic and dedup is correct). At batch-1
    decode re-reading k×4KB beats a materialize round-trip — the right
-   call. (Contested 2026-07-26 and STILL UNDECIDED: materializing was
-   built and decode went 15.9 → 19.3 ms/step, but every millisecond of
-   that is one duplicated MLP-down GEMM per layer, not the round trip
-   this note is about. See item 7a.) At long-context prefill the re-reads grow ~quadratically with
-   depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
-   decision to revisit when prefill matters.
+   call.
+
+   **NO LONGER TRUE, and the call was wrong (landed 2026-07-26, item
+   7a).** The residual stream IS materialized now, at both contributions
+   of every layer: the MLP one rides its down-projection GEMM as an
+   epilogue and is therefore free, the attention one is a standalone
+   2048-wide map. Norms read TWO buffers where the deepest read 33, and
+   decode went 57.8 → 60.1 tok/s bf16 (16.6 → 15.95 ms/step), 49.2 →
+   50.7 f32, generated text byte-identical on both dtypes. Re-reading
+   only looked cheaper because the re-sum was priced at peak bandwidth;
+   the norm reduce is one threadgroup of 128 threads and sees Little's
+   law's floor. The prefill half of this note stands untested and is now
+   the *stronger* claim, since the mechanism it wanted already exists.
 
 3. **The measured tuner — LANDED 2026-07-25 as `SANIC_TUNE=1`.**
    Measured: bf16 15.8→14.9ms/step (60.2→63.5 tok/s), f32
