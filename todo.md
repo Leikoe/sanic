@@ -292,11 +292,10 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    all N+2 prior residual contributions in-register (growing arity, so
    layers genuinely aren't isomorphic and dedup is correct). At batch-1
    decode re-reading k×4KB beats a materialize round-trip — the right
-   call. (Annotated WRONG on 2026-07-26 and then RE-CONFIRMED RIGHT the
-   same day: materializing really was built, and decode went 15.9 → 19.3
-   ms/step. The 0.588 ms of re-sum is real but hides behind the matmuls
-   beside it. See item 7a. The prefill half of this note stands and is
-   where the mechanism should be re-measured.) At long-context prefill the re-reads grow ~quadratically with
+   call. (Contested 2026-07-26 and STILL UNDECIDED: materializing was
+   built and decode went 15.9 → 19.3 ms/step, but every millisecond of
+   that is one duplicated MLP-down GEMM per layer, not the round trip
+   this note is about. See item 7a.) At long-context prefill the re-reads grow ~quadratically with
    depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
    decision to revisit when prefill matters.
 
@@ -646,7 +645,7 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    Work items, in measured value order:
 
    a. **Materialize the residual stream — MECHANISM BUILT AND CORRECT,
-      OPTIMIZATION REFUTED (2026-07-26).** Mechanism preserved at stash
+      VERDICT STILL OPEN (2026-07-26).** Mechanism preserved at stash
       `47bd695`; all 222 tests pass with it in.
 
       The position: `leaf_cuts` walks DOWNWARD from a fold's leaves, so a
@@ -671,20 +670,35 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       shape `inside=3 total=4` — the residual, read three times in a body
       and once by the next layer — and every test passes.
 
-      **And then it loses.** llama 263 → 324 kernels, **15.9 → 19.3
-      ms/step**. The probe (`tests/residual_stream_probe.rs`, 4.78×) was
-      measuring norms with nothing beside them; in the real schedule those
-      re-sums overlap with the big matmuls and cost nothing to hide, while
-      the extra stages and the round trip are paid in full. Same regime
-      error as reading `SANIC_DEBUG=4` per-class rates as production —
-      made twice in one day, once with each instrument.
+      **And then it loses — 263 → 324 kernels, 15.9 → 19.3 ms/step. The
+      reason is a duplication bug in the cut, NOT a verdict on the
+      optimization.** Diffing the two per-kernel profiles puts all of it
+      in one family: the MLP down projection goes 16 → 31 kernels and its
+      traffic DOUBLES, 538 → 1042 MB. At ~150 GB/s that is +3.4 ms — the
+      whole regression, and nothing else moves.
 
-      **So item 2's original call was RIGHT and my annotation on it was
-      wrong:** at batch-1 decode, re-reading k×4KB really does beat a
-      materialize round-trip. The annotation is corrected in place. The
-      re-sum still grows quadratically with depth, so the mechanism is
-      worth keeping for PREFILL, where item 2 always said the arithmetic
-      flips — that is the workload to re-measure it on, not decode.
+      The schedule dump says why the bytes double. Per layer there are two
+      down-projection folds reading the same weight:
+
+      > `[22] t7  = fold intermediate … ▸then add(t1, t8)`
+      > `[23] t23 = fold intermediate …`
+
+      The first carries the residual add as an EPILOGUE — rule 2 of this
+      file, "a residual add rides its GEMM for free" — which is exactly
+      the free materialization the item wants, and the baseline has zero
+      epilogues. So cutting the residual does light up the right path. But
+      the bare GEMM stays live beside it, so the weight is read twice.
+      Cutting every chain link instead of the shallowest changes nothing
+      (still 324), so the duplicate is not about which prefixes are
+      stored; something else keeps the un-fused contribution live and I
+      do not yet have a model for what.
+
+      **So the verdict is OPEN, not refuted, and an earlier version of
+      this item claiming otherwise was wrong.** What is measured: the
+      position works, the cone-aware predicate is correct (222 tests,
+      flash attention intact), the epilogue path engages — and the
+      integration emits one GEMM twice per layer. Find that and the
+      optimization gets a real answer for the first time.
 
       It also changes NUMERICS: materializing stores at boundary
       precision, so a bf16 residual rounds where the in-register f32 chain
