@@ -678,43 +678,53 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       same move for any shared body expression, so it stays a general law
       rather than a residual-stream rule.
 
-      **Built to the decision point 2026-07-26, not landed. WIP is stash
-      `4cf2a61`.** Four things are now established, and the last one is
-      what stopped it:
+      **Designed and tried properly 2026-07-26. Two halves landed, the
+      third found its real bug.**
 
-      1. **The cut position is a pre-pass at partition entry**, walking
-         each root BOTTOM-UP (children first) and pricing every shared
-         `Map`. Bottom-up matters: by the time layer N is priced, layer
-         N−1 is already a buffer read, so a chain materializes once per
-         link instead of once per prefix.
-      2. **Price the SPLICED view, not the raw node.** `subtree_read_bytes`
-         on the raw node charges for work no consumer redoes, and on a
-         graph this shared it does not terminate in reasonable time.
-      3. **Price against ATTAINABLE bandwidth, not peak — this is the
-         whole result.** At `hbm_bandwidth` the residual re-sum costs
-         ~100 ns against a 2 µs launch and never pays to cut, which is
-         exactly why nothing was hoisting. At the rate a scalar-output
-         fold actually sustains (Little's law floor, 1/64 of peak ≈
-         3 GB/s here) the same re-sum is tens of µs — matching both the
-         measured 6→31 µs slope and the probe. `cost::mem_occupancy`
-         already IS this law; it just needed factoring out so a caller
-         holding a lane count can use it. With that in place **64 nodes
-         price as worth hoisting**, in 7 s.
-      4. **`plan::count_issue_ops` is exponential on shared DAGs** — it
-         re-descends every parent edge, which is right for a tree and
-         fatal on a residual stream (200 s on llama before it was
-         replaced). It is also the wrong count for a kernel BODY, where
-         the emitter names a value once: a memoized walk counting each
-         distinct node once is both linear and more correct. This is a
-         latent bug on the existing callers too, not just this pass.
+      The architecture was the thing I had wrong. `partition.rs` states its
+      own law — *the derive frontier is the fusion boundary*, algebra
+      settles legality and the cost model ranks what is left. Sharing is
+      not a legality question (fusing a shared value is perfectly legal),
+      so `derive` must NOT learn about it. It belongs where profitability
+      already acts, and `emit_fold` is documented as doing exactly this
+      shape of thing: *cut the carrier leaves the kernel cannot compute
+      in-body, re-plan on the cut graph, push a stage.* The addition is
+      one more cut-collection step there, walking root→leaves (the body)
+      with the SAME stream translation `leaf_cuts` uses. An earlier
+      attempt cut in a pre-pass BEFORE derivation instead, which is why
+      compile time blew to 400 s: every fold re-derived from a graph that
+      had changed under it.
 
-      **What stopped it:** with the 64 cuts actually taken, compile time
-      blows past 400 s (it is fast in dry-run, so the cost is in
-      `cut`→`emit` re-planning, not in the pricing). That is the next
-      thing to diagnose — probably that cutting inside a fold body forces
-      the enclosing fold to re-plan, and cascades. Not a design flaw
-      found so far; a wiring problem, and one that wants a fresh session
-      rather than the tail of a long one.
+      LANDED, each measured alone: (i) traffic priced at
+      `cost::sustainable_bandwidth` rather than peak — a scalar-output
+      fold sees Little's law's floor, 3 GB/s not 200, so re-reading into a
+      small fold priced at ~100 ns against a 2 µs launch and every
+      recompute looked free; (ii) `count_issue_ops` counts each distinct
+      node once — it re-descended every parent edge, exponential on a
+      shared DAG (200 s on a llama step) and the wrong number for a kernel
+      body anyway, since the emitter names a value once. Compile 5.3 →
+      4.6 s, schedule and text unchanged.
+
+      NOT LANDED — the body walk works and its predicate is wrong. With
+      `shared(node)` = "more than one parent in the graph" it cuts, and
+      llama goes 263 → 391 kernels, 15.7 → 19.3 ms, and
+      `projected_attention_cuts_the_gemms` fails. That failure is the
+      useful part: **in flash attention the score contraction has two
+      parents — the max slot and the exp slot — and BOTH are inside the
+      same kernel.** The carrier deliberately recomputes it in-body, and
+      the rule materialized it, destroying the fusion.
+
+      So the predicate is measured at the wrong granularity. What makes
+      recompute cost real is being rebuilt by several KERNELS; a value
+      referenced twice inside one body is emitted once (that is exactly
+      what (ii) above establishes). The rule wants *parents outside this
+      fold's cone*, not parents in the graph — countable during the same
+      walk, since the walk already has the cone. Worth noting it also
+      changes NUMERICS: materializing stores at boundary precision, so a
+      bf16 residual rounds where an in-register f32 chain did not, and
+      llama's text moved to match its own f32 output. MLX has the same
+      rounding, so this is a real property to decide rather than a bug —
+      but it should be decided, not discovered.
 
       The probe stands; the 0.43 ms is still there to collect.
 
