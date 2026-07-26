@@ -292,7 +292,8 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    all N+2 prior residual contributions in-register (growing arity, so
    layers genuinely aren't isomorphic and dedup is correct). At batch-1
    decode re-reading k×4KB beats a materialize round-trip — the right
-   call. At long-context prefill the re-reads grow ~quadratically with
+   call. (WRONG, measured in item 7a: the re-reads cost 0.588 ms/step at
+   16 layers — norms are 0.951 ms where arity 1 would be 0.363.) At long-context prefill the re-reads grow ~quadratically with
    depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
    decision to revisit when prefill matters.
 
@@ -340,6 +341,11 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    rows-per-thread and any further wide-load work are therefore dead
    ends; do not spend time there.** The whole remaining gap is phase
    count, and the only lever on phase count is FUSION.
+   (SUPERSEDED by item 7: the 97% is an AGGREGATE measured with barriers
+   off, where neighbours fill each other's ramps. Per class, in
+   isolation, the MLP folds run at 83-90% of the 184 GB/s our own
+   lm_head demonstrates with the same codegen. Wide loads are alive;
+   only P2, which REDUCES thread count, is dead.)
 
    The graph is 263 dispatches in 213 serial phases (`SANIC_DEBUG=3`
    prints this). 134 of the 263 are STARVED — ≤8 of the M1 Pro's 16
@@ -473,6 +479,11 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    tokens per pass), batching (>1 sequence makes every GEMV a GEMM), or
    quantization (fewer bytes, the only lever on the floor itself).
    Further single-step kernel work on this workload is not worth doing.
+   (SUPERSEDED by item 7 — and note the goal is the ROOFLINE, not the
+   fastest number, so all three levers named just above are out of
+   scope: each moves the floor instead of reaching it. There is 3.12 ms
+   between the measured step and the traffic floor, itemized per class
+   in item 7.)
 
 5. **What the GPU will actually tell us (asked and answered 2026-07-25).**
    Apple exposes 150+ counters — performance LIMITERS (ALU, buffer
@@ -577,6 +588,102 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
    launch floor dominates the measurement; number step footers so the
    cold first step (clock ramp + weight page-in) is identifiable.
+
+7. **THE ROOFLINE, PER CLASS — and why item 4's "kernels are essentially
+   optimal" is the wrong reading (2026-07-25).** The goal here is the
+   ROOFLINE: 100% of bandwidth on the traffic we actually do. Not the
+   fastest possible number — quantization, speculative decoding and
+   batching all move the floor instead of reaching it, and are out of
+   scope for this item by construction.
+
+   Item 4 measured `barriers=none` at 13.87 ms against a 13.48 ms traffic
+   floor and concluded 97% of practical peak, hence "the generated kernels
+   are essentially optimal" and "any further wide-load work is a dead end;
+   do not spend time there". **That conclusion does not survive a per-class
+   look.** `SANIC_DEBUG=4` times each kernel in ISOLATION (encoder per
+   kernel, no neighbour to overlap with), and isolated rates are not
+   uniform — llama-3.2-1B bf16, warm run, Σ 16.57 ms:
+
+   | class | MB | ms | GB/s | at 184 | slack |
+   |---|---|---|---|---|---|
+   | mlp gate/up | 1075.2 | 6.46 | 166 | 5.84 | 0.62 |
+   | mlp down | 537.6 | 3.52 | **153** | 2.92 | 0.60 |
+   | lm_head | 525.6 | 2.86 | **184** | 2.86 | 0.00 |
+   | q proj | 134.4 | 0.85 | 158 | 0.73 | 0.12 |
+   | o proj | 134.4 | 0.89 | 151 | 0.73 | 0.16 |
+   | k/v proj | 67.2 | 0.56 | **120** | 0.37 | 0.19 |
+   | small ops (norms, rope, sdpa, silu, cache) | ~5 | 1.43 | — | 0.00 | 1.43 |
+   | **total** | **2474** | **16.57** | | **13.45** | **3.12** |
+
+   The lm_head row is the control: the SAME one-thread-per-output fold
+   reaches 184 GB/s when the grid is 128k wide, and 153–166 when it is
+   8k. So 184 is demonstrably reachable by our own codegen, and the big
+   MLP folds run at 83–90% of it. **Weight-class slack alone is 1.69 ms**
+   — against the 1.68 ms item 4 attributes to the serial dependency
+   chain. Those are not two problems; they are one problem seen from two
+   sides. A fold that cannot saturate DRAM alone either gets its ramp
+   filled by a concurrent neighbour (`barriers=none` → aggregate 97%) or
+   runs below peak in isolation (real schedule → 83–90%). Item 4 closed
+   BOTH doors: the chain is irreducible AND the kernels are optimal. At
+   most one of those can be true, and the per-class table says it is the
+   first. **The open door is raising the isolated per-kernel rate**, and
+   the lever is bytes in flight (Little's law, already in `cost.rs`), so
+   P1 chunk+wide-loads is alive; only P2 rows-per-thread, which REDUCES
+   thread count, is dead. Do not cite item 4 to skip this.
+
+   Work items, in measured value order:
+
+   a. **Materialize the residual stream — ~0.4 ms/step, measured cause.**
+      Norms cost 0.951 ms; held at arity 1 they would cost 0.363. The
+      0.588 ms difference is the re-sum: with the residual never
+      materialized, each norm re-adds every prior layer, reduce climbing
+      6 → 31 µs and apply 5 → 12 µs across the 16 layers, the fold's
+      `Add` count growing by exactly two per layer (1, 3, 5, …, 65).
+      Cost of the fix is ~32 small adds (~0.16 ms by analogy with our
+      other 2048-wide maps), or zero if the add lands in the producing
+      matmul's epilogue. NOTE this contradicts item 2's standing line
+      that "at batch-1 decode re-reading k×4KB beats a materialize
+      round-trip — the right call": that was reasoned, not timed.
+      It does NOT contradict `fused_rms_against_reduce_then_apply`
+      (8.00 vs 7.71 µs, 1.04×) — that probe is correct and runs at arity
+      ONE, which is exactly the regime the re-sum leaves.
+
+   b. **Wide/vectorized loads on the MLP folds — ~1.2 ms of the 1.69.**
+      gate/up 166 and down 153 against lm_head's demonstrated 184, same
+      codegen, 15× fewer output lanes. More bytes in flight per lane is
+      the lever.
+
+   c. **Merge q/k/v into one projection — ~0.19 ms.** k/v at 120 GB/s is
+      not a codegen fault: a 2 MB read cannot keep enough bytes in
+      flight. One [3072, 2048] stream fixes it by construction. Neither
+      sanic nor mlx-lm does this today.
+
+   d. **Fuse the small ops into the streams they ride — up to 1.43 ms.**
+      Norms, rope, cache writes, sdpa and silu touch ~5 MB total, i.e.
+      0.03 ms of DRAM, and cost 1.43 ms purely as separate dispatches.
+      sanic already HAS the mechanism: the deferred-division tuple fold
+      it emits at layer 0's k/v computes Σx² alongside the projection dot
+      in one pass and divides at the end — norm∘matmul in one kernel,
+      exactly. It is applied at layer 0 and nowhere else, and (a) is what
+      unblocks applying it everywhere. This is the megakernel direction,
+      approached one fusion at a time rather than by hand-writing it.
+
+   e. **Pipeline submission — ~1 ms, host side, orthogonal to all of the
+      above.** See `vs_mlx.md` § "The two schedules, side by side": MLX
+      chops a step into ~31 command buffers and commits while the CPU
+      keeps encoding; sanic encodes 263 dispatches, commits once, waits.
+      Moving MLX's own caps prices the effect at 17.70 ms/tok (~124
+      cbufs) → 16.38 (~4) → 17.11 (1), and with chopping off MLX runs
+      17.5 ms/tok, exactly sanic's. ~4 command buffers is the optimum.
+
+   Cross-check that this is not sanic-specific: mlx-lm, hand-written for
+   this chip, reconstructs to 16.42 ms on the same traffic — 75% and 76%
+   of the 200 GB/s spec roofline respectively. Kernel for kernel the two
+   are within 2%, and sanic's derived folds BEAT MLX's gemv on every
+   attention projection and on lm_head (`vs_mlx.md` § "The kernels, class
+   by class"). Being at parity with MLX is therefore not evidence of
+   being at the roofline; both are a quarter short of it, for the same
+   reason, and that is the gap this item exists to close.
 
 ## What "done" looks like
 
