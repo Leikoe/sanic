@@ -740,13 +740,28 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       unblocks applying it everywhere. This is the megakernel direction,
       approached one fusion at a time rather than by hand-writing it.
 
-   e. **Pipeline submission — ~1 ms, host side, orthogonal to all of the
-      above.** See `vs_mlx.md` § "The two schedules, side by side": MLX
-      chops a step into ~31 command buffers and commits while the CPU
-      keeps encoding; sanic encodes 263 dispatches, commits once, waits.
-      Moving MLX's own caps prices the effect at 17.70 ms/tok (~124
-      cbufs) → 16.38 (~4) → 17.11 (1), and with chopping off MLX runs
-      17.5 ms/tok, exactly sanic's. ~4 command buffers is the optimum.
+   e. **Pipeline submission — LANDED 2026-07-26, +3.4%.** A step in one
+      command buffer cannot start on the GPU until the host has finished
+      encoding all 263 dispatches. `replay_checked` now commits in
+      chunks, so chunk k runs while k+1 is still being encoded; buffers
+      on one queue execute in commit order, so a chunk boundary is itself
+      a barrier and the schedule still holds. Measured, llama-3.2-1B
+      bf16, 128 tokens, decode tok/s:
+
+      > 1 → 55.5 · 2 → 56.0 · **4 → 57.4** · 8 → 57.3 · 16 → 56.8 · 32 → 55.6
+
+      **~0.6 ms/step**, same curve shape and same optimum as MLX's own
+      commit policy. Default 4, `SANIC_COMMIT_CHUNKS` overrides. 221
+      tests pass; generated text unchanged on the bf16 and f32 paths.
+
+      Worth less than the ~1 ms this item first estimated, and the reason
+      is instructive: that figure came from pricing MLX's chopping with
+      MLX's own caps, but MLX is EAGER and pays a large per-dispatch host
+      cost, while sanic replays a frozen graph. Only the part of the
+      host gap that is ENCODE can be hidden, and sanic's is small. NOTE
+      the reported "GPU replay" figure rises with chunking (16.2 → 16.6)
+      because the span now spans inter-buffer gaps; wall clock is the
+      honest metric here.
 
    Cross-check that this is not sanic-specific: mlx-lm, hand-written for
    this chip, reconstructs to 16.42 ms on the same traffic — 75% and 76%

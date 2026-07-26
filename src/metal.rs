@@ -492,6 +492,24 @@ fn encode_dispatch(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, d: &Dispa
     );
 }
 
+/// How many command buffers one graph replay is split across.
+///
+/// A step in ONE buffer cannot start on the GPU until the host has finished
+/// encoding all of it; committing in chunks lets chunk k run while k+1 is
+/// still being encoded. Measured on llama-3.2-1B bf16, 128 tokens, decode
+/// tok/s: 1 → 55.5, 2 → 56.0, **4 → 57.4**, 8 → 57.3, 16 → 56.8, 32 → 55.6.
+/// The curve has the shape MLX's own commit policy sweeps out and the same
+/// optimum (`vs_mlx.md` § "The two schedules, side by side"): too few and
+/// the GPU waits on the host, too many and per-buffer overhead dominates.
+/// `SANIC_COMMIT_CHUNKS` overrides it for measurement or another machine.
+fn commit_chunks() -> usize {
+    std::env::var("SANIC_COMMIT_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+}
+
 /// A committed command buffer's GPU residency in seconds.
 fn gpu_seconds(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
     // CFTimeInterval (f64 seconds); raw messages sidestep feature gates
@@ -543,32 +561,64 @@ impl MetalDevice {
     /// (`GPUEndTime − GPUStartTime`: kernel time plus inter-dispatch
     /// bubbles, free of CPU encode/submit cost).
     pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
-        self.replay_checked(g).map(|cb| gpu_seconds(&cb))
+        self.replay_checked(g).map(|cbs| {
+            // GPU residency of the whole step: the first chunk's start to the
+            // last chunk's end, so chunking does not change what is reported.
+            let start: f64 = unsafe { msg_send![&*cbs[0], GPUStartTime] };
+            let end: f64 = unsafe { msg_send![&*cbs[cbs.len() - 1], GPUEndTime] };
+            end - start
+        })
     }
 
     /// One replay, error-checked. Any command buffer error — a GPU fault of
     /// our own, or "Discarded (victim of GPU error/recovery)" when something
     /// ELSE faults the GPU mid-flight — is an `Err`: the step's writes are
     /// untrustworthy and a decode loop must not continue on them.
-    fn replay_checked(&self, g: &MetalGraph) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+    fn replay_checked(&self, g: &MetalGraph) -> Result<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>, String> {
         let capture = self.capture_trace();
-        let cb = self.queue.commandBuffer().expect("command buffer");
-        // Name the step for Instruments/Xcode GPU captures.
-        cb.setLabel(Some(&NSString::from_str(&format!(
-            "sanic batched {}",
-            g.dispatches.len()
-        ))));
-        encode_graph(&cb, &g.dispatches, &g.barriers);
-        cb.commit();
-        cb.waitUntilCompleted();
+        // A step encoded into ONE command buffer cannot start on the GPU until
+        // the host has finished encoding all of it. Committing in chunks lets
+        // chunk k run while chunk k+1 is still being encoded — MLX gets this
+        // for free from its byte-capped commit policy, and it is worth ~1 ms
+        // of a llama step (`vs_mlx.md` § "The two schedules, side by side").
+        // Command buffers committed to one queue execute in commit order, so
+        // a chunk boundary is itself a barrier and the schedule still holds.
+        let chunks = commit_chunks();
+        let per_chunk = g.dispatches.len().div_ceil(chunks).max(1);
+        let mut committed = Vec::new();
+        for (index, (dispatches, barriers)) in g
+            .dispatches
+            .chunks(per_chunk)
+            .zip(g.barriers.chunks(per_chunk))
+            .enumerate()
+        {
+            let cb = self.queue.commandBuffer().expect("command buffer");
+            // Name the step for Instruments/Xcode GPU captures.
+            cb.setLabel(Some(&NSString::from_str(&format!(
+                "sanic batched {} [{}/{}]",
+                g.dispatches.len(),
+                index + 1,
+                g.dispatches.len().div_ceil(per_chunk),
+            ))));
+            encode_graph(&cb, dispatches, barriers);
+            cb.commit();
+            committed.push(cb);
+        }
+        // Buffers on one queue complete in commit order, so waiting on the
+        // last waits for all of them.
+        committed.last().expect("a graph has at least one dispatch").waitUntilCompleted();
         if let Some(manager) = capture {
             manager.stopCapture();
         }
-        match cb.error() {
-            Some(error) => Err(format!("graph replay failed: {error}")),
-            None => Ok(cb),
+        for cb in &committed {
+            if let Some(error) = cb.error() {
+                return Err(format!("graph replay failed: {error}"));
+            }
         }
+        Ok(committed)
     }
+
+
 
     /// `SANIC_GPUTRACE=<path>` — capture the FIRST graph replay into a
     /// `.gputrace` document, once per process.
