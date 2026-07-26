@@ -864,6 +864,9 @@ mod metal_backend {
                 );
                 return Ok((&self.outputs[parity], seconds));
             }
+            let watch = (crate::debug_level() >= 2)
+                .then(|| self.program.backend.clock())
+                .flatten();
             let seconds = self
                 .program
                 .backend
@@ -883,6 +886,7 @@ mod metal_backend {
                     &self.program.executable.program,
                     &self.program.schedule,
                     seconds,
+                    watch.and_then(|watch| watch.read()),
                 );
             }
             Ok((&self.outputs[parity], seconds))
@@ -1009,7 +1013,13 @@ mod metal_backend {
     /// fold total, and the step's aggregate DRAM position. Unplanned stages
     /// and inter-dispatch bubbles land in the ratio on purpose: it is the
     /// end-to-end honesty number, not per-kernel calibration.
-    fn print_step_line(device: &MetalDevice, program: &MetalProgram, schedule: &Schedule, seconds: f64) {
+    fn print_step_line(
+        device: &MetalDevice,
+        program: &MetalProgram,
+        schedule: &Schedule,
+        seconds: f64,
+        clock: Option<crate::metal::Clock>,
+    ) {
         let logical_bytes = logical_byte_table(program);
         let gather_bytes = gather_stage_bytes(schedule, program, &logical_bytes);
         let plans = stage_plans(schedule);
@@ -1027,8 +1037,15 @@ mod metal_backend {
             String::new()
         };
         let peak_fraction = bytes / seconds.max(1e-9) / device.profile().hbm_bandwidth;
+        // The clock this step actually ran at: a line measured below the
+        // GPU's top DVFS state is not comparable to one measured at it, and
+        // saying so beats silently publishing a throttled number.
+        let clock = match clock {
+            Some(clock) if !clock.at_peak() => format!("  \x1b[33m{clock}\x1b[0m"),
+            _ => String::new(),
+        };
         eprintln!(
-            "*** metal batched {} {:6.2}ms GPU  {calibration}  ~{:.0}MB bw {:3.0}%",
+            "*** metal batched {} {:6.2}ms GPU  {calibration}  ~{:.0}MB bw {:3.0}%{clock}",
             program.stages.len(),
             seconds * 1e3,
             bytes / 1e6,
@@ -1244,11 +1261,27 @@ mod metal_backend {
             bindings.insert(name.clone(), alloc_scratch(device, &program, name, *elements));
         }
         let base = program_dispatches(&program, &bindings, &pipelines);
+        // Each replay is bracketed by a clock watch and DISCARDED if the GPU
+        // ran it below its top DVFS state — a throttled sample is ~25% slow
+        // for reasons the schedule had nothing to do with, and would hand a
+        // candidate a win or a loss it did not earn. Falls back to the
+        // unfiltered minimum if the GPU never reached peak at all, so a warm
+        // machine degrades to the previous behaviour rather than tuning
+        // nothing.
         let step_wall = |dispatches: &[Dispatch]| -> f64 {
             let graph = device.capture(dispatches);
-            (0..ROUNDS)
-                .filter_map(|_| device.run_graph_timed(&graph).ok())
-                .fold(f64::INFINITY, f64::min)
+            let (mut at_peak, mut any) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..ROUNDS {
+                let watch = device.clock();
+                let Ok(seconds) = device.run_graph_timed(&graph) else {
+                    continue;
+                };
+                any = any.min(seconds);
+                if watch.and_then(|watch| watch.read()).is_none_or(|clock| clock.at_peak()) {
+                    at_peak = at_peak.min(seconds);
+                }
+            }
+            if at_peak.is_finite() { at_peak } else { any }
         };
         // Warm the machine before ANY verdict: the first replays carry clock
         // ramp and paging, and a cold baseline would flatter every later
