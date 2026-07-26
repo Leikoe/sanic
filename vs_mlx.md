@@ -64,6 +64,76 @@ slots than it needs (attention is ~1% of the step, so this does not carry
 the result); and the comparison is decode steps against decode steps, since
 the two harnesses count *tokens* differently.
 
+## The two schedules, side by side (2026-07-25)
+
+Parity above is a wall time. This is the *shape* of the work behind it: one
+llama-3.2-1B bf16 decode step, sanic's dispatch list against mlx-lm's
+primitive graph. sanic's side is the `SANIC_DEBUG=2` schedule dump plus the
+`=3` capture line; MLX's is `mx.export_to_dot` over one unevaluated step of
+**mlx-lm's own Llama** (not a reimplementation), classified against which
+primitives reach `eval_gpu` without launching a kernel.
+
+|  | sanic | mlx-lm |
+|---|---|---|
+| kernel launches | **263** | 276 |
+| graph nodes | 263 | 811 (535 zero-cost views) |
+| dependency depth | **180** | 196 |
+| available width | 1.46 | 1.41 |
+| command buffers / step | **1** | ~31 (default caps) |
+| encoders / step | **1** concurrent | ~31 concurrent |
+| barriers | 212, all computed at capture | dynamic, per dispatch |
+
+**The schedules are the same schedule.** Same launch count within 5%, same
+critical path within 8%, the same intrinsic concurrency — one derived from
+naive dataflow by algebra, the other assembled from a hand-written
+primitive library (Matmul×113, RMSNorm×33, RoPE×32, SliceUpdate×32,
+Add×32, SDPA×16, a compiled SiLU×16, Gather, ArgReduce). The one
+structural difference is that 535 of MLX's 811 nodes are metadata rewrites
+— Transpose×177, Flatten/Unflatten×226, Reshape×64, Slice×64 — that sanic
+never materializes as nodes at all: views are absorbed into the fold
+algebra before a schedule exists.
+
+The barrier LAW is also the same law, arrived at independently: accumulate
+reads and writes since the last barrier, barrier on RAW/WAW/WAR against
+allocation identity, reset both histories at the barrier
+(`barrier_schedule`/`barrier_before` here,
+`CommandEncoder::maybeInsertBarrier` in `mlx/backend/metal/device.cpp`).
+sanic computes it once at capture off the static graph; MLX rediscovers it
+per dispatch because it is eager.
+
+**Where they genuinely differ is submission granularity, and that is the
+whole remaining gap.** MLX commits a command buffer whenever a step exceeds
+40 mega-*elements* of distinct inputs (`data_size()` is in items, not
+bytes) or 40 ops — at 1.24 G elements of weights per step the byte cap
+dominates and chops one step into ~31 command buffers, each committed while
+the CPU keeps encoding the next. sanic encodes all 263 dispatches, commits
+once, and waits. Measured on the same machine and session, by moving MLX's
+own caps:
+
+| MLX `MLX_MAX_MB_PER_BUFFER` | ≈ cbufs/step | ms/tok |
+|---|---|---|
+| 10 | ~124 | 17.70 |
+| 20 | ~62 | 17.17 |
+| 40 (default) | ~31 | 16.89 |
+| 80 | ~15 | 16.57 |
+| 160 | ~8 | 16.56 |
+| **320** | **~4** | **16.38** |
+| 2600 | 1 | 17.11 |
+
+With chopping off — one command buffer per step, sanic's submission shape —
+MLX runs **17.5 ms/tok**, which is exactly sanic's 17.5 ms/tok wall in the
+same session (16.2 ms of it GPU). The GPU work is settled; MLX's ~1 ms
+edge is bought entirely by overlapping host encode with GPU execution, and
+its own default is ~0.5 ms past the optimum (~4 command buffers).
+
+The other candidate — recovering more in-encoder concurrency — was priced
+and is not the answer. sanic emits 213 phases against a DAG floor of 180,
+so encode order leaves 33 phases of avoidable serialization on the table;
+but forcing a barrier before *every* dispatch (263 phases, all concurrency
+destroyed) costs only ~0.15 ms/step. Each barrier is worth ~2–4 µs, so the
+33 recoverable phases are worth ≲0.1 ms. **At batch-1 decode the schedule's
+value is in when work is submitted, not in what runs beside what.**
+
 ## Scoreboard (one decode step)
 
 The document below is the AUTOPSY that started at 211.7 ms; the ladder was
@@ -390,6 +460,12 @@ int4 load rung, unchanged.
 # the llama-3.2-1B head-to-head at the top of this file
 SANIC_TUNE=1 cargo run --release --example llama3_2 -- "The capital of France is" -n 64 --bf16
 .venv/bin/python weights/mlx_llama_bench.py 64     # MLX side, same conditions
+
+# the two schedules, side by side
+SANIC_DEBUG=3 cargo run --release --example llama3_2 -- "..." -n 2 --bf16 2>&1 | tee sched.log
+.venv/bin/python weights/sanic_schedule_depth.py sched.log   # launches, DAG depth, phases
+.venv/bin/python weights/mlx_llama_schedule.py               # MLX census of one step
+MLX_MAX_MB_PER_BUFFER=320 .venv/bin/python weights/mlx_llama_bench.py 64  # submission sweep
 
 # the Trinity autopsy below it
 cargo run --release --example trinity -- --bench   # per-class GPU profile
