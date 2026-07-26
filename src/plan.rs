@@ -514,13 +514,9 @@ fn issue_ops(node: &Node, counted: &mut HashSet<*const NodeKind>) -> f64 {
         NodeKind::Const { .. } => 0.0,
         NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => vol(node),
         NodeKind::Input { shape, .. } => (1.0 + shape.len() as f64) * vol(node),
-        NodeKind::Map { inputs, .. } => {
-            inputs.iter().map(|input| issue_ops(input, counted)).sum::<f64>() + vol(node)
-        }
+        NodeKind::Map { inputs, .. } => inputs.iter().map(|input| issue_ops(input, counted)).sum::<f64>() + vol(node),
         NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => issue_ops(src, counted) + vol(src),
-        NodeKind::Gather { src, index, .. } => {
-            issue_ops(src, counted) + issue_ops(index, counted) + 2.0 * vol(node)
-        }
+        NodeKind::Gather { src, index, .. } => issue_ops(src, counted) + issue_ops(index, counted) + 2.0 * vol(node),
         NodeKind::View { src, dims } => {
             let split_ops: f64 = dims
                 .iter()

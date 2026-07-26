@@ -606,7 +606,10 @@ impl MetalDevice {
         }
         // Buffers on one queue complete in commit order, so waiting on the
         // last waits for all of them.
-        committed.last().expect("a graph has at least one dispatch").waitUntilCompleted();
+        committed
+            .last()
+            .expect("a graph has at least one dispatch")
+            .waitUntilCompleted();
         if let Some(manager) = capture {
             manager.stopCapture();
         }
@@ -617,8 +620,6 @@ impl MetalDevice {
         }
         Ok(committed)
     }
-
-
 
     /// `SANIC_GPUTRACE=<path>` — capture the FIRST graph replay into a
     /// `.gputrace` document, once per process.

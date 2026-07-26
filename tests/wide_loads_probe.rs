@@ -396,7 +396,12 @@ fn wide_loads_stay_worth_nothing() {
             .fold(f64::INFINITY, f64::min)
     };
     let (scalar, wide) = (time("matvec_scalar8"), time("matvec_vec4"));
-    println!("scalar {:.1}us  uint4 {:.1}us  {:.2}x", scalar * 1e6, wide * 1e6, scalar / wide);
+    println!(
+        "scalar {:.1}us  uint4 {:.1}us  {:.2}x",
+        scalar * 1e6,
+        wide * 1e6,
+        scalar / wide
+    );
     assert!(
         scalar / wide < 1.10,
         "wide loads now WIN by {:.2}x — revisit todo.md item 7b",
