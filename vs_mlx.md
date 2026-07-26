@@ -152,7 +152,7 @@ reading the rows.
 | class | sanic n | sanic ms | GB/s | mlx n | mlx ms | GB/s | mlx-lm primitive |
 |---|---|---|---|---|---|---|---|
 | q proj | 16 | **0.85** | 158 | 16 | 1.10 | 122 | Matmul |
-| k/v proj (+ norm fused) | 32 | **0.56** | 120 | 32 | 0.86 | 78 | Matmul |
+| k/v proj | 32 | **0.56** | 120 | 32 | 0.86 | 78 | Matmul |
 | o proj | 16 | **0.89** | 151 | 16 | 1.04 | 130 | Matmul |
 | mlp gate/up | 32 | 6.46 | 166 | 32 | **6.13** | 175 | Matmul |
 | mlp down | 16 | 3.52 | 153 | 16 | **3.42** | 157 | Matmul |
@@ -160,7 +160,7 @@ reading the rows.
 | rms norm | 66 | 0.96 | — | 33 | **0.11** | — | RMSNorm |
 | residual add | **0** | **0.00** | — | 32 | 0.10 | — | Add |
 | rope (tables + q) | 19 | 0.09 | — | 16 | 0.07 | — | RoPE |
-| rope + cache write fused | 32 | **0.17** | — | 48 | 0.26 | — | RoPE + SliceUpdate |
+| cache write (k half fuses rope) | 32 | **0.17** | — | 48 | 0.26 | — | RoPE + SliceUpdate |
 | attention | 16 | 0.12 | — | 16 | 0.11 | — | SDPA |
 | silu*up | 16 | 0.09 | — | 16 | 0.07 | — | compiled Sigmoid*Mul*Mul |
 | embed | 1 | **0.01** | — | 1 | 0.03 | — | Gather |
@@ -175,31 +175,52 @@ if anything tilted MLX's way: its per-class batch is 16–32 mutually
 independent matmuls with nothing to wait on, while sanic's numbers come out
 of a real step with 212 barriers in it.
 
-Three fusions sanic performs that MLX has no kernel for:
+**The kernel BOUNDARIES largely coincide, and that is the finding.** A
+primitive library is already a fused kernel set — `rms_norm.metal` does its
+reduction and its apply in one dispatch behind threadgroup barriers, sdpa is
+one online-softmax kernel, `mx.compile` folds the SiLU chain — so "we fuse,
+they don't" is simply false. Both engines cut where a contraction forces
+materialization; MLX's cuts were placed by hand once, sanic's fall out of
+the fusion criterion per graph. The counts agree class by class (16 q, 32
+k/v, 16 o, 32 gate/up, 16 down, 16 attention, 16 silu) because there is one
+right place to cut and both find it.
 
-- **norm ∘ projection.** The k/v folds read the residual, the norm weight
-  and the projection weight and emit the projection — one kernel where MLX
-  runs RMSNorm then Matmul. (So the 0.56 vs 0.86 above is not purely
-  matvec-vs-gemv; part of the win is that the norm is free.)
-- **RoPE ∘ cache write.** One map rotates the new k/v and scatters it into
-  the cache slot: 32 kernels against MLX's 16 RoPE + 32 SliceUpdate, and
-  0.17 ms against 0.26.
-- **the residual adds, all 32 of them, deleted.** The residual stream is
-  never materialized — layer N's norm re-sums the prior contributions
-  in-register — so MLX's entire `Add×32` class has no sanic counterpart.
+Exactly three boundaries differ, and they are worth naming precisely:
 
-**And that last fusion is the one place sanic clearly loses.** RMS norms
+- **The 32 residual adds are absorbed, model-wide.** MLX's entire `Add×32`
+  class has no sanic counterpart: the residual stream is never materialized,
+  so each norm re-sums the prior contributions in-register. Verified in the
+  op ledger — 1,863 of sanic's 3,193 algebra ops are `Add`, and the norm
+  folds carry `Add×65` at the last layer against `Add×1` at the first — the
+  re-sum grows by exactly two adds per layer (1, 3, 5, …, 65).
+- **RoPE is fused into the k cache write**, 16 of 16 layers: one map rotates
+  the new key and scatters it into the cache slot, where MLX runs RoPE then
+  SliceUpdate. (The v half is a plain scatter in both.) 32 kernels against
+  MLX's 48, 0.17 ms against 0.26.
+- **The norm is SPLIT into reduce + apply**, 33 of 33, where MLX's
+  `fast.rms_norm` is one dispatch. This is the one place sanic is *finer*
+  than the primitive library, and it costs.
+
+An earlier draft of this section claimed norm∘projection as a third
+model-wide fusion. Checked against the emitted MSL, it is not: only **2 of
+32** k/v projections fuse the norm (layer 0's k and v, as a deferred-division
+tuple fold). Everywhere else the norm is materialized once and read by q, k,
+v alike — the same shape MLX has. The k/v class is still 0.56 ms against
+0.86, but that is the fold beating the gemv, not a fusion the other engine
+lacks.
+
+**Where the two boundaries differ is where the time differs.** RMS norms
 cost 0.96 ms against MLX's 0.11 + 0.10 = 0.21 — 4.6× — for two compounding
-reasons. sanic splits each norm into a reduce and an apply (66 dispatches
-where MLX's `fast.rms_norm` is 33), and because the residual stream is
-never materialized, each norm re-sums every prior layer's contribution: the
-measured per-kernel cost climbs **6 µs at layer 0 to 29 µs at layer 15**,
-while the k/v folds beside them stay flat at ~17 µs. The saving (32 Add
-kernels, 0.10 ms) does not cover the growth (~0.7 ms), so at 16 layers the
-choice is a net **~0.7 ms/step, 4% of the step** — and the re-sum is
-quadratic in depth, so it gets worse with every layer. `todo.md` flagged
-this shape for long-context prefill; this is the decode price, and it is
-the largest single kernel-level item left.
+reasons, both consequences of the list above. sanic splits each norm into a
+reduce and an apply (66 dispatches where MLX's is 33), and because the
+residual stream is never materialized, each norm re-sums every prior layer's
+contribution: the measured per-kernel cost climbs **6 µs at layer 0 to 29 µs
+at layer 15**, while the k/v folds beside them stay flat at ~17 µs. The
+saving (32 Add kernels, 0.10 ms) does not cover the growth (~0.7 ms), so at
+16 layers the choice is a net **~0.7 ms/step, 4% of the step** — and the
+re-sum is quadratic in depth, so it gets worse with every layer. `todo.md`
+flagged this shape for long-context prefill; this is the decode price, and
+it is the largest single kernel-level item left.
 
 ## Scoreboard (one decode step)
 
