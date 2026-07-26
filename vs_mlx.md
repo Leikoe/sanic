@@ -157,7 +157,7 @@ reading the rows.
 | mlp gate/up | 32 | 6.46 | 166 | 32 | **6.13** | 175 | Matmul |
 | mlp down | 16 | 3.52 | 153 | 16 | **3.42** | 157 | Matmul |
 | lm_head | 1 | **2.86** | 184 | 1 | 3.12 | 168 | Matmul |
-| rms norm | 66 | 0.96 | — | 33 | **0.11** | — | RMSNorm |
+| rms norm | 66 | 0.95 | — | 33 | **0.11** | — | RMSNorm |
 | residual add | **0** | **0.00** | — | 32 | 0.10 | — | Add |
 | rope (tables + q) | 19 | 0.09 | — | 16 | 0.07 | — | RoPE |
 | cache write (k half fuses rope) | 32 | **0.17** | — | 48 | 0.26 | — | RoPE + SliceUpdate |
@@ -198,8 +198,9 @@ Exactly three boundaries differ, and they are worth naming precisely:
   SliceUpdate. (The v half is a plain scatter in both.) 32 kernels against
   MLX's 48, 0.17 ms against 0.26.
 - **The norm is SPLIT into reduce + apply**, 33 of 33, where MLX's
-  `fast.rms_norm` is one dispatch. This is the one place sanic is *finer*
-  than the primitive library, and it costs.
+  `fast.rms_norm` is one dispatch — the one place sanic is *finer* than the
+  primitive library. It is also, measured, the one that does not matter:
+  see below.
 
 An earlier draft of this section claimed norm∘projection as a third
 model-wide fusion. Checked against the emitted MSL, it is not: only **2 of
@@ -209,18 +210,47 @@ v alike — the same shape MLX has. The k/v class is still 0.56 ms against
 0.86, but that is the fold beating the gemv, not a fusion the other engine
 lacks.
 
-**Where the two boundaries differ is where the time differs.** RMS norms
-cost 0.96 ms against MLX's 0.11 + 0.10 = 0.21 — 4.6× — for two compounding
-reasons, both consequences of the list above. sanic splits each norm into a
-reduce and an apply (66 dispatches where MLX's is 33), and because the
-residual stream is never materialized, each norm re-sums every prior layer's
-contribution: the measured per-kernel cost climbs **6 µs at layer 0 to 29 µs
-at layer 15**, while the k/v folds beside them stay flat at ~17 µs. The
-saving (32 Add kernels, 0.10 ms) does not cover the growth (~0.7 ms), so at
-16 layers the choice is a net **~0.7 ms/step, 4% of the step** — and the
-re-sum is quadratic in depth, so it gets worse with every layer. `todo.md`
-flagged this shape for long-context prefill; this is the decode price, and
-it is the largest single kernel-level item left.
+**Where the two boundaries differ is where the time differs — but not in
+the way the dispatch count suggests.** RMS norms cost 0.95 ms against MLX's
+0.11 + 0.10 = 0.21. The obvious suspect is the split: 66 dispatches where
+`fast.rms_norm` is 33. It is the wrong suspect, and this repo already
+measured it — `tests/block_rows_probe.rs`
+`fused_rms_against_reduce_then_apply` times a hand-written fused two-pass
+kernel against reduce-then-apply on real dispatches:
+
+> reduce+apply 8.00 µs · fused, MLX's shape 7.71 µs · **1.04×**
+
+0.29 µs per norm, ~9 µs per step, **0.06%**. Fusing the two dispatches into
+one is worth nothing. But that probe runs at arity ONE, and that is the
+regime it never left.
+
+In the real step the norms are not arity one. Because the residual stream is
+never materialized, each norm re-sums every prior layer's contribution, and
+the per-kernel cost climbs with depth while the k/v folds beside them stay
+flat at ~17 µs:
+
+| | measured | at arity 1 | the re-sum |
+|---|---|---|---|
+| norm reduce (33) | 0.676 ms | 0.198 ms (33 × 6 µs) | **0.478 ms** |
+| norm apply (33) | 0.275 ms | 0.165 ms (33 × 5 µs) | **0.110 ms** |
+| **total** | **0.951 ms** | **0.363 ms** | **0.588 ms** |
+
+Reduce climbs 6 µs → 31 µs, apply 5 µs → 12 µs, and the fold's `Add` count
+grows by exactly two per layer (1, 3, 5, …, 65). **0.59 ms of the 0.75 ms
+gap is the re-sum** — arithmetic and loads, not launch overhead, so no
+amount of fusing the two dispatches removes a single `Add` of it. The
+remaining ~0.25 ms is per-norm kernel quality at arity 1 (0.36 ms against
+their 0.11), part of which is regime: their figure is a cache-resident floor
+from a 200-op batch, ours is in-graph.
+
+So the lever is materialization, not fusion. Writing the residual stream
+once per layer would make every norm arity-1 — saving the 0.59 ms and
+costing ~32 small add kernels, which by analogy with sanic's other 2048-wide
+maps (~5 µs) is ~0.16 ms: a net **~0.4 ms/step, ~2.5%**. That is an
+estimate from measured neighbours, not a measurement; the way to settle it
+is to build the cut. It does contradict the standing note in `todo.md` § 2
+that "at batch-1 decode re-reading k×4KB beats a materialize round-trip" —
+that call was reasoned, not timed, and the re-reads cost 0.59 ms/step.
 
 ## Scoreboard (one decode step)
 
