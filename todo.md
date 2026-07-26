@@ -416,15 +416,38 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    kernels are already at peak"). It also explains attempt one: making
    the apply ride the reduce inherited a ONE-threadgroup geometry.
 
-   Where that leaves the ~1.5 ms of starved kernels: every fusion that
-   would remove them shrinks the thread count of whatever absorbs them,
-   so the two known directions are both closed. What is NOT yet tried is
-   fusing SIDEWAYS — merging kernels that are independent and equally
-   parallel rather than dependent: q|k|v into one dispatch, gate|up into
-   one, the two rope halves, the kv-cache writes. Those keep every
-   thread and delete a phase each (~48 dispatches, ~48 barriers by the
-   count above). That is the next thing to measure, and unlike the two
-   attempts above it has no mechanism working against it.
+   **Third direction, closed by arithmetic (no probe needed).** Fusing
+   SIDEWAYS — merging independent, equally parallel kernels (q|k|v into
+   one dispatch, gate|up into one) — keeps every thread, so neither law
+   above touches it. But it saves nothing, and the barrier count already
+   proves it: 263 dispatches with 212 barriers means **51 dispatches
+   ride an earlier barrier for free**, and the layer structure predicts
+   exactly 3 per layer × 16 = 48 free (k and v riding q's barrier, up
+   riding gate's) plus the prologue. The match is exact. Those kernels
+   are ALREADY concurrent inside their phase; merging them removes zero
+   barriers and only ~0.1 ms of CPU encode, which is hidden behind the
+   GPU anyway.
+
+   **So all three fusion directions are closed**, and the 212 barriers
+   are true data dependencies of a serial transformer at batch 1, each
+   costing ~7.9 µs of pipeline drain. Fusion cannot remove them:
+   - consumer rides producer → inherits a 1-threadgroup geometry
+   - producer absorbed into consumer → trades away threads (the law)
+   - independent kernels merged → already concurrent
+
+   What remains is not a fusion but a different execution model: keep
+   threadgroups RESIDENT across phases and synchronize inside the kernel
+   instead of at kernel boundaries — the persistent/"megakernel" shape,
+   which is what CUDA-graph decoders reach for and the only known way to
+   avoid drain-and-refill on a serial chain. One kernel per graph, grid
+   sized to what the device can hold resident, phases separated by a
+   device-scope barrier. Risky (a spin barrier deadlocks if the
+   occupancy assumption is ever wrong) and it forfeits the scheduler's
+   freedom to size each kernel's grid, so it wants its own probe first:
+   hand-write two dependent GEMVs as one persistent kernel vs two
+   dispatches, and see whether a device-scope barrier actually costs
+   less than 7.9 µs on Apple silicon. If it does not, then 15.5 ms IS
+   the floor for this decomposition and the honest move is to say so.
 
 5. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
