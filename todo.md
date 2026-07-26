@@ -501,16 +501,77 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    by inference — real DRAM bytes vs our logical estimate, real
    occupancy, and which limiter each fold is actually on.
 
-   **The tinygrad move, unexplored:** those counters reach Instruments
-   somehow, so they are reachable — just not through `MTLDevice`. The
-   path is the AGX accelerator's IOKit user client (what the Metal
-   driver itself talks to), reversed the way tinygrad's `ops_nv`/
-   `ops_amd` bypass CUDA/ROCm. Cheaper first rungs on the same ladder:
-   `IOReport` channels for GPU busy% and FREQUENCY — which would
-   directly explain the clock drift that confounded every measurement
-   today and forced the tuner's per-family adjacent baselines — and
-   `powermetrics --samplers gpu_power` for the same at coarser
-   granularity. Worth doing before trusting any absolute GB/s number.
+   **Reversed properly, and the conclusion above is HALF WRONG.** The
+   counters are absent from *our process*, not from the machine.
+
+   *In-process: closed, and exactly where.* The private API is all
+   there — `_MTLDevice supportsGPUStatistics` → 1,
+   `_MTLCommandQueue requestCounters:`, `addPerfSampleHandler:`,
+   `_MTLCommandBuffer runPerfCounterCallbackWithBlock:`,
+   `newSample`, `_MTLDevice resolveCounters:withRange:` — on real
+   classes `AGXG13XDevice → IOGPUMetalDevice → _MTLDevice`. Every one
+   returns nil/0 unentitled. Disassembling `AGXGPURawCounterImpl::init`
+   and reproducing it standalone finds the wall precisely:
+   `IOConnectCallStructMethod(gpu, selector 261, 72B, 72B)` →
+   `kIOReturnNotPrivileged`. Neighbours 0x100–0x104 are ungated; only
+   261 is privilege-checked. **Not SIP** (disabled here, still refuses)
+   — AMFI enforcing a `com.apple.private.gputools.client` entitlement
+   that `gputoolsserviced` carries and a self-signed binary cannot.
+   Also dead: forging a set via `MTLCounterSetInternal`, MTL4 counter
+   heaps (timestamp-only), `enableConsistentPerfState:`,
+   `GRCCopyAllCounterSourceGroupWithError`.
+
+   *Out-of-process: OPEN, and it works.* Instruments injects NOTHING
+   into the target (verified by diffing `_dyld_image_count` and the
+   full class list under four templates — byte-identical), so there was
+   never anything to trace; collection runs entirely in the entitled
+   daemon. Drive its CLI instead — no root, no Developer Mode:
+
+   ```
+   xcrun xctrace record --instrument "Metal GPU Counters" \
+       --output run.trace --target-stdout - --launch -- <binary>
+   xcrun xctrace export --input run.trace \
+       --xpath '/trace-toc/run[@number="1"]/data/table[@schema="gpu-counter-value"]'
+   ```
+
+   That yields all 31 WWDC20 counters at 20 µs resolution — **ALU
+   Limiter, Buffer Read/Write Limiter, GPU Last Level Cache Limiter,
+   Compute Occupancy, GPU Read/Write Bandwidth** — and combined with
+   `--template "Metal System Trace"` also gives encoder boundaries and
+   a per-shader timeline, which is how a counter gets attributed to one
+   of our named kernels. Validated on a two-phase FMA/stream workload:
+   ALU Limiter 94% in the compute phase, Buffer Write Limiter 72% in
+   the stream phase. Counters are GPU-WIDE (keyed by accelerator, not
+   pid), so quiesce the machine. Export is ~250 MB of XML per second of
+   trace — keep workloads sub-second.
+
+   Counter-set selection lives in the `.tracetemplate`, an
+   NSKeyedArchiver plist with plain int knobs: `counterprofile` (3 =
+   31 limiters, 4 = 16 utilization+bandwidth; others empty) and
+   `gpuperformancestate`. **Negative result: the performance state is
+   recorded faithfully but does NOT move the clock on this M1 Pro** —
+   Min/Med/Max measured 1241.8/1254.1/1291.7 MHz, all pinned at P6. The
+   clock cannot be pinned, only measured.
+
+   *`IOReport`: open, unprivileged, ~1 ms — and this is the one to wire
+   in.* Group `"GPU Stats"`, subgroup `"GPU Performance States"`,
+   channel `GPUPH`, residency per DVFS state at 24 MHz ticks; the
+   index→MHz table is the device tree's `IODeviceTree:/arm-io/pmgr`
+   property `voltage-states9` (here `0, 388.8, 486.0, 648.0, 777.6,
+   972.0, 1296.0`). Verified: idle sits 55% OFF / 45% P1, a Metal load
+   sits 100% P6 at 1296 MHz. `ticks/24e6` recovers the wall window to
+   ~2%, so a bad sampling window is self-evident. **This is the sanity
+   gate every benchmark in this file should have had** — the clock
+   drift that forced the tuner's per-family adjacent baselines is now
+   directly measurable.
+
+   Static tables, if the cost model ever wants absolute bytes:
+   `/System/Library/Extensions/AGXMetalG13X.bundle/Contents/Resources/`
+   `AGXMetalStatisticsExternalA14X-counters.plist` holds 276 derived
+   counters for this exact GPU — including `Bytes Read From Main
+   Memory` and `L2 Bytes Read/Written`, which xctrace does not expose —
+   with the mux registers in `AGXMetalPerfCountersExternal.plist` and
+   the formulas in the `-derived.js` sibling.
 
 6. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
