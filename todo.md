@@ -648,29 +648,60 @@ bubbles no prior mode could see. Four work items fall out, in value order:
       (8.00 vs 7.71 µs, 1.04×) — that probe is correct and runs at arity
       ONE, which is exactly the regime the re-sum leaves.
 
-   b. **Wide/vectorized loads on the MLP folds — ~1.2 ms of the 1.69.**
-      gate/up 166 and down 153 against lm_head's demonstrated 184, same
-      codegen, 15× fewer output lanes. More bytes in flight per lane is
-      the lever.
+   b. **Wide/vectorized loads on the MLP folds — ~1.2 ms of the 1.69,
+      and after 7c the ONLY door left.** gate/up 166 and down 153 against
+      lm_head's demonstrated 184, same codegen, 15× fewer output lanes.
+      More bytes in flight PER LANE is the lever — 7c measured that more
+      bytes in flight per *neighbour* is not one, since a saturating grid
+      leaves no slots. Start here.
 
-   c. **Get q, k and v into ONE phase — and note item 4's theory 4 is
-      half wrong.** k/v at 120 GB/s is not a codegen fault: a 2 MB read
-      cannot keep enough bytes in flight. Theory 4 dismissed sideways
-      fusion of q|k|v because "those kernels ALREADY run concurrently".
-      Measured over the emitted barrier schedule, they do not: the only
-      projection pair that ever shares a phase is gate|up, 16 times, one
-      per layer. **q, k and v each sit in a phase alone**, though the DAG
-      makes them mutually independent (the 31 width-3 levels of the ideal
-      schedule are exactly these). So theory 4 holds for gate|up and is
-      untested for q|k|v.
+   c. **Get q, k and v into ONE phase — BUILT, MEASURED, REFUTED
+      (2026-07-25).** k/v runs at 120 GB/s and theory 4 had dismissed
+      sideways fusion because q|k|v "already run concurrently" — which is
+      false: measured over the emitted schedule, the only projection pair
+      that ever shares a phase is gate|up, 16 times. q, k and v each sat
+      in a phase alone. So the cheap test was a REORDER, not a fusion:
+      sort dispatches by dependency depth over the same RAW/WAW/WAR
+      relation on the same allocation identity `barrier_schedule` uses,
+      which preserves every ordering that carries data.
 
-      Two ways in, cheapest first. (i) REORDER: emit the three adjacent
-      so one phase covers them — no fusion, no new kernel, and it is the
-      cheapest possible test of the ramp-filling hypothesis item 4 raised
-      with `barriers=none`. (ii) MERGE: one [3072, 2048] stream, which
-      also RAISES thread count (3072 output lanes against 2048/512/512)
-      and so sits on the right side of the block-rows law. Measure (i)
-      before building (ii).
+      It worked as designed and bought nothing. 263 dispatches went from
+      213 phases to **180 — exactly the DAG floor** — with q, k and v
+      sharing a phase in 15 of the 16 layers (layer 0 differs: its q path
+      carries an extra materialized norm). All 218 tests passed through
+      the reordered path, so it was correct, not merely fast. Five A/B
+      pairs in one session:
+
+      > level order (180 phases): 16.6 · 16.6 · 16.4 · 16.6 · 16.4 ms
+      > emission order (213):     16.4 · 16.4 · 16.4 · 16.3 · 16.4 ms
+
+      **Never once faster, and ~0.14 ms consistently worse.** Reverted;
+      ~45 lines that buy nothing are not worth their weight.
+
+      WHY, and it is the useful part: **a grid that already fills the
+      machine leaves no slots for a concurrent neighbour.** The q
+      projection is 2048 outputs × 32 lanes ≈ 65k threads on a 16-core
+      GPU — the machine is already full, so k and v queue behind it
+      whether or not a barrier separates them. Concurrency can only pay
+      where grids are SMALL, and small grids are 8.8% of kernel time.
+      This is the block-rows law (bandwidth = outstanding bytes /
+      latency) seen from the other end: co-scheduling two grids cannot
+      add bytes in flight when one grid already saturates. The small
+      penalty is most likely locality — depth order separates a producer
+      from its consumer in time.
+
+      **Two consequences.** (1) The 1.68 ms `barriers=none` gap is NOT
+      legal-concurrency-shaped: item 4's "the serialization is in the
+      model, not the runtime" now rests on a CORRECT run rather than a
+      racy one. Which means the 1.69 ms of weight-class slack has exactly
+      one door left, and it is 7b — raise the isolated per-kernel rate.
+      (2) Merging q/k/v into one [3072, 2048] stream is still open, but
+      the mechanism is NOT "more bytes in flight from concurrency" — that
+      is now refuted. It is "one grid large enough to saturate": k/v's
+      512-output grid is too small alone (120 GB/s), and folding those
+      bytes into a 3072-output grid puts them on a grid that fills the
+      machine. Price it against 7b first; 7b is the same lever applied
+      where the bytes actually are.
 
    d. **Fuse the small ops into the streams they ride — up to 1.43 ms.**
       Norms, rope, cache writes, sdpa and silu touch ~5 MB total, i.e.
