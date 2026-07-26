@@ -134,6 +134,73 @@ destroyed) costs only ~0.15 ms/step. Each barrier is worth ~2–4 µs, so the
 33 recoverable phases are worth ≲0.1 ms. **At batch-1 decode the schedule's
 value is in when work is submitted, not in what runs beside what.**
 
+## The kernels, class by class (2026-07-25)
+
+The schedules match; this is what the *kernels inside them* cost. sanic's
+column is `SANIC_DEBUG=4` in-graph timestamps on the warm replay (Σ 16.57 ms
+over 263 kernels, the log's own summary). MLX's column is per-class
+microbenchmarks at the same shapes and the census counts, with one
+methodological correction that changes the answer: benchmarking one
+projection 200× leaves its weight in the SLC and reports **303 GB/s** —
+above this machine's DRAM peak, a rate no real step can reach. So every
+weight-reading class allocates one DISTINCT weight per dispatch (16 q
+projections, 32 gate/up, …), reproducing the step's 2.47 GB ledger. The
+reconstructed total then lands at **16.42 ms** against mlx-lm's measured
+16.2–16.9 ms/step — the parts add up to the wall, which is what licenses
+reading the rows.
+
+| class | sanic n | sanic ms | GB/s | mlx n | mlx ms | GB/s | mlx-lm primitive |
+|---|---|---|---|---|---|---|---|
+| q proj | 16 | **0.85** | 158 | 16 | 1.10 | 122 | Matmul |
+| k/v proj (+ norm fused) | 32 | **0.56** | 120 | 32 | 0.86 | 78 | Matmul |
+| o proj | 16 | **0.89** | 151 | 16 | 1.04 | 130 | Matmul |
+| mlp gate/up | 32 | 6.46 | 166 | 32 | **6.13** | 175 | Matmul |
+| mlp down | 16 | 3.52 | 153 | 16 | **3.42** | 157 | Matmul |
+| lm_head | 1 | **2.86** | 184 | 1 | 3.12 | 168 | Matmul |
+| rms norm | 66 | 0.96 | — | 33 | **0.11** | — | RMSNorm |
+| residual add | **0** | **0.00** | — | 32 | 0.10 | — | Add |
+| rope (tables + q) | 19 | 0.09 | — | 16 | 0.07 | — | RoPE |
+| rope + cache write fused | 32 | **0.17** | — | 48 | 0.26 | — | RoPE + SliceUpdate |
+| attention | 16 | 0.12 | — | 16 | 0.11 | — | SDPA |
+| silu*up | 16 | 0.09 | — | 16 | 0.07 | — | compiled Sigmoid*Mul*Mul |
+| embed | 1 | **0.01** | — | 1 | 0.03 | — | Gather |
+| argmax | 0 (host) | — | — | 1 | 0.01 | — | ArgReduce |
+| **TOTAL** | **263** | **16.57** | 150 | 276 | **16.42** | 150 | |
+
+**Kernel for kernel the two engines are within 2%** — and the derived folds
+are not the weak side. sanic's one-thread-per-output matvec fold *beats*
+MLX's hand-written gemv on every attention projection (1.2–1.4×) and on the
+lm_head, while MLX keeps ~5% on the two big MLP classes. The comparison is
+if anything tilted MLX's way: its per-class batch is 16–32 mutually
+independent matmuls with nothing to wait on, while sanic's numbers come out
+of a real step with 212 barriers in it.
+
+Three fusions sanic performs that MLX has no kernel for:
+
+- **norm ∘ projection.** The k/v folds read the residual, the norm weight
+  and the projection weight and emit the projection — one kernel where MLX
+  runs RMSNorm then Matmul. (So the 0.56 vs 0.86 above is not purely
+  matvec-vs-gemv; part of the win is that the norm is free.)
+- **RoPE ∘ cache write.** One map rotates the new k/v and scatters it into
+  the cache slot: 32 kernels against MLX's 16 RoPE + 32 SliceUpdate, and
+  0.17 ms against 0.26.
+- **the residual adds, all 32 of them, deleted.** The residual stream is
+  never materialized — layer N's norm re-sums the prior contributions
+  in-register — so MLX's entire `Add×32` class has no sanic counterpart.
+
+**And that last fusion is the one place sanic clearly loses.** RMS norms
+cost 0.96 ms against MLX's 0.11 + 0.10 = 0.21 — 4.6× — for two compounding
+reasons. sanic splits each norm into a reduce and an apply (66 dispatches
+where MLX's `fast.rms_norm` is 33), and because the residual stream is
+never materialized, each norm re-sums every prior layer's contribution: the
+measured per-kernel cost climbs **6 µs at layer 0 to 29 µs at layer 15**,
+while the k/v folds beside them stay flat at ~17 µs. The saving (32 Add
+kernels, 0.10 ms) does not cover the growth (~0.7 ms), so at 16 layers the
+choice is a net **~0.7 ms/step, 4% of the step** — and the re-sum is
+quadratic in depth, so it gets worse with every layer. `todo.md` flagged
+this shape for long-context prefill; this is the decode price, and it is
+the largest single kernel-level item left.
+
 ## Scoreboard (one decode step)
 
 The document below is the AUTOPSY that started at 211.7 ms; the ladder was
@@ -466,6 +533,11 @@ SANIC_DEBUG=3 cargo run --release --example llama3_2 -- "..." -n 2 --bf16 2>&1 |
 .venv/bin/python weights/sanic_schedule_depth.py sched.log   # launches, DAG depth, phases
 .venv/bin/python weights/mlx_llama_schedule.py               # MLX census of one step
 MLX_MAX_MB_PER_BUFFER=320 .venv/bin/python weights/mlx_llama_bench.py 64  # submission sweep
+
+# the kernels inside those schedules, class by class
+SANIC_DEBUG=4 cargo run --release --example llama3_2 -- "..." -n 2 --bf16 2>&1 | tee k.log
+.venv/bin/python weights/sanic_kernel_classes.py k.log       # sanic per class, in-graph
+.venv/bin/python weights/mlx_llama_kernels.py 8              # MLX per class, cold weights
 
 # the Trinity autopsy below it
 cargo run --release --example trinity -- --bench   # per-class GPU profile
