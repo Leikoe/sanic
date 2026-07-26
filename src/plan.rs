@@ -496,6 +496,7 @@ fn expr_ops(e: &Expr) -> f64 {
 /// just the `count_flops` op. Schedule choice hinges on recompute, and
 /// recompute is paid in issue slots; pricing it at one flop per element is
 /// what made one-thread-per-output look cheap.
+///
 /// Each DISTINCT node counts once: the emitter names a value and reuses it, so
 /// a subexpression two siblings share is issued once inside the kernel, not
 /// twice. Counting it per parent edge is also exponential on a graph as shared

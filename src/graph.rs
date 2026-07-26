@@ -14,10 +14,6 @@
 //! output buffer becomes the NEXT step's input, ping-ponged internally.
 //! No capture/replay staircase in sight; [`Machine::step`] just runs.
 
-// Only the Metal-gated half of this module compiles a graph or runs one, so
-// off macOS these are dead and `-D warnings` fails the linux CI leg.
-#[cfg(target_os = "macos")]
-use crate::compile::{CompileError, Program, RunError};
 use crate::ir::{Axis, Dtype};
 use crate::tensor::Tensor;
 
@@ -106,7 +102,7 @@ impl Graph {
 #[cfg(target_os = "macos")]
 mod metal_target {
     use super::*;
-    use crate::compile::{Compile, MetalBuffer, MetalReplay};
+    use crate::compile::{Compile, CompileError, MetalBuffer, MetalReplay, Program, RunError};
     use crate::metal::MetalDevice;
 
     /// A [`Graph`] compiled for one Metal device: the lowered program plus
