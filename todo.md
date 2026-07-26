@@ -474,7 +474,45 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    quantization (fewer bytes, the only lever on the floor itself).
    Further single-step kernel work on this workload is not worth doing.
 
-5. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
+5. **What the GPU will actually tell us (asked and answered 2026-07-25).**
+   Apple exposes 150+ counters — performance LIMITERS (ALU, buffer
+   read/write, last-level cache, tile memory), bytes read from main
+   memory, occupancy — and the limiter is the thing worth having: it
+   says *why* a kernel is slow, where a timestamp only says how slow
+   (WWDC20 "Optimize Metal apps and games with GPU counters").
+
+   Queried directly, this M1 Pro exposes to CODE:
+
+   > sampling points: `AtStageBoundary` only
+   > counter sets: **`timestamp`, containing one counter, `GPUTimestamp`**
+
+   No stage-utilization, no statistics, no memory or occupancy counters —
+   and NOT gated by environment (tried `METAL_CAPTURE_ENABLED`,
+   `MTL_CAPTURE_ENABLED`, `METAL_DEVICE_WRAPPER_TYPE`,
+   `MTL_COUNTERS_ENABLED`; the set is one, always). So
+   `MetalDevice::run_kernel_timed` is already spending the entire
+   programmatic budget: there is no richer counter to add to sanic.
+
+   `SANIC_GPUTRACE=<path>` (with `METAL_CAPTURE_ENABLED=1`) is the way
+   through: it captures one graph replay to a `.gputrace` document that
+   opens in Xcode with all 150+ counters, per dispatch, each carrying
+   the descriptive kernel name this compiler generates and each command
+   buffer its step label. That is how to check the claims item 4 makes
+   by inference — real DRAM bytes vs our logical estimate, real
+   occupancy, and which limiter each fold is actually on.
+
+   **The tinygrad move, unexplored:** those counters reach Instruments
+   somehow, so they are reachable — just not through `MTLDevice`. The
+   path is the AGX accelerator's IOKit user client (what the Metal
+   driver itself talks to), reversed the way tinygrad's `ops_nv`/
+   `ops_amd` bypass CUDA/ROCm. Cheaper first rungs on the same ladder:
+   `IOReport` channels for GPU busy% and FREQUENCY — which would
+   directly explain the clock drift that confounded every measurement
+   today and forced the tuner's per-family adjacent baselines — and
+   `powermetrics --samplers gpu_power` for the same at coarser
+   granularity. Worth doing before trusting any absolute GB/s number.
+
+6. **Dump leftovers.** Collapse sub-0.1% rows (a llama table is 263 rows,
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
    launch floor dominates the measurement; number step footers so the
    cold first step (clock ramp + weight page-in) is identifiable.

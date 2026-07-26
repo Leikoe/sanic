@@ -33,14 +33,15 @@ use std::collections::{HashMap, HashSet};
 
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSRange, NSString};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2_foundation::{NSRange, NSString, NSURL};
 use objc2_metal::{
-    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp,
-    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLComputePipelineDescriptor, MTLComputePipelineState,
-    MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLFunction, MTLLibrary, MTLPipelineOption, MTLResource,
-    MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStorageMode,
+    MTLBarrierScope, MTLBuffer, MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer,
+    MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder,
+    MTLComputePassDescriptor, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCounterSampleBuffer,
+    MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLFunction, MTLLibrary, MTLPipelineOption, MTLResource, MTLResourceOptions, MTLResourceUsage,
+    MTLSize, MTLStorageMode,
 };
 
 use crate::emit_metal::MetalProgram;
@@ -550,6 +551,7 @@ impl MetalDevice {
     /// ELSE faults the GPU mid-flight — is an `Err`: the step's writes are
     /// untrustworthy and a decode loop must not continue on them.
     fn replay_checked(&self, g: &MetalGraph) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        let capture = self.capture_trace();
         let cb = self.queue.commandBuffer().expect("command buffer");
         // Name the step for Instruments/Xcode GPU captures.
         cb.setLabel(Some(&NSString::from_str(&format!(
@@ -559,9 +561,58 @@ impl MetalDevice {
         encode_graph(&cb, &g.dispatches, &g.barriers);
         cb.commit();
         cb.waitUntilCompleted();
+        if let Some(manager) = capture {
+            manager.stopCapture();
+        }
         match cb.error() {
             Some(error) => Err(format!("graph replay failed: {error}")),
             None => Ok(cb),
+        }
+    }
+
+    /// `SANIC_GPUTRACE=<path>` — capture the FIRST graph replay into a
+    /// `.gputrace` document, once per process.
+    ///
+    /// This exists because the counters worth having are not reachable from
+    /// code. Apple exposes 150+ performance counters — the limiters (ALU,
+    /// buffer read/write, last-level cache), bytes read from main memory,
+    /// occupancy — but only through Xcode's Metal Debugger and Instruments.
+    /// What `MTLCounterSampleBuffer` offers this machine is exactly one
+    /// counter set, `timestamp`, at stage boundaries, which is what
+    /// [`Self::run_kernel_timed`] already spends. A trace file is therefore
+    /// the only way to see WHY a kernel is slow rather than how slow it is:
+    /// open the result in Xcode, where every dispatch carries the kernel
+    /// name this compiler generated and every command buffer the step label.
+    ///
+    /// Requires `METAL_CAPTURE_ENABLED=1` in the environment.
+    fn capture_trace(&self) -> Option<Retained<MTLCaptureManager>> {
+        static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let path = std::env::var_os("SANIC_GPUTRACE")?;
+        if TAKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        if !manager.supportsDestination(MTLCaptureDestination::GPUTraceDocument) {
+            eprintln!("*** SANIC_GPUTRACE: this process cannot write a trace (set METAL_CAPTURE_ENABLED=1)");
+            return None;
+        }
+        let descriptor = MTLCaptureDescriptor::new();
+        // SAFETY: ProtocolObject is a transparent wrapper over AnyObject
+        let queue: &AnyObject = unsafe { &*(Retained::as_ptr(&self.queue) as *const AnyObject) };
+        unsafe { descriptor.setCaptureObject(Some(queue)) };
+        descriptor.setDestination(MTLCaptureDestination::GPUTraceDocument);
+        descriptor.setOutputURL(Some(&NSURL::fileURLWithPath(&NSString::from_str(
+            &path.to_string_lossy(),
+        ))));
+        match manager.startCaptureWithDescriptor_error(&descriptor) {
+            Ok(()) => {
+                eprintln!("*** SANIC_GPUTRACE: capturing one replay to {}", path.to_string_lossy());
+                Some(manager)
+            }
+            Err(error) => {
+                eprintln!("*** SANIC_GPUTRACE: capture refused: {error}");
+                None
+            }
         }
     }
 }
