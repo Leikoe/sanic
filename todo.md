@@ -292,9 +292,19 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    all N+2 prior residual contributions in-register (growing arity, so
    layers genuinely aren't isomorphic and dedup is correct). At batch-1
    decode re-reading k×4KB beats a materialize round-trip — the right
-   call. At long-context prefill the re-reads grow ~quadratically with
-   depth (2k tokens: ~1.2GB extra over 16 layers) — a cost-model cut
-   decision to revisit when prefill matters.
+   call.
+
+   **NO LONGER TRUE, and the call was wrong (landed 2026-07-26, item
+   7a).** The residual stream IS materialized now, at both contributions
+   of every layer: the MLP one rides its down-projection GEMM as an
+   epilogue and is therefore free, the attention one is a standalone
+   2048-wide map. Norms read TWO buffers where the deepest read 33, and
+   decode went 57.8 → 60.1 tok/s bf16 (16.6 → 15.95 ms/step), 49.2 →
+   50.7 f32, generated text byte-identical on both dtypes. Re-reading
+   only looked cheaper because the re-sum was priced at peak bandwidth;
+   the norm reduce is one threadgroup of 128 threads and sees Little's
+   law's floor. The prefill half of this note stands untested and is now
+   the *stronger* claim, since the mechanism it wanted already exists.
 
 3. **The measured tuner — LANDED 2026-07-25 as `SANIC_TUNE=1`.**
    Measured: bf16 15.8→14.9ms/step (60.2→63.5 tok/s), f32
@@ -340,6 +350,13 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    rows-per-thread and any further wide-load work are therefore dead
    ends; do not spend time there.** The whole remaining gap is phase
    count, and the only lever on phase count is FUSION.
+   (Challenged by item 7 on 2026-07-25, and the challenge was WRONG —
+   corrected 2026-07-26. A hand probe of the emitted fold shape measures
+   183.6 GB/s on gate/up and 167.6 on down, back-to-back over cold
+   weights: this line is right, the kernels ARE essentially optimal, and
+   wide loads measure 1.01×. P1 is dead alongside P2. The one exception
+   is grid WIDTH — down runs identical code 9% slower on a quarter of the
+   grid — see item 7b.)
 
    The graph is 263 dispatches in 213 serial phases (`SANIC_DEBUG=3`
    prints this). 134 of the 263 are STARVED — ≤8 of the M1 Pro's 16
@@ -473,6 +490,15 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    tokens per pass), batching (>1 sequence makes every GEMV a GEMM), or
    quantization (fewer bytes, the only lever on the floor itself).
    Further single-step kernel work on this workload is not worth doing.
+   (PARTLY superseded by item 7, and note the goal is the ROOFLINE, not
+   the fastest number, so all three levers named just above are out of
+   scope: each moves the floor instead of reaching it. ~3 ms still sits
+   between the measured step and the traffic floor — but after item 7b
+   and 7c both came back refuted, that gap is NOT slow kernels and NOT
+   unexploited concurrency, which is what this paragraph was right about.
+   What is left of it: the residual re-sum (7a), grid width on
+   narrow-output projections (7b), the small-op tail (7d), and host-side
+   submission (7e).)
 
 5. **What the GPU will actually tell us (asked and answered 2026-07-25).**
    Apple exposes 150+ counters — performance LIMITERS (ALU, buffer
@@ -577,6 +603,230 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    ~170 of them launch floor); print `--` for `plan ×`/`bw` where the
    launch floor dominates the measurement; number step footers so the
    cold first step (clock ramp + weight page-in) is identifiable.
+
+7. **THE ROOFLINE, PER CLASS — and why item 4's "kernels are essentially
+   optimal" is the wrong reading (2026-07-25).** The goal here is the
+   ROOFLINE: 100% of bandwidth on the traffic we actually do. Not the
+   fastest possible number — quantization, speculative decoding and
+   batching all move the floor instead of reaching it, and are out of
+   scope for this item by construction.
+
+   **CORRECTED 2026-07-26, and the correction is mine: item 4 was right
+   about the kernels.** This item originally read the per-class table below
+   as 1.69 ms of codegen slack and challenged item 4's "the generated
+   kernels are essentially optimal". A hand probe
+   (`tests/wide_loads_probe.rs`) then measured the emitted fold shape
+   directly, 8 dispatches over 8 distinct cold weights in one command
+   buffer: **gate/up sustains 183.6 GB/s and down 167.6** — at or near the
+   184 practical peak, not the 166/153 the table says. The table is a
+   `SANIC_DEBUG=4` measurement, which gives every kernel its own encoder and
+   therefore charges each one a ramp that production hides. I read an
+   isolated-regime number as if it were production, which is the same class
+   of error I accused item 4 of making with its aggregate. The slack below
+   is a REGIME ARTIFACT, not codegen headroom; read the table as relative
+   class weights, not as achievable rates.
+
+   The original per-class table, kept because the SHARES are still right —
+   llama-3.2-1B bf16, warm run, Σ 16.57 ms:
+
+   | class | MB | ms | GB/s | at 184 | slack |
+   |---|---|---|---|---|---|
+   | mlp gate/up | 1075.2 | 6.46 | 166 | 5.84 | 0.62 |
+   | mlp down | 537.6 | 3.52 | **153** | 2.92 | 0.60 |
+   | lm_head | 525.6 | 2.86 | **184** | 2.86 | 0.00 |
+   | q proj | 134.4 | 0.85 | 158 | 0.73 | 0.12 |
+   | o proj | 134.4 | 0.89 | 151 | 0.73 | 0.16 |
+   | k/v proj | 67.2 | 0.56 | **120** | 0.37 | 0.19 |
+   | small ops (norms, rope, sdpa, silu, cache) | ~5 | 1.43 | — | 0.00 | 1.43 |
+   | **total** | **2474** | **16.57** | | **13.45** | **3.12** |
+
+   What the probe leaves standing is narrower and real: **down sustains
+   167.6 GB/s where gate/up sustains 183.6, with identical code and a
+   quarter of the grid** (2048 threadgroups against 8192). That is grid
+   WIDTH — Little's law, already in `cost.rs` — and it is the only
+   kernel-rate lever these probes have not killed. Closing it on the down
+   class is worth ~0.28 ms (537.6 MB at 167.6 → 183.6), plus something
+   smaller on q/o and k/v, whose grids are narrower still. Call it
+   ~0.4–0.5 ms, not 1.69.
+
+   Work items, in measured value order:
+
+   a. **Materialize the residual stream — MECHANISM BUILT AND CORRECT,
+      VERDICT STILL OPEN (2026-07-26).** Mechanism preserved at stash
+      `47bd695`; all 222 tests pass with it in.
+
+      The position: `leaf_cuts` walks DOWNWARD from a fold's leaves, so a
+      value combining several already-materialized leaves — llama's
+      residual stream — lives in the body where no walk reaches it.
+      Nothing was mispriced; there was no position to price. The fix is
+      one more cut-collection step in `emit_fold`, which is already
+      documented as *cut the leaves the kernel cannot compute in-body,
+      re-plan on the cut graph, push a stage*, walking root→leaves with
+      the same stream translation `leaf_cuts` uses. It belongs there and
+      NOT in `derive`: fusing a shared value is perfectly legal, so
+      sharing is a profitability question, and the file's law is that
+      algebra settles legality while the cost model ranks what remains.
+
+      The predicate took two goes and the second is the interesting one.
+      "More than one parent in the graph" cuts flash attention's score
+      contraction, whose two parents — the max slot and the exp slot —
+      are BOTH this kernel; `projected_attention_cuts_the_gemms` catches
+      it. What makes a rebuild real is a parent in ANOTHER kernel, so the
+      rule is `parents[n] > body_edges[n]`, counting the parent edges
+      inside this fold's own cone. With that, the cuts land exactly on
+      shape `inside=3 total=4` — the residual, read three times in a body
+      and once by the next layer — and every test passes.
+
+      **And then it loses — 263 → 324 kernels, 15.9 → 19.3 ms/step. The
+      reason is a duplication bug in the cut, NOT a verdict on the
+      optimization.** Diffing the two per-kernel profiles puts all of it
+      in one family: the MLP down projection goes 16 → 31 kernels and its
+      traffic DOUBLES, 538 → 1042 MB. At ~150 GB/s that is +3.4 ms — the
+      whole regression, and nothing else moves.
+
+      The schedule dump says why the bytes double. Per layer there are two
+      down-projection folds reading the same weight:
+
+      > `[22] t7  = fold intermediate … ▸then add(t1, t8)`
+      > `[23] t23 = fold intermediate …`
+
+      The first carries the residual add as an EPILOGUE — rule 2 of this
+      file, "a residual add rides its GEMM for free" — which is exactly
+      the free materialization the item wants, and the baseline has zero
+      epilogues. So cutting the residual does light up the right path. But
+      the bare GEMM stays live beside it, so the weight is read twice.
+      Cutting every chain link instead of the shallowest changes nothing
+      (still 324), so the duplicate is not about which prefixes are
+      stored; something else keeps the un-fused contribution live and I
+      do not yet have a model for what.
+
+      **So the verdict is OPEN, not refuted, and an earlier version of
+      this item claiming otherwise was wrong.** What is measured: the
+      position works, the cone-aware predicate is correct (222 tests,
+      flash attention intact), the epilogue path engages — and the
+      integration emits one GEMM twice per layer. Find that and the
+      optimization gets a real answer for the first time.
+
+      It also changes NUMERICS: materializing stores at boundary
+      precision, so a bf16 residual rounds where the in-register f32 chain
+      did not (llama's text moved to match its own f32 output). MLX rounds
+      the same way, so it is a property to choose deliberately if this is
+      ever turned on.
+
+   b. **Wide/vectorized loads — BUILT, MEASURED, REFUTED (2026-07-26).**
+      The fold fetches 16 contiguous bytes with eight separate 2-byte
+      loads, and P1's standing theory was a per-load-instruction byte
+      ceiling. Hand-probed both MLP geometries against a `uint4` (16-byte)
+      and a `uint2` (8-byte) rewrite of the same sweep,
+      `tests/wide_loads_probe.rs`, 8 dispatches over 8 distinct cold
+      weights:
+
+      > gate/up 2048→8192, 8192 tgs:  scalar **183.6**  uint2 185.6  uint4 185.0 GB/s
+      > down    8192→2048, 2048 tgs:  scalar **167.6**  uint4 167.1 GB/s
+
+      **1.01× and 1.00×.** Widening the load instruction is worth nothing;
+      P1 is dead for this shape, alongside P2. Pinned by
+      `wide_loads_stay_worth_nothing`, which fails if a future machine or
+      dtype flips it.
+
+      The probe's real yield was the regime correction in this item's
+      header — the emitted shape was already at peak — plus one surviving
+      lever: **grid width.** down and gate/up run identical code at 167.6
+      and 183.6 GB/s, differing only in threadgroup count (2048 vs 8192).
+      Splitting a narrow-output projection's reduction across more
+      threadgroups (split-k, then combine) RAISES thread count, so unlike
+      block-rows it sits on the right side of the law. Worth ~0.28 ms on
+      down, less on q/o and k/v. This is now the only kernel-rate item.
+
+   c. **Get q, k and v into ONE phase — BUILT, MEASURED, REFUTED
+      (2026-07-25).** k/v runs at 120 GB/s and theory 4 had dismissed
+      sideways fusion because q|k|v "already run concurrently" — which is
+      false: measured over the emitted schedule, the only projection pair
+      that ever shares a phase is gate|up, 16 times. q, k and v each sat
+      in a phase alone. So the cheap test was a REORDER, not a fusion:
+      sort dispatches by dependency depth over the same RAW/WAW/WAR
+      relation on the same allocation identity `barrier_schedule` uses,
+      which preserves every ordering that carries data.
+
+      It worked as designed and bought nothing. 263 dispatches went from
+      213 phases to **180 — exactly the DAG floor** — with q, k and v
+      sharing a phase in 15 of the 16 layers (layer 0 differs: its q path
+      carries an extra materialized norm). All 218 tests passed through
+      the reordered path, so it was correct, not merely fast. Five A/B
+      pairs in one session:
+
+      > level order (180 phases): 16.6 · 16.6 · 16.4 · 16.6 · 16.4 ms
+      > emission order (213):     16.4 · 16.4 · 16.4 · 16.3 · 16.4 ms
+
+      **Never once faster, and ~0.14 ms consistently worse.** Reverted;
+      ~45 lines that buy nothing are not worth their weight.
+
+      WHY, and it is the useful part: **a grid that already fills the
+      machine leaves no slots for a concurrent neighbour.** The q
+      projection is 2048 outputs × 32 lanes ≈ 65k threads on a 16-core
+      GPU — the machine is already full, so k and v queue behind it
+      whether or not a barrier separates them. Concurrency can only pay
+      where grids are SMALL, and small grids are 8.8% of kernel time.
+      This is the block-rows law (bandwidth = outstanding bytes /
+      latency) seen from the other end: co-scheduling two grids cannot
+      add bytes in flight when one grid already saturates. The small
+      penalty is most likely locality — depth order separates a producer
+      from its consumer in time.
+
+      **Two consequences.** (1) The 1.68 ms `barriers=none` gap is NOT
+      legal-concurrency-shaped: item 4's "the serialization is in the
+      model, not the runtime" now rests on a CORRECT run rather than a
+      racy one. Which means the 1.69 ms of weight-class slack has exactly
+      one door left, and it is 7b — raise the isolated per-kernel rate.
+      (2) Merging q/k/v into one [3072, 2048] stream is still open, but
+      the mechanism is NOT "more bytes in flight from concurrency" — that
+      is now refuted. It is "one grid large enough to saturate": k/v's
+      512-output grid is too small alone (120 GB/s), and folding those
+      bytes into a 3072-output grid puts them on a grid that fills the
+      machine. Price it against 7b first; 7b is the same lever applied
+      where the bytes actually are.
+
+   d. **Fuse the small ops into the streams they ride — up to 1.43 ms.**
+      Norms, rope, cache writes, sdpa and silu touch ~5 MB total, i.e.
+      0.03 ms of DRAM, and cost 1.43 ms purely as separate dispatches.
+      sanic already HAS the mechanism: the deferred-division tuple fold
+      it emits at layer 0's k/v computes Σx² alongside the projection dot
+      in one pass and divides at the end — norm∘matmul in one kernel,
+      exactly. It is applied at layer 0 and nowhere else, and (a) is what
+      unblocks applying it everywhere. This is the megakernel direction,
+      approached one fusion at a time rather than by hand-writing it.
+
+   e. **Pipeline submission — LANDED 2026-07-26, +3.4%.** A step in one
+      command buffer cannot start on the GPU until the host has finished
+      encoding all 263 dispatches. `replay_checked` now commits in
+      chunks, so chunk k runs while k+1 is still being encoded; buffers
+      on one queue execute in commit order, so a chunk boundary is itself
+      a barrier and the schedule still holds. Measured, llama-3.2-1B
+      bf16, 128 tokens, decode tok/s:
+
+      > 1 → 55.5 · 2 → 56.0 · **4 → 57.4** · 8 → 57.3 · 16 → 56.8 · 32 → 55.6
+
+      **~0.6 ms/step**, same curve shape and same optimum as MLX's own
+      commit policy. Default 4, `SANIC_COMMIT_CHUNKS` overrides. 221
+      tests pass; generated text unchanged on the bf16 and f32 paths.
+
+      Worth less than the ~1 ms this item first estimated, and the reason
+      is instructive: that figure came from pricing MLX's chopping with
+      MLX's own caps, but MLX is EAGER and pays a large per-dispatch host
+      cost, while sanic replays a frozen graph. Only the part of the
+      host gap that is ENCODE can be hidden, and sanic's is small. NOTE
+      the reported "GPU replay" figure rises with chunking (16.2 → 16.6)
+      because the span now spans inter-buffer gaps; wall clock is the
+      honest metric here.
+
+   Cross-check that this is not sanic-specific: mlx-lm, hand-written for
+   this chip, reconstructs to 16.42 ms on the same traffic — 75% and 76%
+   of the 200 GB/s spec roofline respectively. Kernel for kernel the two
+   are within 2%, and sanic's derived folds BEAT MLX's gemv on every
+   attention projection and on lm_head (`vs_mlx.md` § "The kernels, class
+   by class"). Being at parity with MLX is therefore not evidence of
+   being at the roofline; both are a quarter short of it, for the same
+   reason, and that is the gap this item exists to close.
 
 ## What "done" looks like
 

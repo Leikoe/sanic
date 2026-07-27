@@ -40,8 +40,8 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder,
     MTLComputePassDescriptor, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLCounterSampleBuffer,
     MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLFunction, MTLLibrary, MTLPipelineOption, MTLResource, MTLResourceOptions, MTLResourceUsage,
-    MTLSize, MTLStorageMode,
+    MTLDispatchType, MTLFunction, MTLLibrary, MTLPipelineOption, MTLPixelFormat, MTLResource, MTLResourceOptions,
+    MTLResourceUsage, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
 };
 
 use crate::emit_metal::MetalProgram;
@@ -131,6 +131,10 @@ pub struct Dispatch {
     pub grid: usize,
     pub argbuf: Option<MetalBuf>,
 }
+
+/// A texture VIEW over bytes that already live in a buffer — no copy.
+#[derive(Clone)]
+pub struct MetalTexture(Retained<ProtocolObject<dyn MTLTexture>>);
 
 impl Dispatch {
     /// Threads per threadgroup — CUDA's block size: the pipeline's occupancy
@@ -243,6 +247,128 @@ impl MetalDevice {
             .newBufferWithLength_options(bytes.max(4), MTLResourceOptions::StorageModeShared)
             .expect("buffer allocation");
         unsafe { std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes.max(4)) };
+        MetalBuf(buf, 0)
+    }
+
+    /// Replay one frozen graph on `queues` INDEPENDENT command queues at once,
+    /// returning the wall seconds for all of them to finish.
+    ///
+    /// Submissions to different queues are separate submission contexts and may
+    /// execute concurrently. Dispatches inside one command buffer are not the
+    /// same question: this asks whether the device's bandwidth ceiling belongs
+    /// to a queue or to the hardware (`tests/bandwidth_probe.rs`). Every queue
+    /// replays the same read-only graph, so there is no hazard between them.
+    pub fn replay_on_parallel_queues(&self, g: &MetalGraph, queues: usize) -> f64 {
+        let extra: Vec<_> = (0..queues)
+            .map(|_| self.dev.newCommandQueue().expect("command queue"))
+            .collect();
+        let buffers: Vec<_> = extra
+            .iter()
+            .map(|q| {
+                let cb = q.commandBuffer().expect("command buffer");
+                encode_graph(&cb, &g.dispatches, &g.barriers);
+                cb.commit();
+                cb
+            })
+            .collect();
+        for cb in &buffers {
+            cb.waitUntilCompleted();
+        }
+        // GPU span, not wall: wall would be dominated by encoding every graph
+        // on the host before any of them starts, which is not what is being
+        // asked. First start to last end covers whatever overlap the GPU gave.
+        let starts = buffers
+            .iter()
+            .map(|cb| -> f64 { unsafe { msg_send![&**cb, GPUStartTime] } });
+        let ends = buffers
+            .iter()
+            .map(|cb| -> f64 { unsafe { msg_send![&**cb, GPUEndTime] } });
+        let first = starts.fold(f64::INFINITY, f64::min);
+        let last = ends.fold(f64::NEG_INFINITY, f64::max);
+        last - first
+    }
+
+    /// A `texture_buffer` view over `buf`'s first `elements` RGBA32Uint texels
+    /// (16 B each). Same bytes, different path into the core.
+    pub fn texture_view(&self, buf: &MetalBuf, elements: usize) -> MetalTexture {
+        let desc = MTLTextureDescriptor::new();
+        desc.setTextureType(MTLTextureType::TypeTextureBuffer);
+        desc.setPixelFormat(MTLPixelFormat::RGBA32Uint);
+        unsafe {
+            desc.setWidth(elements);
+            desc.setHeight(1);
+        }
+        desc.setStorageMode(buf.0.storageMode());
+        desc.setUsage(objc2_metal::MTLTextureUsage::ShaderRead);
+        let tex = buf
+            .0
+            .newTextureWithDescriptor_offset_bytesPerRow(&desc, buf.1, elements * 16)
+            .expect("texture view over buffer");
+        MetalTexture(tex)
+    }
+
+    /// Time one dispatch that binds `tex` at `[[texture(0)]]` alongside its
+    /// buffers, returning the fastest GPU span over `reps` replays.
+    ///
+    /// Apple GPUs serve textures through their own cache and request path. If
+    /// that path has miss slots of its own, a kernel reading through BOTH can
+    /// hold more outstanding lines per core than the ~23 a buffer-only kernel
+    /// tops out at — which is the one way past the ceiling that the rest of
+    /// `tests/bandwidth_probe.rs` has not ruled out.
+    pub fn time_with_texture(
+        &self,
+        pipe: &Pipeline,
+        inputs: &[MetalBuf],
+        texture: Option<&MetalTexture>,
+        output: &MetalBuf,
+        grid: usize,
+        reps: usize,
+    ) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let cb = self.queue.commandBuffer().expect("command buffer");
+            let enc = cb
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                .expect("encoder");
+            enc.setComputePipelineState(pipe);
+            for (i, b) in inputs.iter().enumerate() {
+                unsafe { enc.setBuffer_offset_atIndex(Some(&b.0), b.1, i) };
+            }
+            unsafe { enc.setBuffer_offset_atIndex(Some(&output.0), output.1, inputs.len()) };
+            if let Some(t) = texture {
+                unsafe { enc.setTexture_atIndex(Some(&t.0), 0) };
+            }
+            let tg = pipe.maxTotalThreadsPerThreadgroup().min(grid);
+            enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: grid,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: tg,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.endEncoding();
+            cb.commit();
+            cb.waitUntilCompleted();
+            best = best.min(gpu_seconds(&cb));
+        }
+        best
+    }
+
+    /// A GPU-PRIVATE buffer of raw bytes: no CPU-visible mapping, so the
+    /// fabric owes it no coherency. Nothing can read it from the host, which
+    /// is why the rest of the allocator is `Shared` — but a streaming
+    /// benchmark can ask whether coherency is costing bandwidth
+    /// (`tests/bandwidth_probe.rs`).
+    pub fn alloc_private_bytes(&self, bytes: usize) -> MetalBuf {
+        let buf = self
+            .dev
+            .newBufferWithLength_options(bytes.max(4), MTLResourceOptions::StorageModePrivate)
+            .expect("private buffer allocation");
         MetalBuf(buf, 0)
     }
 
@@ -542,15 +668,12 @@ impl MetalDevice {
     /// Replay a frozen graph and wait, returning GPU residency in seconds
     /// (`GPUEndTime − GPUStartTime`: kernel time plus inter-dispatch
     /// bubbles, free of CPU encode/submit cost).
+    ///
+    /// Any command buffer error — a GPU fault of our own, or "Discarded
+    /// (victim of GPU error/recovery)" when something ELSE faults the GPU
+    /// mid-flight — is an `Err`: the step's writes are untrustworthy and a
+    /// decode loop must not continue on them.
     pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
-        self.replay_checked(g).map(|cb| gpu_seconds(&cb))
-    }
-
-    /// One replay, error-checked. Any command buffer error — a GPU fault of
-    /// our own, or "Discarded (victim of GPU error/recovery)" when something
-    /// ELSE faults the GPU mid-flight — is an `Err`: the step's writes are
-    /// untrustworthy and a decode loop must not continue on them.
-    fn replay_checked(&self, g: &MetalGraph) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let capture = self.capture_trace();
         let cb = self.queue.commandBuffer().expect("command buffer");
         // Name the step for Instruments/Xcode GPU captures.
@@ -566,7 +689,7 @@ impl MetalDevice {
         }
         match cb.error() {
             Some(error) => Err(format!("graph replay failed: {error}")),
-            None => Ok(cb),
+            None => Ok(gpu_seconds(&cb)),
         }
     }
 

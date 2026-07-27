@@ -131,26 +131,32 @@ pub fn occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
     (resident / dev.min_blocks).clamp(1.0 / 64.0, 1.0)
 }
 
-/// How much of peak HBM bandwidth the kernel can sustain — Little's law:
-/// outstanding bytes over `bandwidth × latency`. A fold with a tiny output
-/// grid (a matvec, a huge softmax denominator) cannot keep enough bytes in
-/// flight — which is exactly why re-associating it into a split reduction
-/// pays even when it is memory-bound, and why a contiguous `chunk` run
-/// beats one narrow load per lane.
-pub fn mem_occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
-    let lanes = (k.parallel_blocks * k.lanes_per_block).max(1.0);
-    let outstanding = lanes * k.bytes_in_flight_per_lane.max(1.0);
-    (outstanding / (dev.hbm_bandwidth * dev.mem_latency_s)).clamp(1.0 / 64.0, 1.0)
+/// The bandwidth a kernel of this shape can actually reach — Little's law:
+/// outstanding bytes over `bandwidth × latency`, capped at peak. `hbm_bandwidth`
+/// is what a grid wide enough to saturate the machine gets; a fold with a tiny
+/// output grid (a matvec, a huge softmax denominator) cannot keep enough bytes
+/// in flight and sees the floor instead — 3 GB/s on an M1 Pro rather than 200.
+/// That is exactly why re-associating such a fold into a split reduction pays
+/// even when it is memory-bound, and why a contiguous `chunk` run beats one
+/// narrow load per lane. Anyone pricing traffic wants this, not the peak.
+pub fn sustainable_bandwidth(dev: &DeviceProfile, lanes: f64, bytes_in_flight_per_lane: f64) -> f64 {
+    let outstanding = lanes.max(1.0) * bytes_in_flight_per_lane.max(1.0);
+    dev.hbm_bandwidth * (outstanding / (dev.hbm_bandwidth * dev.mem_latency_s)).clamp(1.0 / 64.0, 1.0)
+}
+
+/// [`sustainable_bandwidth`] for a kernel whose shape is already parameterized.
+fn kernel_bandwidth(dev: &DeviceProfile, k: &Kernel) -> f64 {
+    sustainable_bandwidth(dev, k.parallel_blocks * k.lanes_per_block, k.bytes_in_flight_per_lane)
 }
 
 /// Per-kernel time: the roofline (compute vs. bandwidth, whichever binds)
 /// plus a fixed launch cost. Compute is divided by block occupancy (latency
-/// hiding needs resident warps); bandwidth by memory occupancy (saturation
-/// needs loads in flight). Right for kernels that overlap compute with
-/// traffic — the cooperative tiled kind this module's searches rank.
+/// hiding needs resident warps); traffic by the bandwidth the shape sustains,
+/// not the peak (saturation needs loads in flight). Right for kernels that
+/// overlap compute with traffic — the cooperative tiled kind this module ranks.
 pub fn kernel_time(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
-    let memory = k.hbm_bytes / (dev.hbm_bandwidth * mem_occupancy(dev, k));
+    let memory = k.hbm_bytes / kernel_bandwidth(dev, k);
     compute.max(memory) + dev.launch_overhead
 }
 
@@ -166,7 +172,7 @@ pub fn kernel_time(dev: &DeviceProfile, k: &Kernel) -> f64 {
 /// max stays the model for cooperative tiled kernels.
 pub fn kernel_time_additive(dev: &DeviceProfile, k: &Kernel) -> f64 {
     let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
-    let memory = k.hbm_bytes / (dev.hbm_bandwidth * mem_occupancy(dev, k));
+    let memory = k.hbm_bytes / kernel_bandwidth(dev, k);
     compute + memory + dev.launch_overhead
 }
 

@@ -1,0 +1,29 @@
+#!/bin/sh
+# What CI checks, run before the commit instead of fourteen minutes after it.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Skip for one commit:     git commit --no-verify
+#
+# `cargo test` is deliberately NOT here: the Metal suite is ~11 minutes, which
+# is a pre-push cost at best. This hook only runs the checks that are fast and
+# that have actually broken the build.
+set -e
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --check
+
+echo "pre-commit: cargo clippy (host)"
+cargo clippy --all-targets -- -D warnings
+
+# The linux leg is the one that breaks. Everything Metal is cfg'd out there, so
+# code that is perfectly live on macOS becomes dead-code and unused-import
+# errors that a host-only clippy can never see — twice in one day, in graph.rs
+# and in the llama example. Checking the target catches it in seconds; the
+# linker is missing on macOS, but clippy only needs to CHECK, never to link.
+LINUX=x86_64-unknown-linux-gnu
+if rustup target list --installed 2>/dev/null | grep -qx "$LINUX"; then
+    echo "pre-commit: cargo clippy ($LINUX)"
+    cargo clippy --target "$LINUX" --all-targets -- -D warnings
+else
+    echo "pre-commit: skipping $LINUX — install it with: rustup target add $LINUX"
+fi

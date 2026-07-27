@@ -64,6 +64,194 @@ slots than it needs (attention is ~1% of the step, so this does not carry
 the result); and the comparison is decode steps against decode steps, since
 the two harnesses count *tokens* differently.
 
+## The two schedules, side by side (2026-07-25)
+
+Parity above is a wall time. This is the *shape* of the work behind it: one
+llama-3.2-1B bf16 decode step, sanic's dispatch list against mlx-lm's
+primitive graph. sanic's side is the `SANIC_DEBUG=2` schedule dump plus the
+`=3` capture line; MLX's is `mx.export_to_dot` over one unevaluated step of
+**mlx-lm's own Llama** (not a reimplementation), classified against which
+primitives reach `eval_gpu` without launching a kernel.
+
+|  | sanic | mlx-lm |
+|---|---|---|
+| kernel launches | **263** | 276 |
+| graph nodes | 263 | 811 (535 zero-cost views) |
+| dependency depth | **180** | 196 |
+| available width | 1.46 | 1.41 |
+| command buffers / step | **1** | ~31 (default caps) |
+| encoders / step | **1** concurrent | ~31 concurrent |
+| barriers | 212, all computed at capture | dynamic, per dispatch |
+
+**The schedules are the same schedule.** Same launch count within 5%, same
+critical path within 8%, the same intrinsic concurrency — one derived from
+naive dataflow by algebra, the other assembled from a hand-written
+primitive library (Matmul×113, RMSNorm×33, RoPE×32, SliceUpdate×32,
+Add×32, SDPA×16, a compiled SiLU×16, Gather, ArgReduce). The one
+structural difference is that 535 of MLX's 811 nodes are metadata rewrites
+— Transpose×177, Flatten/Unflatten×226, Reshape×64, Slice×64 — that sanic
+never materializes as nodes at all: views are absorbed into the fold
+algebra before a schedule exists.
+
+The barrier LAW is also the same law, arrived at independently: accumulate
+reads and writes since the last barrier, barrier on RAW/WAW/WAR against
+allocation identity, reset both histories at the barrier
+(`barrier_schedule`/`barrier_before` here,
+`CommandEncoder::maybeInsertBarrier` in `mlx/backend/metal/device.cpp`).
+sanic computes it once at capture off the static graph; MLX rediscovers it
+per dispatch because it is eager.
+
+**Where they genuinely differ is submission granularity, and that is the
+whole remaining gap.** MLX commits a command buffer whenever a step exceeds
+40 mega-*elements* of distinct inputs (`data_size()` is in items, not
+bytes) or 40 ops — at 1.24 G elements of weights per step the byte cap
+dominates and chops one step into ~31 command buffers, each committed while
+the CPU keeps encoding the next. sanic encodes all 263 dispatches, commits
+once, and waits. Measured on the same machine and session, by moving MLX's
+own caps:
+
+| MLX `MLX_MAX_MB_PER_BUFFER` | ≈ cbufs/step | ms/tok |
+|---|---|---|
+| 10 | ~124 | 17.70 |
+| 20 | ~62 | 17.17 |
+| 40 (default) | ~31 | 16.89 |
+| 80 | ~15 | 16.57 |
+| 160 | ~8 | 16.56 |
+| **320** | **~4** | **16.38** |
+| 2600 | 1 | 17.11 |
+
+With chopping off — one command buffer per step, sanic's submission shape —
+MLX runs **17.5 ms/tok**, which is exactly sanic's 17.5 ms/tok wall in the
+same session (16.2 ms of it GPU). The GPU work is settled; MLX's ~1 ms
+edge is bought entirely by overlapping host encode with GPU execution, and
+its own default is ~0.5 ms past the optimum (~4 command buffers).
+
+The other candidate — recovering more in-encoder concurrency — was priced
+and is not the answer. sanic emits 213 phases against a DAG floor of 180,
+so encode order leaves 33 phases of avoidable serialization on the table;
+but forcing a barrier before *every* dispatch (263 phases, all concurrency
+destroyed) costs only ~0.15 ms/step. Each barrier is worth ~2–4 µs, so the
+33 recoverable phases are worth ≲0.1 ms. **At batch-1 decode the schedule's
+value is in when work is submitted, not in what runs beside what.**
+
+## The kernels, class by class (2026-07-25)
+
+The schedules match; this is what the *kernels inside them* cost. sanic's
+column is `SANIC_DEBUG=4` in-graph timestamps on the warm replay (Σ 16.57 ms
+over 263 kernels, the log's own summary). MLX's column is per-class
+microbenchmarks at the same shapes and the census counts, with one
+methodological correction that changes the answer: benchmarking one
+projection 200× leaves its weight in the SLC and reports **303 GB/s** —
+above this machine's DRAM peak, a rate no real step can reach. So every
+weight-reading class allocates one DISTINCT weight per dispatch (16 q
+projections, 32 gate/up, …), reproducing the step's 2.47 GB ledger. The
+reconstructed total then lands at **16.42 ms** against mlx-lm's measured
+16.2–16.9 ms/step — the parts add up to the wall, which is what licenses
+reading the rows.
+
+| class | sanic n | sanic ms | GB/s | mlx n | mlx ms | GB/s | mlx-lm primitive |
+|---|---|---|---|---|---|---|---|
+| q proj | 16 | **0.85** | 158 | 16 | 1.10 | 122 | Matmul |
+| k/v proj | 32 | **0.56** | 120 | 32 | 0.86 | 78 | Matmul |
+| o proj | 16 | **0.89** | 151 | 16 | 1.04 | 130 | Matmul |
+| mlp gate/up | 32 | 6.46 | 166 | 32 | **6.13** | 175 | Matmul |
+| mlp down | 16 | 3.52 | 153 | 16 | **3.42** | 157 | Matmul |
+| lm_head | 1 | **2.86** | 184 | 1 | 3.12 | 168 | Matmul |
+| rms norm | 66 | 0.95 | — | 33 | **0.11** | — | RMSNorm |
+| residual add | **0** | **0.00** | — | 32 | 0.10 | — | Add |
+| rope (tables + q) | 19 | 0.09 | — | 16 | 0.07 | — | RoPE |
+| cache write (k half fuses rope) | 32 | **0.17** | — | 48 | 0.26 | — | RoPE + SliceUpdate |
+| attention | 16 | 0.12 | — | 16 | 0.11 | — | SDPA |
+| silu*up | 16 | 0.09 | — | 16 | 0.07 | — | compiled Sigmoid*Mul*Mul |
+| embed | 1 | **0.01** | — | 1 | 0.03 | — | Gather |
+| argmax | 0 (host) | — | — | 1 | 0.01 | — | ArgReduce |
+| **TOTAL** | **263** | **16.57** | 150 | 276 | **16.42** | 150 | |
+
+**Kernel for kernel the two engines are within 2%** — and the derived folds
+are not the weak side. sanic's one-thread-per-output matvec fold *beats*
+MLX's hand-written gemv on every attention projection (1.2–1.4×) and on the
+lm_head, while MLX keeps ~5% on the two big MLP classes. The comparison is
+if anything tilted MLX's way: its per-class batch is 16–32 mutually
+independent matmuls with nothing to wait on, while sanic's numbers come out
+of a real step with 212 barriers in it.
+
+**The kernel BOUNDARIES largely coincide, and that is the finding.** A
+primitive library is already a fused kernel set — `rms_norm.metal` does its
+reduction and its apply in one dispatch behind threadgroup barriers, sdpa is
+one online-softmax kernel, `mx.compile` folds the SiLU chain — so "we fuse,
+they don't" is simply false. Both engines cut where a contraction forces
+materialization; MLX's cuts were placed by hand once, sanic's fall out of
+the fusion criterion per graph. The counts agree class by class (16 q, 32
+k/v, 16 o, 32 gate/up, 16 down, 16 attention, 16 silu) because there is one
+right place to cut and both find it.
+
+Exactly three boundaries differ, and they are worth naming precisely:
+
+- **The 32 residual adds are absorbed, model-wide.** MLX's entire `Add×32`
+  class has no sanic counterpart: the residual stream is never materialized,
+  so each norm re-sums the prior contributions in-register. Verified in the
+  op ledger — 1,863 of sanic's 3,193 algebra ops are `Add`, and the norm
+  folds carry `Add×65` at the last layer against `Add×1` at the first — the
+  re-sum grows by exactly two adds per layer (1, 3, 5, …, 65).
+- **RoPE is fused into the k cache write**, 16 of 16 layers: one map rotates
+  the new key and scatters it into the cache slot, where MLX runs RoPE then
+  SliceUpdate. (The v half is a plain scatter in both.) 32 kernels against
+  MLX's 48, 0.17 ms against 0.26.
+- **The norm is SPLIT into reduce + apply**, 33 of 33, where MLX's
+  `fast.rms_norm` is one dispatch — the one place sanic is *finer* than the
+  primitive library. It is also, measured, the one that does not matter:
+  see below.
+
+An earlier draft of this section claimed norm∘projection as a third
+model-wide fusion. Checked against the emitted MSL, it is not: only **2 of
+32** k/v projections fuse the norm (layer 0's k and v, as a deferred-division
+tuple fold). Everywhere else the norm is materialized once and read by q, k,
+v alike — the same shape MLX has. The k/v class is still 0.56 ms against
+0.86, but that is the fold beating the gemv, not a fusion the other engine
+lacks.
+
+**Where the two boundaries differ is where the time differs — but not in
+the way the dispatch count suggests.** RMS norms cost 0.95 ms against MLX's
+0.11 + 0.10 = 0.21. The obvious suspect is the split: 66 dispatches where
+`fast.rms_norm` is 33. It is the wrong suspect, and this repo already
+measured it — `tests/block_rows_probe.rs`
+`fused_rms_against_reduce_then_apply` times a hand-written fused two-pass
+kernel against reduce-then-apply on real dispatches:
+
+> reduce+apply 8.00 µs · fused, MLX's shape 7.71 µs · **1.04×**
+
+0.29 µs per norm, ~9 µs per step, **0.06%**. Fusing the two dispatches into
+one is worth nothing. But that probe runs at arity ONE, and that is the
+regime it never left.
+
+In the real step the norms are not arity one. Because the residual stream is
+never materialized, each norm re-sums every prior layer's contribution, and
+the per-kernel cost climbs with depth while the k/v folds beside them stay
+flat at ~17 µs:
+
+| | measured | at arity 1 | the re-sum |
+|---|---|---|---|
+| norm reduce (33) | 0.676 ms | 0.198 ms (33 × 6 µs) | **0.478 ms** |
+| norm apply (33) | 0.275 ms | 0.165 ms (33 × 5 µs) | **0.110 ms** |
+| **total** | **0.951 ms** | **0.363 ms** | **0.588 ms** |
+
+Reduce climbs 6 µs → 31 µs, apply 5 µs → 12 µs, and the fold's `Add` count
+grows by exactly two per layer (1, 3, 5, …, 65). **0.59 ms of the 0.75 ms
+gap is the re-sum** — arithmetic and loads, not launch overhead, so no
+amount of fusing the two dispatches removes a single `Add` of it. The
+remaining ~0.25 ms is per-norm kernel quality at arity 1 (0.36 ms against
+their 0.11), part of which is regime: their figure is a cache-resident floor
+from a 200-op batch, ours is in-graph.
+
+So the lever is materialization, not fusion. Writing the residual stream
+once per layer would make every norm arity-1 — saving the 0.59 ms and
+costing ~32 small add kernels, which by analogy with sanic's other 2048-wide
+maps (~5 µs) is ~0.16 ms: a net **~0.4 ms/step, ~2.5%**. That is an
+estimate from measured neighbours, not a measurement; the way to settle it
+is to build the cut. It does contradict the standing note in `todo.md` § 2
+that "at batch-1 decode re-reading k×4KB beats a materialize round-trip" —
+that call was reasoned, not timed, and the re-reads cost 0.59 ms/step.
+
 ## Scoreboard (one decode step)
 
 The document below is the AUTOPSY that started at 211.7 ms; the ladder was
@@ -390,6 +578,17 @@ int4 load rung, unchanged.
 # the llama-3.2-1B head-to-head at the top of this file
 SANIC_TUNE=1 cargo run --release --example llama3_2 -- "The capital of France is" -n 64 --bf16
 .venv/bin/python weights/mlx_llama_bench.py 64     # MLX side, same conditions
+
+# the two schedules, side by side
+SANIC_DEBUG=3 cargo run --release --example llama3_2 -- "..." -n 2 --bf16 2>&1 | tee sched.log
+.venv/bin/python weights/sanic_schedule_depth.py sched.log   # launches, DAG depth, phases
+.venv/bin/python weights/mlx_llama_schedule.py               # MLX census of one step
+MLX_MAX_MB_PER_BUFFER=320 .venv/bin/python weights/mlx_llama_bench.py 64  # submission sweep
+
+# the kernels inside those schedules, class by class
+SANIC_DEBUG=4 cargo run --release --example llama3_2 -- "..." -n 2 --bf16 2>&1 | tee k.log
+.venv/bin/python weights/sanic_kernel_classes.py k.log       # sanic per class, in-graph
+.venv/bin/python weights/mlx_llama_kernels.py 8              # MLX per class, cold weights
 
 # the Trinity autopsy below it
 cargo run --release --example trinity -- --bench   # per-class GPU profile

@@ -496,15 +496,28 @@ fn expr_ops(e: &Expr) -> f64 {
 /// just the `count_flops` op. Schedule choice hinges on recompute, and
 /// recompute is paid in issue slots; pricing it at one flop per element is
 /// what made one-thread-per-output look cheap.
+///
+/// Each DISTINCT node counts once: the emitter names a value and reuses it, so
+/// a subexpression two siblings share is issued once inside the kernel, not
+/// twice. Counting it per parent edge is also exponential on a graph as shared
+/// as a transformer's residual stream — 200 s on a llama step, against 0.2 s
+/// counted this way.
 pub(crate) fn count_issue_ops(node: &Node) -> f64 {
+    issue_ops(node, &mut HashSet::new())
+}
+
+fn issue_ops(node: &Node, counted: &mut HashSet<*const NodeKind>) -> f64 {
+    if !counted.insert(Arc::as_ptr(node)) {
+        return 0.0;
+    }
     let vol = |n: &Node| -> f64 { n.shape().iter().map(|ax| ax.extent() as f64).product() };
     match node.as_ref() {
         NodeKind::Const { .. } => 0.0,
         NodeKind::Iota { .. } | NodeKind::Coordinate { .. } => vol(node),
         NodeKind::Input { shape, .. } => (1.0 + shape.len() as f64) * vol(node),
-        NodeKind::Map { inputs, .. } => inputs.iter().map(count_issue_ops).sum::<f64>() + vol(node),
-        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => count_issue_ops(src) + vol(src),
-        NodeKind::Gather { src, index, .. } => count_issue_ops(src) + count_issue_ops(index) + 2.0 * vol(node),
+        NodeKind::Map { inputs, .. } => inputs.iter().map(|input| issue_ops(input, counted)).sum::<f64>() + vol(node),
+        NodeKind::Reduce { src, .. } | NodeKind::Scan { src, .. } => issue_ops(src, counted) + vol(src),
+        NodeKind::Gather { src, index, .. } => issue_ops(src, counted) + issue_ops(index, counted) + 2.0 * vol(node),
         NodeKind::View { src, dims } => {
             let split_ops: f64 = dims
                 .iter()
@@ -516,11 +529,11 @@ pub(crate) fn count_issue_ops(node: &Node) -> f64 {
                     }
                 })
                 .sum();
-            count_issue_ops(src) + split_ops * vol(node)
+            issue_ops(src, counted) + split_ops * vol(node)
         }
         NodeKind::Reindex { src, map, padded, .. } => {
             let per = map.len() as f64 * 2.0 + if *padded { 2.0 } else { 0.0 };
-            count_issue_ops(src) + per * vol(node)
+            issue_ops(src, counted) + per * vol(node)
         }
     }
 }
