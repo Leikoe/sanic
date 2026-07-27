@@ -940,9 +940,53 @@ impl Partitioner<'_> {
         // a residual history into a scalar-output norm prices at ~100 ns
         // against a 2 µs launch and every recompute looks free.
         let sustained = crate::cost::sustainable_bandwidth(dev, pricing.out_vol, dev.dtype_bytes);
-        let recompute_once = count_issue_ops(node) / dev.peak_flops + subtree_read_bytes(node) / sustained;
+        let (rebuild_ops, rebuild_bytes) = self.rebuild_cost(node);
+        let recompute_once = rebuild_ops / dev.peak_flops + rebuild_bytes / sustained;
         let round_trip = volume * dev.dtype_bytes / sustained;
         (replicas - 1.0) * recompute_once < (replicas + 1.0) * round_trip + dev.launch_overhead
+    }
+
+    /// What a consumer would actually REBUILD if this cone stays in-body:
+    /// (issue slots, bytes read), walking down to leaves and stopping at any
+    /// producer already materialized — that is one buffer read, not its whole
+    /// history.
+    ///
+    /// Walking the raw subtree instead sums every input reachable beneath the
+    /// node, which for anything deep in a transformer is every prior layer's
+    /// weights: 2.2 GB of "recompute" for a node of 2048 elements, 91 ms
+    /// against a 0.16 µs round trip. No cone clears that bar, so Prop 4.1
+    /// collapsed into "always materialize" and `inline_pays` answered false 93
+    /// times out of 93 on a llama step — ranking nothing.
+    fn rebuild_cost(&self, node: &Node) -> (f64, f64) {
+        let (mut ops, mut bytes) = (0.0, 0.0);
+        let mut seen: HashSet<*const NodeKind> = HashSet::new();
+        let mut stack = vec![node.clone()];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(Arc::as_ptr(&current)) {
+                continue;
+            }
+            let volume: f64 = current.shape().iter().map(|axis| axis.extent() as f64).product();
+            // A producer already materialized is one buffer read. So is one
+            // that carries a fold: `leaf_cuts` cuts those unconditionally, so
+            // it WILL be a buffer read by the time this cone runs, even though
+            // `done` cannot know it yet — pricing happens on the way down,
+            // before anything below has been emitted.
+            let will_be_a_buffer_read = self.done.contains_key(&Arc::as_ptr(&current))
+                || matches!(current.as_ref(), NodeKind::Reduce { .. } | NodeKind::Scan { .. });
+            if will_be_a_buffer_read {
+                bytes += volume * self.dev.dtype_bytes;
+                continue;
+            }
+            match current.as_ref() {
+                NodeKind::Input { dtype, .. } => bytes += volume * dtype.bytes(),
+                NodeKind::Const { .. } => {}
+                _ => {
+                    ops += volume;
+                    stack.extend(ir::children(&current));
+                }
+            }
+        }
+        (ops, bytes)
     }
 
     /// Elements this node materializes to (the product of its output axes'
