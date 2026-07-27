@@ -604,6 +604,35 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    launch floor dominates the measurement; number step footers so the
    cold first step (clock ramp + weight page-in) is identifiable.
 
+6.5 **THE PROP 4.1 PRICING IS MEASURED ON THE WRONG SUBTREE (2026-07-27).**
+   `inline_pays` decides every leaf-cut in the partitioner, and on a llama
+   step it returns **false 93 times out of 93**. It never says inline. The
+   reason is `subtree_read_bytes`, which walks `input_axes` over the RAW node
+   and therefore sums every input reachable beneath it — for anything deep in
+   the model that is every prior layer's weights:
+
+   > `out_vol=8192 vol=2048 replicas=256 recompute=90996us round_trip=0.16us bytes=2249406472`
+
+   **2.2 GB of "recompute" for a node of volume 2048**, i.e. 91 ms against a
+   0.16 µs round trip. No cone can ever clear that bar, so the inequality has
+   degenerated into "always materialize" and the cost model is not ranking
+   anything — it is answering the same way every time.
+
+   The fix is the one already learned the hard way in item 7a: price the
+   SPLICED view, which stops at producers already materialized, instead of the
+   raw subtree. What a consumer would actually rebuild is the cone down to its
+   buffer reads, not the model's whole history.
+
+   Visible consequence, from "why does q not fuse its norm while k and v do":
+   k/v absorb the norm algebraically (`defer-div+tuple`), q gets a materialized
+   norm instead — two kernels per layer, 32 in total, whose only consumer is
+   the q projection. The post-attention norm is the honest case: gate AND up
+   both read it, so materializing once is right. Nothing tells the q case from
+   the gate/up case today because the pricing cannot discriminate at all.
+
+   Worth ~0.18 ms/step if q fuses like k/v, and the fix is a precondition for
+   trusting any other fusion decision in the file.
+
 7. **THE ROOFLINE, PER CLASS — and why item 4's "kernels are essentially
    optimal" is the wrong reading (2026-07-25).** The goal here is the
    ROOFLINE: 100% of bandwidth on the traffic we actually do. Not the
