@@ -542,15 +542,12 @@ impl MetalDevice {
     /// Replay a frozen graph and wait, returning GPU residency in seconds
     /// (`GPUEndTime − GPUStartTime`: kernel time plus inter-dispatch
     /// bubbles, free of CPU encode/submit cost).
+    ///
+    /// Any command buffer error — a GPU fault of our own, or "Discarded
+    /// (victim of GPU error/recovery)" when something ELSE faults the GPU
+    /// mid-flight — is an `Err`: the step's writes are untrustworthy and a
+    /// decode loop must not continue on them.
     pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
-        self.replay_checked(g).map(|cb| gpu_seconds(&cb))
-    }
-
-    /// One replay, error-checked. Any command buffer error — a GPU fault of
-    /// our own, or "Discarded (victim of GPU error/recovery)" when something
-    /// ELSE faults the GPU mid-flight — is an `Err`: the step's writes are
-    /// untrustworthy and a decode loop must not continue on them.
-    fn replay_checked(&self, g: &MetalGraph) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let capture = self.capture_trace();
         let cb = self.queue.commandBuffer().expect("command buffer");
         // Name the step for Instruments/Xcode GPU captures.
@@ -566,7 +563,7 @@ impl MetalDevice {
         }
         match cb.error() {
             Some(error) => Err(format!("graph replay failed: {error}")),
-            None => Ok(cb),
+            None => Ok(gpu_seconds(&cb)),
         }
     }
 

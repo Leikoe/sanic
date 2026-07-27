@@ -417,19 +417,49 @@ fn count_parents(node: &Node, out: &mut HashMap<*const NodeKind, usize>) {
     }
 }
 
-fn contains_node(root: &Node, target: &Node) -> bool {
-    if Arc::ptr_eq(root, target) {
-        return true;
+/// The nodes still reachable from `node` once `cut` values are read from their
+/// buffers instead of computed — what this kernel is left to evaluate. A cut
+/// stops the descent, but only along the paths that go through it: a value the
+/// graph also reaches another way (an attention score under the max AND under
+/// the exp) stays reachable, and stays this kernel's to place. Visited-keyed —
+/// the graph is a DAG whose diamonds make an unmemoized descent exponential.
+fn reachable_past_cuts(node: &Node, cut: &HashSet<*const NodeKind>, out: &mut HashSet<*const NodeKind>) {
+    if cut.contains(&Arc::as_ptr(node)) || !out.insert(Arc::as_ptr(node)) {
+        return;
     }
-    match root.as_ref() {
-        NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => false,
-        NodeKind::Coordinate { src, .. }
-        | NodeKind::Reduce { src, .. }
-        | NodeKind::Scan { src, .. }
-        | NodeKind::View { src, .. }
-        | NodeKind::Reindex { src, .. } => contains_node(src, target),
-        NodeKind::Map { inputs, .. } => inputs.iter().any(|input| contains_node(input, target)),
-        NodeKind::Gather { src, index, .. } => contains_node(src, target) || contains_node(index, target),
+    for child in ir::children(node) {
+        reachable_past_cuts(&child, cut, out);
+    }
+}
+
+/// One fold's body: every node strictly between its root and its carrier
+/// leaves, each with the number of parent edges reaching it from inside.
+///
+/// The second number [`Partitioner::shared_body_cuts`] needs. A value two
+/// slots of the same carrier reference is emitted ONCE — the generator names
+/// it and reuses the name — so being referenced twice here is free. What makes
+/// a rebuild real is a parent in ANOTHER kernel, which is `parents[n] >
+/// body[n]`. Counting graph parents alone cannot tell the two apart, and flash
+/// attention is the case that proves it: its score contraction has two
+/// parents, the max slot and the exp slot, and both are this kernel.
+fn fold_body(node: &Node, leaves: &[Node], out: &mut HashMap<*const NodeKind, usize>) {
+    for child in ir::children(node) {
+        if leaves.iter().any(|leaf| Arc::ptr_eq(leaf, &child)) {
+            continue; // the fusion boundary: what is below it is another kernel's
+        }
+        let edges = out.entry(Arc::as_ptr(&child)).or_insert(0);
+        *edges += 1;
+        if *edges == 1 {
+            fold_body(&child, leaves, out); // every edge counts, each node descends once
+        }
+    }
+}
+
+/// A cut candidate, deduped by identity — the same node found down two paths
+/// is one materialization.
+fn push_cut(node: &Node, out: &mut Vec<Node>) {
+    if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
+        out.push(node.clone());
     }
 }
 
@@ -569,6 +599,17 @@ impl Partitioner<'_> {
         self.done.insert(Arc::as_ptr(node), name);
         self.keepalive.push(node.clone());
         name
+    }
+
+    /// Materialize every cut a walk found and record the substitution one
+    /// rebuild pass will apply. Splice, not `input(name, output_axes, dtype)`:
+    /// a view/reindex above the cut must keep its reshape so the buffer is
+    /// read under the axes it was stored with.
+    fn cut_all(&mut self, cuts: &[Node], subs: &mut Vec<(Node, Node)>) {
+        for cut in cuts {
+            self.cut(cut);
+            subs.push((cut.clone(), self.splice(cut, false)));
+        }
     }
 
     /// Cut the computation beneath structural index arithmetic while leaving
@@ -741,13 +782,8 @@ impl Partitioner<'_> {
     /// stays in-body of the down projection — recomputed once per output
     /// row instead of evaluated once per element.
     fn leaf_cuts(&self, node: &Node, axes: &[AxisRef], pricing: &CutPricing, out: &mut Vec<Node>) {
-        let push = |node: &Node, out: &mut Vec<Node>| {
-            if !out.iter().any(|n| Arc::ptr_eq(n, node)) {
-                out.push(node.clone());
-            }
-        };
         if self.done.contains_key(&Arc::as_ptr(node)) {
-            push(node, out); // splices to its buffer read
+            push_cut(node, out); // splices to its buffer read
             return;
         }
         // When something below WILL be cut, cut at the TOP of the
@@ -764,7 +800,7 @@ impl Partitioner<'_> {
                 if let Some((hot_volume, hot_shape)) = self.hot_volume(node, axes)
                     && (self.volume(node) < hot_volume || node.shape().iter().map(|axis| axis.extent()).eq(hot_shape))
                 {
-                    push(node, out);
+                    push_cut(node, out);
                     return;
                 }
                 for input in inputs {
@@ -775,7 +811,7 @@ impl Partitioner<'_> {
             // materialize it once. Keeping it inline both repeats the load and
             // makes planning price the gather's whole backing tensor as a
             // resident input instead of the selected rows.
-            NodeKind::Gather { .. } if self.shared(node) => push(node, out),
+            NodeKind::Gather { .. } if self.shared(node) => push_cut(node, out),
             NodeKind::Gather { src, index, dim } => {
                 let gathered = ir::source_axis(src, *dim);
                 self.leaf_cuts(src, &stream_below_gather(axes, index, gathered), pricing, out);
@@ -790,7 +826,59 @@ impl Partitioner<'_> {
                 pricing,
                 out,
             ),
-            _ => push(node, out),
+            _ => push_cut(node, out),
+        }
+    }
+
+    /// The values in this fold's BODY that another kernel rebuilds too.
+    ///
+    /// A carrier's leaves are where derivation stopped, so everything between
+    /// the fold's root and those leaves is body: legal to compute in-body, and
+    /// free to do so only if this is the one kernel computing it.
+    /// [`Partitioner::leaf_cuts`] walks DOWNWARD from a leaf and so can never
+    /// see it — which is why llama's residual stream was re-added by all 33
+    /// norms and every projection rather than stored once. Nothing was
+    /// mispriced; there was no position at which to price it.
+    ///
+    /// The stream translation is the one `stream_provenance` already resolved
+    /// for this kernel, so only the pricing question is new. The SHALLOWEST
+    /// value on each path wins — storing a residual chain's tip turns the rest
+    /// of the chain into one buffer read, so the links below stop being shared
+    /// work at all.
+    fn shared_body_cuts(
+        &self,
+        node: &Node,
+        body: &HashMap<*const NodeKind, usize>,
+        pricing: &CutPricing,
+        stream: &HashMap<*const NodeKind, Vec<AxisRef>>,
+        out: &mut Vec<Node>,
+    ) {
+        let Some(&inside) = body.get(&Arc::as_ptr(node)) else {
+            return; // a carrier leaf, or below one — past the fusion boundary
+        };
+        // Already materialized: READ it, exactly as `leaf_cuts` does at the same
+        // question. Returning instead leaves it inline, and the kernel rebuilds
+        // it from the links below — the very sharing this walk exists to find.
+        if self.done.contains_key(&Arc::as_ptr(node)) {
+            push_cut(node, out); // splices to its buffer read
+            return;
+        }
+        match node.as_ref() {
+            NodeKind::Map { .. } => {
+                let total = self.parents.get(&Arc::as_ptr(node)).copied().unwrap_or(1);
+                let axes = stream.get(&Arc::as_ptr(node)).map(Vec::as_slice).unwrap_or_default();
+                if total > inside && !self.inline_pays(node, axes, pricing) {
+                    push_cut(node, out);
+                    return;
+                }
+            }
+            // Reductions and the structural operators are pure per-element
+            // work; nothing below a gather or a free source is body.
+            NodeKind::Reduce { .. } | NodeKind::Scan { .. } | NodeKind::View { .. } | NodeKind::Reindex { .. } => {}
+            _ => return,
+        }
+        for child in ir::children(node) {
+            self.shared_body_cuts(&child, body, pricing, stream, out);
         }
     }
 
@@ -843,8 +931,17 @@ impl Partitioner<'_> {
             replicas = (replicas / sharable.clamp(1.0, SIMD as f64)).max(1.0);
         }
         let dev = self.dev;
-        let recompute_once = count_issue_ops(node) / dev.peak_flops + subtree_read_bytes(node) / dev.hbm_bandwidth;
-        let round_trip = volume * dev.dtype_bytes / dev.hbm_bandwidth;
+        // Traffic is priced at the rate THIS kernel can sustain, not at peak.
+        // Both sides of the inequality are traffic issued by this consumer —
+        // the leaves it re-reads when the subtree stays in-body, or the one
+        // value it reads when the subtree is cut — and a fold whose output is
+        // small keeps too few loads in flight to reach `hbm_bandwidth`
+        // (Little's law, [`cost::sustainable_bandwidth`]). At peak, re-reading
+        // a residual history into a scalar-output norm prices at ~100 ns
+        // against a 2 µs launch and every recompute looks free.
+        let sustained = crate::cost::sustainable_bandwidth(dev, pricing.out_vol, dev.dtype_bytes);
+        let recompute_once = count_issue_ops(node) / dev.peak_flops + subtree_read_bytes(node) / sustained;
+        let round_trip = volume * dev.dtype_bytes / sustained;
         (replicas - 1.0) * recompute_once < (replicas + 1.0) * round_trip + dev.launch_overhead
     }
 
@@ -1029,7 +1126,7 @@ impl Partitioner<'_> {
         let pricing = CutPricing::for_kernel(node, carrier);
         let mut subs: Vec<(Node, Node)> = Vec::new();
         let cut_into = |p: &mut Self, leaf: &Node, subs: &mut Vec<(Node, Node)>| {
-            let mut cuts = Vec::new();
+            let mut cuts: Vec<Node> = Vec::new();
             // Translate the root stream along the actual path to this leaf.
             // A carrier's leaf list intentionally omits structural nodes, so
             // its flat alias table cannot represent a split followed by a
@@ -1037,14 +1134,23 @@ impl Partitioner<'_> {
             let local_axes = stream_provenance.get(&Arc::as_ptr(leaf)).cloned().unwrap_or_default();
             let local_axes = if local_axes.is_empty() { vec![axis] } else { local_axes };
             p.leaf_cuts(leaf, &local_axes, &pricing, &mut cuts);
-            for c in cuts {
-                p.cut(&c);
-                // splice, not `input(name, output_axes, dtype)`: a view/reindex above
-                // the cut must keep its reshape so the buffer is read under
-                // the axes it was stored with.
-                subs.push((c.clone(), p.splice(&c, false)));
-            }
+            p.cut_all(&cuts, subs);
         };
+
+        // Body values another kernel rebuilds too, before the leaf walk:
+        // storing one turns the subtree under it into a single read, which is
+        // what the leaves should then see. The fold root is what this kernel
+        // WRITES — its consumers read that buffer, so none of its parent edges
+        // is a rebuild and it is never a value to store.
+        let mut body = HashMap::new();
+        fold_body(node, &carrier.leaves, &mut body);
+        body.insert(
+            Arc::as_ptr(node),
+            self.parents.get(&Arc::as_ptr(node)).copied().unwrap_or(1),
+        );
+        let mut body_cuts = Vec::new();
+        self.shared_body_cuts(node, &body, &pricing, &stream_provenance, &mut body_cuts);
+        self.cut_all(&body_cuts, &mut subs);
 
         // A flatten/reindex immediately beneath a reduction can hide the
         // common elementwise ancestor of several carrier leaves. Find cuts
@@ -1056,14 +1162,17 @@ impl Partitioner<'_> {
             && matches!(src.as_ref(), NodeKind::View { .. } | NodeKind::Reindex { .. })
         {
             self.leaf_cuts(src, &[axis], &pricing, &mut structural_cuts);
-            for cut in &structural_cuts {
-                self.cut(cut);
-                subs.push((cut.clone(), self.splice(cut, false)));
-            }
+            self.cut_all(&structural_cuts, &mut subs);
         }
 
+        // A leaf this kernel no longer reaches is not this kernel's to cut: the
+        // value it belonged to is a buffer read now, so cutting it materializes
+        // a producer nothing reads.
+        let cut_here: HashSet<*const NodeKind> = body_cuts.iter().chain(&structural_cuts).map(Arc::as_ptr).collect();
+        let mut live = HashSet::new();
+        reachable_past_cuts(node, &cut_here, &mut live);
         for (idx, leaf) in carrier.leaves.iter().enumerate() {
-            if structural_cuts.iter().any(|cut| contains_node(cut, leaf)) {
+            if !live.contains(&Arc::as_ptr(leaf)) {
                 continue;
             }
             // Fuse the online-softmax score contraction in-body (FlashAttention's
@@ -1248,9 +1357,20 @@ impl Partitioner<'_> {
                     subs.push((p.clone(), read));
                 }
             }
-            let t = self.fresh();
+            // Cutting the other producers can materialize the host too — they
+            // share the graph below. The host was chosen before that happened,
+            // so ask `done` again: emitting it a second time is a whole kernel
+            // recomputed. A materialized host cannot carry the epilogue (its
+            // buffer holds the host's own value, which other stages read), so
+            // this falls through to the map stage that reads it.
             let before = self.stages.len();
-            let landed = self.emit(&producer, t);
+            let landed = match self.done.get(&Arc::as_ptr(&producer)).copied() {
+                Some(name) => name,
+                None => {
+                    let t = self.fresh();
+                    self.emit(&producer, t)
+                }
+            };
             if self.stages.len() > before
                 && let Some(Stage::Fused {
                     spec,
