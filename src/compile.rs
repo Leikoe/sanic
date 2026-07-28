@@ -668,6 +668,17 @@ mod metal_backend {
             bindings: &[&Self::Buffer],
             output_shapes: &[Vec<usize>],
         ) -> Result<Vec<Self::Buffer>, RunError> {
+            // Kernels for these roots store only the part they change, on the
+            // promise that the rest is already in the buffer they write. Only
+            // `capture` binds that buffer; a fresh allocation here would leave
+            // everything the kernel skipped unwritten.
+            if !schedule.agrees_in_place.is_empty() {
+                return Err(RunError::Backend(format!(
+                    "outputs {:?} are compiled to overwrite an input's buffer; run this \
+                     program through capture(), which binds the two as one",
+                    schedule.agrees_in_place
+                )));
+            }
             let mut buffers = HashMap::<String, MetalBuf>::new();
             for (input, buffer) in inputs.iter().zip(bindings) {
                 buffers.insert(input.lowered_name.to_string(), buffer.raw.clone());
