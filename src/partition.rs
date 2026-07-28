@@ -109,6 +109,11 @@ pub struct Schedule {
     /// not compose at the node the partitioner stood on, in emission order.
     /// [`Schedule::decline_census`] buckets it.
     pub declines: Vec<Decline>,
+    /// Outputs whose buffer IS the buffer of the value they replace, so the
+    /// part they leave unchanged is already in place and need not be written.
+    /// Set by the caller that owns the aliasing decision (a persistent state
+    /// and its successor); empty for an ordinary compilation.
+    pub agrees_in_place: Vec<String>,
     // Occurrence metadata uses raw node pointers. Stages retain their
     // executable subgraphs, while this pins original/rebuilt nodes referenced
     // only by scheduling metadata so allocator reuse cannot alias identities.
@@ -173,6 +178,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         stages,
         outputs,
         declines: std::mem::take(&mut p.declines),
+        agrees_in_place: Vec::new(),
         _keepalive: keepalive,
     };
     // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like

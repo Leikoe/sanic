@@ -260,6 +260,26 @@ pub fn assign(name: &str, val: &str) -> String {
 /// their own scope — a reduction loop, a gather index — are pushed to `out` in
 /// order; the return is a pure expression reading whatever `out` set up. This
 /// is [`crate::interp`]'s `eval_node`, targeting code.
+/// The coordinate map one input of a [`NodeKind::Map`] is rendered under —
+/// the caller's coordinates, restated in the axis occurrences that input owns.
+/// [`value`] uses this whenever it descends; an emitter that renders a single
+/// input on its own needs it for the same reason.
+pub fn map_input_coord(
+    node: &Node,
+    input: &Node,
+    coord: &HashMap<AxisRef, String>,
+    g: &Gen,
+) -> HashMap<AxisRef, String> {
+    let mut input_coord = coord.clone();
+    for output_axis in ir::axis_refs(node) {
+        let input_axis = ir::map_input_axis(node, input, output_axis);
+        if input_axis != output_axis {
+            input_coord.insert(input_axis, g.coordinate(coord, output_axis).clone());
+        }
+    }
+    input_coord
+}
+
 pub fn value<L: Lang>(
     lang: &L,
     node: &Node,
@@ -281,13 +301,7 @@ pub fn value<L: Lang>(
             let a: Vec<String> = inputs
                 .iter()
                 .map(|input| {
-                    let mut input_coord = coord.clone();
-                    for output_axis in ir::axis_refs(node) {
-                        let input_axis = ir::map_input_axis(node, input, output_axis);
-                        if input_axis != output_axis {
-                            input_coord.insert(input_axis, g.coordinate(coord, output_axis).clone());
-                        }
-                    }
+                    let input_coord = map_input_coord(node, input, coord, g);
                     value(lang, input, &input_coord, g, out)
                 })
                 .collect();
