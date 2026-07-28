@@ -1,0 +1,6 @@
+# Apple's documentation is copyrighted and not ours to redistribute, so the
+# corpus never enters git — only the script that fetches it. Run ./dl.py and
+# the tree appears here, ignored.
+*
+!.gitignore
+!dl.py
