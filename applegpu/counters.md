@@ -104,6 +104,38 @@ cache), bytes read from main memory, occupancy.
 Out of process, in an entitled daemon. That is the supported route to anything
 past a timestamp. `SANIC_GPUTRACE=<path>` in `src/metal.rs`.
 
+### `gpudebug`: documented, and NOT on this machine
+
+Apple documents a command-line reader for exactly these traces — a text REPL
+with a `performance` subtree, `info`, and `fetch`, explicitly pitched at
+scripted and agent-driven use. It would be the terminal route to the counters
+that currently need the Xcode GUI.
+
+It does not exist here. **Measured 2026-07-28**, macOS 26.5.2 (25F84),
+Xcode 26.6 (17F113) — newer than the macOS 26.2 in Apple's own example:
+
+```
+which gpudebug                  -> not found
+xcrun -f gpudebug               -> unable to find utility "gpudebug"
+man -w gpudebug                 -> No manual entry
+find /Applications/Xcode.app -name 'gpudebug*'   -> nothing
+find /Library/Developer -name 'gpudebug*'        -> nothing
+```
+
+So it ships in some SDK or seed this machine does not have, and nothing in
+`applegpu/` may lean on it yet. Everything below about what it *would* show is
+Apple's documentation, unverified here:
+
+- root has four children: `commands`, `performance`, `api_calls`, `resources`
+- `gpudebug -t t.gputrace -c list`, then `gpudebug -s <id> -c ...` reuses the
+  loaded session; `--oneshot` pays the load cost every call
+- every documented example is RENDER work — draws, color attachments, vertex
+  layouts. Whether a compute-only trace exposes anything useful under
+  `performance` is unknown, and is the first thing to check.
+
+We already emit the input: `SANIC_GPUTRACE=<path>` writes one. When `gpudebug`
+appears, the experiment is one command against a trace we can produce today.
+
 ## Instruments / xctrace
 
 Counters are **GPU-wide** (keyed by accelerator, not pid) — quiesce the machine
