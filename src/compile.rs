@@ -128,6 +128,11 @@ pub struct Program<B: Backend> {
     executable: B::Executable,
     inputs: Vec<InputSpec>,
     output_shapes: Vec<Vec<usize>>,
+    /// Roots that write the buffer of an input instead of one of their own,
+    /// as (root index, that input's name). See [`compile_roots_in_place`].
+    /// Only the replay path acts on it, and only Metal has one.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    in_place: Vec<(usize, &'static str)>,
 }
 
 impl<B: Backend> Program<B> {
@@ -330,13 +335,26 @@ tuple_roots!(
 /// Extension trait for compiling one or more roots.
 pub trait Compile: Roots {
     fn compile<B: Backend>(&self, backend: &B) -> Result<Program<B>, CompileError> {
-        compile_roots(self.roots(), backend)
+        compile_roots_in_place(self.roots(), Vec::new(), backend)
     }
 }
 
 impl<T: Roots> Compile for T {}
 
-fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program<B>, CompileError> {
+/// Compile `roots`, where the roots named in `in_place` write the buffer of
+/// an existing input rather than one of their own — `(root index, input
+/// name)`.
+///
+/// The caller owns that claim: it must know the root's value agrees with the
+/// input everywhere the root does not store, and that nothing in the step
+/// still wants the input's OLD contents. In exchange the emitted kernel skips
+/// the part it would have copied, and no second buffer is allocated or
+/// swapped between steps.
+pub(crate) fn compile_roots_in_place<B: Backend>(
+    roots: Vec<NodeRef>,
+    in_place: Vec<(usize, &'static str)>,
+    backend: &B,
+) -> Result<Program<B>, CompileError> {
     if roots.is_empty() {
         return Err(CompileError::EmptyOutputs);
     }
@@ -358,7 +376,11 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         .map(|index| leak(format!("Out{index}")))
         .collect::<Vec<_>>();
     let named_roots = roots.iter().cloned().zip(output_names).collect::<Vec<_>>();
-    let schedule = partition_many(&named_roots, &backend.profile());
+    let mut schedule = partition_many(&named_roots, &backend.profile());
+    schedule.agrees_in_place = in_place
+        .iter()
+        .map(|&(root, _)| schedule.outputs[root].clone())
+        .collect();
     let executable = backend.prepare(&schedule, &output_shapes)?;
 
     Ok(Program {
@@ -367,6 +389,7 @@ fn compile_roots<B: Backend>(roots: Vec<NodeRef>, backend: &B) -> Result<Program
         executable,
         inputs,
         output_shapes,
+        in_place,
     })
 }
 
@@ -645,6 +668,17 @@ mod metal_backend {
             bindings: &[&Self::Buffer],
             output_shapes: &[Vec<usize>],
         ) -> Result<Vec<Self::Buffer>, RunError> {
+            // Kernels for these roots store only the part they change, on the
+            // promise that the rest is already in the buffer they write. Only
+            // `capture` binds that buffer; a fresh allocation here would leave
+            // everything the kernel skipped unwritten.
+            if !schedule.agrees_in_place.is_empty() {
+                return Err(RunError::Backend(format!(
+                    "outputs {:?} are compiled to overwrite an input's buffer; run this \
+                     program through capture(), which binds the two as one",
+                    schedule.agrees_in_place
+                )));
+            }
             let mut buffers = HashMap::<String, MetalBuf>::new();
             for (input, buffer) in inputs.iter().zip(bindings) {
                 buffers.insert(input.lowered_name.to_string(), buffer.raw.clone());
@@ -718,6 +752,8 @@ mod metal_backend {
             let ordered = self.ordered_bindings(bindings)?;
             // (output buffer name, the fed input's lowered name)
             let mut swaps = Vec::new();
+            // the same pair, where the two names already denote one buffer
+            let mut aliases = Vec::new();
             let mut fed_outputs = HashSet::new();
             let mut fed_inputs = HashSet::new();
             for &(output, input_name) in feedback {
@@ -755,7 +791,13 @@ mod metal_backend {
                         "input `{input_name}` is fed more than once"
                     )));
                 }
-                swaps.push((output_name.clone(), input.lowered_name));
+                // A root compiled in place already writes its predecessor's
+                // buffer, so the pair is one buffer, not two that trade roles.
+                if self.in_place.iter().any(|&(root, _)| root == output) {
+                    aliases.push((output_name.clone(), input.lowered_name));
+                } else {
+                    swaps.push((output_name.clone(), input.lowered_name));
+                }
             }
 
             let device = &self.backend;
@@ -765,10 +807,17 @@ mod metal_backend {
                 base.insert(input.lowered_name.to_string(), buffer.raw.clone());
             }
             for (name, size) in &executable.program.buffers {
+                if aliases.iter().any(|(output_name, _)| output_name == name) {
+                    continue;
+                }
                 base.insert(name.clone(), alloc_scratch(device, &executable.program, name, *size));
             }
+            for (output_name, lowered_name) in &aliases {
+                let buffer = base[*lowered_name].clone();
+                base.insert(output_name.clone(), buffer);
+            }
 
-            let parities = if feedback.is_empty() { 1 } else { 2 };
+            let parities = if swaps.is_empty() { 1 } else { 2 };
             let mut graphs = Vec::with_capacity(parities);
             let mut dispatches = Vec::with_capacity(parities);
             let mut outputs = Vec::with_capacity(parities);

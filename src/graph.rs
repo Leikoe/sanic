@@ -81,6 +81,41 @@ impl Graph {
         self.outputs.push((name, value));
     }
 
+    /// The states whose successor may simply overwrite them, as `(root index,
+    /// state name)`.
+    ///
+    /// `where(c, x, s)` differs from `s` only where `c` is nonzero, so such a
+    /// successor is the old state with a part replaced: writing it into `s`'s
+    /// own buffer leaves precisely the points it does not store, which already
+    /// hold the right values. The one thing that can go wrong is somebody else
+    /// still wanting the old contents, and the count settles it — the whole
+    /// step reads `s`'s values exactly once, in the fallback arm this erases.
+    ///
+    /// The law is target-independent; only [`Graph::compile_for`] acts on it
+    /// today, and it exists only where there is a device to compile for.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn overwritable_states(&self, roots: &[crate::ir::NodeRef]) -> Vec<(usize, &'static str)> {
+        use crate::ir::{MapOp, Node};
+        self.states
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| {
+                let Some(successor) = &state.successor else {
+                    return false;
+                };
+                let Node::Map {
+                    op: MapOp::Where,
+                    inputs,
+                } = successor.node().as_ref()
+                else {
+                    return false;
+                };
+                std::sync::Arc::ptr_eq(&inputs[2], state.input.node()) && value_reads(roots, state.input.node()) == 1
+            })
+            .map(|(index, state)| (index, state.name))
+            .collect()
+    }
+
     /// Every root of the step, state successors first (producers before
     /// consumers, so a later root reaching a successor reuses its buffer).
     pub fn roots(&self) -> Vec<crate::ir::NodeRef> {
@@ -99,10 +134,41 @@ impl Graph {
     }
 }
 
+/// How many places across `roots` read `target`'s VALUES.
+///
+/// Every graph edge counts but one: a [`crate::ir::Node::Coordinate`]'s source.
+/// A coordinate is an index along one of its operand's dimensions, so it is a
+/// function of that operand's SHAPE and never of its contents — the operand is
+/// not loaded, and neither is anything beneath it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn value_reads(roots: &[crate::ir::NodeRef], target: &crate::ir::NodeRef) -> usize {
+    use crate::ir::{Node, NodeRef, children};
+    use std::sync::Arc;
+
+    fn walk(node: &NodeRef, target: &NodeRef, seen: &mut std::collections::HashSet<*const Node>, reads: &mut usize) {
+        if matches!(node.as_ref(), Node::Coordinate { .. }) || !seen.insert(Arc::as_ptr(node)) {
+            return;
+        }
+        for child in children(node) {
+            if Arc::ptr_eq(&child, target) {
+                *reads += 1;
+            }
+            walk(&child, target, seen, reads);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut reads = 0;
+    for root in roots {
+        walk(root, target, &mut seen, &mut reads);
+    }
+    reads
+}
+
 #[cfg(target_os = "macos")]
 mod metal_target {
     use super::*;
-    use crate::compile::{Compile, CompileError, MetalBuffer, MetalReplay, Program, RunError};
+    use crate::compile::{CompileError, MetalBuffer, MetalReplay, Program, RunError};
     use crate::metal::MetalDevice;
 
     /// A [`Graph`] compiled for one Metal device: the lowered program plus
@@ -133,7 +199,9 @@ mod metal_target {
                     )));
                 }
             }
-            let program = self.roots().compile(device)?;
+            let roots = self.roots();
+            let overwritable = self.overwritable_states(&roots);
+            let program = crate::compile::compile_roots_in_place(roots, overwritable, device)?;
             let feedback = self
                 .states
                 .iter()

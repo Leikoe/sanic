@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 
 use crate::codegen::{
-    Gen, LaneBody, Lang, buffers, carrier_expr, carrier_expr_map, grid_of, offset, san, thread_grid_decode,
-    thread_grid_decode_from, value,
+    Gen, LaneBody, Lang, buffers, carrier_expr, carrier_expr_map, grid_of, map_input_coord, offset, san,
+    thread_grid_decode, thread_grid_decode_from, value,
 };
 use crate::derive::{Carrier, Expr, SlotKind};
 use crate::ir::{self, Axis, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, input_dtypes, volume};
@@ -1063,6 +1063,19 @@ pub fn emit_fused_metal_sched_with(
 /// A straight-line (elementwise / gather / reduce) MSL kernel: one thread per
 /// output point, writing [`value`] of the spliced graph. No carrier.
 pub fn emit_pointwise_metal(name: &str, exec: &Node, storage: Dtype) -> MetalKernel {
+    emit_pointwise_metal_on(name, exec, storage, false)
+}
+
+/// [`emit_pointwise_metal`], told whether this kernel writes the very buffer
+/// its own `Where` falls back to.
+///
+/// `where(c, x, s)` equals `s` wherever `c` is zero, so when the output IS
+/// `s`'s buffer those points already hold the answer: the kernel stores only
+/// where `c` holds, and never reads `s` at all. The grid is unchanged — the
+/// threads that fail `c` simply retire — but the traffic collapses from the
+/// whole tensor to the part `c` selects. Whoever passes `true` here owns the
+/// proof that the buffers really are one (see [`Schedule::agrees_in_place`]).
+pub fn emit_pointwise_metal_on(name: &str, exec: &Node, storage: Dtype, agrees_in_place: bool) -> MetalKernel {
     let (grid, grid_size) = grid_of(exec);
     let bufs = buffers(exec);
     let dtypes: HashMap<&'static str, Dtype> = input_dtypes(exec).into_iter().collect();
@@ -1071,14 +1084,42 @@ pub fn emit_pointwise_metal(name: &str, exec: &Node, storage: Dtype) -> MetalKer
     g.dtypes = dtypes.clone();
     let mut body: Vec<String> = vec![format!("if (gid >= {grid_size}) return;")];
     let coord = thread_grid_decode(&METAL, &grid, &mut g, &mut body);
-    let mut vbody = Vec::new();
-    let v = value(&METAL, exec, &coord, &mut g, &mut vbody);
-    body.extend(vbody);
-    body.push(format!(
-        "outb[{}] = {};",
-        offset(&grid, &coord),
-        store_expr(storage, &v)
-    ));
+    // The fallback arm is only erasable when it is literally the destination.
+    let guarded = match exec.as_ref() {
+        NodeKind::Map {
+            op: MapOp::Where,
+            inputs,
+        } if agrees_in_place => Some((&inputs[0], &inputs[1])),
+        _ => None,
+    };
+    match guarded {
+        Some((condition, replacement)) => {
+            let mut cbody = Vec::new();
+            let condition_coord = map_input_coord(exec, condition, &coord, &g);
+            let c = value(&METAL, condition, &condition_coord, &mut g, &mut cbody);
+            body.extend(cbody);
+            body.push(format!("if (({c}) == 0.0f) return;"));
+            let mut vbody = Vec::new();
+            let replacement_coord = map_input_coord(exec, replacement, &coord, &g);
+            let v = value(&METAL, replacement, &replacement_coord, &mut g, &mut vbody);
+            body.extend(vbody);
+            body.push(format!(
+                "outb[{}] = {};",
+                offset(&grid, &coord),
+                store_expr(storage, &v)
+            ));
+        }
+        None => {
+            let mut vbody = Vec::new();
+            let v = value(&METAL, exec, &coord, &mut g, &mut vbody);
+            body.extend(vbody);
+            body.push(format!(
+                "outb[{}] = {};",
+                offset(&grid, &coord),
+                store_expr(storage, &v)
+            ));
+        }
+    }
 
     MetalKernel {
         msl: format!("{MSL_HEADER}{}", wrap(name, signature(&bufs, &dtypes, storage), body)),
@@ -1306,7 +1347,8 @@ pub fn emit_schedule_metal_tuned(
                     _ => "map",
                 };
                 let kname = kernel_name(kind, &exec.shape(), None);
-                let mut k = emit_pointwise_metal(&kname, exec, dev.storage);
+                let agrees_in_place = sched.agrees_in_place.iter().any(|name| name == output);
+                let mut k = emit_pointwise_metal_on(&kname, exec, dev.storage, agrees_in_place);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }

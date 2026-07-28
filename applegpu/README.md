@@ -23,3 +23,12 @@ Reproductions live in `tests/` at the repo root:
 - **Measured** — a number this repo produced, with the probe named.
 - **Read** — extracted from an Apple binary or plist.
 - **Inferred** — a conclusion from measurements, labelled as such.
+
+## Unmined — vendor documentation worth reading
+
+Listed so it is not forgotten, NOT cited. Nothing here has been read against
+this machine yet, so nothing from it belongs in the files above until a
+measurement stands beside it.
+
+- [Debugging with interactive command-line tools](https://developer.apple.com/documentation/xcode/debugging-with-interactive-command-line-tools)
+- [Investigating GPU issues with AI agents](https://developer.apple.com/documentation/xcode/investigating-gpu-issues-with-ai-agents)
