@@ -633,17 +633,23 @@ mod tests {
             intermediate_dim: 16,
         };
         let graph = build_decode(config, 3, Dtype::F32);
+        // The two caches are laid out DIFFERENTLY on purpose, and this pins it:
+        // each stores the axis its fold contracts innermost. K is contracted
+        // over head_dim, so it is [kv_heads, cache_sequence, head_dim]; V is
+        // contracted over cache_sequence, so it is [kv_heads, head_dim,
+        // cache_sequence]. Here that is [2, 3, 2] against [2, 2, 3].
+        let cache_shapes = [vec![2, 3, 2], vec![2, 2, 3], vec![1, 16]];
         assert_eq!(
             graph
                 .roots()
                 .iter()
                 .map(|root| root.shape().into_iter().map(Axis::extent).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
-            [vec![2, 3, 2], vec![2, 3, 2], vec![1, 16]]
+            cache_shapes
         );
 
         let program = graph.roots().compile(&CpuDevice::new()).unwrap();
-        assert_eq!(program.output_shapes(), &[vec![2, 3, 2], vec![2, 3, 2], vec![1, 16]]);
+        assert_eq!(program.output_shapes(), &cache_shapes);
         assert_eq!(program.input_names().len(), 15);
     }
 

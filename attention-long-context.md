@@ -277,8 +277,13 @@ Each of these has already cost real time in this repo; none are hypothetical.
   when re-measured, on the same machine and commit. Only matched pairs taken
   within one session mean anything; the tables above are shape, not ground truth.
 - **Check the f32 path.** It is the default and no test covers it; a change can
-  pass all 226 tests and still leave only `--bf16` working. Diff the text against
-  a baseline binary — do not just check that it runs and looks like English.
+  pass every test and still leave only `--bf16` working. Diff the text against a
+  baseline binary — do not just check that it runs and looks like English.
+- **`cargo test --release` is not what CI runs.** CI runs `cargo test
+  --all-targets`, which additionally builds the `#[cfg(test)]` modules inside
+  `examples/` — where the llama decode graph's shapes are pinned. A layout
+  change turns those assertions red while a full green `--release` run says
+  nothing, because it never compiles them.
 
 ## How to verify a fix
 
@@ -303,7 +308,13 @@ Each of these has already cost real time in this repo; none are hypothetical.
      evaluates the condition and retires. The grid criterion is NOT met: it
      should be O(1) in context, and is still 515 threadgroups at 1030.
    - C: scores-fold `bw=3%` rises.
-3. `cargo test --release` — 226 pass, 0 fail.
+3. **`cargo test --all-targets`** — what CI runs, and not the same thing as
+   `cargo test --release`. `--all-targets` builds the `#[cfg(test)]` modules
+   inside `examples/`, which plain `cargo test` never compiles. This cost a red
+   CI run: `llama3_2.rs` pins the cache root shapes, the V transpose changed one
+   of them, and a green `cargo test --release` said nothing about it because the
+   assertion was never built. Run both — release for speed on the GPU probes,
+   `--all-targets` before pushing.
 4. Both dtypes, text byte-identical.
    `./target/release/examples/llama3_2 "The capital of France is" -n 32 --bf16`
    should still print `…is Paris. It is the most populous city in France and
