@@ -24,11 +24,29 @@ Reproductions live in `tests/` at the repo root:
 - **Read** — extracted from an Apple binary or plist.
 - **Inferred** — a conclusion from measurements, labelled as such.
 
-## Unmined — vendor documentation worth reading
+## `metal/` — Apple's reference, on demand
 
-Listed so it is not forgotten, NOT cited. Nothing here has been read against
-this machine yet, so nothing from it belongs in the files above until a
-measurement stands beside it.
+[`metal/dl.py`](metal/dl.py) downloads Apple's Metal documentation into
+`metal/` as a tree of markdown, so the reference is greppable offline instead of
+a browser tab and a network round trip per lookup. About 3,800 pages in roughly
+a minute.
+
+```
+python3 applegpu/metal/dl.py
+```
+
+**The corpus is not checked in** — it is Apple's copyrighted documentation and
+not ours to redistribute, so `metal/.gitignore` keeps everything except the
+script. And it is documentation, not measurement: the rule above does not bend
+for it. Nothing fetched into `metal/` belongs in the five files listed above
+without a number measured on this machine beside it.
+
+## Mined — what came of the vendor docs
 
 - [Debugging with interactive command-line tools](https://developer.apple.com/documentation/xcode/debugging-with-interactive-command-line-tools)
-- [Investigating GPU issues with AI agents](https://developer.apple.com/documentation/xcode/investigating-gpu-issues-with-ai-agents)
+  and [Investigating GPU issues with AI agents](https://developer.apple.com/documentation/xcode/investigating-gpu-issues-with-ai-agents)
+  — both describe `gpudebug`, a text REPL over `.gputrace` files built for
+  scripted and agent-driven use. **It does not exist on this machine** at macOS
+  26.5.2 / Xcode 26.6; measured absence and what it would buy us are in
+  [`counters.md`](counters.md#gpudebug-documented-and-not-on-this-machine).
+  Revisit when a seed ships it — we already emit the traces.
