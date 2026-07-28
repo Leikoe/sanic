@@ -12,10 +12,15 @@ separately and verified separately.
 
 Self-contained; nothing below assumes context from the session that found it.
 
-**Status.** B is fixed (2026-07-28, `bc37a49`) — but it was worth 0.24 ms, not
-the 0.78 ms predicted here, and the miss is the most useful thing this document
-now records: see [What a fix is worth](#what-a-fix-is-worth) before trusting the
-numbers for A and C. A and C are untouched.
+**Status (2026-07-28).** **A and B are fixed**, both by layout rather than by
+the transforms proposed below, and both worth less than predicted — see
+[What a fix is worth](#what-a-fix-is-worth) before trusting the number for C.
+Measured warm at ctx 1030: **19.18 → 17.08 ms/tok**, of which B is 0.24 and A is
+1.84. C is untouched.
+
+The order mattered. Fixing B is what made A's fix free, and this document said A
+should not be fixed that way — see the transpose trap, which was correct when
+written and is now wrong.
 
 ## The measurement
 
@@ -72,7 +77,7 @@ contiguous in `head_dim`. One `(head, position)` row is 64 × 2 = **128 bytes,
 exactly one cache line**. Per layer, K is `8 × 1030 × 64 × 2` = 1.055 MB, and V
 the same; K+V across 16 layers is 33.75 MB.
 
-### A. The output fold reads V with a 128-byte stride — +4.7 ms
+### A. The output fold read V with a 128-byte stride — FIXED, worth 1.84 ms
 
 ```
 fold_query_heads32_singleton1_head_dim64_over_cache_sequence1030
@@ -93,6 +98,38 @@ reuse each line 64×. Measurement says they largely do not. Whether that is a
 residency/scheduling artefact or something else is **not established** — the
 stride is the structural cause, the reuse behaviour is worth confirming before
 choosing between the fixes below.
+
+**FIXED in `3e52313`, worth 1.84 ms — by layout, not by either fix proposed
+below.** The stride is not inherent to the fold; it is where V sits. K is
+contracted over `head_dim` by the scores fold and wants `head_dim` innermost;
+V is contracted over `cache_sequence` by the output fold and wants
+`cache_sequence` innermost. They are different tensors and may have different
+layouts. V is now stored `[kv_heads, head_dim, cache_sequence]`, and the load
+`V[kv*65920 + s*64 + d]` becomes `V[kv*65920 + d*1030 + s]` — contiguous in the
+folded axis, so a 32-lane load touches one line instead of 32.
+
+The transpose **fuses into the fold** — same 342 kernels, nothing materialized —
+because a view only changes the offsets codegen computes. The whole change is
+the model's cache declaration plus `update_cache` taking the sequence dimension
+instead of assuming dim 1.
+
+| | base | V transposed | Δ |
+|---|---|---|---|
+| output fold class, `SANIC_DEBUG=4`, ctx 1030 | 4454 µs | 801 µs | **5.6×** |
+| scores fold class (K untouched) | 1920 µs | 1891 µs | flat |
+| cache write, both tensors | 750 µs | 823 µs | +73 µs |
+| **production wall, ctx 1030** (ABBA×4, n=8) | **18.91** | **17.08** | **−1.84 ms** |
+
+Pooled sd 0.07, ranges disjoint (18.8–19.0 vs 17.0–17.2).
+
+**Why this was the only lever.** sanic does not generate tiled algorithms. The
+emitter is one thread per output point with the contracted axis folded in
+registers; `FoldSched` schedules the *reduction* (across simdgroups, across
+lanes, in chunks) and threadgroup memory is used only to merge partial
+reduction results — never to stage operands for reuse. `plan.rs` prices tiles,
+but no emitter reads a tile field. So there is no blocking transform to reach
+for: with no tiling and thread count effectively pinned by the 0.61× trap
+below, the only thing left to change is where the data sits.
 
 ### B. The whole cache was rewritten every step — FIXED, worth 0.24 ms
 
@@ -173,24 +210,25 @@ load-to-use). 1030 threadgroups × 128 B is not enough to fill that.
 The original estimates scaled the `SANIC_DEBUG=4` deltas to production by
 ×0.735:
 
-| fix | predicted at 1024 | measured |
-|---|---|---|
-| A | ~3.45 ms | — |
-| C | ~1.41 ms | — |
-| B | ~0.78 ms | **0.24 ms** |
+| fix | predicted at 1024 | measured | debug Δ → wall Δ |
+|---|---|---|---|
+| A | ~3.45 ms | **1.84 ms** | −3653 µs → −1.84 ms (×0.50) |
+| B | ~0.78 ms | **0.24 ms** | −772 µs → −0.24 ms (×0.31) |
+| C | ~1.41 ms | — | — |
 
-**The one prediction that has been tested was 3× high.** B's debug-regime delta
-was −772 µs, which ×0.735 predicts −0.57 ms; the wall clock moved −0.24. The
-observed debug→production ratio is ~0.31, not 0.735.
+**Both tested predictions were high, by 1.9× and 3.2×.** The debug→production
+ratio is not the ×0.735 assumed here; it came out ×0.50 for A and ×0.31 for B,
+so it is not even a constant — it depends on how well the class overlaps other
+work.
 
 Why: in production every kernel shares one concurrent encoder, so these
 dispatches overlap other work. Deleting their traffic does not delete their
 time. `SANIC_DEBUG=4` gives each kernel its own encoder, which is exactly what
 makes a per-kernel delta look like a step delta when it is not.
 
-So **treat A's 3.45 ms and C's 1.41 ms as upper bounds**, and expect something
-nearer ×0.31 — A around 1.5 ms, C around 0.6 ms. That is still an order of
-magnitude more than what is left in B, and A is still the whole ballgame.
+So **treat C's 1.41 ms as an upper bound** and expect ~0.4–0.7 ms. With A and B
+done, C plus B's remaining grid is all that is left of the three, and together
+they are worth about 1 ms against the 2.08 already collected.
 
 The roofline argument is unchanged and is the real target: attention's working
 set is 33.75 MB, which is 0.19 ms of streaming. Nothing about the *ceiling*
@@ -200,16 +238,24 @@ moved — only the estimate of how much of it each fix collects.
 
 Each of these has already cost real time in this repo; none are hypothetical.
 
-- **Do not fix A by giving threadgroups more rows.** The obvious "one
-  threadgroup handles several `d`, amortise the loads" transform reduces thread
-  count, and `applegpu/msl.md` records that exact shape measuring **0.61×** on a
-  matvec — 8× fewer threads is 8× fewer loads in flight. The fix has to make
-  loads contiguous *while keeping the thread count*: stage a V tile in
-  threadgroup memory with contiguous `head_dim` loads and fold across `s` in
-  registers, flash-style.
-- **Transposing the cache to `[kv_heads, head_dim, cache_sequence]` moves the
-  problem, it does not solve it.** That makes A's fold contiguous and makes B's
-  write strided. Decide with a measurement, not on paper.
+- **Do not fix a strided fold by giving threadgroups more rows.** The obvious
+  "one threadgroup handles several `d`, amortise the loads" transform reduces
+  thread count, and `applegpu/msl.md` records that exact shape measuring
+  **0.61×** on a matvec — 8× fewer threads is 8× fewer loads in flight. Still
+  true, and it is why A was fixed by layout: with thread count pinned and no
+  tiling in the compiler, *where the data sits* is the only lever left. (This
+  entry used to propose staging a V tile in threadgroup memory, flash-style.
+  That would have meant building a tiling capability sanic does not have — see
+  "Why this was the only lever" under A.)
+- ~~**Transposing the cache moves the problem, it does not solve it.**~~
+  **This trap was true when written and is now wrong — and how it stopped being
+  true is the lesson.** It said transposing makes A's fold contiguous but B's
+  write strided. That was a fair trade only while the write mapped the whole
+  extent. Once B was fixed the write became 512 threads, and V's scatter over 64
+  lines costs 391 µs against K's contiguous 432 — no penalty at all. **Fixing B
+  is what made A's fix free.** Transpose K and V independently; each wants the
+  axis its own fold contracts stored innermost. The trap's real advice — "decide
+  with a measurement, not on paper" — is what caught this.
 - **Measurement regimes do not transfer.** `SANIC_DEBUG=4` understates
   production by ~27% here. A standalone attention probe over one small cache
   measures the SLC, not DRAM. Trust wall-clock A/B on the real example. Now
@@ -231,24 +277,44 @@ Each of these has already cost real time in this repo; none are hypothetical.
   when re-measured, on the same machine and commit. Only matched pairs taken
   within one session mean anything; the tables above are shape, not ground truth.
 - **Check the f32 path.** It is the default and no test covers it; a change can
-  pass all 226 tests and still leave only `--bf16` working. Diff the text against
-  a baseline binary — do not just check that it runs and looks like English.
+  pass every test and still leave only `--bf16` working. Diff the text against a
+  baseline binary — do not just check that it runs and looks like English.
+- **`cargo test --release` is not what CI runs.** CI runs `cargo test
+  --all-targets`, which additionally builds the `#[cfg(test)]` modules inside
+  `examples/` — where the llama decode graph's shapes are pinned. A layout
+  change turns those assertions red while a full green `--release` run says
+  nothing, because it never compiles them.
 
 ## How to verify a fix
 
 1. **The acceptance test is flatness.** sanic's ms/tok at 1024 within a few
-   percent of its ms/tok at 32. Today: 22.65 vs 16.45. A fix that improves the
-   1024 number but leaves the *slope* intact has not solved this. Measured after
-   B, in one warm session: 15.28 → 19.18 base, 15.30 → 18.94 in place. The slope
-   went from +3.90 ms to +3.64. Still a slope; A and C own the rest of it.
+   percent of its ms/tok at 32. A fix that improves the 1024 number but leaves
+   the *slope* intact has not solved this. Slope over 32 → 1024, from matched
+   ABBA sets in one warm session:
+
+   | | ctx 38 | ctx 1030 | slope |
+   |---|---|---|---|
+   | before | 15.28 | 19.18 | +3.90 |
+   | B fixed | 15.20 | 18.91 | +3.71 |
+   | **A + B fixed** | **15.20** | **17.08** | **+1.88** |
+
+   Halved, and neither fix costs anything at short context. Still a slope: C and
+   B's remaining grid own the rest.
 2. Per-defect, from `SANIC_DEBUG=4` at `-n 1024` — use these to confirm the
    *mechanism* changed, then go to the wall clock for what it is worth:
-   - A: output-fold `bw=1%` rises; per-layer time falls from ~310 µs.
+   - A: ~~output-fold `bw=1%` rises~~ **done** — the fold reads V contiguously
+     in the folded axis; class 4454 → 801 µs.
    - B: ~~the cache-write kernel stops reading the cache~~ **done** — it now
      evaluates the condition and retires. The grid criterion is NOT met: it
      should be O(1) in context, and is still 515 threadgroups at 1030.
    - C: scores-fold `bw=3%` rises.
-3. `cargo test --release` — 226 pass, 0 fail.
+3. **`cargo test --all-targets`** — what CI runs, and not the same thing as
+   `cargo test --release`. `--all-targets` builds the `#[cfg(test)]` modules
+   inside `examples/`, which plain `cargo test` never compiles. This cost a red
+   CI run: `llama3_2.rs` pins the cache root shapes, the V transpose changed one
+   of them, and a green `cargo test --release` said nothing about it because the
+   assertion was never built. Run both — release for speed on the GPU probes,
+   `--all-targets` before pushing.
 4. Both dtypes, text byte-identical.
    `./target/release/examples/llama3_2 "The capital of France is" -n 32 --bf16`
    should still print `…is Paris. It is the most populous city in France and

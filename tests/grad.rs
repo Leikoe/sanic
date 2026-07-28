@@ -523,8 +523,8 @@ fn backward_schedule_census() {
     let k = rope(&k, &position, seq, hd, rope_inv_freq(10_000.0));
     let v = project(&attn_in, &w("wv", axis("kv_proj", 32), hidden), kv_heads);
     let cache_shape = [kv_heads, ctx, hd];
-    let kc = update_cache(&Tensor::input("ck", cache_shape, Dtype::F32), &k, &position);
-    let vc = update_cache(&Tensor::input("cv", cache_shape, Dtype::F32), &v, &position);
+    let kc = update_cache(&Tensor::input("ck", cache_shape, Dtype::F32), &k, &position, 1usize);
+    let vc = update_cache(&Tensor::input("cv", cache_shape, Dtype::F32), &v, &position, 1usize);
     let mask = Tensor::iota(ctx).lt(&position + 1.0).select(0.0, f64::NEG_INFINITY);
     let attended = attention(&q, &kc, &vc, Some(&mask), None, true)
         .transpose(0usize, 1usize)

@@ -410,7 +410,16 @@ fn weight_env(graph: &DecodeGraph, context_length: usize, config: Config) -> Env
         let value = if name == "position" || name == "tokens" || name.starts_with("cache.") {
             Value::from_shape_fn(&shape, |_| 0.0)
         } else {
-            let mut rng = Lcg(0xC0FFEE ^ name.bytes().fold(0u64, |h, b| h * 31 + b as u64));
+            // Wrapping on purpose: this is a name hash, and every weight name
+            // here is long enough to overflow u64 well before the last byte —
+            // which panics in debug and silently wraps in release, so the plain
+            // `*` made `cargo test --all-targets` fail on any machine that has
+            // a real Metal device. CI never saw it: its macOS runners have no
+            // GPU, so this test returns before reaching the seed.
+            let seed = name
+                .bytes()
+                .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+            let mut rng = Lcg(0xC0FFEE ^ seed);
             let _ = rng.f();
             Value::from_shape_fn(&shape, |_| rng.f() * 0.25)
         };
