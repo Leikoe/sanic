@@ -22,6 +22,12 @@ The order mattered. Fixing B is what made A's fix free, and this document said A
 should not be fixed that way — see the transpose trap, which was correct when
 written and is now wrong.
 
+**The gap at 1024 is now 4.9%, down from 14.6% — and none of what is left is on
+the GPU.** sanic's GPU replay is 17.0 ms against mlx-lm's 18.39 ms of wall
+clock; the deficit is 2.6 ms of host overhead. See
+[the re-measurement](#re-measured-after-a-and-b-2026-07-28-one-warm-session).
+That, not C, is where the next millisecond is.
+
 ## The measurement
 
 sanic vs mlx-lm, both bf16 Llama-3.2-1B, batch 1, prefill excluded, greedy.
@@ -42,6 +48,53 @@ Run-to-run spread within a pair is 1–3% (worst, sanic at 512: 5.8%), so the
 The shape is the finding, not the endpoint. Going 32 → 1024 **mlx-lm loses
 2.51 ms/tok; sanic loses 6.20** — sanic degrades ~2.5× faster. Of sanic's 6.20,
 4.8 is GPU replay and the remaining ~1.4 is host-side overhead outside replay.
+
+### Re-measured after A and B (2026-07-28, one warm session)
+
+| generated tokens | sanic | mlx-lm | |
+|---|---|---|---|
+| 32 | **15.78** | 16.49 | sanic ahead 4.3% |
+| 128 | **16.80** | 17.48 | sanic ahead 3.9% |
+| 512 | **18.39** | 18.42 | tie |
+| 1024 | 19.29 | **18.39** | mlx ahead 4.9% |
+
+1024 is n=8 per engine; the others are one ABBA block each. **The gap at 1024
+went from 14.6% to 4.9%, and the crossover moved from between 32–128 out to
+between 512–1024.** Slope 32 → 1024: sanic 3.43, mlx 1.90 — sanic still
+degrades faster, but 1.8× rather than 2.5×.
+
+Both columns moved, so do not read these against the table above: that one
+predates the warm-up discipline (see Traps). Only the within-session comparison
+means anything.
+
+### The remaining gap is not on the GPU
+
+sanic's GPU replay at 1024 is **17.0 ms, on every one of the eight runs.** That
+is 1.4 ms *faster than mlx-lm's entire wall time*. Everything sanic is behind by
+is host-side. Measured, one instrumented run at ctx 1030:
+
+| per token | ms |
+|---|---|
+| GPU replay | 17.0 |
+| **`step()` wall − GPU** | **1.908** |
+| CPU argmax over 128,256 logits | 0.569 |
+| read + widen the logits buffer | 0.040 |
+| everything else (tokenizer, buffer writes) | 0.062 |
+
+That sums to the wall clock, so nothing is hiding. **Host overhead is now the
+largest single item left — 2.6 ms/tok, against ~0.4–0.7 for defect C and ≤0.4
+for B's grid.** Two things to look at, in order:
+
+- **The 1.9 ms around the replay.** The host commits the frozen graph and blocks
+  until it completes. 342 dispatches × the 4.2 µs per-dispatch cost in
+  `applegpu/bandwidth.md` is 1.44 ms, which is close enough to be worth
+  testing first — if it is per-dispatch, fewer kernels is the lever, not a
+  faster host loop.
+- **The 0.569 ms argmax.** It runs on the CPU over the full vocabulary; mlx does
+  `mx.argmax` on the GPU. This is a fold sanic can express.
+
+Fix both and sanic is ~17 ms against mlx's 18.4 at 1024 — ahead at every length
+measured, which the GPU work already earns today.
 
 Reproduce:
 
