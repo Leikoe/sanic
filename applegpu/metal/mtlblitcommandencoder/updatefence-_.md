@@ -1,0 +1,45 @@
+# updateFence(_:)
+
+*Instance Method · iOS 10.0, iPadOS 10.0, Mac Catalyst 13.1, macOS 10.13, tvOS 10.0, visionOS 1.0*
+
+<https://developer.apple.com/documentation/metal/mtlblitcommandencoder/updatefence(_:)>
+
+Encodes a command that instructs the GPU to update a fence after the blit pass completes.
+
+## Declaration
+
+```swift
+func updateFence(_ fence: any MTLFence)
+```
+
+## Parameters
+
+- **fence** — A fence the pass updates after it completes.
+
+## Discussion
+
+You can synchronize memory operations of a blit pass that access resources with an [MTLFence](https://developer.apple.com/documentation/metal/mtlfence). This method instructs the pass to update `fence` after it runs all its memory store operations to the resources it accesses. The fence indicates when other passes can access those resources without a race condition.
+
+For more information about synchronization with fences, see:
+
+- [Resource synchronization](https://developer.apple.com/documentation/metal/resource-synchronization)
+
+- [Synchronizing passes with a fence](https://developer.apple.com/documentation/metal/synchronizing-passes-with-a-fence)
+
+### Reuse a fence by waiting first and updating second
+
+When encoding a blit pass that reuses a fence, wait for other passes to update the fence before repurposing that fence to notify subsequent passes with an update:
+
+1. Call the [waitForFence(_:)](https://developer.apple.com/documentation/metal/mtlblitcommandencoder/waitforfence(_:)) method before encoding commands that need to wait for other passes.
+
+2. Call the [updateFence(_:)](https://developer.apple.com/documentation/metal/mtlblitcommandencoder/updatefence(_:)) method after encoding commands that later passes depend on.
+
+The GPU driver evaluates the fences that apply to the pass and the commands that depend on those fences when your app commits the enclosing [MTLCommandBuffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer).
+
+> **Warning:**
+>  Don’t update a fence and then wait for the same fence within a pass because it can create a GPU deadlock.
+
+## See also
+
+### Preventing resource access conflicts
+- [waitForFence(_:)](https://developer.apple.com/documentation/metal/mtlblitcommandencoder/waitforfence(_:)) — Encodes a command that instructs the GPU to pause the blit pass until another pass updates a fence.

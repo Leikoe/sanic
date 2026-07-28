@@ -1,0 +1,20 @@
+# MTLTessellationPartitionMode.pow2
+
+*Case · iOS 10.0, iPadOS 10.0, Mac Catalyst 13.1, macOS 10.12, tvOS 10.0, visionOS 1.0*
+
+<https://developer.apple.com/documentation/metal/mtltessellationpartitionmode/pow2>
+
+A power of two partitioning mode.
+
+## Declaration
+
+```swift
+case pow2
+```
+
+## See also
+
+### Partition modes
+- [MTLTessellationPartitionMode.integer](https://developer.apple.com/documentation/metal/mtltessellationpartitionmode/integer) — An integer partitioning mode.
+- [MTLTessellationPartitionMode.fractionalOdd](https://developer.apple.com/documentation/metal/mtltessellationpartitionmode/fractionalodd) — A fractional odd partitioning mode.
+- [MTLTessellationPartitionMode.fractionalEven](https://developer.apple.com/documentation/metal/mtltessellationpartitionmode/fractionaleven) — A fractional even partitioning mode.

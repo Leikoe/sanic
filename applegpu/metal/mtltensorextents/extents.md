@@ -1,0 +1,13 @@
+# extents
+
+*Instance Property · iOS 26.0, iPadOS 26.0, Mac Catalyst 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0*
+
+<https://developer.apple.com/documentation/metal/mtltensorextents/extents>
+
+Retrieves the extents for this object.
+
+## Declaration
+
+```swift
+var extents: [Int] { get }
+```

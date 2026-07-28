@@ -1,0 +1,22 @@
+# MTLPixelFormat.gbgr422
+
+*Case · iOS 8.0, iPadOS 8.0, Mac Catalyst 13.1, macOS 10.11, tvOS, visionOS 1.0*
+
+<https://developer.apple.com/documentation/metal/mtlpixelformat/gbgr422>
+
+A pixel format where the red and green components are subsampled horizontally.
+
+## Declaration
+
+```swift
+case gbgr422
+```
+
+## Discussion
+
+Two pixels are stored in 32 bits, with shared red and blue values, and unique green values. The component arrangement is the same as it is in YUY2, YUYV, yuvs, and kYUVS pixel formats, except there is no implicit format conversion from a YUV to RGB color space. Only 2D non-mipmapped textures can be created with this pixel format, and the width needs to be a multiple of 2. Neither [MTLTextureType.type2DArray](https://developer.apple.com/documentation/metal/mtltexturetype/type2darray) nor [MTLTextureType.typeCube](https://developer.apple.com/documentation/metal/mtltexturetype/typecube) textures are supported. This format is a compressed format with a block size of 2x1 in a 32-bit block. During sampling, the address mode needs to be set to [MTLSamplerAddressMode.clampToEdge](https://developer.apple.com/documentation/metal/mtlsampleraddressmode/clamptoedge).
+
+## See also
+
+### YUV pixel formats
+- [MTLPixelFormat.bgrg422](https://developer.apple.com/documentation/metal/mtlpixelformat/bgrg422) — A pixel format where the red and green components are subsampled horizontally.

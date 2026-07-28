@@ -1,0 +1,19 @@
+# MTLIOPriority.normal
+
+*Case · iOS 16.0, iPadOS 16.0, Mac Catalyst 16.0, macOS 13.0, tvOS 16.0, visionOS 1.0*
+
+<https://developer.apple.com/documentation/metal/mtliopriority/normal>
+
+Designates the normal priority for a new input/output command queue.
+
+## Declaration
+
+```swift
+case normal
+```
+
+## See also
+
+### I/O command queue priorities
+- [MTLIOPriority.low](https://developer.apple.com/documentation/metal/mtliopriority/low) — Designates the low priority for a new input/output command queue.
+- [MTLIOPriority.high](https://developer.apple.com/documentation/metal/mtliopriority/high) — Sets a new input/output command queue’s priority to a high priority.

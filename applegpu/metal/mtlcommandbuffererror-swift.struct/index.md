@@ -1,0 +1,46 @@
+# MTLCommandBufferError
+
+*Structure · iOS 8.0, iPadOS 8.0, Mac Catalyst 13.1, macOS 10.11, tvOS, visionOS 1.0*
+
+<https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct>
+
+The command buffer error codes that indicate why the GPU doesn’t finish executing a command buffer.
+
+## Declaration
+
+```swift
+struct MTLCommandBufferError
+```
+
+## Topics
+
+### Errors codes
+- [none](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/none) — An error code that represents the absence of any problems.
+- [timeout](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/timeout) — An error code that indicates the system interrupted and terminated the command buffer before it finished running.
+- [pageFault](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/pagefault) — An error code that indicates the command buffer generated a page fault the GPU can’t service.
+- [notPermitted](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/notpermitted) — An error code that indicates a process doesn’t have access to a GPU device.
+- [outOfMemory](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/outofmemory) — An error code that indicates the GPU device doesn’t have sufficient memory to execute a command buffer.
+- [invalidResource](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/invalidresource) — An error code that indicates the command buffer has an invalid reference to resource.
+- [memoryless](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/memoryless) — An error code that indicates the GPU ran out of one or more of its internal resources that support memoryless render pass attachments.
+- [deviceRemoved](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/deviceremoved) — An error code that indicates a person physically removed the GPU device before the command buffer finished running.
+- [stackOverflow](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/stackoverflow) — An error code that indicates the GPU terminated the command buffer because a kernel function of tile shader used too many stack frames.
+- [accessRevoked](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/accessrevoked) — An error code that indicates the system has revoked the Metal device’s access because it’s responsible for too many timeouts or hangs.
+- [internal](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/internal) — An error code that indicates the Metal framework has an internal problem.
+- [MTLCommandBufferError.Code](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/code) — Error codes that indicate why a GPU is unable to finish running a command buffer.
+
+### Error domain
+- [errorDomain](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/errordomain) — The current command buffer error domain.
+- [MTLCommandBufferErrorDomain](https://developer.apple.com/documentation/metal/mtlcommandbuffererrordomain) — The domain for Metal command buffer errors.
+
+### Deprecated
+- [blacklisted](https://developer.apple.com/documentation/metal/mtlcommandbuffererror-swift.struct/blacklisted) — A former error code that indicates the system has revoked the Metal device’s access because it’s responsible for too many timeouts or hangs.
+
+## See also
+
+### Submitting work to a GPU with Metal
+- [Setting up a command structure](https://developer.apple.com/documentation/metal/setting-up-a-command-structure) — Discover how Metal executes commands on a GPU.
+- [MTLCommandQueue](https://developer.apple.com/documentation/metal/mtlcommandqueue) — An instance you use to create, submit, and schedule command buffers to a specific GPU device to run the commands within those buffers.
+- [MTLCommandQueueDescriptor](https://developer.apple.com/documentation/metal/mtlcommandqueuedescriptor) — A configuration that customizes the behavior for a new command queue.
+- [MTLCommandBuffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer) — A container that stores a sequence of GPU commands that you encode into it.
+- [MTLCommandBufferDescriptor](https://developer.apple.com/documentation/metal/mtlcommandbufferdescriptor) — A configuration that customizes the behavior for a new command buffer.
+- [MTLCommandEncoder](https://developer.apple.com/documentation/metal/mtlcommandencoder) — An encoder that writes GPU commands into a command buffer.

@@ -1,0 +1,53 @@
+# Assessing multi-GPU and multidisplay setups on an Intel-based Mac
+
+*Article*
+
+<https://developer.apple.com/documentation/metal/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac>
+
+Learn the possible GPU and display configurations for a Mac and their limitations.
+
+## Overview
+
+An Intel-based Mac can have multiple GPUs, and each GPU may connect to zero, one, or multiple displays. Prepare your app for various combinations of GPUs and display configurations by testing as many as possible, starting with the more common ones described below.
+
+![image](https://docs-assets.developer.apple.com/published/c776350aeeab804a826997bf07e005f0/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-1%402x.png)
+
+In general, each GPU in the system has its advantages and tradeoffs, depending on your app’s needs. It’s important your app chooses an appropriate GPU for each task, especially when it involves presenting the results on a specific display or transferring data between GPUs. For more information about choosing GPUs and transferring data between them, see [Finding multiple GPUs on an Intel-based Mac](https://developer.apple.com/documentation/metal/finding-multiple-gpus-on-an-intel-based-mac) and [Adjusting for GPU memory bandwidth tradeoffs](https://developer.apple.com/documentation/metal/adjusting-for-gpu-memory-bandwidth-tradeoffs).
+
+> **Tip:**
+>  As an alternative to implementing a policy that selects a GPU and a display for a task, your app can suggest configurations to a person and let them decide.
+
+### Consider various GPU and display configurations
+
+For a Mac with one built-in GPU — either integrated or discrete — that GPU always drives the built-in display.
+
+![image](https://docs-assets.developer.apple.com/published/04f3eca6fb75e41ae37bdcf5defac6f7/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-2%402x.png)
+
+For a Mac with two built-in GPUs — both an integrated GPU and a discrete GPU — either GPU can drive the built-in display.
+
+![image](https://docs-assets.developer.apple.com/published/b022119842cf3a4a9bc64718e4ac3a20/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-3%402x.png)
+
+A Mac can also directly connect to and drive one or more external displays. For a Mac that has a single, built-in GPU (either integrated or discrete), that GPU drives every display that’s directly connected.
+
+However, for a Mac with two built-in GPUs (both integrated and discrete), only the discrete GPU can drive the external displays. The discrete GPU also drives the built-in display when the Mac is driving one or more external displays. On that same Mac, the integrated GPU can drive only the built-in display, and only when the Mac isn’t driving any external displays.
+
+![image](https://docs-assets.developer.apple.com/published/efa16b8c347bd7c8298f23522e39838e/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-4%402x.png)
+
+Your app can use external GPUs for compute or rendering tasks, but an external GPU can’t drive the built-in display.
+
+![image](https://docs-assets.developer.apple.com/published/48d37a14fcf9ce28e62e71ea938d9805/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-5%402x.png)
+
+For a display that’s connected to an external GPU, only that GPU can drive the display. A built-in GPU can’t drive a display that’s connected to an external GPU.
+
+![image](https://docs-assets.developer.apple.com/published/b22a3f95645c4220377c91079b7fb6c5/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-6%402x.png)
+
+A person can configure a Mac with a combination of the scenarios above. For example, someone may connect multiple external GPUs and external displays that directly connect to the Mac and indirectly through an external GPU.
+
+![image](https://docs-assets.developer.apple.com/published/b505af846a78d0167e779ce702fb7d61/assessing-multi-gpu-and-multi-display-setups-on-an-intel-based-mac-7%402x.png)
+
+## See also
+
+### Selecting GPUs
+- [Adjusting for GPU memory bandwidth tradeoffs](https://developer.apple.com/documentation/metal/adjusting-for-gpu-memory-bandwidth-tradeoffs) — Choose a suitable GPU and memory storage mode for tasks based on that GPU’s memory bandwidth on a Mac.
+- [Selecting device objects for graphics rendering](https://developer.apple.com/documentation/metal/selecting-device-objects-for-graphics-rendering) — Switch dynamically between multiple GPUs to efficiently render to a display.
+- [Selecting device objects for compute processing](https://developer.apple.com/documentation/metal/selecting-device-objects-for-compute-processing) — Switch dynamically between multiple GPUs to efficiently execute a compute-intensive simulation.

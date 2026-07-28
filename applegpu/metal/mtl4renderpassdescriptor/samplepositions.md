@@ -1,0 +1,17 @@
+# samplePositions
+
+*Instance Property · iOS 26.0, iPadOS 26.0, Mac Catalyst 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0*
+
+<https://developer.apple.com/documentation/metal/mtl4renderpassdescriptor/samplepositions>
+
+Configures the custom sample positions to use in MSAA rendering.
+
+## Declaration
+
+```swift
+var samplePositions: [MTLSamplePosition] { get set }
+```
+
+## Discussion
+
+Set to an empty array to disable custom sample positions.

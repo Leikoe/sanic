@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 API = "https://developer.apple.com/tutorials/data/documentation/{}.json"
 UA = "sanic-applegpu-docs (github.com/Leikoe/sanic)"
@@ -282,7 +283,8 @@ def main():
     parser.add_argument("--out", required=True, help="output directory")
     parser.add_argument("--max-pages", type=int, default=100000)
     parser.add_argument("--max-depth", type=int, default=64)
-    parser.add_argument("--delay", type=float, default=0.15, help="seconds between requests")
+    parser.add_argument("--delay", type=float, default=0.05, help="seconds a worker waits between requests")
+    parser.add_argument("--jobs", type=int, default=8, help="concurrent fetches")
     parser.add_argument("--refresh", action="store_true", help="rewrite pages already on disk")
     args = parser.parse_args()
 
@@ -292,45 +294,53 @@ def main():
     seen = {root}
     written = skipped = missing = 0
 
-    while queue and written + skipped < args.max_pages:
-        path, depth = queue.popleft()
-        segments = [slug(s) for s in path.split("/")]
-        # a page with children owns a directory; decided after fetching, so
-        # write to <dir>/index.md and let a childless page be <name>.md
-        doc = None
-        target_file = os.path.join(args.out, *segments) + ".md"
-        target_dir = os.path.join(args.out, *segments, "index.md")
-
-        if not args.refresh and (os.path.exists(target_file) or os.path.exists(target_dir)):
-            skipped += 1
-            # still need children to continue the walk
+    def load(item):
+        """Fetch one page. Round-trip latency dominates, so these overlap."""
+        path, depth = item
+        try:
             doc = fetch(path)
-            time.sleep(args.delay)
-        else:
-            doc = fetch(path)
-            time.sleep(args.delay)
-            if doc is None:
-                missing += 1
-                continue
-            kids = children_of(doc)
-            target = target_dir if kids else target_file
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with open(target, "w") as handle:
-                handle.write(render(doc, path))
-            written += 1
-            if written % 25 == 0:
-                print(f"  {written} written, {len(queue)} queued", file=sys.stderr, flush=True)
+        except Exception as error:
+            print(f"  ! {path}: {error}", file=sys.stderr, flush=True)
+            doc = None
+        time.sleep(args.delay)
+        return path, depth, doc
 
-        if doc is None:
-            missing += 1
-            continue
-        if depth >= args.max_depth:
-            continue
-        for child in children_of(doc):
-            if child in seen or not child.startswith(prefix + "/"):
-                continue
-            seen.add(child)
-            queue.append((child, depth + 1))
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        while queue and written + skipped < args.max_pages:
+            batch = [queue.popleft() for _ in range(min(args.jobs * 4, len(queue)))]
+            for path, depth, doc in pool.map(load, batch):
+                if doc is None:
+                    missing += 1
+                    continue
+
+                segments = [slug(s) for s in path.split("/")]
+                kids = children_of(doc)
+                # a page with children owns a directory holding index.md;
+                # a leaf is just <name>.md
+                target = (
+                    os.path.join(args.out, *segments, "index.md") if kids else os.path.join(args.out, *segments) + ".md"
+                )
+                if os.path.exists(target) and not args.refresh:
+                    skipped += 1
+                else:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "w") as handle:
+                        handle.write(render(doc, path))
+                    written += 1
+                    if written % 250 == 0:
+                        print(
+                            f"  {written} written, {skipped} skipped, {len(queue)} queued",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+
+                if depth >= args.max_depth:
+                    continue
+                for child in kids:
+                    if child in seen or not child.startswith(prefix + "/"):
+                        continue
+                    seen.add(child)
+                    queue.append((child, depth + 1))
 
     print(f"written={written} skipped={skipped} missing={missing} queued={len(queue)}", file=sys.stderr)
 

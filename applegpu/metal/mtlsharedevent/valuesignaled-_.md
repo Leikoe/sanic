@@ -1,0 +1,12 @@
+# valueSignaled(_:)
+
+*Instance Method · iOS 13.0, iPadOS 13.0, Mac Catalyst 13.0, macOS 10.15, tvOS 13.0, visionOS*
+
+<https://developer.apple.com/documentation/metal/mtlsharedevent/valuesignaled(_:)>
+
+## Declaration
+
+```swift
+@backDeployed(before: macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0)
+func valueSignaled(_ value: UInt64) async
+```

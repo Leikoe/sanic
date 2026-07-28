@@ -1,0 +1,30 @@
+# setVertexTextures(_:range:)
+
+*Instance Method · iOS 8.0, iPadOS 8.0, Mac Catalyst 8.0, macOS 10.11, tvOS 8.0, visionOS*
+
+<https://developer.apple.com/documentation/metal/mtlrendercommandencoder/setvertextextures(_:range:)>
+
+Assigns multiple textures to a range of entries in the vertex shader argument table.
+
+## Declaration
+
+```swift
+func setVertexTextures(_ textures: [(any MTLTexture)?], range: Range<Int>)
+```
+
+## Parameters
+
+- **textures** — An array of [MTLTexture](https://developer.apple.com/documentation/metal/mtltexture) instances the command assigns to entries in the vertex shader argument table for textures.
+- **range** — A span of integers that represent the entries in the vertex shader argument table for textures. Each entry stores a record of the corresponding element in `textures`.
+
+## Discussion
+
+By default, the texture at each index is `nil`.
+
+> **Note:**
+>  The Objective-C version of this method is [setVertexTextures:withRange:](https://developer.apple.com/documentation/metal/mtlrendercommandencoder/setvertextextures:withrange:).
+
+## See also
+
+### Assigning textures
+- [setVertexTexture(_:index:)](https://developer.apple.com/documentation/metal/mtlrendercommandencoder/setvertextexture(_:index:)) — Assigns a texture to an entry in the vertex shader argument table.

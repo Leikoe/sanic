@@ -1,0 +1,13 @@
+# preloadedLibraries
+
+*Instance Property · iOS 26.0, iPadOS 26.0, Mac Catalyst 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0*
+
+<https://developer.apple.com/documentation/metal/mtl4pipelinestagedynamiclinkingdescriptor/preloadedlibraries>
+
+Provides an array of dynamic libraries the compiler loads when it builds the pipeline.
+
+## Declaration
+
+```swift
+var preloadedLibraries: [any MTLDynamicLibrary] { get set }
+```

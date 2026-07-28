@@ -1,0 +1,17 @@
+# shaderValidation
+
+*Instance Property · iOS 18.0, iPadOS 18.0, Mac Catalyst 18.0, macOS 15.0, tvOS 18.0, visionOS 2.0*
+
+<https://developer.apple.com/documentation/metal/mtltilerenderpipelinedescriptor/shadervalidation>
+
+A value that enables or disables shader validation for the pipeline.
+
+## Declaration
+
+```swift
+var shaderValidation: MTLShaderValidation { get set }
+```
+
+## Discussion
+
+You can override the value using either of these environment variables: `MTL_SHADER_VALIDATION_ENABLE_PIPELINES` or `MTL_SHADER_VALIDATION_DISABLE_PIPELINES.`
