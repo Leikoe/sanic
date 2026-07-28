@@ -604,6 +604,41 @@ bubbles no prior mode could see. Four work items fall out, in value order:
    launch floor dominates the measurement; number step footers so the
    cold first step (clock ramp + weight page-in) is identifiable.
 
+6.5 **PROP 4.1 PRICED ITS RECOMPUTE ON THE WRONG SUBTREE — FIXED
+   2026-07-27, no schedule change.** `subtree_read_bytes` walked `input_axes`
+   over the RAW node, so it summed every input reachable beneath it: for
+   anything deep in a transformer that is every prior layer's weight.
+
+   > before: `out_vol=8192 vol=2048 bytes=2249406472 recompute=90996us rt=0.164us`
+   > after:  `out_vol=8192 vol=2048 bytes=8192       recompute=0.328us rt=0.164us`
+
+   2.2 GB and 91 ms of "recompute" for a cone of 2048 elements. `rebuild_cost`
+   now walks down to what a consumer would actually rebuild and stops where the
+   value will be a buffer read — at a producer already in `done`, and at any
+   fold-bearing node, since `leaf_cuts` cuts those unconditionally and pricing
+   happens on the way DOWN, before anything below has been emitted (`done`
+   cannot know it yet). k/v go 117 MB → 12 KB, lm_head 16.8 MB → 8 KB.
+
+   **The verdicts do not change, and llama's schedule is identical**: 278
+   kernels, same text, 225 tests, bf16 and f32 unchanged. What changes is that
+   the model now decides for reasons that survive inspection — recomputing a
+   2048-element cone 256 times prices at 84 µs against 44 µs to materialize,
+   which is a real comparison, where before every cone lost to a number no cone
+   could beat.
+
+   **Correction to the claim that motivated this.** I reported `inline_pays`
+   answering false 93 times out of 93 and concluded it was "ranking nothing".
+   That count came from instrumentation filtered to `volume >= 2048` — the full
+   distribution is 93 false and 128 true, and the small cones were being inlined
+   all along. The pricing was wrong in magnitude, not degenerate.
+
+   Consequence for the q-norm idea: with sane numbers the model says
+   MATERIALIZE for that cone, so "q should fuse its norm like k/v" is not
+   supported by it. k/v fuse algebraically in `derive` (defer-div), never
+   consulting the price. The open question is narrower and better posed: the
+   model prices a re-read of a 4 KB activation at DRAM rates when it is
+   cache-resident, and it has no cache term at all.
+
 7. **THE ROOFLINE, PER CLASS — and why item 4's "kernels are essentially
    optimal" is the wrong reading (2026-07-25).** The goal here is the
    ROOFLINE: 100% of bandwidth on the traffic we actually do. Not the
