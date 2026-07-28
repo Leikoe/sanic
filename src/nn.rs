@@ -159,7 +159,7 @@ pub use functional::scaled_dot_product_attention;
 /// mechanisms.
 pub mod ops {
     use crate::Tensor;
-    use crate::ir::{Axis, axis};
+    use crate::ir::{Axis, Dimension, axis};
 
     /// RMS normalization: `x·weight / sqrt(mean(x², last) + eps)`.
     pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
@@ -198,11 +198,15 @@ pub mod ops {
         move |frequency: Axis| (Tensor::iota(frequency) * (-theta.ln() / frequency.extent() as f64)).exp()
     }
 
-    /// A functional cache write: the whole cache tensor with the row at
-    /// `position` (along dimension 1) replaced by `current`. Pure — the
-    /// runtime decides whether the write lands in place.
-    pub fn update_cache(cache: &Tensor, current: &Tensor, position: &Tensor) -> Tensor {
-        let index = cache.coordinate(1usize);
+    /// A functional cache write: the whole cache tensor with the slice at
+    /// `position` along `sequence` replaced by `current`. Pure — the runtime
+    /// decides whether the write lands in place.
+    ///
+    /// `sequence` is a dimension rather than a convention because which
+    /// dimension a cache counts positions along is a LAYOUT choice, and layout
+    /// is what decides whether the folds that read this cache stride or not.
+    pub fn update_cache(cache: &Tensor, current: &Tensor, position: &Tensor, sequence: impl Dimension) -> Tensor {
+        let index = cache.coordinate(sequence);
         let at_position = index.lt(position + 1.0) * position.lt(&index + 1.0);
         at_position.select(current, cache)
     }

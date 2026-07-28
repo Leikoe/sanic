@@ -142,17 +142,25 @@ fn decode_block(
         .split(-1isize, axes.kv_heads, axes.head_dim)
         .transpose(0usize, 1usize);
 
-    let cache_shape = [axes.kv_heads, cache_sequence, axes.head_dim];
-    let key_state = graph.state(format!("cache.{layer}.key"), cache_shape, cache_dtype);
-    let key_cache = update_cache(&key_state, &k, position);
+    // Each cache is stored with the axis its fold CONTRACTS innermost, so both
+    // folds walk memory contiguously. K is contracted over head_dim by the
+    // scores fold; V is contracted over cache_sequence by the output fold, so
+    // V is stored transposed. The cost is that V's row write scatters over
+    // head_dim — 64 lines instead of one — which is 64 values per layer and
+    // nothing next to what the fold saves.
+    let key_shape = [axes.kv_heads, cache_sequence, axes.head_dim];
+    let key_state = graph.state(format!("cache.{layer}.key"), key_shape, cache_dtype);
+    let key_cache = update_cache(&key_state, &k, position, 1usize);
     graph.update(&key_state, key_cache.clone());
-    let value_state = graph.state(format!("cache.{layer}.value"), cache_shape, cache_dtype);
-    let value_cache = update_cache(&value_state, &v, position);
+    let value_shape = [axes.kv_heads, axes.head_dim, cache_sequence];
+    let value_state = graph.state(format!("cache.{layer}.value"), value_shape, cache_dtype);
+    let value_cache = update_cache(&value_state, &v.transpose(1usize, 2usize), position, 2usize);
     graph.update(&value_state, value_cache.clone());
 
     let visible = Tensor::iota(cache_sequence).lt(position + 1.0);
     let mask = visible.select(0.0, f64::NEG_INFINITY);
-    let attended = attention(&q, &key_cache, &value_cache, Some(&mask), None, true)
+    let value_rows = value_cache.transpose(1usize, 2usize);
+    let attended = attention(&q, &key_cache, &value_rows, Some(&mask), None, true)
         .transpose(0usize, 1usize)
         .flatten(&[1usize, 2usize][..], axes.hidden);
     let attended = projection(&attended, name("self_attn.o_proj.weight"), axes.hidden, axes.hidden);
