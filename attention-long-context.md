@@ -94,7 +94,26 @@ for B's grid.** Two things to look at, in order:
   for step N+1 while step N runs. Neither is done today; `run_graph_timed`
   encodes, commits and blocks, in that order.
 - ~~**The 0.569 ms argmax.**~~ **Done** (`04eb8a9`) — sampling runs on the GPU.
-  Not measured end to end; the machine was in outside contention that day.
+
+**Both measured, together, once the machine was inside its window**: a balanced
+ABBA at ctx 1030 against the pre-sampling build, whose two baseline runs agreed
+to 0.17 ms — so the sweep sat in the plateau rather than the drift.
+
+| | ms/tok |
+|---|---|
+| before GPU sampling and pipelined encoding | **19.27** |
+| after both | **18.32** |
+| | **−0.95** |
+
+Predicted 1.30 (0.569 argmax + 0.73 encode); collected 0.95, about 73% — the two
+savings partially overlap, which is the same pattern as every other estimate in
+this document coming in high. The baseline agrees with the 19.29 measured for
+the mlx-lm comparison, so these are the same regime and directly comparable:
+**sanic 18.32 against mlx-lm's 18.39 at 1024 — level, from 14.6% behind.**
+
+A second cycle corroborated the direction (18.06 against 19.63/19.56) but its
+last run jumped to 23.77, which is throttle onset, and is discarded under the
+rule two bullets down: an upward-drifting run is heat, not signal.
 
 ### Why argmax does not fuse into the lm_head, and why that is not a one-line fix
 
