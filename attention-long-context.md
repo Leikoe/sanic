@@ -85,13 +85,58 @@ That sums to the wall clock, so nothing is hiding. **Host overhead is now the
 largest single item left — 2.6 ms/tok, against ~0.4–0.7 for defect C and ≤0.4
 for B's grid.** Two things to look at, in order:
 
-- **The 1.9 ms around the replay.** The host commits the frozen graph and blocks
-  until it completes. 342 dispatches × the 4.2 µs per-dispatch cost in
-  `applegpu/bandwidth.md` is 1.44 ms, which is close enough to be worth
-  testing first — if it is per-dispatch, fewer kernels is the lever, not a
-  faster host loop.
-- **The 0.569 ms argmax.** It runs on the CPU over the full vocabulary; mlx does
-  `mx.argmax` on the GPU. This is a fold sanic can express.
+- **The 1.9 ms around the replay**, now split by measurement: **0.73 ms** is the
+  CPU encoding 342 dispatches (2.1 µs each), and **~1.0 ms** is commit → GPU
+  start → completion notification. The encode is pure waste: the dispatch list
+  and its bindings are IDENTICAL every step — the token and position travel
+  through buffer *contents*, not the command stream — so nothing about the
+  encoding depends on what the model produced. It can be built once, or built
+  for step N+1 while step N runs. Neither is done today; `run_graph_timed`
+  encodes, commits and blocks, in that order.
+- ~~**The 0.569 ms argmax.**~~ **Done** (`04eb8a9`) — sampling runs on the GPU.
+  Not measured end to end; the machine was in outside contention that day.
+
+### Why argmax does not fuse into the lm_head, and why that is not a one-line fix
+
+Worth writing down, because the obvious fix is a trap. `argmax` reads the logits
+twice — `ΣMax/vocab`, then `ΣMin/vocab` over `where(x < max, +∞, coord)` — so the
+vocabulary is materialized between two folds. Nothing DECLINED over `vocab`; the
+folds simply never couple.
+
+They never couple because coupling is discovered in exactly one place, and it is
+narrower than it looks. It is not keyed on `exp` — it is keyed on SUBTRACTION:
+
+```rust
+(Bin::Sub, S::Pe { .. }, S::Coll(Expr::F(i)))
+    if matches!(ctx.slots[i].kind, SlotKind::Plain(Monoid::Max)) => S::PeOff { .. }
+```
+
+`x − max` is the online-softmax shift, and `exp` is its only consumer;
+everything else declines. Argmax couples through a COMPARISON (`x < max`), so
+the rule cannot see it.
+
+**Do not "fix" this by matching `Where(Lt(x, max), +∞, coord)` reduced by `Min`.**
+That is a pattern match on argmax's spelling — an operation-specific rule of
+exactly the kind this repo refuses, one layer below where they are usually
+caught.
+
+What is defensible is a FAMILY: one algebraic identity per scalar primitive that
+can ride a running max, each stating how a partial accumulation repairs itself
+when the max advances.
+
+| consumer of a max-coupled value | repair when the max advances |
+|---|---|
+| `exp` | multiply by `exp(m_old − m_new)` — exp's homomorphism |
+| `lt` | discard the accumulated index and take the new one |
+
+That is a second instance of the same principle, not a generalisation of it, and
+it should be argued for on those terms rather than smuggled in. Note also that
+`(max, index)` needs LESS machinery than softmax: it is already an associative
+pair monoid — larger value wins, smaller index breaks ties — with no repair step
+at all. Softmax's pair merge contains `exp` only because its formula does.
+
+Fully general fusion of dependent reductions would mean synthesizing the repair
+operator, which is a different and much larger problem than adding a rule.
 
 Fix both and sanic is ~17 ms against mlx's 18.4 at 1024 — ahead at every length
 measured, which the GPU work already earns today.
