@@ -105,6 +105,15 @@ pub struct Schedule {
     /// [`Schedule::execute`] returns the last; a stateful runtime
     /// ([`crate::runtime`]) reads them all.
     pub outputs: Vec<String>,
+    /// Every materialized buffer whose value is EXACT (an integer system) —
+    /// the boundaries a narrow storage width could corrupt, an argmax index
+    /// under bf16 being the founding case. Facts, not verdicts: whether one
+    /// is actually unstorable depends on the width it lands at, which a
+    /// caller may pin per output ([`Schedule::output_dtypes`]) after
+    /// partition returns. [`Schedule::unstorable`] applies the law at the
+    /// effective widths, and [`crate::compile`] turns a non-empty answer
+    /// into a compile error naming each buffer.
+    pub exact_boundaries: Vec<(String, crate::numeric::Inferred)>,
     /// The decline census: every MONOIDAL-classified axis the deriver could
     /// not compose at the node the partitioner stood on, in emission order.
     /// [`Schedule::decline_census`] buckets it.
@@ -150,6 +159,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         dev,
         stages: Vec::new(),
         declines: Vec::new(),
+        exact_boundaries: Vec::new(),
         fresh: 0,
         done: HashMap::new(),
         keepalive: Vec::new(),
@@ -160,6 +170,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
     let mut outputs = Vec::new();
     for (r, name) in roots {
         let landed = p.emit(r, name);
+        p.note_boundary(landed, r);
         // a later root (or leaf) reaching this one reuses the buffer
         p.done.insert(Arc::as_ptr(r), landed);
         outputs.push(landed.to_string());
@@ -184,6 +195,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         declines: std::mem::take(&mut p.declines),
         output_dtypes: vec![None; roots.len()],
         agrees_in_place: Vec::new(),
+        exact_boundaries: std::mem::take(&mut p.exact_boundaries),
         _keepalive: keepalive,
     };
     // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like
@@ -376,6 +388,10 @@ struct Partitioner<'a> {
     /// compose there. The census (CRITIQUE.md §2.2) — the declines this
     /// WORKLOAD actually hit, not the syllabus's.
     declines: Vec<Decline>,
+    /// Exact-valued boundaries (see [`Schedule::exact_boundaries`]), noted
+    /// as each buffer is minted — the one point where the producing node is
+    /// in hand, unspliced, with full `Iota`/`Coordinate`/`Const` provenance.
+    exact_boundaries: Vec<(String, crate::numeric::Inferred)>,
     fresh: usize,
     /// Nodes already materialized, by pointer → the name they live under.
     /// A DAG-shared producer (a residual, say) is cut once, not per consumer.
@@ -481,6 +497,23 @@ impl Partitioner<'_> {
         let name = format!("t{}", self.fresh);
         self.fresh += 1;
         Box::leak(name.into_boxed_str())
+    }
+
+    /// The analysis, at the only correct moment: as a buffer is minted,
+    /// while the producing node is in hand unspliced. An exact (integer)
+    /// claim is recorded as a fact; the LAW applies later, per width, in
+    /// [`Schedule::unstorable`] — because an output's width is not final
+    /// here (a caller may pin it after partition returns), and a fact
+    /// recorded against the wrong width would miss a narrow pin. Real
+    /// (approximate) values are not recorded: every writable float carries
+    /// them, so they can never fail the law. Nothing is widened: no dtype
+    /// changes, so there is no producer/consumer agreement to maintain —
+    /// decline, don't guess.
+    fn note_boundary(&mut self, name: &str, node: &Node) {
+        let claim = crate::numeric::infer_root(node);
+        if claim.system.is_exact() {
+            self.exact_boundaries.push((name.to_string(), claim));
+        }
     }
 
     /// Emit the stages that produce `node` under the name `out`.
@@ -607,6 +640,7 @@ impl Partitioner<'_> {
         // A view aliases its source, so the name things actually landed
         // under is emit's return value, not necessarily `t`.
         let name = self.emit(node, t);
+        self.note_boundary(name, node);
         self.done.insert(Arc::as_ptr(node), name);
         self.keepalive.push(node.clone());
         name
@@ -989,7 +1023,7 @@ impl Partitioner<'_> {
                 continue;
             }
             match current.as_ref() {
-                NodeKind::Input { dtype, .. } => bytes += volume * dtype.bytes(),
+                NodeKind::Input { dtype, .. } => bytes += volume * dtype.bytes_per_element(),
                 NodeKind::Const { .. } => {}
                 _ => {
                     ops += volume;
@@ -1467,6 +1501,7 @@ impl Partitioner<'_> {
             }
             // The producer didn't land as a fused kernel — keep the map stage,
             // reading the producers' materialized buffers.
+            self.note_boundary(landed, &producer);
             self.done.insert(Arc::as_ptr(&producer), landed);
             self.keepalive.push(producer.clone());
             let exec = self.executable(node);
@@ -1987,6 +2022,35 @@ fn replace_many(node: &Node, subs: &[(Node, Node)], memo: &mut HashMap<*const No
     };
     memo.insert(key, rebuilt.clone());
     rebuilt
+}
+
+impl Schedule {
+    /// The law, applied at each boundary's EFFECTIVE width: a pinned output
+    /// ([`Schedule::output_dtypes`]) is judged against its pin — the caller
+    /// chose, and `output_at(F32)` on an argmax is precisely the lawful
+    /// choice — everything else against `default`, the target's boundary
+    /// policy. Returns every buffer whose width cannot faithfully carry its
+    /// value, with the width that fails it. Empty means the program is
+    /// storable as configured.
+    pub fn unstorable(
+        &self,
+        default: crate::ir::Dtype,
+    ) -> Vec<(String, crate::numeric::Inferred, crate::ir::Dtype)> {
+        let effective = |name: &str| -> crate::ir::Dtype {
+            self.outputs
+                .iter()
+                .position(|output| output == name)
+                .and_then(|index| self.output_dtypes.get(index).copied().flatten())
+                .unwrap_or(default)
+        };
+        self.exact_boundaries
+            .iter()
+            .filter_map(|(name, claim)| {
+                let width = effective(name);
+                (!crate::numeric::may_store(*claim, width)).then(|| (name.clone(), *claim, width))
+            })
+            .collect()
+    }
 }
 
 // ── rendering ────────────────────────────────────────────────────────────────

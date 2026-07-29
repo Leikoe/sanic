@@ -287,3 +287,87 @@ fn a_float_input_is_a_real() {
         NumberSystem::Real
     );
 }
+
+// ── the refusal: M11's second half, on the compiled program ─────────────────
+//
+// The done-condition asserts on the SCHEDULE, not on a computed value —
+// CI's macOS runners have no GPU, and the defect is a property of the
+// compilation either way.
+
+#[test]
+fn an_argmax_boundary_under_bf16_storage_is_refused_by_name() {
+    use sanic::cost::DeviceProfile;
+    use sanic::partition::partition;
+
+    let vocab = axis("vocab", 128_256);
+    let scores = input("X", [vocab], Dtype::F32);
+    let index = argmax(scores, 0usize);
+
+    let schedule = partition(&index, &DeviceProfile::toy());
+    assert!(
+        !schedule.exact_boundaries.is_empty(),
+        "an argmax output is an exact boundary — a recorded fact, whatever the width"
+    );
+
+    let refused = schedule.unstorable(Dtype::BF16);
+    assert!(!refused.is_empty(), "an index over 128,256 tokens must not be stored bf16");
+    let (name, claim, width) = &refused[0];
+    assert!(schedule.outputs.contains(name), "the refusal names the buffer");
+    assert!(claim.system.is_exact());
+    assert_eq!(*width, Dtype::BF16, "and the width that fails it");
+
+    // The same schedule at f32 is storable: f32 holds the index exactly,
+    // and ±∞ (the Min fold's identity) besides.
+    assert!(schedule.unstorable(Dtype::F32).is_empty());
+}
+
+#[test]
+fn a_pinned_output_is_judged_against_its_pin() {
+    use sanic::cost::DeviceProfile;
+    use sanic::partition::partition;
+
+    // The reconciliation with `output_at` (#21): the caller pinning an
+    // argmax output to f32 is the LAWFUL choice, and the refusal must
+    // respect it even under a bf16 boundary policy — pins are the Caller
+    // row of the who-chooses table, the policy is only the default.
+    let vocab = axis("vocab", 128_256);
+    let scores = input("X", [vocab], Dtype::F32);
+    let index = argmax(scores, 0usize);
+
+    let mut schedule = partition(&index, &DeviceProfile::toy());
+    schedule.output_dtypes = vec![Some(Dtype::F32)];
+    assert!(
+        schedule.unstorable(Dtype::BF16).is_empty(),
+        "a pin wider than the policy satisfies the law"
+    );
+
+    // And the law still catches a pin that is itself too narrow.
+    schedule.output_dtypes = vec![Some(Dtype::F16)];
+    assert!(
+        !schedule.unstorable(Dtype::F32).is_empty(),
+        "an unlawful pin is caught even under a lawful default"
+    );
+}
+
+#[test]
+fn real_valued_boundaries_are_untouched_by_the_refusal() {
+    use sanic::cost::DeviceProfile;
+    use sanic::partition::partition;
+
+    // llama's shape: logits are reals, and the 16% lives on bf16 staying
+    // permitted for them. Reals are not even recorded as exact boundaries —
+    // every writable float carries them, so they can never fail the law.
+    let vocab = axis("vocab", 128_256);
+    let hidden = axis("hidden", 64);
+    let x = input("X", [hidden], Dtype::F32);
+    let w = input("W", [vocab, hidden], Dtype::BF16);
+    let logits = reduce(
+        map(MapOp::Mul, vec![unsqueeze(x, 0usize), w]),
+        1usize,
+        Monoid::Add,
+    );
+
+    let schedule = partition(&logits, &DeviceProfile::toy());
+    assert!(schedule.exact_boundaries.is_empty());
+    assert!(schedule.unstorable(Dtype::BF16).is_empty());
+}

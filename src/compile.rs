@@ -390,6 +390,9 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .iter()
         .map(|&(root, _)| schedule.outputs[root].clone())
         .collect();
+    // After the pins land: a pinned output is checked against ITS width,
+    // everything else against the boundary policy.
+    refuse_unstorable(&schedule, backend.profile().storage)?;
     let executable = backend.prepare(&schedule, &output_shapes)?;
 
     Ok(Program {
@@ -400,6 +403,41 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         output_shapes,
         in_place,
     })
+}
+
+/// The refusal half of the numeric law: a schedule whose boundary storage
+/// cannot faithfully carry some buffer's values does not compile. Nothing is
+/// widened — no dtype changes anywhere, so there is no producer/consumer
+/// width to keep in agreement — the program is refused with the buffers
+/// named, which turns the silent index corruption of `--bf16` argmax into a
+/// loud, actionable error.
+fn refuse_unstorable(schedule: &Schedule, storage: Dtype) -> Result<(), CompileError> {
+    let offending = schedule.unstorable(storage);
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let listed = offending
+        .iter()
+        .map(|(name, claim, width)| {
+            let bounds = match (claim.bounds.lo, claim.bounds.hi) {
+                (Some(lo), Some(hi)) => format!("[{lo}, {hi}]"),
+                _ => "unbounded".to_string(),
+            };
+            let infinite = if claim.bounds.is_finite() { "" } else { " ∪ {±∞}" };
+            format!(
+                "`{name}` holds {:?} values in {bounds}{infinite}, stored {width:?} \
+                 (exact only to {})",
+                claim.system,
+                width.exact_integers_to()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CompileError::Backend(format!(
+        "storage cannot faithfully carry: {listed}. Pin these outputs wider \
+         (`output_at` — f32 holds indices to 2^24 and ±∞ besides) or widen \
+         the boundary policy"
+    )))
 }
 
 fn leak(value: String) -> &'static str {
