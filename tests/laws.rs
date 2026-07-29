@@ -1159,3 +1159,27 @@ fn coupled_carrier_composes_through_free_axis_repeat() {
         assert_eq!(carrier.kinds.len(), 2, "{label}: the (max, Σexp) tuple");
     }
 }
+
+// ── ones_like survives masked (−∞-carrying) inputs ──────────────────────────
+//
+// The arithmetic spelling `x·0 + 1` returned NaN wherever a mask had fired:
+// `−∞ · 0 = NaN`, and attention builds −∞-carrying tensors by design
+// (`visible.select(0.0, NEG_INFINITY)`). ones_like must be 1 there — a count
+// slot that NaNs on the masked lane poisons the whole fold.
+#[test]
+fn ones_like_is_one_even_where_a_mask_fired() {
+    use sanic::interp::{Env, Value, eval};
+
+    let n = axis("n", 4);
+    let masked = Value::from_shape_fn(&[4], |coordinate| {
+        [1.5, f64::NEG_INFINITY, f64::INFINITY, f64::NAN][coordinate[0]]
+    });
+    let env: Env = [("X", masked)].into_iter().collect();
+
+    let ones = ones_like(input("X", [n], Dtype::F32));
+    assert_eq!(eval(&ones, &env).data, vec![1.0; 4]);
+
+    // The count-slot use: Σ ones_like over a masked lane is the extent.
+    let count = reduce(ones_like(input("X", [n], Dtype::F32)), 0usize, add_r());
+    assert_eq!(eval(&count, &env).data, vec![4.0]);
+}

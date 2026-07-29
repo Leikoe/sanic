@@ -630,8 +630,14 @@ pub fn konst(v: f64) -> NodeRef {
 
 /// A tensor of ones with the same positional shape as `source`, expressed
 /// from scalar maps so it preserves the source dimension occurrences.
+///
+/// `source` sits on the never-taken branch of a `Where`, contributing shape
+/// and nothing else. The arithmetic spelling `source·0 + 1` is NOT
+/// equivalent: `−∞ · 0 = NaN`, and masked tensors carry `−∞` by design
+/// (attention builds them with `select(0, −∞)`), so it returned NaN
+/// exactly where a mask had fired.
 pub fn ones_like(source: NodeRef) -> NodeRef {
-    map(MapOp::Add, vec![map(MapOp::Mul, vec![source, konst(0.0)]), konst(1.0)])
+    map(MapOp::Where, vec![konst(1.0), konst(1.0), source])
 }
 
 pub fn iota(axis: Axis) -> NodeRef {

@@ -152,6 +152,13 @@ fn ecos(a: Expr) -> Expr {
     Expr::Cos(Box::new(a))
 }
 fn ewhere(c: Expr, a: Expr, b: Expr) -> Expr {
+    // A constant condition selects its branch outright. Sound for every
+    // value on the dropped branch — selection discards it, ±∞ and NaN
+    // included — unlike the `0·x` peephole below, which is why `ones_like`
+    // rides a constant-condition Where rather than `x·0 + 1`.
+    if let Expr::Const(condition) = c {
+        return if condition != 0.0 { a } else { b };
+    }
     Expr::Where(Box::new(c), Box::new(a), Box::new(b))
 }
 
