@@ -75,10 +75,7 @@ fn variant_order_is_the_inclusion_law() {
     assert!(NumberSystem::Bool < NumberSystem::Natural);
     assert!(NumberSystem::Natural < NumberSystem::Integer);
     assert!(NumberSystem::Integer < NumberSystem::Real);
-    assert_eq!(
-        NumberSystem::Bool.join(NumberSystem::Integer),
-        NumberSystem::Integer
-    );
+    assert_eq!(NumberSystem::Bool.join(NumberSystem::Integer), NumberSystem::Integer);
     assert!(NumberSystem::Integer.is_exact());
     assert!(!NumberSystem::Real.is_exact());
 }
@@ -166,7 +163,11 @@ fn the_argmax_sentinel_does_not_destroy_exactness() {
         "the sentinel must not drag the index into the reals"
     );
     assert_eq!(claim.bounds.lo, Some(0));
-    assert_eq!(claim.bounds.hi, Some(128_255), "the sentinel must not erase the upper bound");
+    assert_eq!(
+        claim.bounds.hi,
+        Some(128_255),
+        "the sentinel must not erase the upper bound"
+    );
 }
 
 #[test]
@@ -184,10 +185,7 @@ fn argmax_is_an_index_that_bf16_cannot_hold() {
         !may_store(claim, Dtype::BF16),
         "bf16 holds integers only to 256; this is the defect"
     );
-    assert!(
-        !may_store(claim, Dtype::F16),
-        "f16 holds integers only to 2048"
-    );
+    assert!(!may_store(claim, Dtype::F16), "f16 holds integers only to 2048");
     assert!(
         may_store(claim, Dtype::F32),
         "f32 holds this index exactly, and ±∞ besides"
@@ -282,10 +280,7 @@ fn sub_byte_sizes_round_up_rather_than_truncate() {
 #[test]
 fn a_float_input_is_a_real() {
     let n = axis("n", 4);
-    assert_eq!(
-        infer_root(&input("W", [n], Dtype::BF16)).system,
-        NumberSystem::Real
-    );
+    assert_eq!(infer_root(&input("W", [n], Dtype::BF16)).system, NumberSystem::Real);
 }
 
 // ── the refusal: M11's second half, on the compiled program ─────────────────
@@ -295,7 +290,7 @@ fn a_float_input_is_a_real() {
 // compilation either way.
 
 #[test]
-fn an_argmax_boundary_under_bf16_storage_is_refused_by_name() {
+fn the_law_mints_the_width_the_policy_cannot_supply() {
     use sanic::cost::DeviceProfile;
     use sanic::partition::partition;
 
@@ -303,22 +298,46 @@ fn an_argmax_boundary_under_bf16_storage_is_refused_by_name() {
     let scores = input("X", [vocab], Dtype::F32);
     let index = argmax(scores, 0usize);
 
-    let schedule = partition(&index, &DeviceProfile::toy());
-    assert!(
-        !schedule.exact_boundaries.is_empty(),
-        "an argmax output is an exact boundary — a recorded fact, whatever the width"
-    );
+    // Partitioned FOR a bf16 boundary policy: the argmax output is an exact
+    // boundary the policy cannot carry, so the law mints f32 for that one
+    // buffer — no refusal, no manual pin, and every other buffer keeps the
+    // policy. This is the milestone: the defect that opened the arc is now
+    // closed by construction rather than refused.
+    let narrow = DeviceProfile::toy().with_storage(Dtype::BF16);
+    let schedule = partition(&index, &narrow);
 
+    assert!(!schedule.exact_boundaries.is_empty(), "the fact is recorded");
+    assert!(schedule.unstorable(Dtype::BF16).is_empty(), "minted, not refused");
+    let out = schedule.outputs[0].clone();
+    assert_eq!(schedule.minted_dtypes.get(&out).copied(), Some(Dtype::F32));
+    assert_eq!(schedule.width_of(&out, Dtype::BF16), Dtype::F32);
+
+    // A pin outranks the mint — the caller is the Caller row — but only a
+    // LAWFUL pin: width_of resolves pin first, and unstorable() judges it.
+    let mut pinned = schedule;
+    pinned.output_dtypes = vec![Some(Dtype::F16)];
+    assert_eq!(pinned.width_of(&out, Dtype::BF16), Dtype::F16);
+    assert!(!pinned.unstorable(Dtype::BF16).is_empty(), "128255 does not fit f16");
+}
+
+#[test]
+fn an_unmintable_exact_boundary_is_still_refused() {
+    use sanic::cost::DeviceProfile;
+    use sanic::partition::partition;
+
+    // A product fold over coordinates saturates its bounds — no writable
+    // dtype can promise to carry it, so the law has nothing to mint and the
+    // program is refused rather than guessed at. "Decline, don't guess"
+    // survives minting.
+    let n = axis("n", 64);
+    let product = reduce(iota(n), 0usize, Monoid::Mul);
+
+    let schedule = partition(&product, &DeviceProfile::toy().with_storage(Dtype::BF16));
+    assert!(!schedule.exact_boundaries.is_empty());
+    assert!(schedule.minted_dtypes.is_empty(), "nothing lawful to mint");
     let refused = schedule.unstorable(Dtype::BF16);
-    assert!(!refused.is_empty(), "an index over 128,256 tokens must not be stored bf16");
-    let (name, claim, width) = &refused[0];
-    assert!(schedule.outputs.contains(name), "the refusal names the buffer");
-    assert!(claim.system.is_exact());
-    assert_eq!(*width, Dtype::BF16, "and the width that fails it");
-
-    // The same schedule at f32 is storable: f32 holds the index exactly,
-    // and ±∞ (the Min fold's identity) besides.
-    assert!(schedule.unstorable(Dtype::F32).is_empty());
+    assert!(!refused.is_empty(), "an unboundable exact value has no lawful width");
+    assert!(schedule.outputs.contains(&refused[0].0));
 }
 
 #[test]
@@ -361,11 +380,7 @@ fn real_valued_boundaries_are_untouched_by_the_refusal() {
     let hidden = axis("hidden", 64);
     let x = input("X", [hidden], Dtype::F32);
     let w = input("W", [vocab, hidden], Dtype::BF16);
-    let logits = reduce(
-        map(MapOp::Mul, vec![unsqueeze(x, 0usize), w]),
-        1usize,
-        Monoid::Add,
-    );
+    let logits = reduce(map(MapOp::Mul, vec![unsqueeze(x, 0usize), w]), 1usize, Monoid::Add);
 
     let schedule = partition(&logits, &DeviceProfile::toy());
     assert!(schedule.exact_boundaries.is_empty());

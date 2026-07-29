@@ -114,7 +114,16 @@ const EXPRESSION_LAYER: &[&str] = &[
 /// The deciding half: everything parameterised by a device or owning an
 /// execution order.
 const PROGRAM_LAYER: &[&str] = &[
-    "cost", "plan", "partition", "codegen", "emit_metal", "rustgen", "metal", "compile", "graph", "runtime",
+    "cost",
+    "plan",
+    "partition",
+    "codegen",
+    "emit_metal",
+    "rustgen",
+    "metal",
+    "compile",
+    "graph",
+    "runtime",
 ];
 
 #[test]
@@ -143,12 +152,39 @@ fn the_expression_layer_never_reaches_the_program_layer() {
 #[test]
 fn no_core_rule_names_a_frontend_operation() {
     const CORE: &[&str] = &[
-        "scalar", "interp", "analyze", "derive", "simplify", "grad", "numeric", "verify", "cost", "plan",
-        "partition", "codegen", "emit_metal", "rustgen", "metal", "compile", "graph", "runtime",
+        "scalar",
+        "interp",
+        "analyze",
+        "derive",
+        "simplify",
+        "grad",
+        "numeric",
+        "verify",
+        "cost",
+        "plan",
+        "partition",
+        "codegen",
+        "emit_metal",
+        "rustgen",
+        "metal",
+        "compile",
+        "graph",
+        "runtime",
     ];
     const FRONTEND_OPERATIONS: &[&str] = &[
-        "argmax", "topk", "one_hot", "softmax", "attention", "rope", "rms_norm", "silu", "flash", "gelu",
-        "embedding", "causal", "cumsum",
+        "argmax",
+        "topk",
+        "one_hot",
+        "softmax",
+        "attention",
+        "rope",
+        "rms_norm",
+        "silu",
+        "flash",
+        "gelu",
+        "embedding",
+        "causal",
+        "cumsum",
     ];
     for file in CORE {
         let code = code_of(file);
@@ -183,9 +219,10 @@ fn the_structural_debt_ledger_is_exact() {
     // regression caught, shrinkage is milestone progress recorded.
     const LEDGER: &[(&str, &str, usize, &str)] = &[
         // The consumer read sites minting `Input(name, shape, GLOBAL)` into
-        // spliced stage bodies, plus note_boundary's law check against the
-        // policy. M12 replaces all of them with reads of Γ on `Schedule`.
-        ("partition", "dev.storage", 5, "M12"),
+        // spliced stage bodies. M12 replaces them with reads of Γ on
+        // `Schedule` — whose first entries already exist: `output_dtypes`
+        // (#21's caller pins) and `exact_boundaries` (the analysis' facts).
+        ("partition", "dev.storage", 4, "M12"),
         // Allocation width, output/readback dtype stamps, nanscan and
         // bandwidth accounting, all from one global. M12 moves them to Γ.
         ("compile", "program.storage", 10, "M12"),

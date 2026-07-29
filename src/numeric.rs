@@ -235,6 +235,30 @@ pub fn may_store(value: Inferred, dtype: Dtype) -> bool {
     value.bounds.within(dtype.exact_integers_to())
 }
 
+/// The law as a choice, not a veto: `preferred` when it carries the value,
+/// otherwise the narrowest writable dtype that does, otherwise `None`.
+///
+/// - `Some(d)` implies [`may_store`]`(value, d)` — the result is always
+///   lawful.
+/// - An approximate value gets `preferred` unchanged: the ℝ̄ half is
+///   unpoliced until per-value declarations exist (M14), which is what
+///   keeps `--bf16`'s measured win.
+/// - An exact value gets the *narrowest sufficient* width, not a jump to
+///   f32: ℕ̄ bounded by 1000 under a bf16 default takes f16 — exact to
+///   2048, at the same two bytes.
+///
+/// The candidate list is the writable boundary set. F64 is absent because
+/// the device cannot write it — a capability that belongs on the device's
+/// spec, and lands there in M14.
+pub fn store_dtype(value: Inferred, preferred: Dtype) -> Option<Dtype> {
+    if may_store(value, preferred) {
+        return Some(preferred);
+    }
+    [Dtype::BF16, Dtype::F16, Dtype::F32]
+        .into_iter()
+        .find(|&candidate| may_store(value, candidate))
+}
+
 /// Infer every node's system and bounds, memoised by address the way shapes
 /// are. The result is transient: its only consumer is the choice of a
 /// storage width, and nothing carries it past that.
@@ -267,9 +291,7 @@ fn derive_node(node: &NodeRef, known: &mut HashMap<*const Node, Inferred>) -> In
         // better — `tokens` is an index stored as f32 — has no way to say so
         // yet; that is the open question this analysis waits on.
         Node::Input { dtype, .. } => match dtype {
-            Dtype::I8 | Dtype::I4 => {
-                Inferred::exact(NumberSystem::Integer, Bounds::UNBOUNDED)
-            }
+            Dtype::I8 | Dtype::I4 => Inferred::exact(NumberSystem::Integer, Bounds::UNBOUNDED),
             _ => Inferred::real(),
         },
 
@@ -307,7 +329,10 @@ fn derive_node(node: &NodeRef, known: &mut HashMap<*const Node, Inferred>) -> In
         Node::Reindex { src, padded, .. } => {
             let source = infer_node(src, known);
             if *padded && source.system.is_exact() {
-                Inferred::exact(source.system.join(NumberSystem::Natural), source.bounds.union(Bounds::point(0)))
+                Inferred::exact(
+                    source.system.join(NumberSystem::Natural),
+                    source.bounds.union(Bounds::point(0)),
+                )
             } else {
                 source
             }
@@ -370,14 +395,8 @@ fn map(op: MapOp, arguments: &[Inferred]) -> Inferred {
             Inferred { system, bounds }.at_least(system)
         }
         MapOp::Sub => {
-            let system = arguments
-                .iter()
-                .fold(NumberSystem::Integer, |a, b| a.join(b.system));
-            let bounds = corners(
-                arguments[0].bounds,
-                negated(arguments[1].bounds),
-                i64::checked_add,
-            );
+            let system = arguments.iter().fold(NumberSystem::Integer, |a, b| a.join(b.system));
+            let bounds = corners(arguments[0].bounds, negated(arguments[1].bounds), i64::checked_add);
             Inferred { system, bounds }.at_least(system)
         }
         MapOp::Neg => Inferred {

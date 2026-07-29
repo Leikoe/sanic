@@ -192,7 +192,10 @@ fn plan_axis_costed(
     // Per-input storage bytes. Every input declares its representation, so
     // int8/int4 weights earn their bandwidth win without a device-dependent
     // fallback.
-    let declared: HashMap<&'static str, f64> = input_dtypes(node).into_iter().map(|(n, d)| (n, d.bytes_per_element())).collect();
+    let declared: HashMap<&'static str, f64> = input_dtypes(node)
+        .into_iter()
+        .map(|(n, d)| (n, d.bytes_per_element()))
+        .collect();
     let in_bytes = |name: &'static str| {
         declared
             .get(name)

@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use sanic::ir::*;
-use sanic::numeric::{Bounds, Inferred, NumberSystem, infer_root, may_store};
+use sanic::numeric::{Bounds, Inferred, NumberSystem, infer_root, may_store, store_dtype};
 
 // ── the calculus side ────────────────────────────────────────────────────────
 
@@ -184,11 +184,7 @@ impl<'id> Gamma<'id> {
     /// given for reals; if they also make a claim, the dtype must be able to
     /// carry it — "the expert knob widens freely, and a request narrower
     /// than the law permits is a compile error, not an override."
-    pub fn declare_input(
-        &mut self,
-        name: &'static str,
-        declaration: InputDeclaration,
-    ) -> Result<Bound<'id>, Refusal> {
+    pub fn declare_input(&mut self, name: &'static str, declaration: InputDeclaration) -> Result<Bound<'id>, Refusal> {
         if self.entries.contains_key(name) {
             return Err(Refusal::AlreadyBound(name));
         }
@@ -215,12 +211,7 @@ impl<'id> Gamma<'id> {
     /// producer, consumer, allocation, readback and the cost model all read
     /// the entry this creates, which is why their disagreement is
     /// inexpressible rather than checked.
-    pub fn mint(
-        &mut self,
-        name: &'static str,
-        inferred: Inferred,
-        policy: &Policy,
-    ) -> Result<Bound<'id>, Refusal> {
+    pub fn mint(&mut self, name: &'static str, inferred: Inferred, policy: &Policy) -> Result<Bound<'id>, Refusal> {
         if self.entries.contains_key(name) {
             return Err(Refusal::AlreadyBound(name));
         }
@@ -271,28 +262,11 @@ impl<'id> Gamma<'id> {
     }
 }
 
-/// The law as a choice, not a veto (M13's shape, absorbed into M12):
-/// `preferred` when it carries the value, otherwise the narrowest writable
-/// dtype that does, otherwise nothing.
-///
-/// Promises, witnessed below:
-/// - `Some(d)` implies `may_store(value, d)` — the result is always lawful.
-/// - An approximate value gets `preferred` unchanged: the ℝ̄ half is
-///   **unpoliced until M14**, which is what keeps the measured 16%.
-/// - An exact value gets the *narrowest sufficient* width, not a jump to
-///   f32: ℕ̄ bounded by 1000 under a bf16 default takes f16 — exact to 2048,
-///   at the same two bytes.
-pub fn store_dtype(value: Inferred, preferred: Dtype) -> Option<Dtype> {
-    if may_store(value, preferred) {
-        return Some(preferred);
-    }
-    // Writable boundary formats, narrowest first. F64 is absent because the
-    // device cannot write it — a capability that belongs on `DeviceSpecs`,
-    // not here, and lands there in M14.
-    [Dtype::BF16, Dtype::F16, Dtype::F32]
-        .into_iter()
-        .find(|&candidate| may_store(value, candidate))
-}
+// `store_dtype` — the law as a choice, not a veto — began life in this file
+// and moved to `src/numeric.rs` when M12's minting landed: partition now
+// calls it as each buffer is named, and `Schedule::width_of` resolves
+// pin → mint → policy for every consumer. Rule 4 in action: src converged,
+// this file shrank to the re-export above and its witnesses below.
 
 // ── witnesses ────────────────────────────────────────────────────────────────
 //
@@ -354,7 +328,11 @@ fn the_law_chooses_the_narrowest_sufficient_width() {
         system: NumberSystem::Natural,
         bounds: Bounds::range(0, 200),
     };
-    assert_eq!(store_dtype(tiny, Dtype::BF16), Some(Dtype::BF16), "lawful preferences stand");
+    assert_eq!(
+        store_dtype(tiny, Dtype::BF16),
+        Some(Dtype::BF16),
+        "lawful preferences stand"
+    );
 }
 
 /// Refusal, not guessing: an exact value with saturated (unbounded) range

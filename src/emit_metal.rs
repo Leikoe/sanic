@@ -1232,16 +1232,11 @@ pub fn emit_schedule_metal_tuned(
     // same dtypes (both baked into the body, so canonical equality covers
     // them) — and buffers bind positionally at dispatch, so the shared
     // pipeline is exact, not approximate.
-    // An output may pin its own storage width; everything else takes the
-    // target's boundary policy.
-    let width_of = |output: &str| -> Dtype {
-        sched
-            .outputs
-            .iter()
-            .position(|name| name == output)
-            .and_then(|index| sched.output_dtypes.get(index).copied().flatten())
-            .unwrap_or(dev.storage)
-    };
+    // A buffer's width: the caller's pin, else the law's mint (an exact
+    // value the policy cannot carry — an argmax index under bf16), else the
+    // target's boundary policy. One resolution, shared with allocation,
+    // readback and the refusal through `Schedule::width_of`.
+    let width_of = |output: &str| -> Dtype { sched.width_of(output, dev.storage) };
     let mut canon: HashMap<String, String> = HashMap::new();
     let mut name_uses: HashMap<String, usize> = HashMap::new();
     let dedup = |k: &MetalKernel,

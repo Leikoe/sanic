@@ -2379,3 +2379,57 @@ fn clock_reports_the_dvfs_state_a_workload_ran_at() {
         "clock {clock} outside the DVFS table"
     );
 }
+
+// The number-systems arc, end to end on the device: an argmax over 4096
+// entries under a bf16 boundary policy. bf16 holds integers exactly only to
+// 256 — at index 3333 its spacing is 32, so storing the index at the policy
+// width would reload 3328, a DIFFERENT token. The law mints f32 for that one
+// buffer (f16 also fails: exact only to 2048), no pin and no refusal, and
+// the index survives the round trip exactly while every real-valued buffer
+// keeps the policy width.
+#[test]
+fn an_argmax_index_survives_bf16_storage_by_minted_width() {
+    let profile = DeviceProfile::m1_pro().with_storage(Dtype::BF16);
+    let v = axis("v", 4096);
+    let mut rng = Lcg(0xA51);
+    let mut scores = rand_tensor(&[v], &mut rng);
+    let winner = 3333usize;
+    scores.data[winner] = 100.0;
+    let env: Env = [("X", scores)].into_iter().collect();
+
+    let index = argmax(input("X", [v], Dtype::F32), 0usize);
+    assert_eq!(eval(&index, &env).data, vec![winner as f64]);
+
+    let sched = partition(&index, &profile);
+    assert!(sched.unstorable(Dtype::BF16).is_empty(), "minted, not refused");
+    let program = emit_schedule_metal_on(&profile, &sched);
+    let out = sched.outputs[0].clone();
+    assert_eq!(
+        program.dtypes.get(out.as_str()).copied(),
+        Some(Dtype::F32),
+        "emission registered the minted width for allocation and readback"
+    );
+
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    let pipes = dev.compile(&program.msl);
+    let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
+    for (n, _) in &program.inputs {
+        bufs.insert(n.to_string(), dev.from_f64(&env[*n].data));
+    }
+    for (n, size) in &program.buffers {
+        // Allocation at each buffer's OWN width — the minted f32 index
+        // buffer must not be sized at the bf16 policy.
+        let width = program.dtypes.get(n.as_str()).copied().unwrap_or(program.storage);
+        bufs.insert(n.clone(), dev.alloc_elems(*size, width));
+    }
+    dev.run(&program_dispatches(&program, &bufs, &pipes));
+
+    let got = dev.read_as_f32(&bufs[&out], 1, Dtype::F32);
+    assert_eq!(
+        got[0], winner as f32,
+        "the index must survive storage EXACTLY — bf16 would have made it 3328"
+    );
+}

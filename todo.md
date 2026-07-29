@@ -1529,7 +1529,24 @@ closure errors surfaced), and integrality is tested with `fract() == 0.0`, not
 just containment. The regression test asserts on the *compiled program*, not a
 computed value: CI's macOS runners have no GPU.
 
-### M12 — Evict `Dtype` from `Input`; Γ on `Schedule` · [todo] · retires *layer leakage*
+### M12 — Evict `Dtype` from `Input`; Γ on `Schedule` · [minting LANDED · eviction open] · retires *layer leakage*
+
+**Landed (M12a):** the law mints widths at partition time.
+`Schedule.minted_dtypes` records each exact boundary the policy cannot carry
+at the narrowest dtype that can (`numeric::store_dtype`, moved in from the
+contract file); `Schedule::width_of` is the one resolution — pin → mint →
+policy — read by emission's `width_of`, and through `program.dtypes` by
+allocation and readback (#21's plumbing, extended). Consumers splice reads at
+the minted width (`read_width` at the three buffer-read sites), and the
+epilogue-rename path transfers the mint with the name or the writer and
+reader would disagree about the very width the mint protects. Refusal now
+fires only for the genuinely unmintable (saturated exact bounds) and for
+pins narrower than the law. Proven on device:
+`an_argmax_index_survives_bf16_storage_by_minted_width` — index 3333 under a
+bf16 policy survives exactly, where the policy width would reload 3328.
+
+**Still open (M12b):** the eviction itself — `Node::Input` loses its dtype,
+`shallow_key` its dtype component, declarations move to the program layer.
 
 The former "two graphs" milestone, shrunk to its true size — and it no longer
 reverses `ir.rs`'s doctrine, it vindicates it: stage bodies stay `ir::Node`
