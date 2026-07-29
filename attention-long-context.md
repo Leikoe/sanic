@@ -85,13 +85,77 @@ That sums to the wall clock, so nothing is hiding. **Host overhead is now the
 largest single item left — 2.6 ms/tok, against ~0.4–0.7 for defect C and ≤0.4
 for B's grid.** Two things to look at, in order:
 
-- **The 1.9 ms around the replay.** The host commits the frozen graph and blocks
-  until it completes. 342 dispatches × the 4.2 µs per-dispatch cost in
-  `applegpu/bandwidth.md` is 1.44 ms, which is close enough to be worth
-  testing first — if it is per-dispatch, fewer kernels is the lever, not a
-  faster host loop.
-- **The 0.569 ms argmax.** It runs on the CPU over the full vocabulary; mlx does
-  `mx.argmax` on the GPU. This is a fold sanic can express.
+- **The 1.9 ms around the replay**, now split by measurement: **0.73 ms** is the
+  CPU encoding 342 dispatches (2.1 µs each), and **~1.0 ms** is commit → GPU
+  start → completion notification. The encode is pure waste: the dispatch list
+  and its bindings are IDENTICAL every step — the token and position travel
+  through buffer *contents*, not the command stream — so nothing about the
+  encoding depends on what the model produced. It can be built once, or built
+  for step N+1 while step N runs. Neither is done today; `run_graph_timed`
+  encodes, commits and blocks, in that order.
+- ~~**The 0.569 ms argmax.**~~ **Done** (`04eb8a9`) — sampling runs on the GPU.
+
+**Both measured, together, once the machine was inside its window**: a balanced
+ABBA at ctx 1030 against the pre-sampling build, whose two baseline runs agreed
+to 0.17 ms — so the sweep sat in the plateau rather than the drift.
+
+| | ms/tok |
+|---|---|
+| before GPU sampling and pipelined encoding | **19.27** |
+| after both | **18.32** |
+| | **−0.95** |
+
+Predicted 1.30 (0.569 argmax + 0.73 encode); collected 0.95, about 73% — the two
+savings partially overlap, which is the same pattern as every other estimate in
+this document coming in high. The baseline agrees with the 19.29 measured for
+the mlx-lm comparison, so these are the same regime and directly comparable:
+**sanic 18.32 against mlx-lm's 18.39 at 1024 — level, from 14.6% behind.**
+
+A second cycle corroborated the direction (18.06 against 19.63/19.56) but its
+last run jumped to 23.77, which is throttle onset, and is discarded under the
+rule two bullets down: an upward-drifting run is heat, not signal.
+
+### Why argmax does not fuse into the lm_head, and why that is not a one-line fix
+
+Worth writing down, because the obvious fix is a trap. `argmax` reads the logits
+twice — `ΣMax/vocab`, then `ΣMin/vocab` over `where(x < max, +∞, coord)` — so the
+vocabulary is materialized between two folds. Nothing DECLINED over `vocab`; the
+folds simply never couple.
+
+They never couple because coupling is discovered in exactly one place, and it is
+narrower than it looks. It is not keyed on `exp` — it is keyed on SUBTRACTION:
+
+```rust
+(Bin::Sub, S::Pe { .. }, S::Coll(Expr::F(i)))
+    if matches!(ctx.slots[i].kind, SlotKind::Plain(Monoid::Max)) => S::PeOff { .. }
+```
+
+`x − max` is the online-softmax shift, and `exp` is its only consumer;
+everything else declines. Argmax couples through a COMPARISON (`x < max`), so
+the rule cannot see it.
+
+**Do not "fix" this by matching `Where(Lt(x, max), +∞, coord)` reduced by `Min`.**
+That is a pattern match on argmax's spelling — an operation-specific rule of
+exactly the kind this repo refuses, one layer below where they are usually
+caught.
+
+What is defensible is a FAMILY: one algebraic identity per scalar primitive that
+can ride a running max, each stating how a partial accumulation repairs itself
+when the max advances.
+
+| consumer of a max-coupled value | repair when the max advances |
+|---|---|
+| `exp` | multiply by `exp(m_old − m_new)` — exp's homomorphism |
+| `lt` | discard the accumulated index and take the new one |
+
+That is a second instance of the same principle, not a generalisation of it, and
+it should be argued for on those terms rather than smuggled in. Note also that
+`(max, index)` needs LESS machinery than softmax: it is already an associative
+pair monoid — larger value wins, smaller index breaks ties — with no repair step
+at all. Softmax's pair merge contains `exp` only because its formula does.
+
+Fully general fusion of dependent reductions would mean synthesizing the repair
+operator, which is a different and much larger problem than adding a rule.
 
 Fix both and sanic is ~17 ms against mlx's 18.4 at 1024 — ahead at every length
 measured, which the GPU work already earns today.
@@ -317,14 +381,24 @@ Each of these has already cost real time in this repo; none are hypothetical.
 - **Always-baseline-first A/B is biased.** Whichever variant runs first loses on
   this machine; an ordered A/B once produced a spurious +3.4% that vanished
   under ABBA. Report pooled sd and position-matched pairs.
-- **Warm the machine up, and then do NOT let it idle.** This is the opposite of
-  the obvious instinct and it cost a whole sweep. An 8-run ABBA at 1024 with 75 s
-  gaps between runs drifted **28.0 → 19.1 ms/tok monotonically** — the same
-  binary, fastest at the end. The SoC takes minutes of sustained load to reach
-  its fast state and every idle gap gives it back, so a "cooled" sweep measures
-  the warm-up, not the change. After ~10 minutes of continuous load, back-to-back
-  runs are stable to ±0.1 ms and a 0.24 ms effect is resolvable. Discard
-  everything before the plateau; never insert cooldowns.
+- **There is a measurement WINDOW, and both edges bite.** From cold the machine
+  is slow and gets faster: an 8-run ABBA at 1024 with 75 s gaps drifted
+  **28.0 → 19.1 ms/tok monotonically**, the same binary, fastest at the end — a
+  "cooled" sweep measures the warm-up, not the change. After ~10 minutes of
+  continuous load it plateaus, back-to-back runs hold ±0.1 ms, and a 0.24 ms
+  effect is resolvable. **After some HOURS of sustained GPU load it throttles the
+  other way**: a later sweep on a quiet machine ran **18.65 → 41.78** across ten
+  back-to-back runs, degrading monotonically. So: warm up, measure inside the
+  plateau, and treat a sweep that drifts UPWARD as heat, not signal. If a run
+  takes 2× the first run of the day, stop and let it cool.
+- **Check `ps` properly before blaming the machine.** A `cargo test` child is
+  named after its test file — `completeness-<hash>`, `bandwidth_probe-<hash>` —
+  so `ps | grep cargo` finds NOTHING while a GPU probe saturates the device.
+  `completeness` runs 601 s and `bandwidth_probe` 273 s, both on the GPU. This
+  cost an hour of "the machine is contended by something outside this session",
+  written into a commit message before the grep was checked. Sort by CPU
+  (`ps -Ao pid,%cpu,comm | sort -k2 -rn`) rather than grepping for names you
+  expect.
 - **Absolute numbers here are not reproducible across sessions.** The
   `SANIC_DEBUG=4` step total was 27.5 ms the day this was written and 43.8 ms
   when re-measured, on the same machine and commit. Only matched pairs taken

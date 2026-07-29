@@ -641,6 +641,9 @@ pub struct MetalGraph {
     dispatches: Vec<Dispatch>,
     /// `barriers[i]` true — a memory barrier goes before dispatch `i`.
     barriers: Vec<bool>,
+    /// The NEXT step's command buffer, encoded while the previous step's was
+    /// still on the GPU. See [`MetalDevice::run_graph_timed`].
+    pending: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
 }
 
 impl MetalDevice {
@@ -662,6 +665,7 @@ impl MetalDevice {
         MetalGraph {
             barriers,
             dispatches: dispatches.to_vec(),
+            pending: std::cell::RefCell::new(None),
         }
     }
 
@@ -673,8 +677,8 @@ impl MetalDevice {
     /// (victim of GPU error/recovery)" when something ELSE faults the GPU
     /// mid-flight — is an `Err`: the step's writes are untrustworthy and a
     /// decode loop must not continue on them.
-    pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
-        let capture = self.capture_trace();
+    /// One command buffer with this graph's whole dispatch list encoded.
+    fn encoded(&self, g: &MetalGraph) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         let cb = self.queue.commandBuffer().expect("command buffer");
         // Name the step for Instruments/Xcode GPU captures.
         cb.setLabel(Some(&NSString::from_str(&format!(
@@ -682,7 +686,20 @@ impl MetalDevice {
             g.dispatches.len()
         ))));
         encode_graph(&cb, &g.dispatches, &g.barriers);
+        cb
+    }
+
+    pub fn run_graph_timed(&self, g: &MetalGraph) -> Result<f64, String> {
+        let capture = self.capture_trace();
+        let cb = g.pending.borrow_mut().take().unwrap_or_else(|| self.encoded(g));
         cb.commit();
+        // Encode the NEXT step while the GPU works on this one. Sound because
+        // the dispatch list and its bindings never change: a step's inputs
+        // reach its kernels through buffer CONTENTS, so nothing here can
+        // depend on the result being waited for. Measured, this is 0.73 ms of
+        // encoding per step for llama's 342 dispatches, and it was sitting on
+        // the critical path.
+        *g.pending.borrow_mut() = Some(self.encoded(g));
         cb.waitUntilCompleted();
         if let Some(manager) = capture {
             manager.stopCapture();
