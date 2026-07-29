@@ -57,7 +57,7 @@ impl DeviceProfile {
     /// pricing width follows, so round trips get honestly cheaper.
     pub fn with_storage(mut self, storage: crate::scalar::Dtype) -> Self {
         self.storage = storage;
-        self.dtype_bytes = storage.bytes();
+        self.dtype_bytes = storage.bytes_per_element();
         self
     }
 

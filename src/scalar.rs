@@ -176,13 +176,83 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    pub fn bytes(self) -> f64 {
+    /// Sign, exponent and significand bits. The single description every
+    /// other property is computed from, so widths and ranges cannot drift
+    /// apart. Integer formats have no exponent; their significand is the
+    /// magnitude.
+    ///
+    /// This wants to be a struct rather than a match the moment a format is
+    /// *parameterised* — a quantized dtype carries a scale and a zero point,
+    /// which are values, not variants. Until then the enum is worth keeping:
+    /// `buf_ty`, `out_ty`, `store_expr`, `buffer_load` and `round_to` all
+    /// match exhaustively and panic on formats a target cannot handle, and
+    /// that exhaustiveness is what makes those refusals loud.
+    const fn layout(self) -> (u32, u32) {
         match self {
-            Dtype::F64 => 8.0,
-            Dtype::F32 => 4.0,
-            Dtype::F16 | Dtype::BF16 => 2.0,
-            Dtype::I8 => 1.0,
-            Dtype::I4 => 0.5,
+            Dtype::F64 => (11, 52),
+            Dtype::F32 => (8, 23),
+            Dtype::F16 => (5, 10),
+            Dtype::BF16 => (8, 7),
+            Dtype::I8 => (0, 7),
+            Dtype::I4 => (0, 3),
         }
+    }
+
+    /// An IEEE-style floating format.
+    pub const fn is_float(self) -> bool {
+        self.layout().0 > 0
+    }
+
+    /// Can this format represent ±∞?
+    ///
+    /// Not a synonym for [`Dtype::is_float`], though the two coincide today:
+    /// the `fp8` finite-only formats are floats without infinities. Every
+    /// order monoid's identity is an infinity, so this decides whether a
+    /// fold's output can be stored in a given format at all.
+    pub const fn has_infinities(self) -> bool {
+        self.is_float()
+    }
+
+    /// Integers this format holds exactly. A property of the format,
+    /// identical on every device — bf16 is exact to 256 on any silicon.
+    ///
+    /// A float is exact up to `2^(significand+1)`, where the implicit
+    /// leading bit buys the extra power. A signed integer stops one short
+    /// of its magnitude range.
+    pub const fn exact_integers_to(self) -> i64 {
+        let (exponent, significand) = self.layout();
+        if exponent > 0 {
+            1i64 << (significand + 1)
+        } else {
+            (1i64 << significand) - 1
+        }
+    }
+
+    /// Width of one element. The honest unit: sub-byte formats have no
+    /// fractional-byte size, and newer ones (fp4, fp6) are not even a power
+    /// of two, so bits is the only unit that stays exact.
+    pub const fn nbits(self) -> u32 {
+        let (exponent, significand) = self.layout();
+        1 + exponent + significand
+    }
+
+    /// Does an element occupy less than a byte, so that storage packs
+    /// several per byte and an element has no address of its own?
+    pub const fn is_subbyte(self) -> bool {
+        self.nbits() < 8
+    }
+
+    /// Bytes an array of `elements` occupies, packing included. This is the
+    /// allocation and bounds-check unit; [`Dtype::bytes_per_element`] is not,
+    /// because a width of 0.5 truncates to zero the moment anyone writes
+    /// `as usize`.
+    pub const fn nbytes(self, elements: usize) -> usize {
+        (elements * self.nbits() as usize).div_ceil(8)
+    }
+
+    /// Per-element width as a *pricing weight*, for bandwidth arithmetic
+    /// already in floating point. Never a size — see [`Dtype::nbytes`].
+    pub fn bytes_per_element(self) -> f64 {
+        f64::from(self.nbits()) / 8.0
     }
 }

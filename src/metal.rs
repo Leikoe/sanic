@@ -218,7 +218,7 @@ impl MetalDevice {
 
     /// A zeroed buffer of `count` elements at a storage dtype's width.
     pub fn alloc_elems(&self, count: usize, dtype: Dtype) -> MetalBuf {
-        self.alloc_bytes((count.max(1) as f64 * dtype.bytes()).ceil() as usize)
+        self.alloc_bytes(dtype.nbytes(count.max(1)))
     }
 
     /// Read `count` elements stored as `dtype`, widened to f32. The bf16

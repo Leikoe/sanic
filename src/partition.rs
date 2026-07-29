@@ -1650,7 +1650,7 @@ impl<'c> CutPricing<'c> {
 fn subtree_read_bytes(node: &Node) -> f64 {
     let widths: HashMap<&'static str, f64> = input_dtypes(node)
         .into_iter()
-        .map(|(name, dtype)| (name, dtype.bytes()))
+        .map(|(name, dtype)| (name, dtype.bytes_per_element()))
         .collect();
     let mut seen = HashSet::new();
     input_axes(node)

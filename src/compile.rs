@@ -999,11 +999,11 @@ mod metal_backend {
     fn logical_byte_table(program: &MetalProgram) -> HashMap<&str, f64> {
         let mut logical_bytes = HashMap::<&str, f64>::new();
         for (name, elements) in &program.buffers {
-            logical_bytes.insert(name, *elements as f64 * program.storage.bytes());
+            logical_bytes.insert(name, *elements as f64 * program.storage.bytes_per_element());
         }
         for (name, axes) in &program.inputs {
             let elements: usize = axes.iter().map(|a| a.extent()).product();
-            let width = program.dtypes.get(*name).map_or(4.0, |dtype| dtype.bytes());
+            let width = program.dtypes.get(*name).map_or(4.0, |dtype| dtype.bytes_per_element());
             logical_bytes.insert(name, elements as f64 * width);
         }
         logical_bytes
@@ -1057,7 +1057,7 @@ mod metal_backend {
             program
                 .dtypes
                 .get(name)
-                .map_or(program.storage.bytes(), |dtype| dtype.bytes())
+                .map_or(program.storage.bytes_per_element(), |dtype| dtype.bytes_per_element())
         };
         let mut traffic = HashMap::new();
         for stage in &schedule.stages {
@@ -1199,7 +1199,7 @@ mod metal_backend {
         };
         if std::env::var_os("SANIC_NANSCAN").is_some() {
             for (stage, dispatch) in program.stages.iter().zip(dispatches) {
-                let width = program.storage.bytes();
+                let width = program.storage.bytes_per_element();
                 let count = (dispatch.output.byte_len() as f64 / width) as usize;
                 let data = device.read_as_f32(&dispatch.output, count, program.storage);
                 if let Some(at) = data.iter().position(|v| !v.is_finite()) {
@@ -1551,10 +1551,7 @@ mod metal_backend {
         ) -> Result<MetalBuffer, RunError> {
             let shape = shape.into();
             let elements = shape.iter().product::<usize>().max(1);
-            let required_bytes = match dtype {
-                Dtype::I4 => elements.div_ceil(2),
-                _ => elements * dtype.bytes() as usize,
-            };
+            let required_bytes = dtype.nbytes(elements);
             if raw.byte_len() < required_bytes {
                 return Err(RunError::Backend(format!(
                     "shape {shape:?} with dtype {dtype:?} requires {required_bytes} bytes, \

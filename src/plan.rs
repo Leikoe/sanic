@@ -192,7 +192,7 @@ fn plan_axis_costed(
     // Per-input storage bytes. Every input declares its representation, so
     // int8/int4 weights earn their bandwidth win without a device-dependent
     // fallback.
-    let declared: HashMap<&'static str, f64> = input_dtypes(node).into_iter().map(|(n, d)| (n, d.bytes())).collect();
+    let declared: HashMap<&'static str, f64> = input_dtypes(node).into_iter().map(|(n, d)| (n, d.bytes_per_element())).collect();
     let in_bytes = |name: &'static str| {
         declared
             .get(name)
@@ -598,7 +598,7 @@ pub fn priced_fold_sched_candidates(
     // kernels rank by memory occupancy rather than flop noise.
     let declared: HashMap<&'static str, f64> = input_dtypes(fold_node)
         .into_iter()
-        .map(|(n, d)| (n, d.bytes()))
+        .map(|(n, d)| (n, d.bytes_per_element()))
         .collect();
     let mut seen = HashSet::new();
     let hbm: f64 = input_axes(fold_node)
