@@ -109,6 +109,10 @@ pub struct Schedule {
     /// not compose at the node the partitioner stood on, in emission order.
     /// [`Schedule::decline_census`] buckets it.
     pub declines: Vec<Decline>,
+    /// Per-output storage width, aligned with `outputs`. `None` means the
+    /// target's boundary policy. An index-valued output overrides it: bf16
+    /// holds integers exactly only to 256, so narrowing one corrupts it.
+    pub output_dtypes: Vec<Option<crate::ir::Dtype>>,
     /// Outputs whose buffer IS the buffer of the value they replace, so the
     /// part they leave unchanged is already in place and need not be written.
     /// Set by the caller that owns the aliasing decision (a persistent state
@@ -178,6 +182,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         stages,
         outputs,
         declines: std::mem::take(&mut p.declines),
+        output_dtypes: vec![None; roots.len()],
         agrees_in_place: Vec::new(),
         _keepalive: keepalive,
     };

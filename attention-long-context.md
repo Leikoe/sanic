@@ -317,8 +317,18 @@ Each of these has already cost real time in this repo; none are hypothetical.
    `--all-targets` before pushing.
 4. Both dtypes, text byte-identical.
    `./target/release/examples/llama3_2 "The capital of France is" -n 32 --bf16`
-   should still print `…is Paris. It is the most populous city in France and
-   the center of the Paris`, and the f32 default must still compile and run.
+   should print `…is Paris. It is the most visited city in the world. It is
+   also the most expensive city in the world.`, and the f32 default must still
+   compile and run and print `…the country's capital and largest city`.
+
+   **The bf16 text changed when sampling moved to the GPU, and the reason is
+   worth keeping.** `ir::argmax` returns the FIRST maximum, the CPU scan it
+   replaced used `Iterator::max_by`, which returns the LAST. bf16 carries 8
+   mantissa bits, so exact ties are common — at step 6 of this prompt, tokens
+   12263 (` visited`) and 95551 (` populous`) both score exactly 21.500000, and
+   the two rules part company there. f32 is unchanged because ties are rare at
+   24 bits, which is what shows the divergence is tie-breaking and not a bug.
+   First-index is the convention numpy, torch and mlx all follow.
 5. Re-run the ABBA sweep against mlx-lm at 32/128/512/1024 and compare slopes,
    not just the 1024 endpoint.
 

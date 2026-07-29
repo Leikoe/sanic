@@ -335,7 +335,7 @@ tuple_roots!(
 /// Extension trait for compiling one or more roots.
 pub trait Compile: Roots {
     fn compile<B: Backend>(&self, backend: &B) -> Result<Program<B>, CompileError> {
-        compile_roots_in_place(self.roots(), Vec::new(), backend)
+        compile_roots_in_place(self.roots(), Vec::new(), Vec::new(), backend)
     }
 }
 
@@ -353,6 +353,7 @@ impl<T: Roots> Compile for T {}
 pub(crate) fn compile_roots_in_place<B: Backend>(
     roots: Vec<NodeRef>,
     in_place: Vec<(usize, &'static str)>,
+    output_dtypes: Vec<Option<Dtype>>,
     backend: &B,
 ) -> Result<Program<B>, CompileError> {
     if roots.is_empty() {
@@ -377,6 +378,14 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .collect::<Vec<_>>();
     let named_roots = roots.iter().cloned().zip(output_names).collect::<Vec<_>>();
     let mut schedule = partition_many(&named_roots, &backend.profile());
+    if !output_dtypes.is_empty() {
+        assert_eq!(
+            output_dtypes.len(),
+            schedule.outputs.len(),
+            "one storage width per root"
+        );
+        schedule.output_dtypes = output_dtypes;
+    }
     schedule.agrees_in_place = in_place
         .iter()
         .map(|&(root, _)| schedule.outputs[root].clone())
@@ -704,7 +713,12 @@ mod metal_backend {
                     Ok(MetalBuffer {
                         raw,
                         shape: shape.clone(),
-                        dtype: executable.program.storage,
+                        dtype: executable
+                            .program
+                            .dtypes
+                            .get(name.as_str())
+                            .copied()
+                            .unwrap_or(executable.program.storage),
                     })
                 })
                 .collect()
@@ -862,7 +876,12 @@ mod metal_backend {
                             Ok(MetalBuffer {
                                 raw,
                                 shape: shape.clone(),
-                                dtype: executable.program.storage,
+                                dtype: executable
+                                    .program
+                                    .dtypes
+                                    .get(name.as_str())
+                                    .copied()
+                                    .unwrap_or(executable.program.storage),
                             })
                         })
                         .collect::<Result<Vec<_>, RunError>>()?,
@@ -968,7 +987,9 @@ mod metal_backend {
         if is_argbuf {
             device.alloc_f32(elements)
         } else {
-            device.alloc_elems(elements, program.storage)
+            // an output that pinned its own width is registered in `dtypes`
+            let width = program.dtypes.get(name).copied().unwrap_or(program.storage);
+            device.alloc_elems(elements, width)
         }
     }
 

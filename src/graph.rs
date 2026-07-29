@@ -30,7 +30,9 @@ struct State {
 #[derive(Default)]
 pub struct Graph {
     states: Vec<State>,
-    outputs: Vec<(&'static str, Tensor)>,
+    /// `(name, value, storage override)`. `None` stores at the target's
+    /// boundary width, which is what almost everything wants.
+    outputs: Vec<(&'static str, Tensor, Option<Dtype>)>,
 }
 
 impl Graph {
@@ -78,7 +80,20 @@ impl Graph {
 
     /// Declare an ordinary named output of the step.
     pub fn output(&mut self, name: &'static str, value: Tensor) {
-        self.outputs.push((name, value));
+        self.outputs.push((name, value, None));
+    }
+
+    /// An output stored at an explicit width rather than the target's boundary
+    /// policy.
+    ///
+    /// Narrowing is a numeric choice, and it is the right one for tensors of
+    /// values: a bf16 activation loses nothing that matters. It is the WRONG
+    /// one for a tensor of indices, which are exact or they are wrong — bf16
+    /// represents integers exactly only to 256, so a token id past that comes
+    /// back as a different token. Same reason an argument buffer of addresses
+    /// may never narrow.
+    pub fn output_at(&mut self, name: &'static str, value: Tensor, dtype: Dtype) {
+        self.outputs.push((name, value, Some(dtype)));
     }
 
     /// The states whose successor may simply overwrite them, as `(root index,
@@ -127,7 +142,7 @@ impl Graph {
                 .unwrap_or_else(|| panic!("state `{}` has no successor", state.name));
             roots.push(successor.node().clone());
         }
-        for (_, value) in &self.outputs {
+        for (_, value, _) in &self.outputs {
             roots.push(value.node().clone());
         }
         roots
@@ -201,7 +216,10 @@ mod metal_target {
             }
             let roots = self.roots();
             let overwritable = self.overwritable_states(&roots);
-            let program = crate::compile::compile_roots_in_place(roots, overwritable, device)?;
+            // states store at the boundary policy; only declared outputs may pin
+            let mut output_dtypes = vec![None; self.states.len()];
+            output_dtypes.extend(self.outputs.iter().map(|(_, _, dtype)| *dtype));
+            let program = crate::compile::compile_roots_in_place(roots, overwritable, output_dtypes, device)?;
             let feedback = self
                 .states
                 .iter()
@@ -215,7 +233,7 @@ mod metal_target {
                 .outputs
                 .iter()
                 .enumerate()
-                .map(|(index, (name, _))| (*name, self.states.len() + index))
+                .map(|(index, (name, _, _))| (*name, self.states.len() + index))
                 .collect();
             Ok(StepProgram {
                 program,
