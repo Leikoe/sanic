@@ -192,7 +192,27 @@ fn build_decode(config: Config, context_length: usize, cache_dtype: Dtype) -> Gr
         x = decode_block(&mut graph, &axes, cache_sequence, layer, x, &position, cache_dtype);
     }
     let x = rms_norm(&x, &Tensor::input("model.norm.weight", [axes.hidden], Dtype::BF16), EPS);
-    graph.output("logits", x.matmul(embedding.transpose(0usize, 1usize)));
+    // Greedy sampling belongs on the GPU: picking the argmax host-side means
+    // reading the whole vocabulary back and scanning it every token, which is
+    // 128,256 values to learn one. Emitting the index instead makes the step's
+    // useful output a single number. `logits` stays an output because the
+    // argmax already materializes it, so naming it costs nothing and keeps
+    // LLAMA3_2_DEBUG_LOGITS able to rank the scores.
+    // Producer before consumer: `token` folds over `logits`, and a root
+    // reachable from a later root is reused through its materialization. The
+    // other order asks the partitioner to rebuild the vocabulary projection as
+    // its own fold, which it correctly refuses.
+    let logits = x.matmul(embedding.transpose(0usize, 1usize));
+    if std::env::var_os("LLAMA3_2_DEBUG_LOGITS").is_some() {
+        graph.output("logits", logits.clone());
+    }
+    // F32 regardless of the boundary policy: this is an index into a 128,256
+    // entry vocabulary, and bf16 holds integers exactly only to 256.
+    graph.output_at(
+        "token",
+        sanic::argmax(logits.node().clone(), -1isize).into(),
+        Dtype::F32,
+    );
     graph
 }
 
@@ -376,6 +396,17 @@ fn main() {
     }
 }
 
+/// One executed step: the index the GPU sampled, the scores it sampled from
+/// (read only when something asks), and the replay's GPU seconds.
+#[cfg(target_os = "macos")]
+struct Step {
+    token: sanic::MetalBuffer,
+    /// Present only when something asked for the scores; the vocabulary is not
+    /// otherwise materialized as an output.
+    logits: Option<sanic::MetalBuffer>,
+    seconds: f64,
+}
+
 #[cfg(target_os = "macos")]
 fn run_metal() -> Result<(), String> {
     use std::io::Write;
@@ -495,23 +526,29 @@ fn run_metal() -> Result<(), String> {
         started.elapsed().as_secs_f32()
     );
 
+    let want_logits = std::env::var_os("LLAMA3_2_DEBUG_LOGITS").is_some();
     let tokens_buffer = buffers["tokens"].clone();
     let position_buffer = buffers["position"].clone();
-    let mut step = |token: u32, position: usize| -> Result<(sanic::MetalBuffer, f64), String> {
+    // The step's useful result is the sampled index, not the vocabulary.
+    let mut step = |token: u32, position: usize| -> Result<Step, String> {
         device.write_f64(tokens_buffer.raw(), &[token as f64]);
         device.write_f64(position_buffer.raw(), &[position as f64]);
         let seconds = machine.step().map_err(|error| error.to_string())?;
-        Ok((machine.output("logits"), seconds))
+        Ok(Step {
+            token: machine.output("token"),
+            logits: want_logits.then(|| machine.output("logits")),
+            seconds,
+        })
     };
 
     eprintln!("prefilling {} tokens...", prompt_tokens.len());
     let started = std::time::Instant::now();
-    let mut logits = None;
+    let mut last: Option<Step> = None;
     let mut prefill_gpu_seconds = 0.0f64;
     for (position, &token) in prompt_tokens.iter().enumerate() {
-        let (output, seconds) = step(token, position)?;
-        logits = Some(output);
-        prefill_gpu_seconds += seconds;
+        let sampled = step(token, position)?;
+        prefill_gpu_seconds += sampled.seconds;
+        last = Some(sampled);
     }
     eprintln!(
         "prefill finished in {:.2}s ({:.1} ms/tok GPU replay)",
@@ -549,8 +586,9 @@ fn run_metal() -> Result<(), String> {
     let mut decode_steps = 0usize;
     let mut decode_gpu_seconds = 0.0f64;
     while generated < arguments.new_tokens {
-        let scores = device.read_tensor_f32(logits.as_ref().unwrap());
-        if std::env::var_os("LLAMA3_2_DEBUG_LOGITS").is_some() {
+        let sampled = last.as_ref().expect("a step ran");
+        if let Some(scores) = sampled.logits.as_ref() {
+            let scores = device.read_tensor_f32(scores);
             let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
             ranked.sort_by(|(_, left), (_, right)| right.total_cmp(left));
             eprintln!(
@@ -563,12 +601,8 @@ fn run_metal() -> Result<(), String> {
                     .join("  ")
             );
         }
-        let next = scores
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index as u32)
-            .ok_or("model returned empty logits")?;
+        // one value, chosen on the device
+        let next = device.read_tensor_f32(&sampled.token)[0] as u32;
         generated += 1;
         if let Some(text) = stream
             .step(next)
@@ -579,10 +613,10 @@ fn run_metal() -> Result<(), String> {
         if next == 128_001 || generated == arguments.new_tokens {
             break;
         }
-        let (output, seconds) = step(next, prompt_tokens.len() + generated - 1)?;
-        logits = Some(output);
-        decode_gpu_seconds += seconds;
+        let sampled = step(next, prompt_tokens.len() + generated - 1)?;
+        decode_gpu_seconds += sampled.seconds;
         decode_steps += 1;
+        last = Some(sampled);
     }
     if streaming {
         println!();
@@ -638,18 +672,22 @@ mod tests {
         // over head_dim, so it is [kv_heads, cache_sequence, head_dim]; V is
         // contracted over cache_sequence, so it is [kv_heads, head_dim,
         // cache_sequence]. Here that is [2, 3, 2] against [2, 2, 3].
-        let cache_shapes = [vec![2, 3, 2], vec![2, 2, 3], vec![1, 16]];
+        //
+        // The step's only other root is the sampled index — one number, not the
+        // 16-entry vocabulary it was chosen from. `logits` is a root only when
+        // LLAMA3_2_DEBUG_LOGITS asks for the scores.
+        let roots = [vec![2, 3, 2], vec![2, 2, 3], vec![1]];
         assert_eq!(
             graph
                 .roots()
                 .iter()
                 .map(|root| root.shape().into_iter().map(Axis::extent).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
-            cache_shapes
+            roots
         );
 
         let program = graph.roots().compile(&CpuDevice::new()).unwrap();
-        assert_eq!(program.output_shapes(), &cache_shapes);
+        assert_eq!(program.output_shapes(), &roots);
         assert_eq!(program.input_names().len(), 15);
     }
 

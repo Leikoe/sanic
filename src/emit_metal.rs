@@ -1232,6 +1232,16 @@ pub fn emit_schedule_metal_tuned(
     // same dtypes (both baked into the body, so canonical equality covers
     // them) — and buffers bind positionally at dispatch, so the shared
     // pipeline is exact, not approximate.
+    // An output may pin its own storage width; everything else takes the
+    // target's boundary policy.
+    let width_of = |output: &str| -> Dtype {
+        sched
+            .outputs
+            .iter()
+            .position(|name| name == output)
+            .and_then(|index| sched.output_dtypes.get(index).copied().flatten())
+            .unwrap_or(dev.storage)
+    };
     let mut canon: HashMap<String, String> = HashMap::new();
     let mut name_uses: HashMap<String, usize> = HashMap::new();
     let dedup = |k: &MetalKernel,
@@ -1305,8 +1315,9 @@ pub fn emit_schedule_metal_tuned(
                     fold_node,
                     sched,
                     epilogue_node.as_ref().map(|e| (e, *epi_fold_read)),
-                    dev.storage,
+                    width_of(&out),
                 );
+                all_dtypes.insert(out.clone(), k.storage);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
@@ -1348,7 +1359,8 @@ pub fn emit_schedule_metal_tuned(
                 };
                 let kname = kernel_name(kind, &exec.shape(), None);
                 let agrees_in_place = sched.agrees_in_place.iter().any(|name| name == output);
-                let mut k = emit_pointwise_metal_on(&kname, exec, dev.storage, agrees_in_place);
+                let mut k = emit_pointwise_metal_on(&kname, exec, width_of(output), agrees_in_place);
+                all_dtypes.insert(output.clone(), k.storage);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
                 }
