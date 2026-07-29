@@ -66,6 +66,7 @@ pub mod ir;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod nn;
+pub mod numeric;
 #[doc(hidden)]
 pub mod partition;
 #[doc(hidden)]
