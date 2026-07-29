@@ -362,14 +362,24 @@ Each of these has already cost real time in this repo; none are hypothetical.
 - **Always-baseline-first A/B is biased.** Whichever variant runs first loses on
   this machine; an ordered A/B once produced a spurious +3.4% that vanished
   under ABBA. Report pooled sd and position-matched pairs.
-- **Warm the machine up, and then do NOT let it idle.** This is the opposite of
-  the obvious instinct and it cost a whole sweep. An 8-run ABBA at 1024 with 75 s
-  gaps between runs drifted **28.0 → 19.1 ms/tok monotonically** — the same
-  binary, fastest at the end. The SoC takes minutes of sustained load to reach
-  its fast state and every idle gap gives it back, so a "cooled" sweep measures
-  the warm-up, not the change. After ~10 minutes of continuous load, back-to-back
-  runs are stable to ±0.1 ms and a 0.24 ms effect is resolvable. Discard
-  everything before the plateau; never insert cooldowns.
+- **There is a measurement WINDOW, and both edges bite.** From cold the machine
+  is slow and gets faster: an 8-run ABBA at 1024 with 75 s gaps drifted
+  **28.0 → 19.1 ms/tok monotonically**, the same binary, fastest at the end — a
+  "cooled" sweep measures the warm-up, not the change. After ~10 minutes of
+  continuous load it plateaus, back-to-back runs hold ±0.1 ms, and a 0.24 ms
+  effect is resolvable. **After some HOURS of sustained GPU load it throttles the
+  other way**: a later sweep on a quiet machine ran **18.65 → 41.78** across ten
+  back-to-back runs, degrading monotonically. So: warm up, measure inside the
+  plateau, and treat a sweep that drifts UPWARD as heat, not signal. If a run
+  takes 2× the first run of the day, stop and let it cool.
+- **Check `ps` properly before blaming the machine.** A `cargo test` child is
+  named after its test file — `completeness-<hash>`, `bandwidth_probe-<hash>` —
+  so `ps | grep cargo` finds NOTHING while a GPU probe saturates the device.
+  `completeness` runs 601 s and `bandwidth_probe` 273 s, both on the GPU. This
+  cost an hour of "the machine is contended by something outside this session",
+  written into a commit message before the grep was checked. Sort by CPU
+  (`ps -Ao pid,%cpu,comm | sort -k2 -rn`) rather than grepping for names you
+  expect.
 - **Absolute numbers here are not reproducible across sessions.** The
   `SANIC_DEBUG=4` step total was 27.5 ms the day this was written and 43.8 ms
   when re-measured, on the same machine and commit. Only matched pairs taken
