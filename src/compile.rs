@@ -396,12 +396,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
     let target = backend.specs().under(policy);
     let mut schedule = partition_many_declared(&named_roots, &target, &declared);
     if !output_dtypes.is_empty() {
-        assert_eq!(
-            output_dtypes.len(),
-            schedule.outputs.len(),
-            "one storage width per root"
-        );
-        schedule.output_dtypes = output_dtypes;
+        schedule.pin_outputs(output_dtypes);
     }
     schedule.agrees_in_place = in_place
         .iter()
@@ -1484,7 +1479,7 @@ mod metal_backend {
         /// Γ resolved for probe/candidate emission — the same construction
         /// emission itself uses.
         fn tuner_resolved(schedule: &Schedule, storage: Dtype) -> HashMap<String, Dtype> {
-            let mut resolved = schedule.declared_dtypes.clone();
+            let mut resolved = schedule.bindings().snapshot_declared();
             for stage in &schedule.stages {
                 let out = crate::partition::stage_output(stage);
                 resolved.insert(out.to_string(), schedule.width_of(out, storage));

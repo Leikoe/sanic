@@ -316,18 +316,22 @@ fn the_law_mints_the_width_the_policy_cannot_supply() {
     let narrow = DeviceSpecs::toy().under(sanic::cost::Policy { boundary: Dtype::BF16 });
     let schedule = partition(&index, &narrow);
 
-    assert!(!schedule.exact_boundaries.is_empty(), "the fact is recorded");
+    assert!(
+        !schedule.bindings().exact_boundaries().is_empty(),
+        "the fact is recorded"
+    );
     assert!(schedule.unstorable(Dtype::BF16).is_empty(), "minted, not refused");
     let out = schedule.outputs[0].clone();
     // u32, not f32: same four bytes, but the index is an INTEGER in memory
     // — and the +∞ identity has a defined home at u32::MAX via saturation.
-    assert_eq!(schedule.minted_dtypes.get(&out).copied(), Some(Dtype::U32));
+    assert_eq!(schedule.bindings().minted(&out), Some(Dtype::U32));
     assert_eq!(schedule.width_of(&out, Dtype::BF16), Dtype::U32);
 
     // A pin outranks the mint — the caller is the Caller row — but only a
     // LAWFUL pin: width_of resolves pin first, and unstorable() judges it.
+    // Pins enter through the sealed setter; assignment is unwritable now.
     let mut pinned = schedule;
-    pinned.output_dtypes = vec![Some(Dtype::F16)];
+    pinned.pin_outputs(vec![Some(Dtype::F16)]);
     assert_eq!(pinned.width_of(&out, Dtype::BF16), Dtype::F16);
     assert!(!pinned.unstorable(Dtype::BF16).is_empty(), "128255 does not fit f16");
 }
@@ -348,8 +352,9 @@ fn an_unmintable_exact_boundary_is_still_refused() {
         &product,
         &DeviceSpecs::toy().under(sanic::cost::Policy { boundary: Dtype::BF16 }),
     );
-    assert!(!schedule.exact_boundaries.is_empty());
-    assert!(schedule.minted_dtypes.is_empty(), "nothing lawful to mint");
+    assert!(!schedule.bindings().exact_boundaries().is_empty());
+    let out = schedule.outputs[0].clone();
+    assert!(schedule.bindings().minted(&out).is_none(), "nothing lawful to mint");
     let refused = schedule.unstorable(Dtype::BF16);
     assert!(!refused.is_empty(), "an unboundable exact value has no lawful width");
     assert!(schedule.outputs.contains(&refused[0].0));
@@ -369,16 +374,18 @@ fn a_pinned_output_is_judged_against_its_pin() {
     let index = argmax(scores, 0usize);
 
     let mut schedule = partition(&index, &DeviceSpecs::toy());
-    schedule.output_dtypes = vec![Some(Dtype::F32)];
+    schedule.pin_outputs(vec![Some(Dtype::F32)]);
     assert!(
         schedule.unstorable(Dtype::BF16).is_empty(),
         "a pin wider than the policy satisfies the law"
     );
 
-    // And the law still catches a pin that is itself too narrow.
-    schedule.output_dtypes = vec![Some(Dtype::F16)];
+    // Γ is append-only: re-pinning is refused, so judging a DIFFERENT pin
+    // means a different schedule — exactly as a different program would be.
+    let mut narrow = partition(&index, &DeviceSpecs::toy());
+    narrow.pin_outputs(vec![Some(Dtype::F16)]);
     assert!(
-        !schedule.unstorable(Dtype::F32).is_empty(),
+        !narrow.unstorable(Dtype::F32).is_empty(),
         "an unlawful pin is caught even under a lawful default"
     );
 }
@@ -398,7 +405,7 @@ fn real_valued_boundaries_are_untouched_by_the_refusal() {
     let logits = reduce(map(MapOp::Mul, vec![unsqueeze(x, 0usize), w]), 1usize, Monoid::Add);
 
     let schedule = partition(&logits, &DeviceSpecs::toy());
-    assert!(schedule.exact_boundaries.is_empty());
+    assert!(schedule.bindings().exact_boundaries().is_empty());
     assert!(schedule.unstorable(Dtype::BF16).is_empty());
 }
 

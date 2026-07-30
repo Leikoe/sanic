@@ -2421,7 +2421,7 @@ fn a_q8_pinned_output_round_trips_the_grid_exactly() {
         .collect();
 
     let mut sched = partition(&activation, &DeviceSpecs::toy());
-    sched.output_dtypes = vec![Some(q8)];
+    sched.pin_outputs(vec![Some(q8)]);
     let program = emit_schedule_metal_on(&DeviceSpecs::toy(), &sched);
     let out = sched.outputs[0].clone();
     assert_eq!(program.dtypes.get(out.as_str()).copied(), Some(q8));

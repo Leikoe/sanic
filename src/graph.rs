@@ -70,7 +70,13 @@ impl Graph {
         let crate::ir::Node::Input { name, .. } = input.node().as_ref() else {
             unreachable!("Tensor::input builds an Input node")
         };
-        self.declared.insert((*name).to_string(), dtype);
+        // Γ is append-only from the very first entry: redeclaring a name at
+        // a DIFFERENT width is a defect in the caller, never a replacement.
+        // (Redeclaring at the same width is the same declaration — a shared
+        // weight mentioned twice.)
+        if let Some(previous) = self.declared.insert((*name).to_string(), dtype) {
+            assert_eq!(previous, dtype, "input `{name}` was declared twice at different widths");
+        }
         input
     }
 

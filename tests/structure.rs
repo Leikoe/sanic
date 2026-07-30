@@ -114,6 +114,7 @@ const EXPRESSION_LAYER: &[&str] = &[
 /// The deciding half: everything parameterised by a device or owning an
 /// execution order.
 const PROGRAM_LAYER: &[&str] = &[
+    "gamma",
     "cost",
     "plan",
     "partition",
@@ -152,6 +153,7 @@ fn the_expression_layer_never_reaches_the_program_layer() {
 #[test]
 fn no_core_rule_names_a_frontend_operation() {
     const CORE: &[&str] = &[
+        "gamma",
         "scalar",
         "interp",
         "analyze",
@@ -222,7 +224,7 @@ fn the_structural_debt_ledger_is_exact() {
         // bundle (mint preference, produced pricing): legitimate since
         // M14-final — the policy arrives at compilation and never rides the
         // device. Pinned as a growth guard.
-        ("partition", "dev.storage", 3, "guard"),
+        ("partition", "dev.storage", 2, "guard"),
         // The program's recorded policy boundary: fallbacks for names Γ did
         // not touch (per-buffer widths land in program.dtypes; these are the
         // policy default the design licenses). Pinned as a growth guard.

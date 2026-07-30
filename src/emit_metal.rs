@@ -1265,7 +1265,7 @@ pub fn emit_schedule_metal_tuned(
     // the width Schedule::width_of gives it (pin → mint → declared →
     // policy). One map; emitters, pricing, allocation and readback all
     // derive from it.
-    let mut resolved: HashMap<String, Dtype> = sched.declared_dtypes.clone();
+    let mut resolved: HashMap<String, Dtype> = sched.bindings().snapshot_declared();
     for stage in &sched.stages {
         let out = crate::partition::stage_output(stage);
         resolved.insert(out.to_string(), sched.width_of(out, dev.storage()));

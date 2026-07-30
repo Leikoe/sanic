@@ -56,8 +56,9 @@ pub mod derive;
 #[doc(hidden)]
 pub mod emit_metal;
 #[doc(hidden)]
-pub mod grad;
+pub mod gamma;
 #[doc(hidden)]
+pub mod grad;
 pub mod graph;
 #[doc(hidden)]
 pub mod interp;

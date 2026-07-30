@@ -105,38 +105,17 @@ pub struct Schedule {
     /// [`Schedule::execute`] returns the last; a stateful runtime
     /// ([`crate::runtime`]) reads them all.
     pub outputs: Vec<String>,
-    /// Every materialized buffer whose value is EXACT (an integer system) —
-    /// the boundaries a narrow storage width could corrupt, an argmax index
-    /// under bf16 being the founding case. Facts, not verdicts: whether one
-    /// is actually unstorable depends on the width it lands at, which a
-    /// caller may pin per output ([`Schedule::output_dtypes`]) after
-    /// partition returns. [`Schedule::unstorable`] applies the law at the
-    /// effective widths, and [`crate::compile`] turns a non-empty answer
-    /// into a compile error naming each buffer.
-    pub exact_boundaries: Vec<(String, crate::numeric::Inferred)>,
-    /// Widths the LAW minted: buffers whose value is exact and needs more
-    /// than the boundary policy, mapped to the narrowest dtype that carries
-    /// it (an argmax index over a large vocabulary → f32). Populated at the
-    /// same moment the buffer is named; consumers splice reads at this
-    /// width, emission stores at it, allocation and readback follow through
-    /// `MetalProgram.dtypes`. Everything absent takes a pin
-    /// ([`Schedule::output_dtypes`]) or the policy — see
-    /// [`Schedule::width_of`].
-    pub minted_dtypes: std::collections::HashMap<String, crate::ir::Dtype>,
-    /// The caller's storage declarations — Γ's Caller entries: input name →
-    /// the width its bound buffer uses (a bf16 checkpoint weight, packed
-    /// int4). Undeclared inputs are f32. Populated from the declarations a
-    /// program hands to [`partition_many_declared`]; every emission,
-    /// allocation and pricing question about an input resolves here.
-    pub declared_dtypes: std::collections::HashMap<String, crate::ir::Dtype>,
+    /// Γ — every width decision for this program, sealed behind
+    /// [`crate::gamma::Bindings`]: the caller's declarations, the law's
+    /// mints, the output pins, and the analysis' exact-boundary facts.
+    /// Append-only by construction; [`Schedule::width_of`] is the one
+    /// resolution every consumer reads.
+    bindings: crate::gamma::Bindings,
     /// The decline census: every MONOIDAL-classified axis the deriver could
     /// not compose at the node the partitioner stood on, in emission order.
     /// [`Schedule::decline_census`] buckets it.
     pub declines: Vec<Decline>,
-    /// Per-output storage width, aligned with `outputs`. `None` means the
-    /// target's boundary policy. An index-valued output overrides it: bf16
-    /// holds integers exactly only to 256, so narrowing one corrupts it.
-    pub output_dtypes: Vec<Option<crate::ir::Dtype>>,
+
     /// Outputs whose buffer IS the buffer of the value they replace, so the
     /// part they leave unchanged is already in place and need not be written.
     /// Set by the caller that owns the aliasing decision (a persistent state
@@ -185,9 +164,7 @@ pub fn partition_many_declared(
         dev,
         stages: Vec::new(),
         declines: Vec::new(),
-        exact_boundaries: Vec::new(),
-        minted_dtypes: std::collections::HashMap::new(),
-        declared,
+        bindings: crate::gamma::Bindings::with_declared(declared.clone()),
         produced: std::collections::HashSet::new(),
         fresh: 0,
         done: HashMap::new(),
@@ -222,11 +199,8 @@ pub fn partition_many_declared(
         stages,
         outputs,
         declines: std::mem::take(&mut p.declines),
-        output_dtypes: vec![None; roots.len()],
         agrees_in_place: Vec::new(),
-        exact_boundaries: std::mem::take(&mut p.exact_boundaries),
-        minted_dtypes: std::mem::take(&mut p.minted_dtypes),
-        declared_dtypes: declared.clone(),
+        bindings: std::mem::take(&mut p.bindings),
         _keepalive: keepalive,
     };
     // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like
@@ -419,16 +393,10 @@ struct Partitioner<'a> {
     /// compose there. The census (CRITIQUE.md §2.2) — the declines this
     /// WORKLOAD actually hit, not the syllabus's.
     declines: Vec<Decline>,
-    /// Exact-valued boundaries (see [`Schedule::exact_boundaries`]), noted
-    /// as each buffer is minted — the one point where the producing node is
-    /// in hand, unspliced, with full `Iota`/`Coordinate`/`Const` provenance.
-    exact_boundaries: Vec<(String, crate::numeric::Inferred)>,
-    /// The law's width choices (see [`Schedule::minted_dtypes`]), available
-    /// immediately so a consumer spliced LATER in this same partition reads
-    /// the buffer at the width its producer writes.
-    minted_dtypes: std::collections::HashMap<String, crate::ir::Dtype>,
-    /// The caller's declarations (see [`Schedule::declared_dtypes`]).
-    declared: &'a std::collections::HashMap<String, crate::ir::Dtype>,
+    /// Γ under construction — declarations seeded from the caller, facts
+    /// and mints appended as each buffer is named, unspliced, with full
+    /// `Iota`/`Coordinate`/`Const` provenance.
+    bindings: crate::gamma::Bindings,
     /// Every buffer this partition has materialized — the names that price
     /// at the boundary policy rather than the undeclared-input default.
     produced: std::collections::HashSet<String>,
@@ -551,21 +519,10 @@ impl Partitioner<'_> {
     /// decline, don't guess.
     fn note_boundary(&mut self, name: &str, node: &Node) {
         self.produced.insert(name.to_string());
-        let claim = crate::numeric::infer_root(node);
-        if !claim.system.is_exact() {
-            return;
-        }
-        self.exact_boundaries.push((name.to_string(), claim));
-        // The law chooses the width, here, where the name is born. Only a
-        // choice ABOVE the policy is recorded — a real or a small index
-        // takes the boundary policy like everything else, so the policy's
-        // measured win is untouched. `None` (an unmintable exact value,
-        // e.g. saturated bounds) stays a fact for the refusal.
-        if let Some(width) = crate::numeric::store_dtype(claim, self.dev.storage())
-            && width != self.dev.storage()
-        {
-            self.minted_dtypes.insert(name.to_string(), width);
-        }
+        // Γ does the recording and the minting; this is merely the moment —
+        // the buffer's birth, producing node in hand and unspliced.
+        self.bindings
+            .observe(name, crate::numeric::infer_root(node), self.dev.storage());
     }
 
     /// Bytes per element of `name` for pricing: the law's mint, else the
@@ -574,7 +531,7 @@ impl Partitioner<'_> {
     /// (Pins are set after partition returns and apply to terminal outputs,
     /// which no stage reads.)
     fn byte_width(&self, name: &str) -> f64 {
-        if let Some(dtype) = self.minted_dtypes.get(name).or_else(|| self.declared.get(name)) {
+        if let Some(dtype) = self.bindings.width_hint(name) {
             return dtype.bytes_per_element();
         }
         if self.produced.contains(name) {
@@ -1574,12 +1531,9 @@ impl Partitioner<'_> {
                 subs.push((producer.clone(), ir::input(sentinel, producer.shape())));
                 let epi = replace_many(node, &subs, &mut HashMap::new());
                 spec.output_name = out.to_string();
-                // The rename moves the buffer's identity; the law's mint
-                // moves with it, or writer and reader disagree about the
-                // very width the mint exists to protect.
-                if let Some(width) = self.minted_dtypes.remove(landed) {
-                    self.minted_dtypes.insert(out.to_string(), width);
-                }
+                // The rename moves the buffer's identity; Γ moves the fact
+                // and the mint with it.
+                self.bindings.rename(landed, out);
                 *epilogue = ops;
                 let mut all_inputs = plain_inputs;
                 all_inputs.extend(extra);
@@ -2110,35 +2064,29 @@ fn replace_many(node: &Node, subs: &[(Node, Node)], memo: &mut HashMap<*const No
 }
 
 impl Schedule {
-    /// The one resolution of a buffer's storage width — every consumer of
-    /// the answer (emission, allocation, readback, the refusal) asks here,
-    /// which is what makes their disagreement inexpressible. Precedence is
-    /// the who-chooses table: a caller's pin ([`Schedule::output_dtypes`]),
-    /// then the law's mint ([`Schedule::minted_dtypes`]), then `default`,
-    /// the target's boundary policy.
-    pub fn width_of(&self, name: &str, default: crate::ir::Dtype) -> crate::ir::Dtype {
-        self.outputs
-            .iter()
-            .position(|output| output == name)
-            .and_then(|index| self.output_dtypes.get(index).copied().flatten())
-            .or_else(|| self.minted_dtypes.get(name).copied())
-            .or_else(|| self.declared_dtypes.get(name).copied())
-            .unwrap_or(default)
+    /// Γ, read-only. Widths enter through the caller's declarations, the
+    /// law's observations at partition time, and [`Schedule::pin_outputs`]
+    /// — never by assignment.
+    pub fn bindings(&self) -> &crate::gamma::Bindings {
+        &self.bindings
     }
 
-    /// The law, applied at each boundary's EFFECTIVE width
-    /// ([`Schedule::width_of`]). With minting in place this fires for
-    /// exactly two things: an exact value no writable dtype carries
-    /// (saturated bounds), and a caller's pin narrower than the law allows.
-    /// Empty means the program is storable as configured.
+    /// The caller's output pins, once, validated against this schedule's
+    /// roots. Append-only: re-pinning a name is refused.
+    pub fn pin_outputs(&mut self, pins: Vec<Option<crate::ir::Dtype>>) {
+        self.bindings.pin(&self.outputs, pins);
+    }
+
+    /// The one resolution of a buffer's storage width — see
+    /// [`crate::gamma::Bindings::width_of`].
+    pub fn width_of(&self, name: &str, default: crate::ir::Dtype) -> crate::ir::Dtype {
+        self.bindings.width_of(name, default)
+    }
+
+    /// The law at the effective widths — see
+    /// [`crate::gamma::Bindings::unstorable`].
     pub fn unstorable(&self, default: crate::ir::Dtype) -> Vec<(String, crate::numeric::Inferred, crate::ir::Dtype)> {
-        self.exact_boundaries
-            .iter()
-            .filter_map(|(name, claim)| {
-                let width = self.width_of(name, default);
-                (!crate::numeric::may_store(*claim, width)).then(|| (name.clone(), *claim, width))
-            })
-            .collect()
+        self.bindings.unstorable(default)
     }
 }
 
