@@ -133,6 +133,9 @@ pub fn round_to(dtype: Dtype, v: f64) -> f64 {
             let r = (b.wrapping_add(0x7FFF).wrapping_add((b >> 16) & 1)) >> 16;
             f32::from_bits(r << 16) as f64
         }
+        Dtype::U32 => {
+            panic!("round_to: U32 stores saturate; they are not a rounding of ℝ")
+        }
         Dtype::I8 | Dtype::I4 => {
             panic!("round_to: {dtype:?} needs a scale, not a plain rounding")
         }
@@ -171,6 +174,10 @@ pub enum Dtype {
     F32,
     F16,
     BF16,
+    /// Unsigned 32-bit integers — the index format. Stores SATURATE: a
+    /// `+∞` fold identity lands on `u32::MAX` by definition rather than by
+    /// accident, which is what lets an argmax buffer be an integer at all.
+    U32,
     I8,
     I4,
 }
@@ -187,20 +194,34 @@ impl Dtype {
     /// `buf_ty`, `out_ty`, `store_expr`, `buffer_load` and `round_to` all
     /// match exhaustively and panic on formats a target cannot handle, and
     /// that exhaustiveness is what makes those refusals loud.
-    const fn layout(self) -> (u32, u32) {
+    const fn layout(self) -> (u32, u32, u32) {
         match self {
-            Dtype::F64 => (11, 52),
-            Dtype::F32 => (8, 23),
-            Dtype::F16 => (5, 10),
-            Dtype::BF16 => (8, 7),
-            Dtype::I8 => (0, 7),
-            Dtype::I4 => (0, 3),
+            Dtype::F64 => (1, 11, 52),
+            Dtype::F32 => (1, 8, 23),
+            Dtype::F16 => (1, 5, 10),
+            Dtype::BF16 => (1, 8, 7),
+            Dtype::U32 => (0, 0, 32),
+            Dtype::I8 => (1, 0, 7),
+            Dtype::I4 => (1, 0, 3),
         }
     }
 
     /// An IEEE-style floating format.
     pub const fn is_float(self) -> bool {
-        self.layout().0 > 0
+        self.layout().1 > 0
+    }
+
+    /// An unsigned integer format: no sign bit, no negative values — and
+    /// stores saturate rather than wrap.
+    pub const fn is_unsigned(self) -> bool {
+        self.layout().0 == 0
+    }
+
+    /// Does an out-of-range store land on the nearest representable value
+    /// by definition? True of the unsigned integer formats, whose emitted
+    /// store clamps — `+∞ → MAX` is the contract, not an accident.
+    pub const fn saturates(self) -> bool {
+        self.is_unsigned()
     }
 
     /// Can this format represent ±∞?
@@ -220,7 +241,7 @@ impl Dtype {
     /// leading bit buys the extra power. A signed integer stops one short
     /// of its magnitude range.
     pub const fn exact_integers_to(self) -> i64 {
-        let (exponent, significand) = self.layout();
+        let (_, exponent, significand) = self.layout();
         if exponent > 0 {
             1i64 << (significand + 1)
         } else {
@@ -232,8 +253,8 @@ impl Dtype {
     /// fractional-byte size, and newer ones (fp4, fp6) are not even a power
     /// of two, so bits is the only unit that stays exact.
     pub const fn nbits(self) -> u32 {
-        let (exponent, significand) = self.layout();
-        1 + exponent + significand
+        let (sign, exponent, significand) = self.layout();
+        sign + exponent + significand
     }
 
     /// Does an element occupy less than a byte, so that storage packs

@@ -124,6 +124,7 @@ impl Lang for MetalLang {
             // bf16 = the high 16 bits of an f32: widen by shifting back up,
             // exact over the whole f32 range (no rounding, no range limit).
             Dtype::BF16 => format!("as_type<float>((uint){b}[{off}] << 16u)"),
+            Dtype::U32 => format!("((float){b}[{off}])"),
             Dtype::I8 => format!("((float){b}[{off}])"),
             Dtype::I4 => format!("w4({b}, {off})"),
             Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
@@ -154,6 +155,7 @@ fn buf_ty(dtype: Dtype) -> &'static str {
         Dtype::F32 => "device const float*",
         Dtype::F16 => "device const half*",
         Dtype::BF16 => "device const ushort*",
+        Dtype::U32 => "device const uint*",
         Dtype::I8 => "device const char*",
         Dtype::I4 => "device const uchar*",
         Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
@@ -165,6 +167,11 @@ fn buf_ty(dtype: Dtype) -> &'static str {
 pub(crate) const MSL_HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\n\
 inline float w4(device const uchar* p, uint i) {\n\
     return (float)(int)((p[i >> 1] >> ((i & 1u) << 2)) & 0xFu) - 8.0f;\n\
+}\n\n\
+inline uint to_u32_saturating(float v) {\n\
+    if (v >= 4294967040.0f) return 0xFFFFFFFFu;\n\
+    if (!(v > 0.0f)) return 0u;\n\
+    return (uint)(v + 0.5f);\n\
 }\n\n\
 inline ushort to_bf16(float v) {\n\
     uint b = as_type<uint>(v);\n\
@@ -178,6 +185,7 @@ fn out_ty(storage: Dtype) -> &'static str {
         Dtype::F32 => "device float*",
         Dtype::F16 => "device half*",
         Dtype::BF16 => "device ushort*",
+        Dtype::U32 => "device uint*",
         other => panic!("{other:?} is not a boundary storage dtype"),
     }
 }
@@ -189,6 +197,13 @@ fn store_expr(storage: Dtype, value: &str) -> String {
         Dtype::F32 => value.to_string(),
         Dtype::F16 => format!("(half)({value})"),
         Dtype::BF16 => format!("to_bf16({value})"),
+        // SATURATING by contract: +∞ (a Min fold's identity reaching the
+        // store) lands on u32::MAX by definition; negatives — unreachable
+        // under the law, which refuses −∞-carrying claims — clamp to 0
+        // rather than wrap into a plausible index. Values are exact
+        // integers in f32 (the law admits nothing wider than the compute
+        // width can hold), so the +0.5 round is exact, not a heuristic.
+        Dtype::U32 => format!("to_u32_saturating({value})"),
         other => panic!("{other:?} is not a boundary storage dtype"),
     }
 }

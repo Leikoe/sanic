@@ -236,6 +236,12 @@ impl MetalDevice {
                 let ptr = buf.contents() as *const u16;
                 (0..count).map(|i| half_to_f32(unsafe { *ptr.add(i) })).collect()
             }
+            // Exact to 2^24 in this widening — and the law admits nothing an
+            // f32 register could not have held exactly anyway.
+            Dtype::U32 => {
+                let ptr = buf.contents() as *const u32;
+                (0..count).map(|i| unsafe { *ptr.add(i) } as f32).collect()
+            }
             other => panic!("{other:?} is not a boundary storage dtype"),
         }
     }

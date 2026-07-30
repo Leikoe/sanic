@@ -244,13 +244,11 @@ fn build_decode(config: Config, context_length: usize, cache_dtype: Dtype) -> Gr
     if std::env::var_os("LLAMA3_2_DEBUG_LOGITS").is_some() {
         graph.output("logits", logits.clone());
     }
-    // F32 regardless of the boundary policy: this is an index into a 128,256
-    // entry vocabulary, and bf16 holds integers exactly only to 256.
-    graph.output_at(
-        "token",
-        sanic::argmax(logits.node().clone(), -1isize).into(),
-        Dtype::F32,
-    );
+    // No pin: the law knows this is an index into a 128,256-entry
+    // vocabulary — ℕ̄, bounded, +∞ fold identity — and mints u32 with a
+    // saturating store on its own. The pin this replaced (#21) predates the
+    // law; a caller may still outrank the mint, but no longer has to.
+    graph.output("token", sanic::argmax(logits.node().clone(), -1isize).into());
     graph
 }
 

@@ -83,23 +83,24 @@ impl NumberSystem {
 pub struct Bounds {
     pub lo: Option<i64>,
     pub hi: Option<i64>,
-    /// Can this value be ±∞? An integer representation cannot hold one, so
-    /// this is a precondition on every integer store.
-    pub infinite: bool,
+    /// Can this value be −∞? A `Max` fold injects it as its identity. No
+    /// integer representation has a home for it — a saturating unsigned
+    /// store would alias it to index 0, a valid-looking answer — so it
+    /// refuses every integer format outright.
+    pub neg_inf: bool,
+    /// Can this value be +∞? A `Min` fold injects it — the argmax index
+    /// accumulator starts there. Floats hold it exactly, and a SATURATING
+    /// unsigned store gives it a defined home at the maximum, which is what
+    /// lets an index buffer be an integer at all.
+    pub pos_inf: bool,
 }
 
 impl Bounds {
     pub const UNBOUNDED: Bounds = Bounds {
         lo: None,
         hi: None,
-        infinite: true,
-    };
-
-    /// No finite values at all: an infinity and nothing else.
-    pub const INFINITE_ONLY: Bounds = Bounds {
-        lo: Some(i64::MAX),
-        hi: Some(i64::MIN),
-        infinite: true,
+        neg_inf: true,
+        pos_inf: true,
     };
 
     pub fn point(value: i64) -> Bounds {
@@ -110,7 +111,20 @@ impl Bounds {
         Bounds {
             lo: Some(lo),
             hi: Some(hi),
-            infinite: false,
+            neg_inf: false,
+            pos_inf: false,
+        }
+    }
+
+    /// One signed infinity and no finite values at all — a fold identity
+    /// before any element arrives. The empty finite range is `lo > hi`, so
+    /// `union` stays plain min/max.
+    pub fn infinity(negative: bool) -> Bounds {
+        Bounds {
+            lo: Some(i64::MAX),
+            hi: Some(i64::MIN),
+            neg_inf: negative,
+            pos_inf: !negative,
         }
     }
 
@@ -119,7 +133,8 @@ impl Bounds {
         Bounds {
             lo: lower(self.lo, other.lo, i64::min),
             hi: lower(self.hi, other.hi, i64::max),
-            infinite: self.infinite || other.infinite,
+            neg_inf: self.neg_inf || other.neg_inf,
+            pos_inf: self.pos_inf || other.pos_inf,
         }
     }
 
@@ -131,7 +146,7 @@ impl Bounds {
     }
 
     pub fn is_finite(self) -> bool {
-        !self.infinite
+        !self.neg_inf && !self.pos_inf
     }
 }
 
@@ -153,7 +168,8 @@ fn corners(a: Bounds, b: Bounds, combine: fn(i64, i64) -> Option<i64>) -> Bounds
         return Bounds {
             lo: None,
             hi: None,
-            infinite: a.infinite || b.infinite,
+            neg_inf: a.neg_inf || b.neg_inf,
+            pos_inf: a.pos_inf || b.pos_inf,
         };
     };
     let mut lo = None;
@@ -171,7 +187,8 @@ fn corners(a: Bounds, b: Bounds, combine: fn(i64, i64) -> Option<i64>) -> Bounds
     Bounds {
         lo: if overflowed { None } else { lo },
         hi: if overflowed { None } else { hi },
-        infinite: a.infinite || b.infinite,
+        neg_inf: a.neg_inf || b.neg_inf,
+        pos_inf: a.pos_inf || b.pos_inf,
     }
 }
 
@@ -179,7 +196,8 @@ fn negated(bounds: Bounds) -> Bounds {
     Bounds {
         lo: bounds.hi.and_then(i64::checked_neg),
         hi: bounds.lo.and_then(i64::checked_neg),
-        infinite: bounds.infinite,
+        neg_inf: bounds.pos_inf,
+        pos_inf: bounds.neg_inf,
     }
 }
 
@@ -226,11 +244,19 @@ impl Inferred {
 /// either case a value that can be infinite needs a representation that
 /// holds ±∞, which rules out the integer formats.
 pub fn may_store(value: Inferred, dtype: Dtype) -> bool {
-    if !value.bounds.is_finite() && !dtype.has_infinities() {
+    if value.bounds.neg_inf && !dtype.has_infinities() {
+        // −∞ has no integer home: a saturating unsigned store would alias
+        // it to 0, a valid-looking index. Only a float carries it.
+        return false;
+    }
+    if value.bounds.pos_inf && !dtype.has_infinities() && !dtype.saturates() {
         return false;
     }
     if !value.system.is_exact() {
-        return true;
+        return dtype.is_float();
+    }
+    if dtype.is_unsigned() && value.bounds.lo.is_none_or(|lo| lo < 0) {
+        return false;
     }
     value.bounds.within(dtype.exact_integers_to())
 }
@@ -254,7 +280,7 @@ pub fn store_dtype(value: Inferred, preferred: Dtype) -> Option<Dtype> {
     if may_store(value, preferred) {
         return Some(preferred);
     }
-    [Dtype::BF16, Dtype::F16, Dtype::F32]
+    [Dtype::BF16, Dtype::F16, Dtype::U32, Dtype::F32]
         .into_iter()
         .find(|&candidate| may_store(value, candidate))
 }
@@ -344,7 +370,8 @@ fn coordinate_of(extent: usize) -> Inferred {
         Bounds {
             lo: Some(0),
             hi: i64::try_from(extent).ok().map(|n| n - 1),
-            infinite: false,
+            neg_inf: false,
+            pos_inf: false,
         },
     )
 }
@@ -354,7 +381,7 @@ fn coordinate_of(extent: usize) -> Inferred {
 /// smallest system containing it; anything else is a real.
 fn constant(v: f64) -> Inferred {
     if v.is_infinite() {
-        return Inferred::exact(NumberSystem::Bool, Bounds::INFINITE_ONLY);
+        return Inferred::exact(NumberSystem::Bool, Bounds::infinity(v < 0.0));
     }
     if !v.is_finite() || v.fract() != 0.0 {
         return Inferred::real();
@@ -461,10 +488,16 @@ fn fold(op: Monoid, operand: Inferred, extent: usize) -> Inferred {
         }
         // A fold over an order monoid returns one of its elements — or its
         // identity, if the axis is empty. So: the operand's finite range,
-        // and the sentinel this monoid injects.
-        Monoid::Max | Monoid::Min => Inferred {
+        // and the SIGNED sentinel this monoid injects — Max starts at −∞,
+        // Min at +∞, and the difference decides whether a saturating
+        // unsigned store is lawful (§ may_store).
+        Monoid::Max => Inferred {
             system: operand.system,
-            bounds: operand.bounds.union(Bounds::INFINITE_ONLY),
+            bounds: operand.bounds.union(Bounds::infinity(true)),
+        },
+        Monoid::Min => Inferred {
+            system: operand.system,
+            bounds: operand.bounds.union(Bounds::infinity(false)),
         },
         Monoid::LogSumExp => Inferred::real(),
     }

@@ -290,9 +290,13 @@ fn the_argmax_buffer_is_minted_lawful_under_a_bf16_policy() {
     };
 
     with_bindings(|mut gamma| {
-        let proof = gamma.mint("t_argmax", claim, &policy).expect("f32 is lawful");
+        let proof = gamma.mint("t_argmax", claim, &policy).expect("a lawful width exists");
         let binding = gamma.binding(proof);
-        assert_eq!(binding.dtype(), Dtype::F32, "±∞ and 128255 need f32");
+        assert_eq!(
+            binding.dtype(),
+            Dtype::U32,
+            "an index is an integer; +∞ saturates to MAX"
+        );
         assert_eq!(binding.provenance(), Provenance::Law);
         assert!(may_store(binding.inferred(), binding.dtype()));
     });

@@ -203,15 +203,24 @@ fn a_small_index_fits_a_narrow_float() {
 }
 
 #[test]
-fn integer_formats_are_refused_when_a_value_can_be_infinite() {
-    // An order fold injects its identity, so the result's range carries ±∞ —
-    // and no integer representation holds it.
+fn infinities_are_signed_and_only_saturation_or_floats_hold_them() {
+    // argmax's Min fold injects +∞: floats hold it exactly, i8 has no home
+    // for it, and u32 gives it a DEFINED home at the maximum — a saturating
+    // store is a representation choice, not an accident.
     let vocab = axis("vocab", 1024);
     let scores = input("X", [vocab]);
-    let claim = infer_root(&argmax(scores, 0usize));
-    assert!(!claim.bounds.is_finite());
-    assert!(!may_store(claim, Dtype::I8));
-    assert!(may_store(claim, Dtype::F32));
+    let index = infer_root(&argmax(scores, 0usize));
+    assert!(index.bounds.pos_inf && !index.bounds.neg_inf);
+    assert!(!may_store(index, Dtype::I8));
+    assert!(may_store(index, Dtype::U32), "+∞ saturates to u32::MAX by contract");
+    assert!(may_store(index, Dtype::F32));
+
+    // A Max fold injects −∞, and −∞ would saturate to 0 — a valid-looking
+    // index. Only a float carries it.
+    let peak = infer_root(&reduce(coordinate(input("X", [vocab]), 0usize), 0usize, Monoid::Max));
+    assert!(peak.bounds.neg_inf && !peak.bounds.pos_inf);
+    assert!(!may_store(peak, Dtype::U32), "−∞ has no unsigned home");
+    assert!(may_store(peak, Dtype::F32));
 }
 
 #[test]
@@ -233,7 +242,8 @@ fn bounds_do_not_wrap_on_overflow() {
     let widest = Bounds {
         lo: Some(i64::MIN),
         hi: Some(0),
-        infinite: false,
+        neg_inf: false,
+        pos_inf: false,
     };
     assert!(!widest.within(1 << 24));
     let exact = Inferred {
@@ -309,8 +319,10 @@ fn the_law_mints_the_width_the_policy_cannot_supply() {
     assert!(!schedule.exact_boundaries.is_empty(), "the fact is recorded");
     assert!(schedule.unstorable(Dtype::BF16).is_empty(), "minted, not refused");
     let out = schedule.outputs[0].clone();
-    assert_eq!(schedule.minted_dtypes.get(&out).copied(), Some(Dtype::F32));
-    assert_eq!(schedule.width_of(&out, Dtype::BF16), Dtype::F32);
+    // u32, not f32: same four bytes, but the index is an INTEGER in memory
+    // — and the +∞ identity has a defined home at u32::MAX via saturation.
+    assert_eq!(schedule.minted_dtypes.get(&out).copied(), Some(Dtype::U32));
+    assert_eq!(schedule.width_of(&out, Dtype::BF16), Dtype::U32);
 
     // A pin outranks the mint — the caller is the Caller row — but only a
     // LAWFUL pin: width_of resolves pin first, and unstorable() judges it.

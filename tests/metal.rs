@@ -2349,10 +2349,10 @@ fn clock_reports_the_dvfs_state_a_workload_ran_at() {
 // The number-systems arc, end to end on the device: an argmax over 4096
 // entries under a bf16 boundary policy. bf16 holds integers exactly only to
 // 256 — at index 3333 its spacing is 32, so storing the index at the policy
-// width would reload 3328, a DIFFERENT token. The law mints f32 for that one
-// buffer (f16 also fails: exact only to 2048), no pin and no refusal, and
-// the index survives the round trip exactly while every real-valued buffer
-// keeps the policy width.
+// width would reload 3328, a DIFFERENT token. The law mints u32 for that one
+// buffer (f16 fails at 2048; u32 is exact and gives the +∞ fold identity a
+// home at MAX by saturation), no pin and no refusal, and the index survives
+// the round trip as an INTEGER while every real buffer keeps the policy.
 #[test]
 fn an_argmax_index_survives_bf16_storage_by_minted_width() {
     let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
@@ -2372,7 +2372,7 @@ fn an_argmax_index_survives_bf16_storage_by_minted_width() {
     let out = sched.outputs[0].clone();
     assert_eq!(
         program.dtypes.get(out.as_str()).copied(),
-        Some(Dtype::F32),
+        Some(Dtype::U32),
         "emission registered the minted width for allocation and readback"
     );
 
@@ -2393,7 +2393,7 @@ fn an_argmax_index_survives_bf16_storage_by_minted_width() {
     }
     dev.run(&program_dispatches(&program, &bufs, &pipes));
 
-    let got = dev.read_as_f32(&bufs[&out], 1, Dtype::F32);
+    let got = dev.read_as_f32(&bufs[&out], 1, Dtype::U32);
     assert_eq!(
         got[0], winner as f32,
         "the index must survive storage EXACTLY — bf16 would have made it 3328"

@@ -1619,7 +1619,20 @@ decline, so each declaration is a cut.
 *Done when:* interpreter and Metal agree bit-for-bit on a declared graph; the
 16% holds under **ABBA**, pooled sd reported.
 
-### M15 — Integer buffers and index outputs · [todo]
+### M15 — Integer buffers and index outputs · [LANDED]
+
+`Dtype::U32`: sign-aware `layout()` (the format table gained a sign column —
+unsignedness was inexpressible before), exact to 2³²−1, `is_unsigned()`,
+`saturates()`. `Bounds` tracks the SIGN of its infinities, because the two
+sentinels have opposite fates: +∞ (Min's identity) saturates to `u32::MAX`
+by contract; −∞ (Max's) would alias to index 0, so it refuses every integer
+format — tested as a pair. The saturating store (`to_u32_saturating`) is in
+the MSL header, exact because the law admits nothing wider than compute's
+2²⁴. U32 joined the mint's candidates between f16 and f32 — same four bytes,
+an integer in memory — and `round_to` refuses it with the sentence that
+opens M16: "U32 stores saturate; they are not a rounding of ℝ." llama's
+manual F32 pin (#21's workaround) retired; the law mints u32 unaided, both
+modes at full speed, GPU e2e reads the index back as an integer.
 
 Writable integer dtypes (`out_ty`/`store_expr` panic on them today;
 `write_f64` hardcodes `*mut f32`). Index outputs get **one width, u32** — never

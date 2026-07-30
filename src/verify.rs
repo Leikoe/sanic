@@ -38,7 +38,7 @@ pub fn rel_tolerance(dtype: Dtype, terms: usize) -> f64 {
         Dtype::F32 => f32::EPSILON as f64,
         Dtype::F16 => 9.77e-4,
         Dtype::BF16 => 7.82e-3,
-        Dtype::I8 | Dtype::I4 => 0.0,
+        Dtype::U32 | Dtype::I8 | Dtype::I4 => 0.0,
     };
     64.0 * eps * terms.max(1) as f64
 }
