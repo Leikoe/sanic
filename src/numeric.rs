@@ -244,16 +244,19 @@ impl Inferred {
 /// either case a value that can be infinite needs a representation that
 /// holds ±∞, which rules out the integer formats.
 pub fn may_store(value: Inferred, dtype: Dtype) -> bool {
-    if value.bounds.neg_inf && !dtype.has_infinities() {
-        // −∞ has no integer home: a saturating unsigned store would alias
-        // it to 0, a valid-looking index. Only a float carries it.
+    if value.bounds.neg_inf && !dtype.has_infinities() && !dtype.clamps_signed() {
+        // −∞ needs a float or a SIGNED clamped grid (−127·scale is a home);
+        // an unsigned saturating store would alias it to 0, a valid-looking
+        // index.
         return false;
     }
-    if value.bounds.pos_inf && !dtype.has_infinities() && !dtype.saturates() {
+    if value.bounds.pos_inf && !dtype.has_infinities() && !dtype.saturates() && !dtype.clamps_signed() {
         return false;
     }
     if !value.system.is_exact() {
-        return dtype.is_float();
+        // A real may round (floats) or quantize (a scaled grid IS a
+        // declared rounding of ℝ̄) — never land on a plain integer format.
+        return dtype.is_float() || dtype.scale().is_some();
     }
     if dtype.is_unsigned() && value.bounds.lo.is_none_or(|lo| lo < 0) {
         return false;

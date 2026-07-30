@@ -97,6 +97,10 @@ impl Lang for MetalLang {
             MapOp::RoundTo(Dtype::BF16) => format!("as_type<float>((uint)to_bf16({}) << 16u)", a[0]),
             MapOp::RoundTo(Dtype::F16) => format!("((float)((half)({})))", a[0]),
             MapOp::RoundTo(Dtype::F32 | Dtype::F64) => a[0].clone(),
+            MapOp::RoundTo(d @ Dtype::Q8 { .. }) => {
+                let scale = d.scale().expect("Q8 carries its scale");
+                format!("(clamp(rint(({}) / {scale:?}f), -127.0f, 127.0f) * {scale:?}f)", a[0])
+            }
             MapOp::RoundTo(d) => panic!("RoundTo({d:?}) needs a scale, not a plain rounding"),
         }
     }
@@ -125,6 +129,12 @@ impl Lang for MetalLang {
             // exact over the whole f32 range (no rounding, no range limit).
             Dtype::BF16 => format!("as_type<float>((uint){b}[{off}] << 16u)"),
             Dtype::U32 => format!("((float){b}[{off}])"),
+            // Dequantization IS the load: the scale is part of the type,
+            // baked into the kernel as a literal.
+            Dtype::Q8 { .. } => {
+                let scale = dtype.scale().expect("Q8 carries its scale");
+                format!("(((float){b}[{off}]) * {scale:?}f)")
+            }
             Dtype::I8 => format!("((float){b}[{off}])"),
             Dtype::I4 => format!("w4({b}, {off})"),
             Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
@@ -156,6 +166,7 @@ fn buf_ty(dtype: Dtype) -> &'static str {
         Dtype::F16 => "device const half*",
         Dtype::BF16 => "device const ushort*",
         Dtype::U32 => "device const uint*",
+        Dtype::Q8 { .. } => "device const char*",
         Dtype::I8 => "device const char*",
         Dtype::I4 => "device const uchar*",
         Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
@@ -167,6 +178,10 @@ fn buf_ty(dtype: Dtype) -> &'static str {
 pub(crate) const MSL_HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\n\
 inline float w4(device const uchar* p, uint i) {\n\
     return (float)(int)((p[i >> 1] >> ((i & 1u) << 2)) & 0xFu) - 8.0f;\n\
+}\n\n\
+inline char to_q8_saturating(float v, float s) {\n\
+    float q = rint(v / s);\n\
+    return (char)clamp(q, -127.0f, 127.0f);\n\
 }\n\n\
 inline uint to_u32_saturating(float v) {\n\
     if (v >= 4294967040.0f) return 0xFFFFFFFFu;\n\
@@ -186,6 +201,7 @@ fn out_ty(storage: Dtype) -> &'static str {
         Dtype::F16 => "device half*",
         Dtype::BF16 => "device ushort*",
         Dtype::U32 => "device uint*",
+        Dtype::Q8 { .. } => "device char*",
         other => panic!("{other:?} is not a boundary storage dtype"),
     }
 }
@@ -204,6 +220,13 @@ fn store_expr(storage: Dtype, value: &str) -> String {
         // integers in f32 (the law admits nothing wider than the compute
         // width can hold), so the +0.5 round is exact, not a heuristic.
         Dtype::U32 => format!("to_u32_saturating({value})"),
+        // Quantize AT the store, clamped to the signed grid: ±∞ land on
+        // ±127·scale by contract, the same saturation-as-representation
+        // rule that gives u32 its MAX.
+        Dtype::Q8 { .. } => {
+            let scale = storage.scale().expect("Q8 carries its scale");
+            format!("to_q8_saturating({value}, {scale:?}f)")
+        }
         other => panic!("{other:?} is not a boundary storage dtype"),
     }
 }

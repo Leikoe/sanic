@@ -2399,3 +2399,48 @@ fn an_argmax_index_survives_bf16_storage_by_minted_width() {
         "the index must survive storage EXACTLY — bf16 would have made it 3328"
     );
 }
+
+// M16 on the device: an output PINNED to q8 quantizes at the store — the
+// scale rides the type into the kernel — and the bytes read back are the
+// grid, exactly. The oracle is `round_to`, because a Q8 round trip is a
+// declared rounding of ℝ̄; the comparison is equality, not tolerance.
+#[test]
+fn a_q8_pinned_output_round_trips_the_grid_exactly() {
+    let q8 = Dtype::q8(0.03125);
+    let n = axis("n", 512);
+    let mut rng = Lcg(0x0816);
+    let values = rand_tensor(&[n], &mut rng);
+    let env: Env = [("X", values.clone())].into_iter().collect();
+
+    // tanh keeps the range in ±1, a realistic activation for a coarse grid.
+    let activation = map(MapOp::Tanh, vec![input("X", [n])]);
+    let expected: Vec<f32> = eval(&activation, &env)
+        .data
+        .iter()
+        .map(|&v| sanic::ir::round_to(q8, v) as f32)
+        .collect();
+
+    let mut sched = partition(&activation, &DeviceSpecs::toy());
+    sched.output_dtypes = vec![Some(q8)];
+    let program = emit_schedule_metal_on(&DeviceSpecs::toy(), &sched);
+    let out = sched.outputs[0].clone();
+    assert_eq!(program.dtypes.get(out.as_str()).copied(), Some(q8));
+
+    let Some(dev) = MetalDevice::open() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    let pipes = dev.compile(&program.msl);
+    let mut bufs: HashMap<String, MetalBuf> = HashMap::new();
+    for (name, _) in &program.inputs {
+        bufs.insert(name.to_string(), dev.from_f64(&env[*name].data));
+    }
+    for (name, size) in &program.buffers {
+        let width = program.dtypes.get(name.as_str()).copied().unwrap_or(program.storage);
+        bufs.insert(name.clone(), dev.alloc_elems(*size, width));
+    }
+    dev.run(&program_dispatches(&program, &bufs, &pipes));
+
+    let got = dev.read_as_f32(&bufs[&out], n.extent(), q8);
+    assert_eq!(got, expected, "the grid is exact where it lands — no tolerance");
+}

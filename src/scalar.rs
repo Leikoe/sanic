@@ -136,6 +136,15 @@ pub fn round_to(dtype: Dtype, v: f64) -> f64 {
         Dtype::U32 => {
             panic!("round_to: U32 stores saturate; they are not a rounding of ℝ")
         }
+        // The panic that named M16 — "needs a scale, not a plain rounding"
+        // — retires: Q8 HAS one, and its round trip is a genuine rounding
+        // of ℝ̄ onto the grid `{q · scale : −127 ≤ q ≤ 127}`. Idempotent
+        // like every declared rounding: a grid point rounds to itself.
+        Dtype::Q8 { scale_bits } => {
+            let scale = f32::from_bits(scale_bits) as f64;
+            let q = (v / scale).round().clamp(-127.0, 127.0);
+            q * scale
+        }
         Dtype::I8 | Dtype::I4 => {
             panic!("round_to: {dtype:?} needs a scale, not a plain rounding")
         }
@@ -178,6 +187,15 @@ pub enum Dtype {
     /// `+∞` fold identity lands on `u32::MAX` by definition rather than by
     /// accident, which is what lets an argmax buffer be an integer at all.
     U32,
+    /// Affine-quantized 8-bit: a representation OF ℝ̄, not a rounding of
+    /// one — the value `q · scale` for a signed byte `q`, stores clamped to
+    /// ±127. The first parameterised format: the scale is part of the TYPE
+    /// (carried as its f32 bits so the enum stays `Copy + Eq + Hash`),
+    /// exactly MLIR's `!quant.uniform<i8:f32, scale>` observation — storage
+    /// type and expressed type in one.
+    Q8 {
+        scale_bits: u32,
+    },
     I8,
     I4,
 }
@@ -201,6 +219,7 @@ impl Dtype {
             Dtype::F16 => (1, 5, 10),
             Dtype::BF16 => (1, 8, 7),
             Dtype::U32 => (0, 0, 32),
+            Dtype::Q8 { .. } => (1, 0, 7),
             Dtype::I8 => (1, 0, 7),
             Dtype::I4 => (1, 0, 3),
         }
@@ -241,12 +260,40 @@ impl Dtype {
     /// leading bit buys the extra power. A signed integer stops one short
     /// of its magnitude range.
     pub const fn exact_integers_to(self) -> i64 {
+        // A scaled format holds integers exactly only where its grid lands
+        // on them; claiming any is claiming the scale, so it claims none.
+        if matches!(self, Dtype::Q8 { .. }) {
+            return 0;
+        }
         let (_, exponent, significand) = self.layout();
         if exponent > 0 {
             1i64 << (significand + 1)
         } else {
             (1i64 << significand) - 1
         }
+    }
+
+    /// Quantized 8-bit with this scale. The scale rides the type.
+    pub fn q8(scale: f32) -> Dtype {
+        Dtype::Q8 {
+            scale_bits: scale.to_bits(),
+        }
+    }
+
+    /// The quantization scale, for the formats that have one.
+    pub fn scale(self) -> Option<f32> {
+        match self {
+            Dtype::Q8 { scale_bits } => Some(f32::from_bits(scale_bits)),
+            _ => None,
+        }
+    }
+
+    /// Does an out-of-range store clamp to the nearest representable value
+    /// by definition? The unsigned index format and the quantized formats:
+    /// `+∞ → MAX` there is contract, and for the SIGNED quantized grid
+    /// `−∞ → −127·scale` has a home too.
+    pub const fn clamps_signed(self) -> bool {
+        matches!(self, Dtype::Q8 { .. })
     }
 
     /// Width of one element. The honest unit: sub-byte formats have no

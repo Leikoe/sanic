@@ -1650,7 +1650,23 @@ Also answers the input-declaration question for free:
 `Tensor::input("tokens", [seq], Dtype::I32)` declares storage and system at
 once, and `is_int()` does the rest.
 
-### M16 — Quantized stores · [todo] · the reason the arc exists
+### M16 — Quantized stores · [v1 LANDED] · the reason the arc exists
+
+`Dtype::Q8 { scale_bits }` — the first parameterised format, the enum→struct
+trigger fired exactly where predicted: the scale is part of the TYPE (its f32
+bits, so `Copy + Eq + Hash` survive and every Γ map is untouched), MLIR's
+`!quant.uniform<i8:f32, scale>` observation in one variant. The panic that
+named this milestone retires: `round_to(Q8)` IS a rounding — onto the grid
+`{q·scale}`, clamped, idempotent, implemented in the interpreter, the Rust
+backend and Metal alike, so `stored(q8(s))` is a value-level declaration all
+three reproduce bit-for-bit. Dequantization is the load; quantization is the
+store (`to_q8_saturating`, scale baked as a literal); ±∞ have HOMES on the
+signed clamped grid (−∞ → −127·scale — unlike u32, whose floor would alias
+it to an index). The law rules: reals may quantize, indices may not
+(`exact_integers_to(Q8) = 0` — claiming any integer is claiming the scale).
+GPU-proven grid-EXACT, equality not tolerance. Deliberately absent, each its
+own arc: scale inference (a calibration question — §12), weight
+re-quantization, Q8 as a policy boundary.
 
 int8-with-a-scale: the first value whose representation is not a *rounding* of
 its number system. `round_to` panics on `I8`/`I4` today for exactly this reason.

@@ -97,6 +97,13 @@ impl Lang for RustLang {
                  f32::from_bits(((b.wrapping_add(0x7FFF).wrapping_add((b >> 16) & 1)) >> 16) << 16) }}) as f64 }}",
                 a[0]
             ),
+            MapOp::RoundTo(d @ Dtype::Q8 { .. }) => {
+                let scale = d.scale().expect("Q8 carries its scale") as f64;
+                format!(
+                    "((({}) / {scale:?}f64).round().clamp(-127.0, 127.0) * {scale:?}f64)",
+                    a[0]
+                )
+            }
             MapOp::RoundTo(d) => panic!("RoundTo({d:?}) is not emitted for the Rust backend"),
         }
     }

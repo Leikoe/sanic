@@ -401,3 +401,70 @@ fn real_valued_boundaries_are_untouched_by_the_refusal() {
     assert!(schedule.exact_boundaries.is_empty());
     assert!(schedule.unstorable(Dtype::BF16).is_empty());
 }
+
+// ── Q8: the first representation that is not a rounding without its scale ──
+
+#[test]
+fn q8_round_trip_is_a_declared_rounding_of_the_grid() {
+    use sanic::ir::round_to;
+    let q8 = Dtype::q8(0.5);
+
+    // Grid points round to themselves — the idempotence every declared
+    // rounding owes ("rounding twice is rounding once").
+    for q in [-127i32, -3, 0, 1, 88, 127] {
+        let v = q as f64 * 0.5;
+        assert_eq!(round_to(q8, v), v);
+        assert_eq!(round_to(q8, round_to(q8, 1.23456)), round_to(q8, 1.23456));
+    }
+    // Off-grid values land on the nearest grid point; the ends clamp —
+    // ±∞ have HOMES on a signed clamped grid.
+    assert_eq!(round_to(q8, 1.2), 1.0);
+    assert_eq!(round_to(q8, 1000.0), 63.5);
+    assert_eq!(round_to(q8, f64::INFINITY), 63.5);
+    assert_eq!(round_to(q8, f64::NEG_INFINITY), -63.5);
+}
+
+#[test]
+fn a_stored_q8_declaration_matches_the_scalar_grid_exactly() {
+    // `stored(q8(s))` is a VALUE operation: the interpreter, the Rust
+    // backend and Metal all reproduce the same grid because the rounding is
+    // part of the term, not of any schedule.
+    let n = axis("n", 7);
+    let x = input("X", [n]);
+    let declared = map(MapOp::RoundTo(Dtype::q8(0.25)), vec![x]);
+
+    let values = Value::from_shape_fn(&[7], |c| [0.3, -1.7, 100.0, -0.126, 0.0, 31.74, -31.9][c[0]]);
+    let env: Env = [("X", values.clone())].into_iter().collect();
+    let got = eval(&declared, &env);
+    for (v, g) in values.data.iter().zip(&got.data) {
+        assert_eq!(*g, round_to(Dtype::q8(0.25), *v));
+    }
+}
+
+#[test]
+fn the_law_rules_on_q8_exactly_as_the_design_says() {
+    // A real may quantize: the scaled grid is a declared rounding of ℝ̄.
+    let real = Inferred {
+        system: NumberSystem::Real,
+        bounds: Bounds::UNBOUNDED,
+    };
+    assert!(may_store(real, Dtype::q8(0.02)), "reals may take a grid");
+
+    // An index may NOT: the grid holds integers only where the scale happens
+    // to land, and claiming any is claiming the scale.
+    let vocab = axis("vocab", 128_256);
+    let index = infer_root(&argmax(input("X", [vocab]), 0usize));
+    assert!(!may_store(index, Dtype::q8(1.0)), "an index is exact or it is wrong");
+
+    // −∞ (a Max fold's identity) has a home at −127·scale on the SIGNED
+    // grid — unlike u32, whose floor would alias it to index zero.
+    let peak = infer_root(&reduce(coordinate(input("X", [vocab]), 0usize), 0usize, Monoid::Max));
+    assert!(!may_store(peak, Dtype::U32));
+    assert!(may_store(
+        Inferred {
+            system: NumberSystem::Real,
+            bounds: peak.bounds
+        },
+        Dtype::q8(0.5)
+    ));
+}

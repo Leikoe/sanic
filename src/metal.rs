@@ -225,6 +225,11 @@ impl MetalDevice {
                 let ptr = buf.contents() as *const u32;
                 (0..count).map(|i| unsafe { *ptr.add(i) } as f32).collect()
             }
+            Dtype::Q8 { scale_bits } => {
+                let scale = f32::from_bits(scale_bits);
+                let ptr = buf.contents() as *const i8;
+                (0..count).map(|i| unsafe { *ptr.add(i) } as f32 * scale).collect()
+            }
             other => panic!("{other:?} is not a boundary storage dtype"),
         }
     }

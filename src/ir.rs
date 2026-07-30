@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-pub use crate::scalar::{Dtype, Extent, MapOp, Monoid};
+pub use crate::scalar::{Dtype, Extent, MapOp, Monoid, round_to};
 
 /// A shared reference to an immutable graph node.
 pub type NodeRef = Arc<Node>;
