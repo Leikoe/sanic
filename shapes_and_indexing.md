@@ -239,7 +239,9 @@ and a composite that leaves the affine language just stays two nodes.
 The bet is that sanic's movement chains are shallow (simplify cancels,
 interning dedups); if a workload ever shows deep chains, a composed-map
 cache on Resolver is the pressure valve — still inside the closed
-language.
+language. *Measured 2026-07-30, llama decode graph at ctx 1030: 2,070
+nodes, 760 movement (36.7%), maximal chain depth **4** (375/225/96/64
+nodes at depths 1→4). The bet holds; no cache.*
 
 **Law 3 — structure stays stated.** Factorizations live in nodes: a split's
 radices, a view's groups. Div/mod exists in exactly one place — emitted
