@@ -9,7 +9,7 @@
 //! two ways: `eval` (the naive semantics) against a hand-written reference,
 //! and `partition(...).execute` (the compiled schedule) against `eval`.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::partition::{Stage, partition};
@@ -52,7 +52,7 @@ fn slice_reads_the_shifted_range() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let sl = slice(input("X", [n], Dtype::F32), 0usize, m, 3);
+    let sl = slice(input("X", [n]), 0usize, m, 3);
     let got = eval(&sl, &env);
     assert_eq!(got.shape, vec![4]);
     for i in 0..4 {
@@ -67,7 +67,7 @@ fn pad_reads_zero_outside() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let pd = pad(input("X", [n], Dtype::F32), 0usize, p, 2);
+    let pd = pad(input("X", [n]), 0usize, p, 2);
     let got = eval(&pd, &env);
     for i in 0..9usize {
         let want = if (2..7).contains(&i) { x.data[i - 2] } else { 0.0 };
@@ -84,7 +84,7 @@ fn split_is_the_inverse_of_flatten() {
     let env: Env = [("X", x.clone())].into_iter().collect();
 
     // flatten [h,w] → f, then split f → (h2, w2): the identity, relabeled.
-    let round = split(flatten(input("X", [h, w], Dtype::F32), &[0, 1][..], f), 0usize, h2, w2);
+    let round = split(flatten(input("X", [h, w]), &[0, 1][..], f), 0usize, h2, w2);
     let got = eval(&round, &env);
     assert_eq!(got.shape, vec![3, 4]);
     assert_eq!(got.data, x.data, "split ∘ flatten must be the identity");
@@ -97,7 +97,7 @@ fn window_matches_the_hand_window() {
     let x = rand_tensor(&[n], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let wd = window(input("X", [n], Dtype::F32), 0usize, o, k, 2, 1);
+    let wd = window(input("X", [n]), 0usize, o, k, 2, 1);
     let got = eval(&wd, &env);
     for oi in 0..3 {
         for ki in 0..3 {
@@ -123,10 +123,10 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
     let w = rand_tensor(&[co, ci, kk], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
-    let xw = window(input("X", [ci, w0], Dtype::F32), 1usize, o, kk, 1, 1); // [ci, o, k]
+    let xw = window(input("X", [ci, w0]), 1usize, o, kk, 1, 1); // [ci, o, k]
     let xf = flatten(xw, &[0, 2][..], r); // [r, o]
     let stream = axis_refs(&xf)[0];
-    let wf = flatten(input("W", [co, ci, kk], Dtype::F32), &[1, 2][..], r); // [co, r]
+    let wf = flatten(input("W", [co, ci, kk]), &[1, 2][..], r); // [co, r]
     let conv = matmul(transpose(xf, 0usize, 1usize), transpose(wf, 0usize, 1usize)); // [o, co]
 
     // the naive semantics equal a hand-written convolution
@@ -144,7 +144,7 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
 
     // it partitions to ONE fused kernel (implicit GEMM over the flattened
     // reduction axis), and the schedule reproduces the reference
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "conv must be one kernel:\n{}", sched.render());
     let Stage::Fused { spec, .. } = &sched.stages[0] else {
         panic!("expected a fused stage")
@@ -176,7 +176,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
 
     // both spatial axes window in a single Reindex node
     let xw = positional_reindex(
-        input("X", [ci, h0, w0], Dtype::F32),
+        input("X", [ci, h0, w0]),
         vec![ci, oh, kh, ow, kw],
         vec![
             (0, vec![(1, 0)], 0),
@@ -187,7 +187,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     ); // [ci, oh, kh, ow, kw]
     let xf = flatten(xw, &[0, 2, 4][..], r); // [r, oh, ow]
     let xf = transpose(transpose(xf, 0usize, 1usize), 1usize, 2usize); // [oh, ow, r]
-    let wf = flatten(input("W", [co, ci, kh, kw], Dtype::F32), &[1, 2, 3][..], r); // [co, r]
+    let wf = flatten(input("W", [co, ci, kh, kw]), &[1, 2, 3][..], r); // [co, r]
     let conv = matmul(xf, transpose(wf, 0usize, 1usize)); // [oh, ow, co]
 
     let got = eval(&conv, &env);
@@ -205,7 +205,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "conv2d must be one kernel:\n{}", sched.render());
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -230,10 +230,10 @@ fn padded_conv1d_matches_hand() {
     let w = rand_tensor(&[co, ci, kk], &mut rng);
     let env: Env = [("X", x.clone()), ("W", w.clone())].into_iter().collect();
 
-    let xp = pad(input("X", [ci, w0], Dtype::F32), 1usize, p0, 1); // [ci, p0]
+    let xp = pad(input("X", [ci, w0]), 1usize, p0, 1); // [ci, p0]
     let xw = window(xp, 1usize, o, kk, 1, 1); // [ci, o, k]
     let xf = flatten(xw, &[0, 2][..], r);
-    let wf = flatten(input("W", [co, ci, kk], Dtype::F32), &[1, 2][..], r);
+    let wf = flatten(input("W", [co, ci, kk]), &[1, 2][..], r);
     let conv = matmul(transpose(xf, 0usize, 1usize), transpose(wf, 0usize, 1usize)); // [o, co]
 
     let got = eval(&conv, &env);
@@ -252,7 +252,7 @@ fn padded_conv1d_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "padded conv is still one kernel");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -267,7 +267,7 @@ fn maxpool_is_one_kernel_and_matches_hand() {
     let x = rand_tensor(&[c, w0], &mut rng);
     let env: Env = [("X", x.clone())].into_iter().collect();
 
-    let xw = window(input("X", [c, w0], Dtype::F32), 1usize, o, kk, 2, 1); // [c, o, k]
+    let xw = window(input("X", [c, w0]), 1usize, o, kk, 2, 1); // [c, o, k]
     let pool = reduce(xw, 2usize, Monoid::Max); // [c, o]
 
     let got = eval(&pool, &env);
@@ -278,7 +278,7 @@ fn maxpool_is_one_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&pool, &DeviceProfile::toy());
+    let sched = partition(&pool, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "pooling is one kernel");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -306,21 +306,21 @@ fn sliding_window_attention_is_one_flash_kernel() {
     // key position read at (s, j): t = s + j − (w−1); j ranges over the window
     let off = -((w - 1) as i64);
     let kw = positional_reindex(
-        input("K", [t, d], Dtype::F32),
+        input("K", [t, d]),
         vec![s, j, d],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     ); // [s, j, d]
     let stream = axis_refs(&kw)[1];
     let vw = positional_reindex(
-        input("V", [t, e], Dtype::F32),
+        input("V", [t, e]),
         vec![s, j, e],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     ); // [s, j, e]
 
     let scores = reduce(
-        map(MapOp::Mul, vec![unsqueeze(input("Q", [s, d], Dtype::F32), 1usize), kw]),
+        map(MapOp::Mul, vec![unsqueeze(input("Q", [s, d]), 1usize), kw]),
         2usize,
         Monoid::Add,
     ); // [s, j]
@@ -368,7 +368,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
     assert_close(&got, &hand);
 
     // one fused flash kernel streaming the WINDOW axis
-    let sched = partition(&attn, &DeviceProfile::toy());
+    let sched = partition(&attn, &DeviceSpecs::toy());
     assert_eq!(
         sched.stages.len(),
         1,

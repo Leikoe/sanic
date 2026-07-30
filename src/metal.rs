@@ -149,8 +149,6 @@ impl Dispatch {
 pub struct MetalDevice {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Boundary storage the compiled schedule writes at kernel boundaries.
-    storage: Dtype,
 }
 
 impl MetalDevice {
@@ -158,22 +156,7 @@ impl MetalDevice {
     pub fn open() -> Option<MetalDevice> {
         let dev = MTLCreateSystemDefaultDevice()?;
         let queue = dev.newCommandQueue().expect("command queue");
-        Some(MetalDevice {
-            dev,
-            queue,
-            storage: Dtype::F32,
-        })
-    }
-
-    /// The same device compiling schedules that store intermediates and
-    /// outputs at `storage` precision (kernels still accumulate f32).
-    pub fn with_storage(mut self, storage: Dtype) -> Self {
-        self.storage = storage;
-        self
-    }
-
-    pub fn storage(&self) -> Dtype {
-        self.storage
+        Some(MetalDevice { dev, queue })
     }
 
     // ── compiler ─────────────────────────────────────────────────────────────
@@ -218,7 +201,7 @@ impl MetalDevice {
 
     /// A zeroed buffer of `count` elements at a storage dtype's width.
     pub fn alloc_elems(&self, count: usize, dtype: Dtype) -> MetalBuf {
-        self.alloc_bytes((count.max(1) as f64 * dtype.bytes()).ceil() as usize)
+        self.alloc_bytes(dtype.nbytes(count.max(1)))
     }
 
     /// Read `count` elements stored as `dtype`, widened to f32. The bf16
@@ -235,6 +218,17 @@ impl MetalDevice {
             Dtype::F16 => {
                 let ptr = buf.contents() as *const u16;
                 (0..count).map(|i| half_to_f32(unsafe { *ptr.add(i) })).collect()
+            }
+            // Exact to 2^24 in this widening — and the law admits nothing an
+            // f32 register could not have held exactly anyway.
+            Dtype::U32 => {
+                let ptr = buf.contents() as *const u32;
+                (0..count).map(|i| unsafe { *ptr.add(i) } as f32).collect()
+            }
+            Dtype::Q8 { scale_bits } => {
+                let scale = f32::from_bits(scale_bits);
+                let ptr = buf.contents() as *const i8;
+                (0..count).map(|i| unsafe { *ptr.add(i) } as f32 * scale).collect()
             }
             other => panic!("{other:?} is not a boundary storage dtype"),
         }

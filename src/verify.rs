@@ -38,7 +38,10 @@ pub fn rel_tolerance(dtype: Dtype, terms: usize) -> f64 {
         Dtype::F32 => f32::EPSILON as f64,
         Dtype::F16 => 9.77e-4,
         Dtype::BF16 => 7.82e-3,
-        Dtype::I8 | Dtype::I4 => 0.0,
+        Dtype::U32 | Dtype::I8 | Dtype::I4 => 0.0,
+        // The grid is exact where it lands; comparisons against a Q8 round
+        // trip use the grid itself as the oracle, so no drift allowance.
+        Dtype::Q8 { .. } => 0.0,
     };
     64.0 * eps * terms.max(1) as f64
 }
@@ -73,7 +76,6 @@ pub fn assert_valid_many(roots: &[Node]) {
 struct InputDecl {
     node_index: usize,
     shape: Vec<Axis>,
-    dtype: Dtype,
 }
 
 #[derive(Default)]
@@ -110,7 +112,7 @@ impl Verifier {
         let fail = |reason: String| VerifyError { node_index, op, reason };
 
         let shape = match node.as_ref() {
-            NodeKind::Input { name, shape, dtype } => {
+            NodeKind::Input { name, shape } => {
                 if name.is_empty() {
                     return Err(fail("input name cannot be empty".into()));
                 }
@@ -127,19 +129,12 @@ impl Verifier {
                             previous.node_index
                         )));
                     }
-                    if previous.dtype != *dtype {
-                        return Err(fail(format!(
-                            "input `{name}` conflicts with node {}: storage dtype {:?} != {:?}",
-                            previous.node_index, previous.dtype, dtype
-                        )));
-                    }
                 } else {
                     self.inputs.insert(
                         name,
                         InputDecl {
                             node_index,
                             shape: shape.clone(),
-                            dtype: *dtype,
                         },
                     );
                 }
@@ -377,14 +372,14 @@ mod tests {
     #[test]
     fn axis_descriptors_are_not_dimension_identities() {
         let n = axis("n", 4);
-        assert_eq!(verify(&input("X", [n, n], Dtype::F32)), Ok(()));
+        assert_eq!(verify(&input("X", [n, n])), Ok(()));
     }
 
     #[test]
     fn rejects_out_of_range_positional_dimension() {
         let n = axis("n", 4);
         let invalid = Arc::new(NodeKind::Reduce {
-            src: input("X", [n], Dtype::F32),
+            src: input("X", [n]),
             dim: 1,
             op: crate::ir::Monoid::Add,
         });

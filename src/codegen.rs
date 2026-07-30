@@ -291,11 +291,14 @@ pub fn value<L: Lang>(
         NodeKind::Const { v } => lang.lit(*v),
         NodeKind::Iota { .. } => lang.iota_val(g.coordinate(coord, ir::axis_refs(node)[0])),
         NodeKind::Coordinate { src, dim } => lang.iota_val(g.coordinate(coord, ir::axis_refs(src)[*dim])),
-        NodeKind::Input { name, dtype, .. } => {
+        NodeKind::Input { name, .. } => {
             if let Some(v) = g.local_inputs.get(*name) {
                 return v.clone();
             }
-            lang.buffer_load(name, &g.buffer_offset(&ir::axis_refs(node), coord), *dtype)
+            // The width is a Γ fact, resolved by name at emission — a term
+            // carries no storage. Undeclared inputs are f32.
+            let dtype = g.dtypes.get(*name).copied().unwrap_or(Dtype::F32);
+            lang.buffer_load(name, &g.buffer_offset(&ir::axis_refs(node), coord), dtype)
         }
         NodeKind::Map { op, inputs } => {
             let a: Vec<String> = inputs
@@ -533,7 +536,7 @@ mod tests {
 
     #[test]
     fn singleton_storage_axes_need_no_loop_coordinate() {
-        let node = input("x", [axis("singleton", 1), axis("hidden", 8)], Dtype::F32);
+        let node = input("x", [axis("singleton", 1), axis("hidden", 8)]);
         let axes = axis_refs(&node);
         let coord = HashMap::from([(axes[1], "h".to_string())]);
         assert_eq!(Gen::new().coordinate(&HashMap::new(), axes[0]), "0");

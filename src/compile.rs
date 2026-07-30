@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::cost;
 use crate::interp::{Env, Value};
 use crate::ir::{self, Axis, AxisRef, Dtype, Extent, Node, NodeRef};
-use crate::partition::{Schedule, partition_many};
+use crate::partition::{Schedule, partition_many_declared};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
@@ -88,8 +88,15 @@ pub trait Backend: Clone + private::Sealed + 'static {
     type Buffer: Buffer;
     type Executable;
 
-    fn profile(&self) -> cost::DeviceProfile;
-    fn prepare(&self, schedule: &Schedule, output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError>;
+    /// Hardware facts and capabilities only; the policy arrives at
+    /// compilation and is bundled by [`cost::DeviceSpecs::under`].
+    fn specs(&self) -> cost::DeviceSpecs;
+    fn prepare(
+        &self,
+        target: &cost::DeviceSpecs,
+        schedule: &Schedule,
+        output_shapes: &[Vec<usize>],
+    ) -> Result<Self::Executable, CompileError>;
     fn execute(
         &self,
         executable: &Self::Executable,
@@ -335,7 +342,14 @@ tuple_roots!(
 /// Extension trait for compiling one or more roots.
 pub trait Compile: Roots {
     fn compile<B: Backend>(&self, backend: &B) -> Result<Program<B>, CompileError> {
-        compile_roots_in_place(self.roots(), Vec::new(), Vec::new(), backend)
+        compile_roots_in_place(
+            self.roots(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            cost::Policy::default(),
+            backend,
+        )
     }
 }
 
@@ -354,6 +368,8 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
     roots: Vec<NodeRef>,
     in_place: Vec<(usize, &'static str)>,
     output_dtypes: Vec<Option<Dtype>>,
+    declared: HashMap<String, Dtype>,
+    policy: cost::Policy,
     backend: &B,
 ) -> Result<Program<B>, CompileError> {
     if roots.is_empty() {
@@ -365,7 +381,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
 
     // Constructors intern: structurally identical subtrees are already one
     // immutable DAG node, across roots and across the whole process.
-    let inputs = collect_inputs(&roots)?;
+    let inputs = collect_inputs(&roots, &declared)?;
     let output_shapes = roots
         .iter()
         .map(|root| root.shape().into_iter().map(Axis::extent).collect())
@@ -377,20 +393,19 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .map(|index| leak(format!("Out{index}")))
         .collect::<Vec<_>>();
     let named_roots = roots.iter().cloned().zip(output_names).collect::<Vec<_>>();
-    let mut schedule = partition_many(&named_roots, &backend.profile());
+    let target = backend.specs().under(policy);
+    let mut schedule = partition_many_declared(&named_roots, &target, &declared);
     if !output_dtypes.is_empty() {
-        assert_eq!(
-            output_dtypes.len(),
-            schedule.outputs.len(),
-            "one storage width per root"
-        );
-        schedule.output_dtypes = output_dtypes;
+        schedule.pin_outputs(output_dtypes);
     }
     schedule.agrees_in_place = in_place
         .iter()
         .map(|&(root, _)| schedule.outputs[root].clone())
         .collect();
-    let executable = backend.prepare(&schedule, &output_shapes)?;
+    // After the pins land: a pinned output is checked against ITS width,
+    // everything else against the boundary policy.
+    refuse_unstorable(&schedule, policy.boundary)?;
+    let executable = backend.prepare(&target, &schedule, &output_shapes)?;
 
     Ok(Program {
         backend: backend.clone(),
@@ -400,6 +415,41 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         output_shapes,
         in_place,
     })
+}
+
+/// The refusal half of the numeric law: a schedule whose boundary storage
+/// cannot faithfully carry some buffer's values does not compile. Nothing is
+/// widened — no dtype changes anywhere, so there is no producer/consumer
+/// width to keep in agreement — the program is refused with the buffers
+/// named, which turns the silent index corruption of `--bf16` argmax into a
+/// loud, actionable error.
+fn refuse_unstorable(schedule: &Schedule, storage: Dtype) -> Result<(), CompileError> {
+    let offending = schedule.unstorable(storage);
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let listed = offending
+        .iter()
+        .map(|(name, claim, width)| {
+            let bounds = match (claim.bounds.lo, claim.bounds.hi) {
+                (Some(lo), Some(hi)) => format!("[{lo}, {hi}]"),
+                _ => "unbounded".to_string(),
+            };
+            let infinite = if claim.bounds.is_finite() { "" } else { " ∪ {±∞}" };
+            format!(
+                "`{name}` holds {:?} values in {bounds}{infinite}, stored {width:?} \
+                 (exact only to {})",
+                claim.system,
+                width.exact_integers_to()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CompileError::Backend(format!(
+        "storage cannot faithfully carry: {listed}. Pin these outputs wider \
+         (`output_at` — f32 holds indices to 2^24 and ±∞ besides) or widen \
+         the boundary policy"
+    )))
 }
 
 fn leak(value: String) -> &'static str {
@@ -428,20 +478,25 @@ fn contains_dynamic(roots: &[NodeRef]) -> bool {
     roots.iter().any(|root| visit(root, &mut seen))
 }
 
-fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
-    fn visit(node: &NodeRef, seen: &mut HashSet<*const Node>, inputs: &mut Vec<InputSpec>) -> Result<(), CompileError> {
+fn collect_inputs(roots: &[NodeRef], declared: &HashMap<String, Dtype>) -> Result<Vec<InputSpec>, CompileError> {
+    fn visit(
+        node: &NodeRef,
+        seen: &mut HashSet<*const Node>,
+        inputs: &mut Vec<InputSpec>,
+        declared: &HashMap<String, Dtype>,
+    ) -> Result<(), CompileError> {
         if !seen.insert(Arc::as_ptr(node)) {
             return Ok(());
         }
         match node.as_ref() {
-            Node::Input { name, shape, dtype } => {
+            Node::Input { name, shape } => {
                 if name.is_empty() {
                     return Err(CompileError::InvalidInput("input names cannot be empty".into()));
                 }
                 if let Some(previous) = inputs.iter().find(|input| input.name == *name) {
                     let previous_extents = previous.shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
                     let extents = shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
-                    if previous_extents != extents || previous.dtype != *dtype {
+                    if previous_extents != extents {
                         return Err(CompileError::InvalidInput(format!(
                             "`{name}` was declared incompatibly"
                         )));
@@ -452,7 +507,7 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
                         lowered_name: name,
                         shape: shape.clone(),
                         axes: ir::axis_refs(node),
-                        dtype: *dtype,
+                        dtype: declared.get(*name).copied().unwrap_or(Dtype::F32),
                     });
                 }
             }
@@ -461,15 +516,15 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
             | Node::Reduce { src, .. }
             | Node::Scan { src, .. }
             | Node::View { src, .. }
-            | Node::Reindex { src, .. } => visit(src, seen, inputs)?,
+            | Node::Reindex { src, .. } => visit(src, seen, inputs, declared)?,
             Node::Map { inputs: children, .. } => {
                 for child in children {
-                    visit(child, seen, inputs)?;
+                    visit(child, seen, inputs, declared)?;
                 }
             }
             Node::Gather { src, index, .. } => {
-                visit(src, seen, inputs)?;
-                visit(index, seen, inputs)?;
+                visit(src, seen, inputs, declared)?;
+                visit(index, seen, inputs, declared)?;
             }
         }
         Ok(())
@@ -478,7 +533,7 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
     let mut inputs = Vec::new();
     let mut seen = HashSet::new();
     for root in roots {
-        visit(root, &mut seen, &mut inputs)?;
+        visit(root, &mut seen, &mut inputs, declared)?;
     }
     Ok(inputs)
 }
@@ -545,11 +600,16 @@ impl Backend for CpuDevice {
     type Buffer = CpuBuffer;
     type Executable = ();
 
-    fn profile(&self) -> cost::DeviceProfile {
-        cost::DeviceProfile::toy()
+    fn specs(&self) -> cost::DeviceSpecs {
+        cost::DeviceSpecs::toy()
     }
 
-    fn prepare(&self, _schedule: &Schedule, _output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError> {
+    fn prepare(
+        &self,
+        _target: &cost::DeviceSpecs,
+        _schedule: &Schedule,
+        _output_shapes: &[Vec<usize>],
+    ) -> Result<Self::Executable, CompileError> {
         Ok(())
     }
 
@@ -635,12 +695,13 @@ mod metal_backend {
         type Buffer = MetalBuffer;
         type Executable = MetalExecutable;
 
-        fn profile(&self) -> cost::DeviceProfile {
-            cost::DeviceProfile::m1_pro().with_storage(self.storage())
+        fn specs(&self) -> cost::DeviceSpecs {
+            cost::DeviceSpecs::m1_pro()
         }
 
         fn prepare(
             &self,
+            target: &cost::DeviceSpecs,
             schedule: &Schedule,
             _output_shapes: &[Vec<usize>],
         ) -> Result<Self::Executable, CompileError> {
@@ -655,9 +716,9 @@ mod metal_backend {
                 )));
             }
             let program = if std::env::var_os("SANIC_TUNE").is_some() {
-                emit_schedule_metal_tuned(&self.profile(), schedule, &tune_fold_scheds(self, schedule))
+                emit_schedule_metal_tuned(target, schedule, &tune_fold_scheds(self, target, schedule))
             } else {
-                emit_schedule_metal_on(&self.profile(), schedule)
+                emit_schedule_metal_on(target, schedule)
             };
             // `SANIC_MSL=<path>` dumps the whole generated source — the raw
             // artifact behind every kernel name the runtime dumps print.
@@ -999,11 +1060,11 @@ mod metal_backend {
     fn logical_byte_table(program: &MetalProgram) -> HashMap<&str, f64> {
         let mut logical_bytes = HashMap::<&str, f64>::new();
         for (name, elements) in &program.buffers {
-            logical_bytes.insert(name, *elements as f64 * program.storage.bytes());
+            logical_bytes.insert(name, *elements as f64 * program.storage.bytes_per_element());
         }
         for (name, axes) in &program.inputs {
             let elements: usize = axes.iter().map(|a| a.extent()).product();
-            let width = program.dtypes.get(*name).map_or(4.0, |dtype| dtype.bytes());
+            let width = program.dtypes.get(*name).map_or(4.0, |dtype| dtype.bytes_per_element());
             logical_bytes.insert(name, elements as f64 * width);
         }
         logical_bytes
@@ -1057,7 +1118,7 @@ mod metal_backend {
             program
                 .dtypes
                 .get(name)
-                .map_or(program.storage.bytes(), |dtype| dtype.bytes())
+                .map_or(program.storage.bytes_per_element(), |dtype| dtype.bytes_per_element())
         };
         let mut traffic = HashMap::new();
         for stage in &schedule.stages {
@@ -1106,7 +1167,7 @@ mod metal_backend {
         } else {
             String::new()
         };
-        let peak_fraction = bytes / seconds.max(1e-9) / device.profile().hbm_bandwidth;
+        let peak_fraction = bytes / seconds.max(1e-9) / device.specs().hbm_bandwidth;
         // The clock this step actually ran at: a line measured below the
         // GPU's top DVFS state is not comparable to one measured at it, and
         // saying so beats silently publishing a throttled number.
@@ -1199,7 +1260,7 @@ mod metal_backend {
         };
         if std::env::var_os("SANIC_NANSCAN").is_some() {
             for (stage, dispatch) in program.stages.iter().zip(dispatches) {
-                let width = program.storage.bytes();
+                let width = program.storage.bytes_per_element();
                 let count = (dispatch.output.byte_len() as f64 / width) as usize;
                 let data = device.read_as_f32(&dispatch.output, count, program.storage);
                 if let Some(at) = data.iter().position(|v| !v.is_finite()) {
@@ -1230,7 +1291,7 @@ mod metal_backend {
                 }
                 _ => " ".repeat(11),
             };
-            let peak_fraction = bytes / seconds.max(1e-9) / device.profile().hbm_bandwidth;
+            let peak_fraction = bytes / seconds.max(1e-9) / device.specs().hbm_bandwidth;
             let bandwidth = if peak_fraction > 5.0 {
                 "bw  --".to_string()
             } else {
@@ -1309,7 +1370,11 @@ mod metal_backend {
     ///
     /// Costs compile time (llama-3.2-1B: 5.2s → 13.3s) to buy ~6% (bf16) /
     /// ~14% (f32) per step, so it is opt-in rather than the default.
-    fn tune_fold_scheds(device: &MetalDevice, schedule: &Schedule) -> HashMap<String, FoldSched> {
+    fn tune_fold_scheds(
+        device: &MetalDevice,
+        target: &cost::DeviceSpecs,
+        schedule: &Schedule,
+    ) -> HashMap<String, FoldSched> {
         use crate::emit_metal::{METAL_MAX_BUFFERS, MSL_HEADER, canonical_source, emit_fused_metal_sched_with};
         use crate::partition::Stage;
         use crate::plan::{fold_sched, priced_fold_sched_candidates};
@@ -1319,7 +1384,7 @@ mod metal_backend {
 
         // The analytic program over zeroed scratch is the instrument: the
         // real dispatch list, barrier schedule, and DRAM pressure.
-        let program = emit_schedule_metal_on(&device.profile(), schedule);
+        let program = emit_schedule_metal_on(target, schedule);
         let pipelines = device.compile(&program.msl);
         let mut bindings: HashMap<String, MetalBuf> = HashMap::new();
         for (name, axes) in &program.inputs {
@@ -1382,7 +1447,8 @@ mod metal_backend {
                 fold_node,
                 FoldSched::scalar(),
                 epi,
-                device.storage(),
+                target.storage(),
+                &tuner_resolved(schedule, target.storage()),
             );
             if probe.inputs.len() + 1 > METAL_MAX_BUFFERS {
                 continue; // bindless stage: keep the analytic choice
@@ -1397,11 +1463,36 @@ mod metal_backend {
         // A family whose whole planned time is a sliver of the step cannot
         // win more than measurement noise — don't spend replays on it (the
         // norm folds are ~33 single-stage families of ~25µs each).
+
+        /// Pricing widths of a fold's leaves from the schedule's Γ.
+        fn tuner_widths(
+            schedule: &Schedule,
+            fold_node: &crate::ir::NodeRef,
+            storage: Dtype,
+        ) -> HashMap<&'static str, f64> {
+            crate::ir::leaf_names(fold_node)
+                .into_iter()
+                .map(|name| (name, schedule.width_of(name, storage).bytes_per_element()))
+                .collect()
+        }
+
+        /// Γ resolved for probe/candidate emission — the same construction
+        /// emission itself uses.
+        fn tuner_resolved(schedule: &Schedule, storage: Dtype) -> HashMap<String, Dtype> {
+            let mut resolved = schedule.bindings().snapshot_declared();
+            for stage in &schedule.stages {
+                let out = crate::partition::stage_output(stage);
+                resolved.insert(out.to_string(), schedule.width_of(out, storage));
+            }
+            resolved
+        }
+
         let family_price = |stage_indices: &[usize]| -> f64 {
             let Stage::Fused { spec, fold_node, .. } = &schedule.stages[stage_indices[0]] else {
                 unreachable!("families hold fused stages");
             };
-            let best = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &device.profile())
+            let widths = tuner_widths(schedule, fold_node, target.storage());
+            let best = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, target, &widths)
                 .into_iter()
                 .filter_map(|(_, priced)| priced.map(|price| price.time))
                 .fold(f64::INFINITY, f64::min);
@@ -1432,8 +1523,9 @@ mod metal_backend {
             else {
                 unreachable!("families hold fused stages");
             };
-            let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, &device.profile());
-            let priced = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &device.profile());
+            let widths = tuner_widths(schedule, fold_node, target.storage());
+            let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, target, &widths);
+            let priced = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, target, &widths);
             let best_price = priced
                 .iter()
                 .filter_map(|(_, priced)| priced.map(|price| price.time))
@@ -1458,7 +1550,8 @@ mod metal_backend {
                     fold_node,
                     candidate,
                     epi,
-                    device.storage(),
+                    target.storage(),
+                    &tuner_resolved(schedule, target.storage()),
                 );
                 msl.push_str(&kernel.msl.replace(MSL_HEADER, ""));
                 msl.push('\n');
@@ -1516,7 +1609,7 @@ mod metal_backend {
         // instrument, against a FRESH baseline (the machine is warmest now)
         // — a tune that does not win ships nothing.
         if !winners.is_empty() {
-            let tuned_program = emit_schedule_metal_tuned(&device.profile(), schedule, &winners);
+            let tuned_program = emit_schedule_metal_tuned(target, schedule, &winners);
             let tuned_pipes = device.compile(&tuned_program.msl);
             let tuned_wall = step_wall(&program_dispatches(&tuned_program, &bindings, &tuned_pipes));
             let analytic_fresh = step_wall(&base).min(analytic_wall);
@@ -1551,10 +1644,7 @@ mod metal_backend {
         ) -> Result<MetalBuffer, RunError> {
             let shape = shape.into();
             let elements = shape.iter().product::<usize>().max(1);
-            let required_bytes = match dtype {
-                Dtype::I4 => elements.div_ceil(2),
-                _ => elements * dtype.bytes() as usize,
-            };
+            let required_bytes = dtype.nbytes(elements);
             if raw.byte_len() < required_bytes {
                 return Err(RunError::Backend(format!(
                     "shape {shape:?} with dtype {dtype:?} requires {required_bytes} bytes, \
@@ -1614,9 +1704,9 @@ mod positional_lowering_tests {
     fn direct_attention_lowers_to_one_kernel() {
         let sequence = axis("sequence", 2);
         let features = axis("features", 2);
-        let q = input("q", [sequence, features], Dtype::F32);
-        let k = input("k", [sequence, features], Dtype::F32);
-        let v = input("v", [sequence, features], Dtype::F32);
+        let q = input("q", [sequence, features]);
+        let k = input("k", [sequence, features]);
+        let v = input("v", [sequence, features]);
         let output = scaled_dot_product_attention(q, k, v, None, 0.0, false, None, false);
         let program = output.compile(&CpuDevice::new()).unwrap();
         assert_eq!(program.kernel_count(), 1, "{}", program.schedule.render());
@@ -1628,9 +1718,9 @@ mod positional_lowering_tests {
         let key_sequence = axis("key_sequence", 3);
         let features = axis("features", 2);
         let output = scaled_dot_product_attention(
-            input("q", [query_sequence, features], Dtype::F32),
-            input("k", [key_sequence, features], Dtype::F32),
-            input("v", [key_sequence, features], Dtype::F32),
+            input("q", [query_sequence, features]),
+            input("k", [key_sequence, features]),
+            input("v", [key_sequence, features]),
             None,
             0.0,
             true,

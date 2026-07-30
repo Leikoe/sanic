@@ -133,6 +133,18 @@ pub fn round_to(dtype: Dtype, v: f64) -> f64 {
             let r = (b.wrapping_add(0x7FFF).wrapping_add((b >> 16) & 1)) >> 16;
             f32::from_bits(r << 16) as f64
         }
+        Dtype::U32 => {
+            panic!("round_to: U32 stores saturate; they are not a rounding of ℝ")
+        }
+        // The panic that named M16 — "needs a scale, not a plain rounding"
+        // — retires: Q8 HAS one, and its round trip is a genuine rounding
+        // of ℝ̄ onto the grid `{q · scale : −127 ≤ q ≤ 127}`. Idempotent
+        // like every declared rounding: a grid point rounds to itself.
+        Dtype::Q8 { scale_bits } => {
+            let scale = f32::from_bits(scale_bits) as f64;
+            let q = (v / scale).round().clamp(-127.0, 127.0);
+            q * scale
+        }
         Dtype::I8 | Dtype::I4 => {
             panic!("round_to: {dtype:?} needs a scale, not a plain rounding")
         }
@@ -171,18 +183,144 @@ pub enum Dtype {
     F32,
     F16,
     BF16,
+    /// Unsigned 32-bit integers — the index format. Stores SATURATE: a
+    /// `+∞` fold identity lands on `u32::MAX` by definition rather than by
+    /// accident, which is what lets an argmax buffer be an integer at all.
+    U32,
+    /// Affine-quantized 8-bit: a representation OF ℝ̄, not a rounding of
+    /// one — the value `q · scale` for a signed byte `q`, stores clamped to
+    /// ±127. The first parameterised format: the scale is part of the TYPE
+    /// (carried as its f32 bits so the enum stays `Copy + Eq + Hash`),
+    /// exactly MLIR's `!quant.uniform<i8:f32, scale>` observation — storage
+    /// type and expressed type in one.
+    Q8 {
+        scale_bits: u32,
+    },
     I8,
     I4,
 }
 
 impl Dtype {
-    pub fn bytes(self) -> f64 {
+    /// Sign, exponent and significand bits. The single description every
+    /// other property is computed from, so widths and ranges cannot drift
+    /// apart. Integer formats have no exponent; their significand is the
+    /// magnitude.
+    ///
+    /// This wants to be a struct rather than a match the moment a format is
+    /// *parameterised* — a quantized dtype carries a scale and a zero point,
+    /// which are values, not variants. Until then the enum is worth keeping:
+    /// `buf_ty`, `out_ty`, `store_expr`, `buffer_load` and `round_to` all
+    /// match exhaustively and panic on formats a target cannot handle, and
+    /// that exhaustiveness is what makes those refusals loud.
+    const fn layout(self) -> (u32, u32, u32) {
         match self {
-            Dtype::F64 => 8.0,
-            Dtype::F32 => 4.0,
-            Dtype::F16 | Dtype::BF16 => 2.0,
-            Dtype::I8 => 1.0,
-            Dtype::I4 => 0.5,
+            Dtype::F64 => (1, 11, 52),
+            Dtype::F32 => (1, 8, 23),
+            Dtype::F16 => (1, 5, 10),
+            Dtype::BF16 => (1, 8, 7),
+            Dtype::U32 => (0, 0, 32),
+            Dtype::Q8 { .. } => (1, 0, 7),
+            Dtype::I8 => (1, 0, 7),
+            Dtype::I4 => (1, 0, 3),
         }
+    }
+
+    /// An IEEE-style floating format.
+    pub const fn is_float(self) -> bool {
+        self.layout().1 > 0
+    }
+
+    /// An unsigned integer format: no sign bit, no negative values — and
+    /// stores saturate rather than wrap.
+    pub const fn is_unsigned(self) -> bool {
+        self.layout().0 == 0
+    }
+
+    /// Does an out-of-range store land on the nearest representable value
+    /// by definition? True of the unsigned integer formats, whose emitted
+    /// store clamps — `+∞ → MAX` is the contract, not an accident.
+    pub const fn saturates(self) -> bool {
+        self.is_unsigned()
+    }
+
+    /// Can this format represent ±∞?
+    ///
+    /// Not a synonym for [`Dtype::is_float`], though the two coincide today:
+    /// the `fp8` finite-only formats are floats without infinities. Every
+    /// order monoid's identity is an infinity, so this decides whether a
+    /// fold's output can be stored in a given format at all.
+    pub const fn has_infinities(self) -> bool {
+        self.is_float()
+    }
+
+    /// Integers this format holds exactly. A property of the format,
+    /// identical on every device — bf16 is exact to 256 on any silicon.
+    ///
+    /// A float is exact up to `2^(significand+1)`, where the implicit
+    /// leading bit buys the extra power. A signed integer stops one short
+    /// of its magnitude range.
+    pub const fn exact_integers_to(self) -> i64 {
+        // A scaled format holds integers exactly only where its grid lands
+        // on them; claiming any is claiming the scale, so it claims none.
+        if matches!(self, Dtype::Q8 { .. }) {
+            return 0;
+        }
+        let (_, exponent, significand) = self.layout();
+        if exponent > 0 {
+            1i64 << (significand + 1)
+        } else {
+            (1i64 << significand) - 1
+        }
+    }
+
+    /// Quantized 8-bit with this scale. The scale rides the type.
+    pub fn q8(scale: f32) -> Dtype {
+        Dtype::Q8 {
+            scale_bits: scale.to_bits(),
+        }
+    }
+
+    /// The quantization scale, for the formats that have one.
+    pub fn scale(self) -> Option<f32> {
+        match self {
+            Dtype::Q8 { scale_bits } => Some(f32::from_bits(scale_bits)),
+            _ => None,
+        }
+    }
+
+    /// Does an out-of-range store clamp to the nearest representable value
+    /// by definition? The unsigned index format and the quantized formats:
+    /// `+∞ → MAX` there is contract, and for the SIGNED quantized grid
+    /// `−∞ → −127·scale` has a home too.
+    pub const fn clamps_signed(self) -> bool {
+        matches!(self, Dtype::Q8 { .. })
+    }
+
+    /// Width of one element. The honest unit: sub-byte formats have no
+    /// fractional-byte size, and newer ones (fp4, fp6) are not even a power
+    /// of two, so bits is the only unit that stays exact.
+    pub const fn nbits(self) -> u32 {
+        let (sign, exponent, significand) = self.layout();
+        sign + exponent + significand
+    }
+
+    /// Does an element occupy less than a byte, so that storage packs
+    /// several per byte and an element has no address of its own?
+    pub const fn is_subbyte(self) -> bool {
+        self.nbits() < 8
+    }
+
+    /// Bytes an array of `elements` occupies, packing included. This is the
+    /// allocation and bounds-check unit; [`Dtype::bytes_per_element`] is not,
+    /// because a width of 0.5 truncates to zero the moment anyone writes
+    /// `as usize`.
+    pub const fn nbytes(self, elements: usize) -> usize {
+        (elements * self.nbits() as usize).div_ceil(8)
+    }
+
+    /// Per-element width as a *pricing weight*, for bandwidth arithmetic
+    /// already in floating point. Never a size — see [`Dtype::nbytes`].
+    pub fn bytes_per_element(self) -> f64 {
+        f64::from(self.nbits()) / 8.0
     }
 }

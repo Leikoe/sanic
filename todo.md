@@ -1471,6 +1471,233 @@ general question is undecidable); what exists now is a standing tripwire
 with the right failure mode: a missed fusion is a failing test naming its
 carrier, not a benchmark surprise.
 
+## Number-system arc — what a value *is* vs how it is *stored* (2026-07-29)
+
+Design: `number_systems_and_representations.md`. Read it first; this is the
+shipping order.
+
+**The defect.** `device.storage()` is one dtype for every produced buffer, so
+under `--bf16` an `argmax`/`topk` index is stored bf16 and rounds — 14924 →
+14912, exact only below 256. Latent on `main` (llama outputs logits, which are
+values), live for anyone who puts an index at a boundary. Verified: exact under
+f32, wrong under `--bf16`, and the error is exactly bf16's integer spacing.
+
+**The cause.** `Dtype` names two things — the *number system* a value inhabits
+(𝔹/ℕ̄/ℤ̄/ℝ̄) and the *representation* the machine stores it in. Inputs already
+carry per-tensor dtypes; only produced buffers fall back to a global. One half
+of the compiler believes representation is a property of a value; the other
+applies it by fiat.
+
+**The sequencing that matters.** M11 *refuses* rather than widens. Widening in
+the current architecture touches ten sites across `partition`/`compile`/`graph`
+— three independent reviews confirmed it, and two of the misses are memory
+safety, not bandwidth — and every one of those sites is plumbing that M12
+deletes. Refusing needs none of it: no dtype ever changes, so there is no
+consumer/allocation/readback to keep in agreement. It follows *"Decline, don't
+guess"* verbatim and turns silent corruption into a named error.
+
+The analysis is not scaffolding for the fix — it *is* the missing input.
+Partition must price every candidate cut at some byte width, for a buffer that
+does not exist yet; today it reaches for the device global because nothing else
+can answer. Once the width is a function of `(system, bounds, policy)`, buffers
+are minted correct at M13 rather than repaired afterwards.
+
+> **2026-07-29 revision.** The design converged further after this plan was
+> first written — see `number_systems_and_representations.md` §2–§3. Summary:
+> there is **no second IR**. The compiler is one first-order calculus plus one
+> context Γ (name → value / system / dtype), three judgments of one shape
+> (`eval`/`infer`/`emit`), and fusion is choosing a term's let-structure.
+> `Input` loses its `Dtype`; `Schedule` owns the bindings. M12 shrinks
+> accordingly and M13 is absorbed into it. M11's analysis half is LANDED.
+
+### M11 — The analysis, and refuse · [analysis LANDED · refusal open] · retires *silent narrowing*
+
+Number systems as a chain 𝔹 ⊂ ℕ̄ ⊂ ℤ̄ ⊂ ℝ̄ (no ℂ — nothing can produce one, and
+ℝ̄ ⊄ ℂ); integer `Bounds` with ±∞ endpoints and checked arithmetic; a signature
+per operation; the law relating the axes. Then: if a produced buffer's value is
+exact and its bounds exceed what the boundary dtype represents exactly, **fail
+the compile** naming the buffer and the reason.
+
+Nothing widens. No dtype changes anywhere, so none of the ten plumbing sites
+move. Pure analysis plus one refusal.
+
+*Done when:* `.argmax("vocab")` under `--bf16` fails to compile with a message
+naming the buffer; it still compiles under f32; llama is byte-identical and the
+16% is untouched. Signature soundness is property-tested against the
+interpreter (draw ±∞ deliberately — that is how the `Sin`/`Cos`/`LogSumExp`
+closure errors surfaced), and integrality is tested with `fract() == 0.0`, not
+just containment. The regression test asserts on the *compiled program*, not a
+computed value: CI's macOS runners have no GPU.
+
+### M12 — Evict `Dtype` from `Input`; Γ on `Schedule` · [LANDED] · retires *layer leakage*
+
+**Landed (M12a):** the law mints widths at partition time.
+`Schedule.minted_dtypes` records each exact boundary the policy cannot carry
+at the narrowest dtype that can (`numeric::store_dtype`, moved in from the
+contract file); `Schedule::width_of` is the one resolution — pin → mint →
+policy — read by emission's `width_of`, and through `program.dtypes` by
+allocation and readback (#21's plumbing, extended). Consumers splice reads at
+the minted width (`read_width` at the three buffer-read sites), and the
+epilogue-rename path transfers the mint with the name or the writer and
+reader would disagree about the very width the mint protects. Refusal now
+fires only for the genuinely unmintable (saturated exact bounds) and for
+pins narrower than the law. Proven on device:
+`an_argmax_index_survives_bf16_storage_by_minted_width` — index 3333 under a
+bf16 policy survives exactly, where the policy width would reload 3328.
+
+**Landed (M12b):** the eviction. `Node::Input { name, shape }` — a free
+variable; `shallow_key` is pure structure (one variable, one node — the
+same-name-different-dtype conflict is unrepresentable and its checks are
+deleted); `input_dtypes` is gone. Declarations live at the program layer:
+`Graph::input(name, shape, dtype)` registers Γ's Caller entries,
+`Schedule.declared_dtypes` carries them, and `width_of` resolves
+pin → mint → declared → policy for every consumer — emission, splices,
+pricing (threaded through `plan` as Γ-resolved widths), the tuner,
+allocation, readback. Undeclared inputs are f32, stated once. The structure
+ledger's `ir.rs` entry retired at zero. 555 call sites; llama declares its
+checkpoint weights bf16 through the graph and runs both modes at full speed.
+
+The former "two graphs" milestone, shrunk to its true size — and it no longer
+reverses `ir.rs`'s doctrine, it vindicates it: stage bodies stay `ir::Node`
+(that is why the oracle can evaluate every stage), and *"there is no second
+graph IR"* remains true. What changes is only where decided facts live.
+
+`Node::Input` becomes `{ name, shape }` — a free variable. `shallow_key` loses
+its dtype component, so CSE identity is pure structure. `Schedule` gains the
+bindings table Γ: name → dtype (and the producing node's `Inferred`, which is
+what keeps inference sharp across spliced stage boundaries). Everything that
+today reads `input_dtypes(node)` or `dev.storage` — partition's consumer
+reads, emit's signatures, `alloc_scratch`, host readback, the cost model —
+reads Γ instead. One entry per name means writer and reader *cannot* disagree
+about a buffer's width; the ten-site agreement problem stops being
+expressible. Declarations move to the program layer where `Graph::state`
+already lives: `graph.input(name, shape, dtype)`, and `tokens` declares
+`(F32, ℕ̄ bounded by vocab)` — closing the input-declaration question.
+
+Buffers are minted at the right width at the point their name is created —
+partition prices each candidate cut at the width the value will take
+(`(system, bounds, policy)`, all known before the cut), so the cost model is
+fixed for free and there is no widening pass. `with_storage` was never wrong
+to exist — partition must price buffers that do not exist yet — it was wrong
+in the value it supplied; Γ is the correct answer to the same question.
+
+*Done when:* every backend agrees with `eval` as today; no dtype appears in
+any expression node; `.argmax("vocab")` under `--bf16` compiles and returns
+correct tokens; the writer/reader agreement assert and the
+no-buffer-without-Γ-entry assert exist and pass; kernel counts and llama
+timings hold.
+
+### M13 — *absorbed into M12* (minting-correct replaces widening; no separate pass)
+
+### M14 — Declarations replace the global · [LANDED] · retires *device-dependent numerics*
+
+**Landed (M14a):** the device tells the truth. `DeviceProfile` is
+`DeviceSpecs`; the boundary storage is a typed `cost::Policy` the caller
+attaches (`with_storage` now constructs one), read through
+`DeviceSpecs::storage()`; and the struct gained its first capability fact,
+`compute: Dtype` — the register width, which is what bounds integer
+exactness in flight. "Profile" no longer collides with profiling, and the
+policy no longer masquerades as a hardware number.
+
+**Landed (M14-final):** the policy is a compilation parameter. MetalDevice
+is `{ dev, queue }` — a device, nothing else; `Backend::specs()` returns
+hardware; `DeviceSpecs::under(policy)` is the one place hardware and policy
+meet, called by compile with the caller's value; `Graph::compile_for(device,
+policy)`; states allocate at their OWN declarations. llama's --bf16 is one
+`Policy { boundary }` line. Ledger: graph/cost/metal entries retired at
+zero; partition/compile survivors reclassified as growth guards over
+legitimate policy plumbing. §5.2's softening stands — the policy default for
+undeclared reals is licensed; per-value `stored(d)` remains available to any
+caller who wants narrower than policy.
+
+Retire `with_storage` for per-value `stored(d)`. The motivation is portability,
+not hygiene: today the interpreter rounds only at an explicit `RoundTo` while
+Metal under `--bf16` rounds at every boundary, so the same graph gives different
+answers per backend and nothing says so. Rename `DeviceProfile` → `DeviceSpecs`
+in the same commit and move the policy out, leaving it the hardware numbers its
+own doc promises — plus the capabilities that are missing today (compute
+precision, accumulator precision, writable dtypes).
+
+Cost is kernel count, not bandwidth: `RoundTo` is an unconditional fusion
+decline, so each declaration is a cut.
+
+*Done when:* interpreter and Metal agree bit-for-bit on a declared graph; the
+16% holds under **ABBA**, pooled sd reported.
+
+### M15 — Integer buffers and index outputs · [LANDED]
+
+`Dtype::U32`: sign-aware `layout()` (the format table gained a sign column —
+unsignedness was inexpressible before), exact to 2³²−1, `is_unsigned()`,
+`saturates()`. `Bounds` tracks the SIGN of its infinities, because the two
+sentinels have opposite fates: +∞ (Min's identity) saturates to `u32::MAX`
+by contract; −∞ (Max's) would alias to index 0, so it refuses every integer
+format — tested as a pair. The saturating store (`to_u32_saturating`) is in
+the MSL header, exact because the law admits nothing wider than compute's
+2²⁴. U32 joined the mint's candidates between f16 and f32 — same four bytes,
+an integer in memory — and `round_to` refuses it with the sentence that
+opens M16: "U32 stores saturate; they are not a rounding of ℝ." llama's
+manual F32 pin (#21's workaround) retired; the law mints u32 unaided, both
+modes at full speed, GPU e2e reads the index back as an integer.
+
+Writable integer dtypes (`out_ty`/`store_expr` panic on them today;
+`write_f64` hardcodes `*mut f32`). Index outputs get **one width, u32** — never
+the narrowest provable, since an index buffer is one element per row and each
+extra writable dtype is another disagreement surface. Needs a saturating store,
+because integer dtypes cannot hold the `+∞` that a Min-fold's identity provably
+puts in an argmax buffer's bounds.
+
+Also answers the input-declaration question for free:
+`Tensor::input("tokens", [seq], Dtype::I32)` declares storage and system at
+once, and `is_int()` does the rest.
+
+### M16 — Quantized stores · [v1 LANDED] · the reason the arc exists
+
+`Dtype::Q8 { scale_bits }` — the first parameterised format, the enum→struct
+trigger fired exactly where predicted: the scale is part of the TYPE (its f32
+bits, so `Copy + Eq + Hash` survive and every Γ map is untouched), MLIR's
+`!quant.uniform<i8:f32, scale>` observation in one variant. The panic that
+named this milestone retires: `round_to(Q8)` IS a rounding — onto the grid
+`{q·scale}`, clamped, idempotent, implemented in the interpreter, the Rust
+backend and Metal alike, so `stored(q8(s))` is a value-level declaration all
+three reproduce bit-for-bit. Dequantization is the load; quantization is the
+store (`to_q8_saturating`, scale baked as a literal); ±∞ have HOMES on the
+signed clamped grid (−∞ → −127·scale — unlike u32, whose floor would alias
+it to an index). The law rules: reals may quantize, indices may not
+(`exact_integers_to(Q8) = 0` — claiming any integer is claiming the scale).
+GPU-proven grid-EXACT, equality not tolerance. Deliberately absent, each its
+own arc: scale inference (a calibration question — §12), weight
+re-quantization, Q8 as a policy boundary.
+
+int8-with-a-scale: the first value whose representation is not a *rounding* of
+its number system. `round_to` panics on `I8`/`I4` today for exactly this reason.
+Prior art worth copying: MLIR's `!quant.uniform<i8:f32, scale:zp>` carries
+storage type and expressed type in one type.
+
+### Independent of this arc
+
+- **`ones_like` returns NaN on any tensor containing `−∞`.** It is
+  `Add(Mul(x, 0.0), 1.0)` (`ir.rs:634`), and `−∞ × 0 = NaN`. llama builds such
+  tensors (`visible.select(0.0, NEG_INFINITY)`). Small, unrelated, real.
+- **The unexplained 16%.** `--bf16` is worth 19.0 → 16.0 ms/tok (ABBA, zero
+  variance) at *unchanged* analytic traffic — 2488 vs 2480 MB. The LM head
+  reads the same 525.9 MB either way and runs at 81% of bandwidth in f32 vs 91%
+  in bf16. Per-kernel store efficiency, not volume. Nobody knows why.
+- **Narrow compute** is its own arc, not part of this one. Metal 3.1 has
+  `bfloat`, but the accumulator must stay f32 regardless — the error term
+  `2·u_bf16 + n·u_f32` is n-independent only because accumulation is wide.
+  Cheapest first probe needs no new code: `--f16` against `--bf16`, ABBA.
+
+### Not doing
+
+- Inventing an order over representations; the incoherence is inherent.
+- Integer *arithmetic*. Our integer data is extent-bounded and needs only
+  compare/min/max/small-add, all exact in f32 far below 2²⁴; flattened index
+  math is emitted as `uint`, not carried as IR values. Forking `apply_map`,
+  `Monoid::identity` and `simplify`'s rewrites would end the single scalar
+  semantics that `tests/laws.rs` and `tests/completeness.rs` rest on.
+- An operation-specific "indices do not narrow" rule. The law is general; a
+  rule naming a frontend op is the red flag.
+
 ## Principles (don't regress these)
 
 - **Every generated artifact is checked against the interpreter.** New emitter,

@@ -20,7 +20,7 @@ use crate::codegen::{
     thread_grid_decode, thread_grid_decode_from, value,
 };
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{self, Axis, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, input_dtypes, volume};
+use crate::ir::{self, Axis, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, volume};
 use crate::partition::{Schedule, Stage};
 use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
 
@@ -97,6 +97,10 @@ impl Lang for MetalLang {
             MapOp::RoundTo(Dtype::BF16) => format!("as_type<float>((uint)to_bf16({}) << 16u)", a[0]),
             MapOp::RoundTo(Dtype::F16) => format!("((float)((half)({})))", a[0]),
             MapOp::RoundTo(Dtype::F32 | Dtype::F64) => a[0].clone(),
+            MapOp::RoundTo(d @ Dtype::Q8 { .. }) => {
+                let scale = d.scale().expect("Q8 carries its scale");
+                format!("(clamp(rint(({}) / {scale:?}f), -127.0f, 127.0f) * {scale:?}f)", a[0])
+            }
             MapOp::RoundTo(d) => panic!("RoundTo({d:?}) needs a scale, not a plain rounding"),
         }
     }
@@ -124,6 +128,13 @@ impl Lang for MetalLang {
             // bf16 = the high 16 bits of an f32: widen by shifting back up,
             // exact over the whole f32 range (no rounding, no range limit).
             Dtype::BF16 => format!("as_type<float>((uint){b}[{off}] << 16u)"),
+            Dtype::U32 => format!("((float){b}[{off}])"),
+            // Dequantization IS the load: the scale is part of the type,
+            // baked into the kernel as a literal.
+            Dtype::Q8 { .. } => {
+                let scale = dtype.scale().expect("Q8 carries its scale");
+                format!("(((float){b}[{off}]) * {scale:?}f)")
+            }
             Dtype::I8 => format!("((float){b}[{off}])"),
             Dtype::I4 => format!("w4({b}, {off})"),
             Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
@@ -154,6 +165,8 @@ fn buf_ty(dtype: Dtype) -> &'static str {
         Dtype::F32 => "device const float*",
         Dtype::F16 => "device const half*",
         Dtype::BF16 => "device const ushort*",
+        Dtype::U32 => "device const uint*",
+        Dtype::Q8 { .. } => "device const char*",
         Dtype::I8 => "device const char*",
         Dtype::I4 => "device const uchar*",
         Dtype::F64 => panic!("Apple GPUs have no f64 buffers"),
@@ -165,6 +178,15 @@ fn buf_ty(dtype: Dtype) -> &'static str {
 pub(crate) const MSL_HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\n\
 inline float w4(device const uchar* p, uint i) {\n\
     return (float)(int)((p[i >> 1] >> ((i & 1u) << 2)) & 0xFu) - 8.0f;\n\
+}\n\n\
+inline char to_q8_saturating(float v, float s) {\n\
+    float q = rint(v / s);\n\
+    return (char)clamp(q, -127.0f, 127.0f);\n\
+}\n\n\
+inline uint to_u32_saturating(float v) {\n\
+    if (v >= 4294967040.0f) return 0xFFFFFFFFu;\n\
+    if (!(v > 0.0f)) return 0u;\n\
+    return (uint)(v + 0.5f);\n\
 }\n\n\
 inline ushort to_bf16(float v) {\n\
     uint b = as_type<uint>(v);\n\
@@ -178,6 +200,8 @@ fn out_ty(storage: Dtype) -> &'static str {
         Dtype::F32 => "device float*",
         Dtype::F16 => "device half*",
         Dtype::BF16 => "device ushort*",
+        Dtype::U32 => "device uint*",
+        Dtype::Q8 { .. } => "device char*",
         other => panic!("{other:?} is not a boundary storage dtype"),
     }
 }
@@ -189,6 +213,20 @@ fn store_expr(storage: Dtype, value: &str) -> String {
         Dtype::F32 => value.to_string(),
         Dtype::F16 => format!("(half)({value})"),
         Dtype::BF16 => format!("to_bf16({value})"),
+        // SATURATING by contract: +∞ (a Min fold's identity reaching the
+        // store) lands on u32::MAX by definition; negatives — unreachable
+        // under the law, which refuses −∞-carrying claims — clamp to 0
+        // rather than wrap into a plausible index. Values are exact
+        // integers in f32 (the law admits nothing wider than the compute
+        // width can hold), so the +0.5 round is exact, not a heuristic.
+        Dtype::U32 => format!("to_u32_saturating({value})"),
+        // Quantize AT the store, clamped to the signed grid: ±∞ land on
+        // ±127·scale by contract, the same saturation-as-representation
+        // rule that gives u32 its MAX.
+        Dtype::Q8 { .. } => {
+            let scale = storage.scale().expect("Q8 carries its scale");
+            format!("to_q8_saturating({value}, {scale:?}f)")
+        }
         other => panic!("{other:?} is not a boundary storage dtype"),
     }
 }
@@ -466,6 +504,16 @@ fn prefix_mask_edge(carrier: &Carrier, stream: AxisRef) -> Option<usize> {
     edge_of(&carrier.into[ms], carrier, stream)
 }
 
+/// The storage widths of `node`'s leaves, resolved from Γ — undeclared
+/// inputs are f32; produced buffers appear in `resolved` at the width their
+/// producer writes them.
+fn leaf_widths(node: &Node, resolved: &HashMap<String, Dtype>) -> HashMap<&'static str, Dtype> {
+    ir::leaf_names(node)
+        .into_iter()
+        .map(|name| (name, resolved.get(name).copied().unwrap_or(Dtype::F32)))
+        .collect()
+}
+
 /// Emit an MSL kernel for one fused, scalar-projecting carrier: one thread
 /// per output grid point, streaming `stream` in registers. The optional
 /// fused EPILOGUE is an elementwise node of the fold's own shape that reads
@@ -480,18 +528,19 @@ pub fn emit_fused_metal_with(
     fold_node: &Node,
     epi: Option<(&Node, &str)>,
     storage: Dtype,
+    resolved: &HashMap<String, Dtype>,
 ) -> MetalKernel {
     assert_eq!(carrier.project.len(), 1, "metal kernel needs a scalar projection");
     let (grid, grid_size) = grid_of(fold_node);
     let mut bufs = buffers(fold_node);
-    let mut dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    let mut dtypes: HashMap<&'static str, Dtype> = leaf_widths(fold_node, resolved);
     if let Some((e, out_name)) = epi {
         for (n, ax) in buffers(e) {
             if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
                 bufs.push((n, ax));
             }
         }
-        dtypes.extend(input_dtypes(e));
+        dtypes.extend(leaf_widths(e, resolved));
     }
 
     let mut g = Gen::new();
@@ -630,6 +679,7 @@ pub fn emit_fused_metal_with(
 /// memory — the same re-association `run_carrier_split` certifies. Any
 /// precondition failure falls back to the scalar kernel: a schedule can be
 /// slow, never wrong.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fused_metal_sched_with(
     name: &str,
     carrier: &Carrier,
@@ -638,9 +688,10 @@ pub fn emit_fused_metal_sched_with(
     sched: FoldSched,
     epi: Option<(&Node, &str)>,
     storage: Dtype,
+    resolved: &HashMap<String, Dtype>,
 ) -> MetalKernel {
     use std::collections::HashSet;
-    let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, epi, storage);
+    let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, epi, storage, resolved);
     if sched.is_scalar() || !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
         return scalar();
     }
@@ -687,14 +738,14 @@ pub fn emit_fused_metal_sched_with(
     }
 
     let mut bufs = buffers(fold_node);
-    let mut dtypes: HashMap<&'static str, Dtype> = input_dtypes(fold_node).into_iter().collect();
+    let mut dtypes: HashMap<&'static str, Dtype> = leaf_widths(fold_node, resolved);
     if let Some((e, out_name)) = epi {
         for (n, ax) in buffers(e) {
             if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
                 bufs.push((n, ax));
             }
         }
-        dtypes.extend(input_dtypes(e));
+        dtypes.extend(leaf_widths(e, resolved));
     }
     let mut g = Gen::new();
     g.axis_aliases = carrier.aliases.clone();
@@ -1063,7 +1114,7 @@ pub fn emit_fused_metal_sched_with(
 /// A straight-line (elementwise / gather / reduce) MSL kernel: one thread per
 /// output point, writing [`value`] of the spliced graph. No carrier.
 pub fn emit_pointwise_metal(name: &str, exec: &Node, storage: Dtype) -> MetalKernel {
-    emit_pointwise_metal_on(name, exec, storage, false)
+    emit_pointwise_metal_on(name, exec, storage, false, &HashMap::new())
 }
 
 /// [`emit_pointwise_metal`], told whether this kernel writes the very buffer
@@ -1075,10 +1126,16 @@ pub fn emit_pointwise_metal(name: &str, exec: &Node, storage: Dtype) -> MetalKer
 /// threads that fail `c` simply retire — but the traffic collapses from the
 /// whole tensor to the part `c` selects. Whoever passes `true` here owns the
 /// proof that the buffers really are one (see [`Schedule::agrees_in_place`]).
-pub fn emit_pointwise_metal_on(name: &str, exec: &Node, storage: Dtype, agrees_in_place: bool) -> MetalKernel {
+pub fn emit_pointwise_metal_on(
+    name: &str,
+    exec: &Node,
+    storage: Dtype,
+    agrees_in_place: bool,
+    resolved: &HashMap<String, Dtype>,
+) -> MetalKernel {
     let (grid, grid_size) = grid_of(exec);
     let bufs = buffers(exec);
-    let dtypes: HashMap<&'static str, Dtype> = input_dtypes(exec).into_iter().collect();
+    let dtypes: HashMap<&'static str, Dtype> = leaf_widths(exec, resolved);
 
     let mut g = Gen::new();
     g.dtypes = dtypes.clone();
@@ -1190,7 +1247,7 @@ fn kernel_name(kind: &str, output_axes: &[Axis], fold: Option<AxisRef>) -> Strin
 /// Lower a whole schedule to a Metal program (the GPU analog of
 /// [`crate::rustgen::emit_schedule`]), fold schedules priced against the
 /// device the kernels will run on.
-pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule) -> MetalProgram {
+pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceSpecs, sched: &Schedule) -> MetalProgram {
     emit_schedule_metal_tuned(dev, sched, &HashMap::new())
 }
 
@@ -1199,11 +1256,20 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
 /// device (`SANIC_TUNE=1`), overruling the analytic chooser for exactly
 /// those stages.
 pub fn emit_schedule_metal_tuned(
-    dev: &crate::cost::DeviceProfile,
+    dev: &crate::cost::DeviceSpecs,
     sched: &Schedule,
     tuned: &HashMap<String, FoldSched>,
 ) -> MetalProgram {
     let mut msl = String::from(MSL_HEADER);
+    // Γ, resolved: the caller's declarations plus every produced buffer at
+    // the width Schedule::width_of gives it (pin → mint → declared →
+    // policy). One map; emitters, pricing, allocation and readback all
+    // derive from it.
+    let mut resolved: HashMap<String, Dtype> = sched.bindings().snapshot_declared();
+    for stage in &sched.stages {
+        let out = crate::partition::stage_output(stage);
+        resolved.insert(out.to_string(), sched.width_of(out, dev.storage()));
+    }
     let mut all_dtypes: HashMap<String, Dtype> = HashMap::new();
     let mut stages: Vec<MetalStageInfo> = Vec::new();
     let mut inputs: Vec<(&'static str, Vec<AxisRef>)> = Vec::new();
@@ -1232,16 +1298,11 @@ pub fn emit_schedule_metal_tuned(
     // same dtypes (both baked into the body, so canonical equality covers
     // them) — and buffers bind positionally at dispatch, so the shared
     // pipeline is exact, not approximate.
-    // An output may pin its own storage width; everything else takes the
-    // target's boundary policy.
-    let width_of = |output: &str| -> Dtype {
-        sched
-            .outputs
-            .iter()
-            .position(|name| name == output)
-            .and_then(|index| sched.output_dtypes.get(index).copied().flatten())
-            .unwrap_or(dev.storage)
-    };
+    // A buffer's width: the caller's pin, else the law's mint (an exact
+    // value the policy cannot carry — an argmax index under bf16), else the
+    // target's boundary policy. One resolution, shared with allocation,
+    // readback and the refusal through `Schedule::width_of`.
+    let width_of = |output: &str| -> Dtype { sched.width_of(output, dev.storage()) };
     let mut canon: HashMap<String, String> = HashMap::new();
     let mut name_uses: HashMap<String, usize> = HashMap::new();
     let dedup = |k: &MetalKernel,
@@ -1292,10 +1353,13 @@ pub fn emit_schedule_metal_tuned(
                     &epilogue_node.as_ref().unwrap_or(fold_node).shape(),
                     Some(spec.streaming_axis),
                 );
-                let sched = tuned
-                    .get(&out)
-                    .copied()
-                    .unwrap_or_else(|| fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev));
+                let sched = tuned.get(&out).copied().unwrap_or_else(|| {
+                    let widths = leaf_widths(fold_node, &resolved)
+                        .into_iter()
+                        .map(|(n, d)| (n, d.bytes_per_element()))
+                        .collect();
+                    fold_sched(fold_node, spec.streaming_axis, &spec.carrier, dev, &widths)
+                });
                 if crate::debug_level() >= 3 {
                     eprintln!(
                         "[sched] {out}: sgs {} lane_stream {} lane_axis {:?} chunk {}",
@@ -1316,6 +1380,7 @@ pub fn emit_schedule_metal_tuned(
                     sched,
                     epilogue_node.as_ref().map(|e| (e, *epi_fold_read)),
                     width_of(&out),
+                    &resolved,
                 );
                 all_dtypes.insert(out.clone(), k.storage);
                 for (n, d) in &k.dtypes {
@@ -1359,7 +1424,7 @@ pub fn emit_schedule_metal_tuned(
                 };
                 let kname = kernel_name(kind, &exec.shape(), None);
                 let agrees_in_place = sched.agrees_in_place.iter().any(|name| name == output);
-                let mut k = emit_pointwise_metal_on(&kname, exec, width_of(output), agrees_in_place);
+                let mut k = emit_pointwise_metal_on(&kname, exec, width_of(output), agrees_in_place, &resolved);
                 all_dtypes.insert(output.clone(), k.storage);
                 for (n, d) in &k.dtypes {
                     all_dtypes.insert(n.to_string(), *d);
@@ -1393,6 +1458,6 @@ pub fn emit_schedule_metal_tuned(
         inputs,
         dtypes: all_dtypes,
         buffers: bufsizes,
-        storage: dev.storage,
+        storage: dev.storage(),
     }
 }

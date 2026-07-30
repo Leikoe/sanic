@@ -57,12 +57,12 @@ fn split_flash_equals_eval_for_any_block_count() {
     .into_iter()
     .collect();
 
-    let key = input("K", [k, d], Dtype::F32);
+    let key = input("K", [k, d]);
     let stream = axis_refs(&key)[0];
     let attn = scaled_dot_product_attention(
-        input("Q", [s, d], Dtype::F32),
+        input("Q", [s, d]),
         key,
-        input("V", [k, e], Dtype::F32),
+        input("V", [k, e]),
         None,
         0.0,
         false,
@@ -94,12 +94,12 @@ fn split_causal_flash_handles_identity_partials() {
     .into_iter()
     .collect();
 
-    let key = input("K", [t, dk], Dtype::F32);
+    let key = input("K", [t, dk]);
     let stream = axis_refs(&key)[0];
     let attn = scaled_dot_product_attention(
-        input("Q", [s, dk], Dtype::F32),
+        input("Q", [s, dk]),
         key,
-        input("V", [t, dv], Dtype::F32),
+        input("V", [t, dv]),
         None,
         0.0,
         true,

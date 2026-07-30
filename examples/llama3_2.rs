@@ -82,8 +82,10 @@ impl Axes {
     }
 }
 
-fn projection(x: &Tensor, name: String, input_dim: Axis, output_dim: Axis) -> Tensor {
-    let weight = Tensor::input(name, [output_dim, input_dim], Dtype::BF16);
+fn projection(graph: &mut Graph, x: &Tensor, name: String, input_dim: Axis, output_dim: Axis) -> Tensor {
+    // The term is a free variable; that the checkpoint stores this weight
+    // bf16 is the graph's declaration, not the mathematics'.
+    let weight = graph.input(name, [output_dim, input_dim], Dtype::BF16);
     x.matmul(weight.transpose(0usize, 1usize))
 }
 
@@ -117,13 +119,14 @@ fn decode_block(
     cache_dtype: Dtype,
 ) -> Tensor {
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
-    let norm_weight = |name: String| Tensor::input(name, [axes.hidden], Dtype::BF16);
-    let attn_input = rms_norm(&x, &norm_weight(name("input_layernorm.weight")), EPS);
+    let norm_weight = |graph: &mut Graph, name: String| graph.input(name, [axes.hidden], Dtype::BF16);
+    let attn_input = rms_norm(&x, &norm_weight(graph, name("input_layernorm.weight")), EPS);
 
     let query_projection = axis("query_projection", axes.query_heads.extent() * axes.head_dim.extent());
     let kv_projection = axis("kv_projection", axes.kv_heads.extent() * axes.head_dim.extent());
 
     let q = projection(
+        graph,
         &attn_input,
         name("self_attn.q_proj.weight"),
         axes.hidden,
@@ -133,14 +136,26 @@ fn decode_block(
     .transpose(0usize, 1usize);
     let q = rope(&q, position, axes.sequence, axes.head_dim, llama3_inv_freq);
 
-    let k = projection(&attn_input, name("self_attn.k_proj.weight"), axes.hidden, kv_projection)
-        .split(-1isize, axes.kv_heads, axes.head_dim)
-        .transpose(0usize, 1usize);
+    let k = projection(
+        graph,
+        &attn_input,
+        name("self_attn.k_proj.weight"),
+        axes.hidden,
+        kv_projection,
+    )
+    .split(-1isize, axes.kv_heads, axes.head_dim)
+    .transpose(0usize, 1usize);
     let k = rope(&k, position, axes.sequence, axes.head_dim, llama3_inv_freq);
 
-    let v = projection(&attn_input, name("self_attn.v_proj.weight"), axes.hidden, kv_projection)
-        .split(-1isize, axes.kv_heads, axes.head_dim)
-        .transpose(0usize, 1usize);
+    let v = projection(
+        graph,
+        &attn_input,
+        name("self_attn.v_proj.weight"),
+        axes.hidden,
+        kv_projection,
+    )
+    .split(-1isize, axes.kv_heads, axes.head_dim)
+    .transpose(0usize, 1usize);
 
     // Each cache is stored with the axis its fold CONTRACTS innermost, so both
     // folds walk memory contiguously. K is contracted over head_dim by the
@@ -163,13 +178,36 @@ fn decode_block(
     let attended = attention(&q, &key_cache, &value_rows, Some(&mask), None, true)
         .transpose(0usize, 1usize)
         .flatten(&[1usize, 2usize][..], axes.hidden);
-    let attended = projection(&attended, name("self_attn.o_proj.weight"), axes.hidden, axes.hidden);
+    let attended = projection(
+        graph,
+        &attended,
+        name("self_attn.o_proj.weight"),
+        axes.hidden,
+        axes.hidden,
+    );
     let residual = x + attended;
 
-    let mlp_input = rms_norm(&residual, &norm_weight(name("post_attention_layernorm.weight")), EPS);
-    let gate = projection(&mlp_input, name("mlp.gate_proj.weight"), axes.hidden, axes.intermediate);
-    let up = projection(&mlp_input, name("mlp.up_proj.weight"), axes.hidden, axes.intermediate);
+    let mlp_input = rms_norm(
+        &residual,
+        &norm_weight(graph, name("post_attention_layernorm.weight")),
+        EPS,
+    );
+    let gate = projection(
+        graph,
+        &mlp_input,
+        name("mlp.gate_proj.weight"),
+        axes.hidden,
+        axes.intermediate,
+    );
+    let up = projection(
+        graph,
+        &mlp_input,
+        name("mlp.up_proj.weight"),
+        axes.hidden,
+        axes.intermediate,
+    );
     let down = projection(
+        graph,
         &(gate.silu() * up),
         name("mlp.down_proj.weight"),
         axes.intermediate,
@@ -183,15 +221,15 @@ fn build_decode(config: Config, context_length: usize, cache_dtype: Dtype) -> Gr
     let axes = Axes::new(config, 1);
     let cache_sequence = axis("cache_sequence", context_length);
     let mut graph = Graph::new();
-    let position = Tensor::input("position", [], Dtype::F32);
-    let tokens = Tensor::input("tokens", [axes.sequence], Dtype::F32);
-    let embedding = Tensor::input("model.embed_tokens.weight", [axes.vocab, axes.hidden], Dtype::BF16);
+    let position = graph.input("position", [], Dtype::F32);
+    let tokens = graph.input("tokens", [axes.sequence], Dtype::F32);
+    let embedding = graph.input("model.embed_tokens.weight", [axes.vocab, axes.hidden], Dtype::BF16);
 
     let mut x = embedding.gather(&tokens, 0usize);
     for layer in 0..config.layers {
         x = decode_block(&mut graph, &axes, cache_sequence, layer, x, &position, cache_dtype);
     }
-    let x = rms_norm(&x, &Tensor::input("model.norm.weight", [axes.hidden], Dtype::BF16), EPS);
+    let x = rms_norm(&x, &graph.input("model.norm.weight", [axes.hidden], Dtype::BF16), EPS);
     // Greedy sampling belongs on the GPU: picking the argmax host-side means
     // reading the whole vocabulary back and scanning it every token, which is
     // 128,256 values to learn one. Emitting the index instead makes the step's
@@ -206,13 +244,11 @@ fn build_decode(config: Config, context_length: usize, cache_dtype: Dtype) -> Gr
     if std::env::var_os("LLAMA3_2_DEBUG_LOGITS").is_some() {
         graph.output("logits", logits.clone());
     }
-    // F32 regardless of the boundary policy: this is an index into a 128,256
-    // entry vocabulary, and bf16 holds integers exactly only to 256.
-    graph.output_at(
-        "token",
-        sanic::argmax(logits.node().clone(), -1isize).into(),
-        Dtype::F32,
-    );
+    // No pin: the law knows this is an index into a 128,256-entry
+    // vocabulary — ℕ̄, bounded, +∞ fold identity — and mints u32 with a
+    // saturating store on its own. The pin this replaced (#21) predates the
+    // law; a caller may still outrank the mint, but no longer has to.
+    graph.output("token", sanic::argmax(logits.node().clone(), -1isize).into());
     graph
 }
 
@@ -227,32 +263,38 @@ fn cached_model_dir() -> Result<PathBuf, String> {
     Ok(repository.join("snapshots").join(revision.trim()))
 }
 
-fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
-    fn visit(node: &NodeRef, specs: &mut HashMap<String, (Vec<usize>, Dtype)>, seen: &mut HashSet<*const Node>) {
+fn input_specs(roots: &[NodeRef], declared: &HashMap<String, Dtype>) -> HashMap<String, (Vec<usize>, Dtype)> {
+    fn visit(
+        node: &NodeRef,
+        declared: &HashMap<String, Dtype>,
+        specs: &mut HashMap<String, (Vec<usize>, Dtype)>,
+        seen: &mut HashSet<*const Node>,
+    ) {
         if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
         match node.as_ref() {
-            Node::Input { name, shape, dtype } => {
+            Node::Input { name, shape } => {
                 let shape = shape.iter().copied().map(Axis::extent).collect();
-                let declaration = (shape, *dtype);
+                let dtype = declared.get(*name).copied().unwrap_or(Dtype::F32);
+                let declaration = (shape, dtype);
                 if let Some(previous) = specs.insert(name.to_string(), declaration.clone()) {
                     assert_eq!(previous, declaration, "incompatible input `{name}`");
                 }
             }
             Node::Const { .. } | Node::Iota { .. } => {}
-            Node::Coordinate { src, .. } => visit(src, specs, seen),
+            Node::Coordinate { src, .. } => visit(src, declared, specs, seen),
             Node::Map { inputs, .. } => {
                 for input in inputs {
-                    visit(input, specs, seen);
+                    visit(input, declared, specs, seen);
                 }
             }
             Node::Reduce { src, .. } | Node::Scan { src, .. } | Node::View { src, .. } | Node::Reindex { src, .. } => {
-                visit(src, specs, seen)
+                visit(src, declared, specs, seen)
             }
             Node::Gather { src, index, .. } => {
-                visit(src, specs, seen);
-                visit(index, specs, seen);
+                visit(src, declared, specs, seen);
+                visit(index, declared, specs, seen);
             }
         }
     }
@@ -260,16 +302,17 @@ fn input_specs(roots: &[NodeRef]) -> HashMap<String, (Vec<usize>, Dtype)> {
     let mut specs = HashMap::new();
     let mut seen = HashSet::new();
     for root in roots {
-        visit(root, &mut specs, &mut seen);
+        visit(root, declared, &mut specs, &mut seen);
     }
     specs
 }
 
 fn validate_checkpoint(
     roots: &[NodeRef],
+    declared: &HashMap<String, Dtype>,
     checkpoint: &SafeTensors,
 ) -> Result<HashMap<String, (Vec<usize>, Dtype)>, String> {
-    let specs = input_specs(roots);
+    let specs = input_specs(roots, declared);
     for (name, (expected_shape, expected_dtype)) in &specs {
         if name == "tokens" || name == "position" || name.starts_with("cache.") {
             continue;
@@ -447,19 +490,20 @@ fn run_metal() -> Result<(), String> {
     eprintln!("reading cached BF16 checkpoint...");
     let (checkpoint_tensors, region) = open_checkpoint_zero_copy(&checkpoint)?;
     let roots = graph.roots();
-    let specs = validate_checkpoint(&roots, &checkpoint_tensors)
+    let specs = validate_checkpoint(&roots, graph.declarations(), &checkpoint_tensors)
         .map_err(|error| format!("invalid cached checkpoint: {error}"))?;
     eprintln!(
         "read and validated checkpoint in {:.2}s",
         started.elapsed().as_secs_f32()
     );
 
-    let device = sanic::MetalDevice::open()
-        .ok_or("no Metal device is available")?
-        .with_storage(storage);
+    let device = sanic::MetalDevice::open().ok_or("no Metal device is available")?;
+    // The policy is the CALLER's, handed to compilation — it never rides
+    // the device. --bf16 is one knob on this line and nowhere else.
+    let policy = sanic::cost::Policy { boundary: storage };
     let started = std::time::Instant::now();
     eprintln!("compiling decode program...");
-    let program = graph.compile_for(&device).map_err(|error| error.to_string())?;
+    let program = graph.compile_for(&device, policy).map_err(|error| error.to_string())?;
     eprintln!(
         "compiled {} kernels in {:.2}s",
         program.kernel_count(),

@@ -1,4 +1,4 @@
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::derive::{SlotKind, derive};
 use sanic::partition::{Stage, partition, partition_many};
 use sanic::{
@@ -13,7 +13,7 @@ fn add() -> Monoid {
 #[test]
 fn positional_dimensions_do_not_alias_equal_metadata() {
     let d = axis("d", 2);
-    let x = input("x", [d, d], Dtype::F32);
+    let x = input("x", [d, d]);
     let rows = reduce(x, 1usize, add());
 
     let cpu = CpuDevice::new();
@@ -30,7 +30,7 @@ fn positional_dimensions_do_not_alias_equal_metadata() {
 fn tuple_roots_share_named_inputs_and_return_a_vec_in_order() {
     let row = axis("row", 2);
     let col = axis("col", 2);
-    let x = input("x", [row, col], Dtype::F32);
+    let x = input("x", [row, col]);
     let by_row = reduce(x.clone(), 1usize, add());
     let by_col = reduce(x, 0usize, add());
 
@@ -48,8 +48,8 @@ fn tuple_roots_share_named_inputs_and_return_a_vec_in_order() {
 fn map_broadcasts_positionally() {
     let row = axis("row", 2);
     let col = axis("col", 3);
-    let x = input("x", [row, col], Dtype::F32);
-    let b = input("b", [col], Dtype::F32);
+    let x = input("x", [row, col]);
+    let b = input("b", [col]);
     let y = map(MapOp::Add, vec![x, b]);
 
     let cpu = CpuDevice::new();
@@ -67,8 +67,8 @@ fn map_broadcasts_positionally() {
 fn broadcasting_preserves_output_order_when_the_short_operand_is_first() {
     let row = axis("row", 2);
     let col = axis("col", 3);
-    let b = input("b", [col], Dtype::F32);
-    let x = input("x", [row, col], Dtype::F32);
+    let b = input("b", [col]);
+    let x = input("x", [row, col]);
     let y = map(MapOp::Sub, vec![b, x]);
 
     let cpu = CpuDevice::new();
@@ -85,7 +85,7 @@ fn broadcasting_preserves_output_order_when_the_short_operand_is_first() {
 fn positional_view_can_permute_storage_order() {
     let row = axis("row", 2);
     let col = axis("col", 3);
-    let x = input("x", [row, col], Dtype::F32);
+    let x = input("x", [row, col]);
     let transposed = positional_view(
         x,
         vec![
@@ -111,7 +111,7 @@ fn positional_view_can_permute_storage_order() {
 
 #[test]
 fn compilation_rejects_dynamic_shapes_at_its_boundary() {
-    let x = input("x", [axis("dynamic", Extent::Dynamic)], Dtype::F32);
+    let x = input("x", [axis("dynamic", Extent::Dynamic)]);
     assert!(matches!(
         x.compile(&CpuDevice::new()),
         Err(CompileError::DynamicShapesNotYetSupported)
@@ -121,8 +121,8 @@ fn compilation_rejects_dynamic_shapes_at_its_boundary() {
 #[test]
 fn matmul_contracts_by_position_even_when_axis_metadata_repeats() {
     let d = axis("d", 2);
-    let left = input("left", [d, d], Dtype::F32);
-    let right = input("right", [d, d], Dtype::F32);
+    let left = input("left", [d, d]);
+    let right = input("right", [d, d]);
     let output = matmul(left, right);
 
     let cpu = CpuDevice::new();
@@ -138,7 +138,7 @@ fn matmul_contracts_by_position_even_when_axis_metadata_repeats() {
 #[test]
 fn positional_argmax_is_one_generic_key_payload_fold() {
     let item = axis("item", 8);
-    let x = input("x", [item], Dtype::F32);
+    let x = input("x", [item]);
     let stream = axis_refs(&x)[0];
     let index = argmax(x, -1isize);
 
@@ -154,7 +154,7 @@ fn positional_argmax_is_one_generic_key_payload_fold() {
             }
         ]
     ));
-    let schedule = partition(&index, &DeviceProfile::toy());
+    let schedule = partition(&index, &DeviceSpecs::toy());
     assert!(matches!(
         schedule.stages.as_slice(),
         [Stage::Fused { spec, .. }] if spec.carrier.slots == 2
@@ -173,7 +173,7 @@ fn positional_argmax_is_one_generic_key_payload_fold() {
 #[test]
 fn positional_topk_composition_returns_descending_values_and_indices() {
     let item = axis("item", 8);
-    let pairs = topk(input("x", [item], Dtype::F32), 0usize, 3);
+    let pairs = topk(input("x", [item]), 0usize, 3);
     let roots = pairs
         .iter()
         .flat_map(|(value, index)| [value.clone(), index.clone()])
@@ -188,7 +188,7 @@ fn positional_topk_composition_returns_descending_values_and_indices() {
             (pairs[2].0.clone(), "v2"),
             (pairs[2].1.clone(), "i2"),
         ],
-        &DeviceProfile::toy(),
+        &DeviceSpecs::toy(),
     );
     assert!(
         schedule
@@ -214,7 +214,7 @@ fn the_same_program_api_executes_on_metal() {
         return;
     };
     let d = axis("d", 2);
-    let output = reduce(input("x", [d, d], Dtype::F32), 1usize, add());
+    let output = reduce(input("x", [d, d]), 1usize, add());
     let program = output.compile(&metal).unwrap();
     let x = metal
         .tensor_from_f64([2, 2], Dtype::F32, &[1.0, 2.0, 3.0, 4.0])
@@ -235,9 +235,9 @@ fn direct_attention_is_one_metal_kernel() {
     };
     let sequence = axis("sequence", 2);
     let features = axis("features", 2);
-    let q = input("q", [sequence, features], Dtype::F32);
-    let k = input("k", [sequence, features], Dtype::F32);
-    let v = input("v", [sequence, features], Dtype::F32);
+    let q = input("q", [sequence, features]);
+    let k = input("k", [sequence, features]);
+    let v = input("v", [sequence, features]);
     let output = scaled_dot_product_attention(q, k, v, None, 0.0, false, None, false);
     let program = output.compile(&metal).unwrap();
     assert_eq!(program.kernel_count(), 1);
@@ -268,8 +268,8 @@ fn captured_replay_feeds_outputs_back_as_inputs() {
         return;
     };
     let d = axis("d", 4);
-    let state = input("state", [d], Dtype::F32);
-    let delta = input("delta", [d], Dtype::F32);
+    let state = input("state", [d]);
+    let delta = input("delta", [d]);
     let program = map(MapOp::Add, vec![state, delta]).compile(&metal).unwrap();
 
     let state = metal.tensor_from_f64([4], Dtype::F32, &[1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -305,7 +305,7 @@ fn captured_replay_without_feedback_reruns_one_graph_over_live_bindings() {
         return;
     };
     let d = axis("d", 2);
-    let output = reduce(input("x", [d, d], Dtype::F32), 1usize, add());
+    let output = reduce(input("x", [d, d]), 1usize, add());
     let program = output.compile(&metal).unwrap();
     let x = metal
         .tensor_from_f64([2, 2], Dtype::F32, &[1.0, 2.0, 3.0, 4.0])
@@ -327,8 +327,8 @@ fn capture_rejects_bad_feedback_wiring() {
         return;
     };
     let d = axis("d", 4);
-    let state = input("state", [d], Dtype::F32);
-    let delta = input("delta", [d], Dtype::F32);
+    let state = input("state", [d]);
+    let delta = input("delta", [d]);
     let program = map(MapOp::Add, vec![state, delta]).compile(&metal).unwrap();
     let state = metal.tensor_from_f64([4], Dtype::F32, &[0.0; 4]).unwrap();
     let delta = metal.tensor_from_f64([4], Dtype::F32, &[0.0; 4]).unwrap();

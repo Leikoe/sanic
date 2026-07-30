@@ -55,10 +55,10 @@ fn decode_cone_bisection() {
         ("mask only", axis("query_heads", 2), true),
         ("bare", axis("query_heads", 2), false),
     ] {
-        let key = input("k", [kv_heads, cache, head_dim], Dtype::F32);
+        let key = input("k", [kv_heads, cache, head_dim]);
         let stream = source_axis(&key, 1);
         let mask = masked.then(|| {
-            let position = input("position", [], Dtype::F32);
+            let position = input("position", []);
             let visible = map(
                 MapOp::Lt,
                 vec![iota(cache), map(MapOp::Add, vec![position, konst(1.0)])],
@@ -66,9 +66,9 @@ fn decode_cone_bisection() {
             map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)])
         });
         let attention = scaled_dot_product_attention(
-            input("q", [query_heads, sequence, head_dim], Dtype::F32),
+            input("q", [query_heads, sequence, head_dim]),
             key,
-            input("v", [kv_heads, cache, head_dim], Dtype::F32),
+            input("v", [kv_heads, cache, head_dim]),
             mask,
             0.0,
             false,
@@ -110,18 +110,18 @@ fn decode_attention_cone_derives_as_one_kernel() {
     .into_iter()
     .collect();
 
-    let key = input("k", [kv_heads, cache, head_dim], Dtype::F32);
+    let key = input("k", [kv_heads, cache, head_dim]);
     let stream = source_axis(&key, 1);
-    let position = input("position", [], Dtype::F32);
+    let position = input("position", []);
     let visible = map(
         MapOp::Lt,
         vec![iota(cache), map(MapOp::Add, vec![position, konst(1.0)])],
     );
     let mask = map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)]);
     let attention = scaled_dot_product_attention(
-        input("q", [query_heads, sequence, head_dim], Dtype::F32),
+        input("q", [query_heads, sequence, head_dim]),
         key,
-        input("v", [kv_heads, cache, head_dim], Dtype::F32),
+        input("v", [kv_heads, cache, head_dim]),
         Some(mask),
         0.0,
         false,
@@ -141,7 +141,15 @@ fn decode_attention_cone_derives_as_one_kernel() {
     );
 
     let reference = eval(&attention, &env);
-    let kernel = emit_fused_metal_with("decode_cone", &carrier, stream, &attention, None, sanic::Dtype::F32);
+    let kernel = emit_fused_metal_with(
+        "decode_cone",
+        &carrier,
+        stream,
+        &attention,
+        None,
+        sanic::Dtype::F32,
+        &Default::default(),
+    );
     let Some(device) = MetalDevice::open() else {
         eprintln!("skipping GPU check: no Metal device");
         return;

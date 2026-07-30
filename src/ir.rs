@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-pub use crate::scalar::{Dtype, Extent, MapOp, Monoid};
+pub use crate::scalar::{Dtype, Extent, MapOp, Monoid, round_to};
 
 /// A shared reference to an immutable graph node.
 pub type NodeRef = Arc<Node>;
@@ -70,10 +70,14 @@ pub struct ViewDim {
 
 #[derive(Debug)]
 pub enum Node {
+    /// A free variable of the calculus: a name and a shape, nothing else.
+    /// How the bound buffer is *stored* is a program fact, declared in the
+    /// bindings the program layer owns (`Graph`'s declarations, a compile
+    /// call's, or the widths partition mints) — never part of the term, so
+    /// structural identity is mathematical identity.
     Input {
         name: &'static str,
         shape: Vec<Axis>,
-        dtype: Dtype,
     },
     Const {
         v: f64,
@@ -615,12 +619,11 @@ impl Dimension for &str {
     }
 }
 
-pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> NodeRef {
+pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>) -> NodeRef {
     let name = Box::leak(name.into().into_boxed_str());
     intern(Node::Input {
         name,
         shape: shape.as_ref().to_vec(),
-        dtype,
     })
 }
 
@@ -630,8 +633,14 @@ pub fn konst(v: f64) -> NodeRef {
 
 /// A tensor of ones with the same positional shape as `source`, expressed
 /// from scalar maps so it preserves the source dimension occurrences.
+///
+/// `source` sits on the never-taken branch of a `Where`, contributing shape
+/// and nothing else. The arithmetic spelling `source·0 + 1` is NOT
+/// equivalent: `−∞ · 0 = NaN`, and masked tensors carry `−∞` by design
+/// (attention builds them with `select(0, −∞)`), so it returned NaN
+/// exactly where a mask had fired.
 pub fn ones_like(source: NodeRef) -> NodeRef {
-    map(MapOp::Add, vec![map(MapOp::Mul, vec![source, konst(0.0)]), konst(1.0)])
+    map(MapOp::Where, vec![konst(1.0), konst(1.0), source])
 }
 
 pub fn iota(axis: Axis) -> NodeRef {
@@ -882,7 +891,7 @@ impl Drop for Node {
 fn shallow_key(n: &Node) -> String {
     let p = |c: &NodeRef| Arc::as_ptr(c) as usize;
     match n {
-        Node::Input { name, shape, dtype } => format!("I{name}{shape:?}{dtype:?}"),
+        Node::Input { name, shape } => format!("I{name}{shape:?}"),
         Node::Const { v } => format!("C{}", v.to_bits()),
         Node::Iota { axis } => format!("O{axis:?}"),
         Node::Coordinate { src, dim } => format!("D{dim}.{}", p(src)),
@@ -955,45 +964,6 @@ pub fn input_axes(node: &NodeRef) -> Vec<(&'static str, Vec<AxisRef>)> {
     output
 }
 
-pub fn input_dtypes(node: &NodeRef) -> Vec<(&'static str, Dtype)> {
-    fn walk(
-        node: &NodeRef,
-        output: &mut Vec<(&'static str, Dtype)>,
-        seen: &mut std::collections::HashSet<*const Node>,
-    ) {
-        if !seen.insert(Arc::as_ptr(node)) {
-            return;
-        }
-        match node.as_ref() {
-            Node::Input { name, dtype, .. } => {
-                if !output.iter().any(|(existing, _)| existing == name) {
-                    output.push((*name, *dtype));
-                }
-            }
-            Node::Const { .. } | Node::Iota { .. } => {}
-            Node::Coordinate { src, .. }
-            | Node::Reduce { src, .. }
-            | Node::Scan { src, .. }
-            | Node::View { src, .. }
-            | Node::Reindex { src, .. } => walk(src, output, seen),
-            Node::Map { inputs, .. } => {
-                for input in inputs {
-                    walk(input, output, seen);
-                }
-            }
-            Node::Gather { src, index, .. } => {
-                walk(src, output, seen);
-                walk(index, output, seen);
-            }
-        }
-    }
-
-    let mut output = Vec::new();
-    walk(node, &mut output, &mut std::collections::HashSet::new());
-    output
-}
-
-/// Input names in first-seen order.
 pub fn leaf_names(node: &NodeRef) -> Vec<&'static str> {
     let mut names = Vec::new();
     for (name, _) in input_axes(node) {

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::nn::scaled_dot_product_attention;
@@ -130,16 +130,16 @@ fn flash_attention_compiles_and_matches() {
     .collect();
 
     let attn = scaled_dot_product_attention(
-        input("Q", [sq, d], Dtype::F32),
-        input("K", [k, d], Dtype::F32),
-        input("V", [k, e], Dtype::F32),
+        input("Q", [sq, d]),
+        input("K", [k, d]),
+        input("V", [k, e]),
         None,
         0.0,
         false,
         Some(1.0),
         false,
     );
-    let sched = partition(&attn, &DeviceProfile::toy());
+    let sched = partition(&attn, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&attn, &env);
     compile_and_verify("flash", &program, &env, &reference);
@@ -161,13 +161,10 @@ fn quantized_matmul_compiles_and_matches() {
 
     let dw = map(
         MapOp::Mul,
-        vec![
-            input("qW", [o, dm], Dtype::F32),
-            unsqueeze(input("scale", [o], Dtype::F32), 1usize),
-        ],
+        vec![input("qW", [o, dm]), unsqueeze(input("scale", [o]), 1usize)],
     );
-    let y = matmul(input("X", [s, dm], Dtype::F32), transpose(dw, 0usize, 1usize));
-    let sched = partition(&y, &DeviceProfile::toy());
+    let y = matmul(input("X", [s, dm]), transpose(dw, 0usize, 1usize));
+    let sched = partition(&y, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&y, &env);
     compile_and_verify("quant", &program, &env, &reference);
@@ -198,22 +195,18 @@ fn conv2d_compiles_and_matches() {
     .into_iter()
     .collect();
 
-    let xw = window(input("X", [ci, h0, w0], Dtype::F32), 1usize, oh, kh, 1, 1);
+    let xw = window(input("X", [ci, h0, w0]), 1usize, oh, kh, 1, 1);
     let xw = window(xw, 3usize, ow, kw, 1, 1);
     let xf = flatten(xw, &[0usize, 2usize, 4usize][..], r);
     let xf = transpose(transpose(xf, 0usize, 1usize), 1usize, 2usize);
     let wf = transpose(
-        flatten(
-            input("W", [co, ci, kh, kw], Dtype::F32),
-            &[1usize, 2usize, 3usize][..],
-            r,
-        ),
+        flatten(input("W", [co, ci, kh, kw]), &[1usize, 2usize, 3usize][..], r),
         0usize,
         1usize,
     );
     let conv = matmul(xf, wf);
 
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&conv, &env);
     compile_and_verify("conv2d", &program, &env, &reference);
@@ -235,18 +228,18 @@ fn sliding_window_attention_compiles_and_matches() {
 
     let off = -((w - 1) as i64);
     let kw = positional_reindex(
-        input("K", [t, d], Dtype::F32),
+        input("K", [t, d]),
         vec![s, j, d],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     );
     let vw = positional_reindex(
-        input("V", [t, e], Dtype::F32),
+        input("V", [t, e]),
         vec![s, j, e],
         vec![(0, vec![(1, 0), (1, 1)], off), (1, vec![(1, 2)], 0)],
         true,
     );
-    let q = unsqueeze(input("Q", [s, d], Dtype::F32), 1usize);
+    let q = unsqueeze(input("Q", [s, d]), 1usize);
     let scores = reduce(map(MapOp::Mul, vec![q, kw]), 2usize, add_r());
     let invalid = map(
         MapOp::Lt,
@@ -268,7 +261,7 @@ fn sliding_window_attention_compiles_and_matches() {
         add_r(),
     );
 
-    let sched = partition(&attn, &DeviceProfile::toy());
+    let sched = partition(&attn, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&attn, &env);
     compile_and_verify("swa", &program, &env, &reference);
@@ -318,12 +311,12 @@ fn transformer_block_compiles_and_matches() {
         reduce(map(MapOp::Mul, vec![x, weight]), 3usize, add_r())
     };
 
-    let x = input("X", [s, dm], Dtype::F32);
-    let xn = rmsnorm(x.clone(), input("g1", [dm], Dtype::F32));
+    let x = input("X", [s, dm]);
+    let xn = rmsnorm(x.clone(), input("g1", [dm]));
     let xn_kv = rename(xn.clone(), 0usize, t);
-    let q = head_projection(xn, input("Wq", [h, dk, dm], Dtype::F32));
-    let k = head_projection(xn_kv.clone(), input("Wk", [h, dk, dm], Dtype::F32));
-    let vv = head_projection(xn_kv, input("Wv", [h, dv, dm], Dtype::F32));
+    let q = head_projection(xn, input("Wq", [h, dk, dm]));
+    let k = head_projection(xn_kv.clone(), input("Wk", [h, dk, dm]));
+    let vv = head_projection(xn_kv, input("Wv", [h, dv, dm]));
     let attn = scaled_dot_product_attention(
         q,
         k,
@@ -335,17 +328,17 @@ fn transformer_block_compiles_and_matches() {
         false,
     );
     let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv);
-    let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32));
+    let o = matmul(flat, input("Wo", [dmv, dm]));
     let res1 = map(MapOp::Add, vec![o, x]);
-    let hn = rmsnorm(res1.clone(), input("g2", [dm], Dtype::F32));
-    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize));
-    let up = matmul(hn, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize));
+    let hn = rmsnorm(res1.clone(), input("g2", [dm]));
+    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm]), 0usize, 1usize));
+    let up = matmul(hn, transpose(input("Wu", [f, dm]), 0usize, 1usize));
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
+    let mlp = matmul(act, input("Wd", [f, dm]));
     let yb = map(MapOp::Add, vec![mlp, res1]);
-    let logits = matmul(yb, transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize));
+    let logits = matmul(yb, transpose(input("W_lm", [v, dm]), 0usize, 1usize));
 
-    let sched = partition(&logits, &DeviceProfile::toy());
+    let sched = partition(&logits, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&logits, &env);
     compile_and_verify("block", &program, &env, &reference);
@@ -364,21 +357,18 @@ fn attention_gradient_compiles_and_matches() {
     .into_iter()
     .collect();
 
-    let scores = matmul(
-        input("Q", [s, dk], Dtype::F32),
-        transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
-    );
+    let scores = matmul(input("Q", [s, dk]), transpose(input("K", [t, dk]), 0usize, 1usize));
     let masked = map(
         MapOp::Add,
         vec![scores.clone(), causal_mask_like(scores, 0usize, 1usize)],
     );
-    let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
+    let out = matmul(softmax(masked, 1usize), input("V", [t, dv]));
     let sq = map(MapOp::Mul, vec![out.clone(), out]);
     let loss = reduce(reduce(sq, 1usize, add_r()), 0usize, add_r());
 
     let grads = sanic::grad::grad(&loss, &["Q"]);
     let g = &grads["Q"];
-    let sched = partition(g, &DeviceProfile::toy());
+    let sched = partition(g, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(g, &env);
     compile_and_verify("dq", &program, &env, &reference);

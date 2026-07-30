@@ -20,7 +20,7 @@ fn a_stateful_counter_steps_on_metal() {
     graph.output("y", &s * 2.0);
     graph.update(&s, &s + 1.0);
 
-    let program = graph.compile_for(&device).unwrap();
+    let program = graph.compile_for(&device, Default::default()).unwrap();
     let mut machine = program.instantiate(&device, std::iter::empty()).unwrap();
     for _ in 0..3 {
         machine.step().unwrap();
@@ -42,14 +42,14 @@ fn a_row_write_state_keeps_what_earlier_steps_wrote() {
     };
     let mut graph = Graph::new();
     let state = graph.state("s", [axis("seq", 4)], Dtype::F32);
-    let position = Tensor::input("position", [], Dtype::F32);
+    let position = Tensor::input("position", []);
     let index = state.coordinate(0usize);
     let here = index.lt(&position + 1.0) * position.lt(&index + 1.0);
     let successor = here.select(&position + 10.0, &state);
     graph.update(&state, successor.clone());
     graph.output("s", successor);
 
-    let program = graph.compile_for(&device).unwrap();
+    let program = graph.compile_for(&device, Default::default()).unwrap();
     let position_buffer = device
         .tensor_from_raw(device.alloc_elems(1, Dtype::F32), vec![], Dtype::F32)
         .unwrap();
@@ -76,10 +76,13 @@ fn storage_mismatch_is_a_compile_error() {
         eprintln!("no Metal device; skipping");
         return;
     };
-    let device = device.with_storage(Dtype::BF16);
+
     let mut graph = Graph::new();
     let s = graph.state("s", [axis("d", 4)], Dtype::F32);
     graph.update(&s, &s + 1.0);
-    let err = graph.compile_for(&device).err().expect("must not compile");
+    let err = graph
+        .compile_for(&device, sanic::cost::Policy { boundary: Dtype::BF16 })
+        .err()
+        .expect("must not compile");
     assert!(err.to_string().contains("boundaries"), "{err}");
 }

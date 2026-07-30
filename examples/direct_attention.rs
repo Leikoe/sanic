@@ -5,9 +5,9 @@ fn main() {
     let sequence = axis("sequence", 2);
     let features = axis("features", 2);
 
-    let q = input("q", [sequence, features], Dtype::F32);
-    let k = input("k", [sequence, features], Dtype::F32);
-    let v = input("v", [sequence, features], Dtype::F32);
+    let q = input("q", [sequence, features]);
+    let k = input("k", [sequence, features]);
+    let v = input("v", [sequence, features]);
     let output = scaled_dot_product_attention(q, k, v, None, 0.0, false, None, false);
 
     let cpu = CpuDevice::new();

@@ -4,7 +4,7 @@
 //! no stop-gradient. The winner-mask of the stabilizing max-shift cancels, and
 //! cross-root CSE lets the backward reuse the forward's logsumexp carrier.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::grad::grad;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
@@ -50,7 +50,7 @@ fn cross_entropy(logits: &NodeRef, primitive: bool) -> NodeRef {
                 one_hot_like(
                     logits.clone(),
                     1usize,
-                    unsqueeze(input("y", [logits.shape()[0]], Dtype::F32), 1usize),
+                    unsqueeze(input("y", [logits.shape()[0]]), 1usize),
                 ),
             ],
         ),
@@ -74,7 +74,7 @@ fn simplify_preserves_the_gradient() {
     .into_iter()
     .collect();
 
-    let loss = cross_entropy(&input("Z", [b, c], Dtype::F32), false);
+    let loss = cross_entropy(&input("Z", [b, c]), false);
     let dz = grad(&loss, &["Z"])["Z"].clone();
     let simplified = simplify_many(&[loss, dz.clone()]).pop().unwrap();
 
@@ -97,12 +97,12 @@ fn simplify_preserves_the_gradient() {
 fn composed_logsumexp_backward_matches_the_primitive() {
     let (b, c) = (axis("b", 100), axis("c", 10));
     let schedule = |primitive: bool| {
-        let loss = cross_entropy(&input("Z", [b, c], Dtype::F32), primitive);
+        let loss = cross_entropy(&input("Z", [b, c]), primitive);
         let dz = grad(&loss, &["Z"])["Z"].clone();
         let roots = simplify_many(&[loss, dz]);
         partition_many(
             &[(roots[0].clone(), "loss"), (roots[1].clone(), "dZ")],
-            &DeviceProfile::toy(),
+            &DeviceSpecs::toy(),
         )
     };
     let composed = schedule(false);
@@ -122,7 +122,7 @@ fn composed_logsumexp_backward_matches_the_primitive() {
 #[test]
 fn interned_construction_merges_structural_duplicates() {
     let (b, c) = (axis("b", 4), axis("c", 6));
-    let x = input("x", [b, c], Dtype::F32);
+    let x = input("x", [b, c]);
     let row_energy = |x: &NodeRef| reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, Monoid::Add);
     // Built twice on purpose: equal structure interns to the same node.
     let once = row_energy(&x);
@@ -155,7 +155,7 @@ fn interned_construction_merges_structural_duplicates() {
 #[test]
 fn partition_computes_a_structural_duplicate_once() {
     let (b, c) = (axis("b", 4), axis("c", 6));
-    let x = || input("x", [b, c], Dtype::F32);
+    let x = || input("x", [b, c]);
     let row_energy = |x: NodeRef| reduce(map(MapOp::Mul, vec![x.clone(), x]), 1usize, Monoid::Add);
     // One fold consumed by two different parents — written once with the
     // node shared, once with the fold rebuilt from scratch.
@@ -165,7 +165,7 @@ fn partition_computes_a_structural_duplicate_once() {
     let shared = combine(shared_fold.clone(), shared_fold);
     let duplicated = combine(row_energy(x()), row_energy(x()));
 
-    let toy = DeviceProfile::toy();
+    let toy = DeviceSpecs::toy();
     let shared_schedule = partition_many(&[(shared.clone(), "Out")], &toy);
     let duplicated_schedule = partition_many(&[(duplicated.clone(), "Out")], &toy);
     assert_eq!(

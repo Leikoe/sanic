@@ -6,16 +6,8 @@ fn add() -> Monoid {
 
 #[test]
 fn an_input_name_is_its_identity_within_the_compiled_roots() {
-    let first = input(
-        String::from("x"),
-        [axis("first row", 2), axis("first col", 2)],
-        Dtype::F32,
-    );
-    let second = input(
-        String::from("x"),
-        [axis("second row", 2), axis("second col", 2)],
-        Dtype::F32,
-    );
+    let first = input(String::from("x"), [axis("first row", 2), axis("first col", 2)]);
+    let second = input(String::from("x"), [axis("second row", 2), axis("second col", 2)]);
     let output = reduce(map(MapOp::Add, vec![first, second]), 1usize, add());
 
     let cpu = CpuDevice::new();
@@ -28,25 +20,26 @@ fn an_input_name_is_its_identity_within_the_compiled_roots() {
 }
 
 #[test]
-fn the_same_name_must_have_one_shape_and_dtype_per_program() {
-    let left = input("x", [axis("d", 2)], Dtype::F32);
-    let right = input("x", [axis("d", 3)], Dtype::F32);
+fn the_same_name_must_have_one_shape_per_program() {
+    let left = input("x", [axis("d", 2)]);
+    let right = input("x", [axis("d", 3)]);
     assert!(matches!(
         (left, right).compile(&CpuDevice::new()),
         Err(CompileError::InvalidInput(_))
     ));
 
-    let left = input("x", [axis("d", 2)], Dtype::F32);
-    let right = input("x", [axis("d", 2)], Dtype::F64);
-    assert!(matches!(
-        (left, right).compile(&CpuDevice::new()),
-        Err(CompileError::InvalidInput(_))
-    ));
+    // The dtype half of the old conflict is gone by construction: a term
+    // carries no storage, so two mentions of the same variable ARE the same
+    // node — there is nothing left to disagree about. Γ holds one entry per
+    // name; the width question has one answer before it is asked.
+    let left = input("x", [axis("d", 2)]);
+    let right = input("x", [axis("d", 2)]);
+    assert!(std::sync::Arc::ptr_eq(&left, &right), "one variable, one node");
 }
 
 #[test]
 fn try_run_reports_named_binding_errors() {
-    let output = input("x", [axis("d", 2)], Dtype::F32);
+    let output = input("x", [axis("d", 2)]);
     let cpu = CpuDevice::new();
     let program = output.compile(&cpu).unwrap();
     let good = cpu.buffer([2], Dtype::F32, vec![1.0, 2.0]).unwrap();
@@ -77,8 +70,8 @@ fn try_run_reports_named_binding_errors() {
 
 #[test]
 fn only_inputs_reachable_from_the_selected_roots_are_compiled() {
-    let x = input("x", [axis("d", 2)], Dtype::F32);
-    let _unrelated = input("y", [axis("d", 2)], Dtype::F32);
+    let x = input("x", [axis("d", 2)]);
+    let _unrelated = input("y", [axis("d", 2)]);
 
     let program = x.compile(&CpuDevice::new()).unwrap();
     assert_eq!(program.input_names().collect::<Vec<_>>(), ["x"]);
@@ -92,7 +85,7 @@ fn only_inputs_reachable_from_the_selected_roots_are_compiled() {
 fn structural_duplicates_are_one_node_at_construction() {
     let d = axis("d", 8);
     let energy = || {
-        let x = input("x", [d], Dtype::F32);
+        let x = input("x", [d]);
         reduce(map(MapOp::Mul, vec![x.clone(), x]), 0usize, add())
     };
     let (first, second) = (energy(), energy());

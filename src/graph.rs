@@ -33,6 +33,10 @@ pub struct Graph {
     /// `(name, value, storage override)`. `None` stores at the target's
     /// boundary width, which is what almost everything wants.
     outputs: Vec<(&'static str, Tensor, Option<Dtype>)>,
+    /// Γ's Caller entries: input name → the storage its bound buffer uses.
+    /// A term is a free variable; how the buffer that binds it is stored is
+    /// declared HERE, at the program layer, by whoever owns the buffer.
+    declared: std::collections::HashMap<String, Dtype>,
 }
 
 impl Graph {
@@ -45,7 +49,7 @@ impl Graph {
     /// it must match the target's boundary policy, which
     /// [`Graph::compile_for`] checks.
     pub fn state(&mut self, name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> Tensor {
-        let input = Tensor::input(name, shape, dtype);
+        let input = self.input(name, shape, dtype);
         let crate::ir::Node::Input { name, .. } = input.node().as_ref() else {
             unreachable!("Tensor::input builds an Input node")
         };
@@ -55,6 +59,30 @@ impl Graph {
             successor: None,
         });
         input
+    }
+
+    /// Declare an input and the storage its buffer will be bound at — Γ's
+    /// Caller row. The term itself carries only name and shape; a bf16
+    /// checkpoint weight is bf16 because THIS says so, not because the
+    /// mathematics knows.
+    pub fn input(&mut self, name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> Tensor {
+        let input = Tensor::input(name, shape);
+        let crate::ir::Node::Input { name, .. } = input.node().as_ref() else {
+            unreachable!("Tensor::input builds an Input node")
+        };
+        // Γ is append-only from the very first entry: redeclaring a name at
+        // a DIFFERENT width is a defect in the caller, never a replacement.
+        // (Redeclaring at the same width is the same declaration — a shared
+        // weight mentioned twice.)
+        if let Some(previous) = self.declared.insert((*name).to_string(), dtype) {
+            assert_eq!(previous, dtype, "input `{name}` was declared twice at different widths");
+        }
+        input
+    }
+
+    /// The declared storage of every input registered on this graph.
+    pub fn declarations(&self) -> &std::collections::HashMap<String, Dtype> {
+        &self.declared
     }
 
     /// Declare `successor` as the value `state` carries into the next step.
@@ -190,8 +218,9 @@ mod metal_target {
     /// the state wiring [`StepProgram::instantiate`] needs.
     pub struct StepProgram {
         program: Program<MetalDevice>,
-        /// (root index, state input name, concrete shape) per state.
-        feedback: Vec<(usize, &'static str, Vec<usize>)>,
+        /// (root index, state input name, concrete shape, declared storage)
+        /// per state — states allocate at their own declaration.
+        feedback: Vec<(usize, &'static str, Vec<usize>, Dtype)>,
         /// Output name → root index.
         output_roots: Vec<(&'static str, usize)>,
     }
@@ -199,18 +228,18 @@ mod metal_target {
     impl Graph {
         /// Lower the whole step for `device` and return the best program the
         /// target admits. State feedback is wired here, not by the caller.
-        pub fn compile_for(&self, device: &MetalDevice) -> Result<StepProgram, CompileError> {
+        pub fn compile_for(
+            &self,
+            device: &MetalDevice,
+            policy: crate::cost::Policy,
+        ) -> Result<StepProgram, CompileError> {
             for state in &self.states {
-                let declared = crate::ir::input_dtypes(state.input.node())
-                    .first()
-                    .map(|(_, dtype)| *dtype);
-                if declared != Some(device.storage()) {
+                let declared = self.declared.get(state.name).copied();
+                if declared != Some(policy.boundary) {
                     return Err(CompileError::Backend(format!(
-                        "state `{}` is declared {:?} but the target stores step \
-                         boundaries as {:?}",
-                        state.name,
-                        declared,
-                        device.storage()
+                        "state `{}` is declared {:?} but the compilation's policy \
+                         stores step boundaries as {:?}",
+                        state.name, declared, policy.boundary
                     )));
                 }
             }
@@ -219,14 +248,22 @@ mod metal_target {
             // states store at the boundary policy; only declared outputs may pin
             let mut output_dtypes = vec![None; self.states.len()];
             output_dtypes.extend(self.outputs.iter().map(|(_, _, dtype)| *dtype));
-            let program = crate::compile::compile_roots_in_place(roots, overwritable, output_dtypes, device)?;
+            let program = crate::compile::compile_roots_in_place(
+                roots,
+                overwritable,
+                output_dtypes,
+                self.declared.clone(),
+                policy,
+                device,
+            )?;
             let feedback = self
                 .states
                 .iter()
                 .enumerate()
                 .map(|(index, state)| {
                     let shape: Vec<usize> = state.input.shape().iter().map(|axis| axis.extent()).collect();
-                    (index, state.name, shape)
+                    let dtype = self.declared[state.name];
+                    (index, state.name, shape, dtype)
                 })
                 .collect();
             let output_roots = self
@@ -263,13 +300,13 @@ mod metal_target {
             let state_buffers: Vec<(&'static str, MetalBuffer)> = self
                 .feedback
                 .iter()
-                .map(|(_, name, shape)| {
+                .map(|(_, name, shape, dtype)| {
                     let elements = shape.iter().product::<usize>().max(1);
-                    let raw = device.alloc_elems(elements, device.storage());
+                    let raw = device.alloc_elems(elements, *dtype);
                     (
                         *name,
                         device
-                            .tensor_from_raw(raw, shape.clone(), device.storage())
+                            .tensor_from_raw(raw, shape.clone(), *dtype)
                             .expect("state buffer"),
                     )
                 })
@@ -280,7 +317,11 @@ mod metal_target {
                 .copied()
                 .chain(state_buffers.iter().map(|(n, b)| (*n as &str, b)))
                 .collect();
-            let pairs: Vec<(usize, &str)> = self.feedback.iter().map(|(index, name, _)| (*index, *name)).collect();
+            let pairs: Vec<(usize, &str)> = self
+                .feedback
+                .iter()
+                .map(|(index, name, _, _)| (*index, *name))
+                .collect();
             let replay = self.program.capture(all, &pairs)?;
             Ok(Machine {
                 replay,
