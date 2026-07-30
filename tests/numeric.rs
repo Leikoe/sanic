@@ -313,7 +313,7 @@ fn the_law_mints_the_width_the_policy_cannot_supply() {
     // buffer — no refusal, no manual pin, and every other buffer keeps the
     // policy. This is the milestone: the defect that opened the arc is now
     // closed by construction rather than refused.
-    let narrow = DeviceSpecs::toy().with_storage(Dtype::BF16);
+    let narrow = DeviceSpecs::toy().under(sanic::cost::Policy { boundary: Dtype::BF16 });
     let schedule = partition(&index, &narrow);
 
     assert!(!schedule.exact_boundaries.is_empty(), "the fact is recorded");
@@ -344,7 +344,10 @@ fn an_unmintable_exact_boundary_is_still_refused() {
     let n = axis("n", 64);
     let product = reduce(iota(n), 0usize, Monoid::Mul);
 
-    let schedule = partition(&product, &DeviceSpecs::toy().with_storage(Dtype::BF16));
+    let schedule = partition(
+        &product,
+        &DeviceSpecs::toy().under(sanic::cost::Policy { boundary: Dtype::BF16 }),
+    );
     assert!(!schedule.exact_boundaries.is_empty());
     assert!(schedule.minted_dtypes.is_empty(), "nothing lawful to mint");
     let refused = schedule.unstorable(Dtype::BF16);

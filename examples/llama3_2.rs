@@ -497,12 +497,13 @@ fn run_metal() -> Result<(), String> {
         started.elapsed().as_secs_f32()
     );
 
-    let device = sanic::MetalDevice::open()
-        .ok_or("no Metal device is available")?
-        .with_storage(storage);
+    let device = sanic::MetalDevice::open().ok_or("no Metal device is available")?;
+    // The policy is the CALLER's, handed to compilation — it never rides
+    // the device. --bf16 is one knob on this line and nowhere else.
+    let policy = sanic::cost::Policy { boundary: storage };
     let started = std::time::Instant::now();
     eprintln!("compiling decode program...");
-    let program = graph.compile_for(&device).map_err(|error| error.to_string())?;
+    let program = graph.compile_for(&device, policy).map_err(|error| error.to_string())?;
     eprintln!(
         "compiled {} kernels in {:.2}s",
         program.kernel_count(),

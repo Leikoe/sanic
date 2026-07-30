@@ -212,8 +212,9 @@ mod metal_target {
     /// the state wiring [`StepProgram::instantiate`] needs.
     pub struct StepProgram {
         program: Program<MetalDevice>,
-        /// (root index, state input name, concrete shape) per state.
-        feedback: Vec<(usize, &'static str, Vec<usize>)>,
+        /// (root index, state input name, concrete shape, declared storage)
+        /// per state — states allocate at their own declaration.
+        feedback: Vec<(usize, &'static str, Vec<usize>, Dtype)>,
         /// Output name → root index.
         output_roots: Vec<(&'static str, usize)>,
     }
@@ -221,16 +222,18 @@ mod metal_target {
     impl Graph {
         /// Lower the whole step for `device` and return the best program the
         /// target admits. State feedback is wired here, not by the caller.
-        pub fn compile_for(&self, device: &MetalDevice) -> Result<StepProgram, CompileError> {
+        pub fn compile_for(
+            &self,
+            device: &MetalDevice,
+            policy: crate::cost::Policy,
+        ) -> Result<StepProgram, CompileError> {
             for state in &self.states {
                 let declared = self.declared.get(state.name).copied();
-                if declared != Some(device.storage()) {
+                if declared != Some(policy.boundary) {
                     return Err(CompileError::Backend(format!(
-                        "state `{}` is declared {:?} but the target stores step \
-                         boundaries as {:?}",
-                        state.name,
-                        declared,
-                        device.storage()
+                        "state `{}` is declared {:?} but the compilation's policy \
+                         stores step boundaries as {:?}",
+                        state.name, declared, policy.boundary
                     )));
                 }
             }
@@ -244,6 +247,7 @@ mod metal_target {
                 overwritable,
                 output_dtypes,
                 self.declared.clone(),
+                policy,
                 device,
             )?;
             let feedback = self
@@ -252,7 +256,8 @@ mod metal_target {
                 .enumerate()
                 .map(|(index, state)| {
                     let shape: Vec<usize> = state.input.shape().iter().map(|axis| axis.extent()).collect();
-                    (index, state.name, shape)
+                    let dtype = self.declared[state.name];
+                    (index, state.name, shape, dtype)
                 })
                 .collect();
             let output_roots = self
@@ -289,13 +294,13 @@ mod metal_target {
             let state_buffers: Vec<(&'static str, MetalBuffer)> = self
                 .feedback
                 .iter()
-                .map(|(_, name, shape)| {
+                .map(|(_, name, shape, dtype)| {
                     let elements = shape.iter().product::<usize>().max(1);
-                    let raw = device.alloc_elems(elements, device.storage());
+                    let raw = device.alloc_elems(elements, *dtype);
                     (
                         *name,
                         device
-                            .tensor_from_raw(raw, shape.clone(), device.storage())
+                            .tensor_from_raw(raw, shape.clone(), *dtype)
                             .expect("state buffer"),
                     )
                 })
@@ -306,7 +311,11 @@ mod metal_target {
                 .copied()
                 .chain(state_buffers.iter().map(|(n, b)| (*n as &str, b)))
                 .collect();
-            let pairs: Vec<(usize, &str)> = self.feedback.iter().map(|(index, name, _)| (*index, *name)).collect();
+            let pairs: Vec<(usize, &str)> = self
+                .feedback
+                .iter()
+                .map(|(index, name, _, _)| (*index, *name))
+                .collect();
             let replay = self.program.capture(all, &pairs)?;
             Ok(Machine {
                 replay,

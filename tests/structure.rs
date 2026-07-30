@@ -218,22 +218,24 @@ fn the_structural_debt_ledger_is_exact() {
     // changed, this ledger changes in the same commit — growth is a
     // regression caught, shrinkage is milestone progress recorded.
     const LEDGER: &[(&str, &str, usize, &str)] = &[
-        // What remains of the boundary policy in partition: the mint's
-        // preferred width, produced-buffer pricing, and the «div» probe.
-        // The policy itself retires with M14's per-value declarations.
-        ("partition", "dev.storage", 3, "M14"),
-        // Allocation width, output/readback dtype stamps, nanscan and
-        // bandwidth accounting, all from one global. M12 moves them to Γ.
-        ("compile", "program.storage", 10, "M12"),
-        // State buffers allocated and wrapped at the device global, and the
-        // declared-dtype equality check (plus its error message). M12 makes
-        // the check "can this dtype carry that expression's system".
-        ("graph", "device.storage()", 4, "M12"),
-        // The one-knob policy, living on device types until M14 retires it
-        // for per-value declarations (and renames DeviceSpecs to
-        // DeviceSpecs, leaving hardware facts only).
-        ("cost", "with_storage", 1, "M14"),
-        ("metal", "with_storage", 1, "M14"),
+        // The scheduler reading the compile-supplied policy through its
+        // bundle (mint preference, produced pricing): legitimate since
+        // M14-final — the policy arrives at compilation and never rides the
+        // device. Pinned as a growth guard.
+        ("partition", "dev.storage", 3, "guard"),
+        // The program's recorded policy boundary: fallbacks for names Γ did
+        // not touch (per-buffer widths land in program.dtypes; these are the
+        // policy default the design licenses). Pinned as a growth guard.
+        ("compile", "program.storage", 10, "guard"),
+        // RETIRED by M14-final: the device carries no policy. States
+        // allocate at their own declarations; the policy arrives at
+        // compile_for as a parameter.
+        ("graph", "device.storage()", 0, "retired — keep it so"),
+        // RETIRED by M14-final: with_storage is gone from both — specs are
+        // bundled with a policy by `under`, at compilation, with the
+        // caller's Policy value.
+        ("cost", "with_storage", 0, "retired — keep it so"),
+        ("metal", "with_storage", 0, "retired — keep it so"),
         // RETIRED by M12b, kept at zero as the doctrine it became: the
         // expression IR mentions no storage, anywhere. An Input is a name
         // and a shape; identity is structure; Γ owns every width.

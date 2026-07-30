@@ -1589,7 +1589,7 @@ timings hold.
 
 ### M13 — *absorbed into M12* (minting-correct replaces widening; no separate pass)
 
-### M14 — Declarations replace the global · [named LANDED · retirement open] · retires *device-dependent numerics*
+### M14 — Declarations replace the global · [LANDED] · retires *device-dependent numerics*
 
 **Landed (M14a):** the device tells the truth. `DeviceProfile` is
 `DeviceSpecs`; the boundary storage is a typed `cost::Policy` the caller
@@ -1599,11 +1599,16 @@ attaches (`with_storage` now constructs one), read through
 exactness in flight. "Profile" no longer collides with profiling, and the
 policy no longer masquerades as a hardware number.
 
-**Still open (M14-final):** retiring the device-attached policy itself —
-handing `Policy` to compilation directly, per-value `stored(d)` for the
-reals that want narrower-than-policy, ABBA on the 16%. Note §5.2's softening
-stands: a policy DEFAULT for undeclared reals is legitimate and stays; what
-retires is its attachment to the device.
+**Landed (M14-final):** the policy is a compilation parameter. MetalDevice
+is `{ dev, queue }` — a device, nothing else; `Backend::specs()` returns
+hardware; `DeviceSpecs::under(policy)` is the one place hardware and policy
+meet, called by compile with the caller's value; `Graph::compile_for(device,
+policy)`; states allocate at their OWN declarations. llama's --bf16 is one
+`Policy { boundary }` line. Ledger: graph/cost/metal entries retired at
+zero; partition/compile survivors reclassified as growth guards over
+legitimate policy plumbing. §5.2's softening stands — the policy default for
+undeclared reals is licensed; per-value `stored(d)` remains available to any
+caller who wants narrower than policy.
 
 Retire `with_storage` for per-value `stored(d)`. The motivation is portability,
 not hygiene: today the interpreter rounds only at an explicit `RoundTo` while

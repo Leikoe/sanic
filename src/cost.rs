@@ -78,13 +78,12 @@ impl DeviceSpecs {
         }
     }
 
-    /// The same specs under a different boundary policy; the pricing width
-    /// follows, so round trips get honestly cheaper. (Retires at M14-final,
-    /// when the policy is handed to compilation directly instead of riding
-    /// the specs.)
-    pub fn with_storage(mut self, storage: crate::scalar::Dtype) -> Self {
-        self.policy = Policy { boundary: storage };
-        self.dtype_bytes = storage.bytes_per_element();
+    /// These specs under a policy — the ONE place hardware and policy meet,
+    /// called by compilation with the policy the caller handed it. The
+    /// pricing width follows the boundary, so round trips price honestly.
+    pub fn under(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self.dtype_bytes = policy.boundary.bytes_per_element();
         self
     }
 

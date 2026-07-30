@@ -149,8 +149,6 @@ impl Dispatch {
 pub struct MetalDevice {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Boundary storage the compiled schedule writes at kernel boundaries.
-    storage: Dtype,
 }
 
 impl MetalDevice {
@@ -158,22 +156,7 @@ impl MetalDevice {
     pub fn open() -> Option<MetalDevice> {
         let dev = MTLCreateSystemDefaultDevice()?;
         let queue = dev.newCommandQueue().expect("command queue");
-        Some(MetalDevice {
-            dev,
-            queue,
-            storage: Dtype::F32,
-        })
-    }
-
-    /// The same device compiling schedules that store intermediates and
-    /// outputs at `storage` precision (kernels still accumulate f32).
-    pub fn with_storage(mut self, storage: Dtype) -> Self {
-        self.storage = storage;
-        self
-    }
-
-    pub fn storage(&self) -> Dtype {
-        self.storage
+        Some(MetalDevice { dev, queue })
     }
 
     // ── compiler ─────────────────────────────────────────────────────────────

@@ -2054,7 +2054,7 @@ fn committed_plan_costs_stay_within_a_band_of_measurement() {
 // in registers, so error does NOT grow with the reduction length.
 #[test]
 fn bf16_storage_stays_within_rounding_of_the_interpreter() {
-    let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
+    let profile = DeviceSpecs::m1_pro().under(sanic::cost::Policy { boundary: Dtype::BF16 });
     let (s, d, v) = (axis("s", 1), axis("d", 256), axis("v", 512));
     let mut rng = Lcg(0xBF16);
     let env: Env = [
@@ -2114,7 +2114,7 @@ fn bf16_storage_stays_within_rounding_of_the_interpreter() {
 // match the interpreter to rounding tolerance, with no NaN escape.
 #[test]
 fn bf16_storage_masked_gqa_decode_matches_oracle() {
-    let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
+    let profile = DeviceSpecs::m1_pro().under(sanic::cost::Policy { boundary: Dtype::BF16 });
     let (query_heads, kv_heads, cache, features) = (
         axis("query_heads", 32),
         axis("kv_heads", 8),
@@ -2355,7 +2355,7 @@ fn clock_reports_the_dvfs_state_a_workload_ran_at() {
 // the round trip as an INTEGER while every real buffer keeps the policy.
 #[test]
 fn an_argmax_index_survives_bf16_storage_by_minted_width() {
-    let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
+    let profile = DeviceSpecs::m1_pro().under(sanic::cost::Policy { boundary: Dtype::BF16 });
     let v = axis("v", 4096);
     let mut rng = Lcg(0xA51);
     let mut scores = rand_tensor(&[v], &mut rng);

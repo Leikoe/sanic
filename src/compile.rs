@@ -88,8 +88,15 @@ pub trait Backend: Clone + private::Sealed + 'static {
     type Buffer: Buffer;
     type Executable;
 
-    fn profile(&self) -> cost::DeviceSpecs;
-    fn prepare(&self, schedule: &Schedule, output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError>;
+    /// Hardware facts and capabilities only; the policy arrives at
+    /// compilation and is bundled by [`cost::DeviceSpecs::under`].
+    fn specs(&self) -> cost::DeviceSpecs;
+    fn prepare(
+        &self,
+        target: &cost::DeviceSpecs,
+        schedule: &Schedule,
+        output_shapes: &[Vec<usize>],
+    ) -> Result<Self::Executable, CompileError>;
     fn execute(
         &self,
         executable: &Self::Executable,
@@ -335,7 +342,14 @@ tuple_roots!(
 /// Extension trait for compiling one or more roots.
 pub trait Compile: Roots {
     fn compile<B: Backend>(&self, backend: &B) -> Result<Program<B>, CompileError> {
-        compile_roots_in_place(self.roots(), Vec::new(), Vec::new(), HashMap::new(), backend)
+        compile_roots_in_place(
+            self.roots(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            cost::Policy::default(),
+            backend,
+        )
     }
 }
 
@@ -355,6 +369,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
     in_place: Vec<(usize, &'static str)>,
     output_dtypes: Vec<Option<Dtype>>,
     declared: HashMap<String, Dtype>,
+    policy: cost::Policy,
     backend: &B,
 ) -> Result<Program<B>, CompileError> {
     if roots.is_empty() {
@@ -378,7 +393,8 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .map(|index| leak(format!("Out{index}")))
         .collect::<Vec<_>>();
     let named_roots = roots.iter().cloned().zip(output_names).collect::<Vec<_>>();
-    let mut schedule = partition_many_declared(&named_roots, &backend.profile(), &declared);
+    let target = backend.specs().under(policy);
+    let mut schedule = partition_many_declared(&named_roots, &target, &declared);
     if !output_dtypes.is_empty() {
         assert_eq!(
             output_dtypes.len(),
@@ -393,8 +409,8 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .collect();
     // After the pins land: a pinned output is checked against ITS width,
     // everything else against the boundary policy.
-    refuse_unstorable(&schedule, backend.profile().storage())?;
-    let executable = backend.prepare(&schedule, &output_shapes)?;
+    refuse_unstorable(&schedule, policy.boundary)?;
+    let executable = backend.prepare(&target, &schedule, &output_shapes)?;
 
     Ok(Program {
         backend: backend.clone(),
@@ -589,11 +605,16 @@ impl Backend for CpuDevice {
     type Buffer = CpuBuffer;
     type Executable = ();
 
-    fn profile(&self) -> cost::DeviceSpecs {
+    fn specs(&self) -> cost::DeviceSpecs {
         cost::DeviceSpecs::toy()
     }
 
-    fn prepare(&self, _schedule: &Schedule, _output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError> {
+    fn prepare(
+        &self,
+        _target: &cost::DeviceSpecs,
+        _schedule: &Schedule,
+        _output_shapes: &[Vec<usize>],
+    ) -> Result<Self::Executable, CompileError> {
         Ok(())
     }
 
@@ -679,12 +700,13 @@ mod metal_backend {
         type Buffer = MetalBuffer;
         type Executable = MetalExecutable;
 
-        fn profile(&self) -> cost::DeviceSpecs {
-            cost::DeviceSpecs::m1_pro().with_storage(self.storage())
+        fn specs(&self) -> cost::DeviceSpecs {
+            cost::DeviceSpecs::m1_pro()
         }
 
         fn prepare(
             &self,
+            target: &cost::DeviceSpecs,
             schedule: &Schedule,
             _output_shapes: &[Vec<usize>],
         ) -> Result<Self::Executable, CompileError> {
@@ -699,9 +721,9 @@ mod metal_backend {
                 )));
             }
             let program = if std::env::var_os("SANIC_TUNE").is_some() {
-                emit_schedule_metal_tuned(&self.profile(), schedule, &tune_fold_scheds(self, schedule))
+                emit_schedule_metal_tuned(target, schedule, &tune_fold_scheds(self, target, schedule))
             } else {
-                emit_schedule_metal_on(&self.profile(), schedule)
+                emit_schedule_metal_on(target, schedule)
             };
             // `SANIC_MSL=<path>` dumps the whole generated source — the raw
             // artifact behind every kernel name the runtime dumps print.
@@ -1150,7 +1172,7 @@ mod metal_backend {
         } else {
             String::new()
         };
-        let peak_fraction = bytes / seconds.max(1e-9) / device.profile().hbm_bandwidth;
+        let peak_fraction = bytes / seconds.max(1e-9) / device.specs().hbm_bandwidth;
         // The clock this step actually ran at: a line measured below the
         // GPU's top DVFS state is not comparable to one measured at it, and
         // saying so beats silently publishing a throttled number.
@@ -1274,7 +1296,7 @@ mod metal_backend {
                 }
                 _ => " ".repeat(11),
             };
-            let peak_fraction = bytes / seconds.max(1e-9) / device.profile().hbm_bandwidth;
+            let peak_fraction = bytes / seconds.max(1e-9) / device.specs().hbm_bandwidth;
             let bandwidth = if peak_fraction > 5.0 {
                 "bw  --".to_string()
             } else {
@@ -1353,7 +1375,11 @@ mod metal_backend {
     ///
     /// Costs compile time (llama-3.2-1B: 5.2s → 13.3s) to buy ~6% (bf16) /
     /// ~14% (f32) per step, so it is opt-in rather than the default.
-    fn tune_fold_scheds(device: &MetalDevice, schedule: &Schedule) -> HashMap<String, FoldSched> {
+    fn tune_fold_scheds(
+        device: &MetalDevice,
+        target: &cost::DeviceSpecs,
+        schedule: &Schedule,
+    ) -> HashMap<String, FoldSched> {
         use crate::emit_metal::{METAL_MAX_BUFFERS, MSL_HEADER, canonical_source, emit_fused_metal_sched_with};
         use crate::partition::Stage;
         use crate::plan::{fold_sched, priced_fold_sched_candidates};
@@ -1363,7 +1389,7 @@ mod metal_backend {
 
         // The analytic program over zeroed scratch is the instrument: the
         // real dispatch list, barrier schedule, and DRAM pressure.
-        let program = emit_schedule_metal_on(&device.profile(), schedule);
+        let program = emit_schedule_metal_on(target, schedule);
         let pipelines = device.compile(&program.msl);
         let mut bindings: HashMap<String, MetalBuf> = HashMap::new();
         for (name, axes) in &program.inputs {
@@ -1426,8 +1452,8 @@ mod metal_backend {
                 fold_node,
                 FoldSched::scalar(),
                 epi,
-                device.storage(),
-                &tuner_resolved(schedule, device.storage()),
+                target.storage(),
+                &tuner_resolved(schedule, target.storage()),
             );
             if probe.inputs.len() + 1 > METAL_MAX_BUFFERS {
                 continue; // bindless stage: keep the analytic choice
@@ -1470,17 +1496,11 @@ mod metal_backend {
             let Stage::Fused { spec, fold_node, .. } = &schedule.stages[stage_indices[0]] else {
                 unreachable!("families hold fused stages");
             };
-            let widths = tuner_widths(schedule, fold_node, device.storage());
-            let best = priced_fold_sched_candidates(
-                fold_node,
-                spec.streaming_axis,
-                &spec.carrier,
-                &device.profile(),
-                &widths,
-            )
-            .into_iter()
-            .filter_map(|(_, priced)| priced.map(|price| price.time))
-            .fold(f64::INFINITY, f64::min);
+            let widths = tuner_widths(schedule, fold_node, target.storage());
+            let best = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, target, &widths)
+                .into_iter()
+                .filter_map(|(_, priced)| priced.map(|price| price.time))
+                .fold(f64::INFINITY, f64::min);
             if best.is_finite() {
                 best * stage_indices.len() as f64
             } else {
@@ -1508,21 +1528,9 @@ mod metal_backend {
             else {
                 unreachable!("families hold fused stages");
             };
-            let widths = tuner_widths(schedule, fold_node, device.storage());
-            let analytic = fold_sched(
-                fold_node,
-                spec.streaming_axis,
-                &spec.carrier,
-                &device.profile(),
-                &widths,
-            );
-            let priced = priced_fold_sched_candidates(
-                fold_node,
-                spec.streaming_axis,
-                &spec.carrier,
-                &device.profile(),
-                &widths,
-            );
+            let widths = tuner_widths(schedule, fold_node, target.storage());
+            let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, target, &widths);
+            let priced = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, target, &widths);
             let best_price = priced
                 .iter()
                 .filter_map(|(_, priced)| priced.map(|price| price.time))
@@ -1547,8 +1555,8 @@ mod metal_backend {
                     fold_node,
                     candidate,
                     epi,
-                    device.storage(),
-                    &tuner_resolved(schedule, device.storage()),
+                    target.storage(),
+                    &tuner_resolved(schedule, target.storage()),
                 );
                 msl.push_str(&kernel.msl.replace(MSL_HEADER, ""));
                 msl.push('\n');
@@ -1606,7 +1614,7 @@ mod metal_backend {
         // instrument, against a FRESH baseline (the machine is warmest now)
         // — a tune that does not win ships nothing.
         if !winners.is_empty() {
-            let tuned_program = emit_schedule_metal_tuned(&device.profile(), schedule, &winners);
+            let tuned_program = emit_schedule_metal_tuned(target, schedule, &winners);
             let tuned_pipes = device.compile(&tuned_program.msl);
             let tuned_wall = step_wall(&program_dispatches(&tuned_program, &bindings, &tuned_pipes));
             let analytic_fresh = step_wall(&base).min(analytic_wall);
