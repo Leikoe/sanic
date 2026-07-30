@@ -104,6 +104,76 @@ and per-dimension classification use those occurrences; axis labels remain
 diagnostic. The algebra needs dimension provenance, but it does not need names
 or identifiers stored in graph nodes.
 
+## The indexing/layout path, end to end (read 2026-07-29)
+
+The complete mechanism, so design arguments cite the machine and not the
+folklore. Six stages.
+
+**0 — frontend.** Six movement UOps — `RESHAPE/PERMUTE/EXPAND/PAD/SHRINK/
+FLIP` (`uop/__init__.py`, `GroupOp.Movement`) — tensor-graph-only. Broadcast
+is *leading*-aligned: EXPAND prepends dims, REDUCE consumes N leading axes
+(`uop/ops.py:399-421`). There is **no data-dependent movement op**: `gather`
+is arithmetic — `index._one_hot_along_dim(n).where(x, 0).sum(-1)`
+(`mixin/op.py:1029`). `mop_cleanup` (`uop/movement.py`) merges adjacent
+RESHAPEs and composes PERMUTEs — closure under composition, as rewrites.
+
+**1 — shape.** `UOp._shape` is a derived recursive property
+(`uop/ops.py:301`); movement args validate there; extents are `sint`
+(int | UOp) with `vmin/vmax`, so symbolic shapes ride the same expressions.
+
+**2 — rangeify** (`schedule/indexing.py:169-280`), where shapes die and
+loops are born. Reverse toposort; a realized op mints fresh `RANGE`s per
+output dim; a single-consumer op *inherits its consumer's ranges* — that
+inheritance IS fusion; a multi-consumer op compares per-dim symbolic index
+expressions (`all_same`): equal → pass through with OR'd valids, unequal →
+new range and a **partial realize on exactly those axes** (`realize_map[x] =
+axis list`; the stage over a range subset lands in LOCAL memory).
+`apply_movement_op` (`indexing.py:150-167`) is the semantic definition of
+movement, as substitution on the range tuple: SHRINK `r+off`; PERMUTE
+argsort; FLIP `(s-1)-r`; EXPAND drops leading ranges; PAD
+`(r-off).valid(off ≤ r < s+off)` — **validity attaches to the index
+expression itself**; RESHAPE flattens the out-ranges into one linear form
+and div/mods it by the in-shape, then hands it to the simplifier with the
+in-tree confession: *"this simplify is doing a lot of heavy lifting. this is
+the replacement for the reshape view merging code."* `ending_ranges` is the
+dependent-reduce cut (§divergence).
+
+**3 — recovery by rewrite.** What stage 0 erased, simplify re-derives:
+`reduce_collapse` turns a load-free REDUCE into closed form (arange);
+`pm_load_collapse` recovers the one-hot gather as an indirect load —
+`(idx≠r).where(0,e).reduce(+,r) → e[r := idx.valid(0≤idx<n)]`
+(`codegen/simplify.py:126-152`); div/mod recombination re-merges reshape
+chains (`uop/divandmod.py`, `symbolic.py:40-66`). The systemic consequence:
+**kernel boundaries are downstream of simplifier canonicalization** — the
+multi-consumer rule is structural equality of symbolic expressions, so two
+equal indices the simplifier fails to canonicalize identically insert a
+spurious partial realize.
+
+**4 — buffers and layout** (`schedule/rangeify.py`). A realized value
+becomes `STAGE(value, *closed_ranges)`; `flatten_bufferize` collapses the
+ranges by *applying RESHAPE to the range tuple*: **every buffer is 1-D,
+contiguous, row-major in stage-range order — strides do not exist as a
+concept anywhere in the system.** Layout is therefore not a degree of
+freedom; the only place a layout choice could live is the order of ranges at
+STAGE, and nothing exercises it. (Sanic's attention defect A — V stored
+sequence-innermost, #17, measured — is a decision this representation cannot
+state.) Symbolic shapes allocate at `vmax` and SHRINK to the bound value
+(`debuf`) — precedent for `shapes_and_indexing.md` M-E's allocate-at-cap.
+Kernel splitting renumbers ranges from 0 per kernel so isomorphic kernels
+dedup (`renumber_range`) — the same canonicalization as sanic's
+`canonical_source`. METAL's 31-buffer limit is met by inserting bufferize
+splits (`limit_bufs`, `DEVICE_MAX_BUFS`) where sanic went bindless.
+
+**5 — scheduled loops** (`codegen/opt/postrange.py`, `codegen/gpudims.py`).
+Every loop is a `RANGE` tagged with an `AxisType` (GLOBAL, WARP, LOCAL,
+LOOP, GROUP_REDUCE, REDUCE, UPCAST, UNROLL, THREAD); an `OptOp` splits a
+range into fresh ranges with new tags (`shift_to`); `add_gpudims` groups and
+splits GLOBAL/LOCAL-tagged ranges to fit the device's 3-D launch limits and
+substitutes `SPECIAL`s; stores missing a local dim are gated
+`.valid(lidx==0)`. Semantic identity died at rangeify; scheduling works on
+loop identities alone — the clean form of design-debt 5's separation, at the
+cost that no scheduling question can ever refer back to a tensor dimension.
+
 ## What `tinyspec` teaches us about our IR
 
 Tinygrad's formal spec is not merely its executable verifier. `spec/tinyspec.tex`
@@ -184,12 +254,11 @@ is attempting.
    shapes, ranges, indices, and min/max bounds. Sanic should build one small
    integer/index language and reuse it for extents, `View`, `Reindex`, planner
    constraints, and bounds proofs.
-4. **Axis order is currently smuggled through arithmetic.**
-   `TensorExpr::permute` and `unsqueeze` call `with_axis_order`, which adds
-   `0 * Iota(axis)` terms solely so `Map`'s ordered union produces a desired
-   dimension order. A value-preserving arithmetic node should not carry
-   storage layout. Shape/order needs an explicit semantic representation that
-   lowers to index expressions.
+4. **Axis order is currently smuggled through arithmetic.** *[PAID —
+   `df77288`/`61228ad` made dimensions positional; `with_axis_order` and its
+   `0 * Iota(axis)` terms are gone. Order is explicit `ViewDim` structure
+   now (`ir::transpose`, ir.rs:716). The follow-on design lives in
+   `shapes_and_indexing.md`.]*
 5. **Semantic axes and scheduled loops need distinct identities.** Today a
    `KernelSpec` assigns roles directly to semantic axes. Split reductions,
    vector lanes, workgroup axes, padding, and tensor-core fragments create new
@@ -270,14 +339,122 @@ search cost and works without hardware. Notably, **neither system does
 cost-driven kernel-boundary placement** — both partition structurally, then
 optimize within kernels. That slot is open.
 
+## Line accounting, on tinygrad's own metric (2026-07-29)
+
+tinygrad is the one project in this field that treats size as a hard
+constraint: `sz.py` counts lines bearing code tokens — blanks, comments and
+docstrings excluded, `runtime/autogen` and `viz/assets` skipped — and CI
+fails the build over budget (`MAX_LINE_COUNT=25000` in
+`.github/workflows/test.yml:220`). They sit at 22,935, 92% spent. That
+makes it the fairest
+available yardstick, so sanic is measured the same way: `src/` with
+`#[cfg(test)]` modules stripped (tinygrad's `test/` is outside the package),
+comment-only and blank lines dropped.
+
+| | lines | tokens | tok/line |
+|---|---|---|---|
+| sanic `src/` | **12,563** | 113,231 | 9.0 |
+| tinygrad package | **22,935** | 420,968 | 18.4 |
+| tinygrad *core* (their split: all but `nn`/`llm`/`renderer`/`runtime`/`viz`) | 9,048 | 169,118 | 18.7 |
+| sanic *core* (frontend + ir + analysis + derive + scheduling) | **7,673** | 69,473 | 9.1 |
+
+Two facts, neither of them the one the raw counts suggest. **Style accounts
+for half the line gap** — 9.0 tokens per line against 18.4, because rustfmt
+does not write `if x: return y`. And **sanic's compiler core is smaller than
+tinygrad's**: 41% of it by token. Rust spends more tokens per unit of meaning
+than Python (`&`, `::`, `<>`, declared types, `Some`/`None`), so that reading
+is generous to tinygrad, not to sanic.
+
+Per subsystem, by token, the ratios are lopsided in both directions:
+
+| subsystem | tinygrad | sanic | ratio |
+|---|---|---|---|
+| runtime / device drivers | 128,641 | 25,064 | 0.19× |
+| renderer / codegen | 67,250 | 18,694 | 0.28× |
+| IR core (`uop/` vs `ir`+`simplify`+`scalar`+`gamma`) | 45,586 | 17,630 | 0.39× |
+| **scheduling** | 16,753 | 23,043 | **1.38×** |
+
+The first two are breadth sanic does not claim — their own kernel-mode AMD/NV
+drivers, five rendered ISAs. The scheduling row is the one that matters: it is
+where sanic deliberately spends more, and `remove_bufferize` says why.
+tinygrad's own comment above its kernel-boundary decision reads `# *** here is
+where we compute the cost ***`, and what follows is `len(accessed_buffers) >
+3`, `buffer_in_reduce`, `out_in_ratio < 10` (`schedule/rangeify.py:214-282`).
+Three literal thresholds against sanic's Prop 4.1 inequality. Those extra
+lines are the research, not a defect.
+
+The IR row prices debts this document already names (§*design debt* 3 and
+4). Three like-for-like pairs, both sides counted code-only:
+
+| concern | tinygrad | sanic | ratio |
+|---|---|---|---|
+| algebraic simplification | `uop/symbolic.py` 313 | `simplify.rs` 657 | 2.1× |
+| IR well-formedness | `uop/spec.py` 152 | `verify.rs` 323 | 2.1× |
+| **autodiff** | `mixin/gradient.py` 114 | `grad.rs` 499 | **4.4×** |
+
+2.1× is precisely the density ratio the totals give (18.7 tokens per line
+against 9.1). Simplification and verification land on it exactly — at
+parity once style is removed. **Autodiff is double the baseline**, and the
+excess over it is ~259 lines.
+
+Shape bookkeeping is 205 of them: `invert_view` 56, `broadcast_to` 46,
+`reduce_to` 41, `transpose_reindex` 34, `scatter_add` 28 — 79% of the
+anomaly. tinygrad writes none of it, and the reason is worth stating
+precisely, because it is **not** the symbolic index language. Autodiff runs
+at the tensor level, where movement ops are still first-class nodes, and
+every movement gradient is a one-line rule sending the op to its inverse
+*inside the same vocabulary*: RESHAPE↔RESHAPE, PAD↔SHRINK,
+PERMUTE↔PERMUTE(argsort), FLIP↔FLIP, EXPAND→REDUCE
+(`mixin/gradient.py:69-76`). Closure under inversion is a property of the
+op set, not of the lowering. Sanic's `invert_view` is 56 hand-written lines
+because `View` + `with_axis_order` is not closed: the `0·Iota` order trick
+(debt 4) has no inverse image in the vocabulary, so inversion is a function
+instead of a rule. `simplify.rs` carries 181 lines of the same per-dimension
+bookkeeping (`preserve_shape` 79, `drop_dimension` 53,
+`depends_on_dimension` 49) and still holds parity, so its rewrite content
+is the leaner of the two.
+
+**~390 lines is the standing cost of a movement vocabulary that does not
+invert**, charged again to every pass that has to run structure backward.
+
+The other half of tinygrad's shape story — dissolving movement into
+loop-variable div/mod arithmetic — is *not* validated by this comparison,
+and their own tree says so. The index language is where they pay, not where
+they win: all of `uop/divandmod.py` (106 lines) plus `_quotient_base` /
+`fold_add_divmod_recombine` (`uop/symbolic.py:40-66`) exist to re-discover,
+by congruence arithmetic, factorization structure the program *stated* as a
+reshape and the encoding erased — the exact mirror of sanic smuggling axis
+order through `0·Iota`. Same sin, different operator: structure encoded as
+arithmetic, then a simplifier hired to see through it. The representation
+is also their second attempt (ShapeTracker deleted after years), still
+cannot express the fusions they want (`test_auto_softmax` skipped,
+`RANGEIFY>1` gated), and makes "does this axis span that subtree"
+unaskable — part of why their kernel boundaries fall back to
+`len(accessed_buffers) > 3`. Neither project has found the representation
+in which movement inverts by construction *and* structure stays visible to
+the algebra. Take the closure property; skip the substrate.
+
+One mechanism explains most of the rest of their density: `UPat` +
+`PatternMatcher` + `graph_rewrite` (~400 lines, `uop/ops.py:1237-1490`,
+`:1666`) carries **731 rules across 145 matchers** — renderers, scheduler,
+codegen, the verifier, autodiff, even a device backend. Rewrites are data.
+Sanic hand-writes five traversals instead (`simplify::pass`,
+`grad::postorder`, `derive::go_uncached`, `partition::{leaf_cuts,
+shared_body_cuts, cone}`, `ir::replace_many`). Not a defect to fix by
+copying: their engine amortizes over 145 matchers, sanic has five, and a
+match arm is debuggable where `graph_rewrite` is not. Understand the leverage;
+do not import it on faith.
+
 ## What tinygrad has that sanic doesn't (the honest column)
 
-209k lines of package Python vs sanic's ~4k of Rust, and most of the
-difference is real capability: autodiff, dtypes/quantization, symbolic
-shapes (`Variable` extents flowing through index math), masks/padding,
-multi-device (`schedule/multi.py`), JIT, memory planning, a dozen working
-backends, and correctness proven by running LLaMA. Two specific mechanisms
-worth stealing beyond the per-axis realize:
+32,699 lines of hand-written package Python against sanic's 17,988 of Rust —
+1.8×, not the 50× the repositories suggest, because **202,952 of tinygrad's
+235,651 lines are machine-generated ctypes bindings** under
+`runtime/autogen`. Most of the real difference is real capability: autodiff,
+dtypes/quantization, symbolic shapes (`Variable` extents flowing through index
+math), masks/padding, multi-device (`schedule/multi.py`), JIT, memory
+planning, a dozen working backends, and correctness proven by running LLaMA.
+Two specific mechanisms worth stealing beyond the per-axis realize:
 
 1. **Computed index tensors are free.** tinygrad collapses a REDUCE with no
    loads into closed-form index arithmetic (`codegen/simplify.py:143-146`),
