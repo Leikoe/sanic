@@ -1209,7 +1209,7 @@ fn kernel_name(kind: &str, output_axes: &[Axis], fold: Option<AxisRef>) -> Strin
 /// Lower a whole schedule to a Metal program (the GPU analog of
 /// [`crate::rustgen::emit_schedule`]), fold schedules priced against the
 /// device the kernels will run on.
-pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule) -> MetalProgram {
+pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceSpecs, sched: &Schedule) -> MetalProgram {
     emit_schedule_metal_tuned(dev, sched, &HashMap::new())
 }
 
@@ -1218,7 +1218,7 @@ pub fn emit_schedule_metal_on(dev: &crate::cost::DeviceProfile, sched: &Schedule
 /// device (`SANIC_TUNE=1`), overruling the analytic chooser for exactly
 /// those stages.
 pub fn emit_schedule_metal_tuned(
-    dev: &crate::cost::DeviceProfile,
+    dev: &crate::cost::DeviceSpecs,
     sched: &Schedule,
     tuned: &HashMap<String, FoldSched>,
 ) -> MetalProgram {
@@ -1230,7 +1230,7 @@ pub fn emit_schedule_metal_tuned(
     let mut resolved: HashMap<String, Dtype> = sched.declared_dtypes.clone();
     for stage in &sched.stages {
         let out = crate::partition::stage_output(stage);
-        resolved.insert(out.to_string(), sched.width_of(out, dev.storage));
+        resolved.insert(out.to_string(), sched.width_of(out, dev.storage()));
     }
     let mut all_dtypes: HashMap<String, Dtype> = HashMap::new();
     let mut stages: Vec<MetalStageInfo> = Vec::new();
@@ -1264,7 +1264,7 @@ pub fn emit_schedule_metal_tuned(
     // value the policy cannot carry — an argmax index under bf16), else the
     // target's boundary policy. One resolution, shared with allocation,
     // readback and the refusal through `Schedule::width_of`.
-    let width_of = |output: &str| -> Dtype { sched.width_of(output, dev.storage) };
+    let width_of = |output: &str| -> Dtype { sched.width_of(output, dev.storage()) };
     let mut canon: HashMap<String, String> = HashMap::new();
     let mut name_uses: HashMap<String, usize> = HashMap::new();
     let dedup = |k: &MetalKernel,
@@ -1420,6 +1420,6 @@ pub fn emit_schedule_metal_tuned(
         inputs,
         dtypes: all_dtypes,
         buffers: bufsizes,
-        storage: dev.storage,
+        storage: dev.storage(),
     }
 }

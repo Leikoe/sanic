@@ -516,7 +516,7 @@ fn metal_prefill(graph: &DecodeGraph, env: &Env, tokens: &[f64], device: &sanic:
 /// literal form.
 #[test]
 fn computed_iota_mask_reaches_the_fused_attention_fold() {
-    use sanic::cost::DeviceProfile;
+    use sanic::cost::DeviceSpecs;
     use sanic::emit_metal::emit_schedule_metal_on;
     use sanic::metal::program_dispatches;
     use sanic::partition::partition;
@@ -548,8 +548,8 @@ fn computed_iota_mask_reaches_the_fused_attention_fold() {
     );
 
     let reference = eval(&attention, &env);
-    let schedule = partition(&attention, &DeviceProfile::m1_pro());
-    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+    let schedule = partition(&attention, &DeviceSpecs::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceSpecs::m1_pro(), &schedule);
     let Some(device) = sanic::metal::MetalDevice::open() else {
         eprintln!("skipping: no Metal device");
         return;

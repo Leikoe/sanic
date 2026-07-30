@@ -1,4 +1,4 @@
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::derive::{SlotKind, derive};
 use sanic::partition::{Stage, partition, partition_many};
 use sanic::{
@@ -154,7 +154,7 @@ fn positional_argmax_is_one_generic_key_payload_fold() {
             }
         ]
     ));
-    let schedule = partition(&index, &DeviceProfile::toy());
+    let schedule = partition(&index, &DeviceSpecs::toy());
     assert!(matches!(
         schedule.stages.as_slice(),
         [Stage::Fused { spec, .. }] if spec.carrier.slots == 2
@@ -188,7 +188,7 @@ fn positional_topk_composition_returns_descending_values_and_indices() {
             (pairs[2].0.clone(), "v2"),
             (pairs[2].1.clone(), "i2"),
         ],
-        &DeviceProfile::toy(),
+        &DeviceSpecs::toy(),
     );
     assert!(
         schedule

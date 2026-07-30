@@ -230,7 +230,7 @@ fn the_structural_debt_ledger_is_exact() {
         // the check "can this dtype carry that expression's system".
         ("graph", "device.storage()", 4, "M12"),
         // The one-knob policy, living on device types until M14 retires it
-        // for per-value declarations (and renames DeviceProfile to
+        // for per-value declarations (and renames DeviceSpecs to
         // DeviceSpecs, leaving hardware facts only).
         ("cost", "with_storage", 1, "M14"),
         ("metal", "with_storage", 1, "M14"),

@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::derive::{Carrier, derive};
 use sanic::emit_metal::{
     MetalKernel, MetalProgram, emit_fused_metal_sched_with, emit_fused_metal_with, emit_schedule_metal_on,
@@ -69,7 +69,7 @@ fn emit_fused_metal_sched(
 }
 
 fn emit_schedule_metal(schedule: &sanic::partition::Schedule) -> MetalProgram {
-    emit_schedule_metal_on(&DeviceProfile::toy(), schedule)
+    emit_schedule_metal_on(&DeviceSpecs::toy(), schedule)
 }
 
 fn attention(query: NodeRef, key: NodeRef, value: NodeRef) -> NodeRef {
@@ -227,8 +227,8 @@ fn masked_gqa_decode_attention_matches_oracle_on_gpu() {
         true,
     );
     let reference = eval(&attention, &env);
-    let schedule = partition(&attention, &DeviceProfile::m1_pro());
-    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+    let schedule = partition(&attention, &DeviceSpecs::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceSpecs::m1_pro(), &schedule);
 
     let Some(result) = run_schedule_on_gpu("masked-gqa-decode", &program, &env, &reference) else {
         eprintln!("skipping: no Metal device");
@@ -281,8 +281,8 @@ fn rmsnorm_of_a_shared_residual_matches_oracle_on_gpu() {
         ],
     );
     let reference = eval(&norm, &env);
-    let schedule = partition(&norm, &DeviceProfile::m1_pro());
-    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+    let schedule = partition(&norm, &DeviceSpecs::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceSpecs::m1_pro(), &schedule);
 
     let Some(result) = run_schedule_on_gpu("residual-rmsnorm", &program, &env, &reference) else {
         eprintln!("skipping: no Metal device");
@@ -337,8 +337,8 @@ fn residual_rmsnorm_fused_projection_matches_oracle_on_gpu() {
     );
     let projection = matmul(norm, transpose(input("weight", [output, hidden]), 0usize, 1usize));
     let reference = eval(&projection, &env);
-    let schedule = partition(&projection, &DeviceProfile::m1_pro());
-    let program = emit_schedule_metal_on(&DeviceProfile::m1_pro(), &schedule);
+    let schedule = partition(&projection, &DeviceSpecs::m1_pro());
+    let program = emit_schedule_metal_on(&DeviceSpecs::m1_pro(), &schedule);
 
     let Some(result) = run_schedule_on_gpu("residual-rmsnorm-projection", &program, &env, &reference) else {
         eprintln!("skipping: no Metal device");
@@ -540,7 +540,7 @@ fn greedy_sampling_runs_on_gpu() {
     let logits = matmul(input("Y", [s, dm]), transpose(input("W_lm", [v, dm]), 0usize, 1usize)); // [s, v]
     let token = argmax(logits, 1usize); // [s]
 
-    let sched = partition(&token, &DeviceProfile::toy());
+    let sched = partition(&token, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&sched);
     let reference = eval(&token, &env);
     let Some(out) = run_schedule_on_gpu("greedy", &program, &env, &reference) else {
@@ -626,7 +626,7 @@ fn greedy_decode_step_runs_on_gpu() {
     let logits = matmul(yb, transpose(input("W_lm", [vv, dm]), 0usize, 1usize)); // [s, v]
     let token = argmax(logits, 1usize); // [s] — next-token per position
 
-    let sched = partition(&token, &DeviceProfile::toy());
+    let sched = partition(&token, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&sched);
     let reference = eval(&token, &env);
     let Some(out) = run_schedule_on_gpu("decode", &program, &env, &reference) else {
@@ -702,7 +702,7 @@ fn full_transformer_block_runs_on_gpu() {
     let yb = map(MapOp::Add, vec![mlp, res1]);
     let logits = matmul(yb, transpose(input("W_lm", [v, dm]), 0usize, 1usize));
 
-    let sched = partition(&logits, &DeviceProfile::toy());
+    let sched = partition(&logits, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&sched);
     let reference = eval(&logits, &env);
     let Some(out) = run_schedule_on_gpu("block", &program, &env, &reference) else {
@@ -923,7 +923,7 @@ fn decode_loop_runs_on_gpu() {
     let logits = linear_vector(out, input("Wl", [v, dv]));
     let sched = sanic::partition::partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
-        &DeviceProfile::toy(),
+        &DeviceSpecs::toy(),
     );
     let program = emit_schedule_metal(&sched);
 
@@ -1020,7 +1020,7 @@ fn attention_backward_runs_on_gpu() {
 
     let grads = sanic::grad::grad(&loss, &["Q"]);
     let g = &grads["Q"];
-    let sched = partition(g, &DeviceProfile::toy());
+    let sched = partition(g, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&sched);
     let reference = eval(g, &env);
 
@@ -1288,7 +1288,7 @@ fn topk_compositions_run_on_gpu() {
     for (r, (v, i)) in topk(x, 0usize, 8).into_iter().enumerate() {
         for (tag, node) in [("val", v), ("idx", i)] {
             let name = format!("top8_{tag}_{r}");
-            let schedule = partition(&node, &DeviceProfile::toy());
+            let schedule = partition(&node, &DeviceSpecs::toy());
             let program = emit_schedule_metal(&schedule);
             let reference = eval(&node, &env);
             let Some(out) = run_schedule_on_gpu(&name, &program, &env, &reference) else {
@@ -1316,7 +1316,7 @@ fn topk_all_composition_runs_on_gpu() {
 
     let x = input("X", [n]);
     let all = topk_all(x, 0usize, 8, rk, true);
-    let schedule = partition(&all, &DeviceProfile::toy());
+    let schedule = partition(&all, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&schedule);
     let reference = eval(&all, &env);
     let Some(out) = run_schedule_on_gpu("top8_all", &program, &env, &reference) else {
@@ -1359,7 +1359,7 @@ fn graph_replay_matches_oracle() {
     let logits = matmul(xn, transpose(input("W", [v, dm]), 0usize, 1usize)); // [s, v]
     let out = reduce(logits, 1usize, Monoid::LogSumExp); // [s]
 
-    let sched = partition(&out, &DeviceProfile::toy());
+    let sched = partition(&out, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&sched);
     let reference = eval(&out, &env);
 
@@ -1407,7 +1407,7 @@ fn bindless_graph_replay_declares_indirect_resources() {
         sum = map(MapOp::Add, vec![sum, input(name, [elements])]);
     }
 
-    let schedule = partition(&sum, &DeviceProfile::toy());
+    let schedule = partition(&sum, &DeviceSpecs::toy());
     let program = emit_schedule_metal(&schedule);
     assert!(
         program.stages.iter().any(|stage| stage.argbuf.is_some()),
@@ -1970,7 +1970,7 @@ kernel void zc_add(
 // every other step) — the min is the kernel, the spikes are the machine.
 #[test]
 fn committed_plan_costs_stay_within_a_band_of_measurement() {
-    let profile = DeviceProfile::m1_pro();
+    let profile = DeviceSpecs::m1_pro();
     let (s, d, v) = (axis("s", 1), axis("d", 1024), axis("v", 16384));
     let mut rng = Lcg(0x51CA);
     let env: Env = [
@@ -2054,7 +2054,7 @@ fn committed_plan_costs_stay_within_a_band_of_measurement() {
 // in registers, so error does NOT grow with the reduction length.
 #[test]
 fn bf16_storage_stays_within_rounding_of_the_interpreter() {
-    let profile = DeviceProfile::m1_pro().with_storage(Dtype::BF16);
+    let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
     let (s, d, v) = (axis("s", 1), axis("d", 256), axis("v", 512));
     let mut rng = Lcg(0xBF16);
     let env: Env = [
@@ -2114,7 +2114,7 @@ fn bf16_storage_stays_within_rounding_of_the_interpreter() {
 // match the interpreter to rounding tolerance, with no NaN escape.
 #[test]
 fn bf16_storage_masked_gqa_decode_matches_oracle() {
-    let profile = DeviceProfile::m1_pro().with_storage(Dtype::BF16);
+    let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
     let (query_heads, kv_heads, cache, features) = (
         axis("query_heads", 32),
         axis("kv_heads", 8),
@@ -2355,7 +2355,7 @@ fn clock_reports_the_dvfs_state_a_workload_ran_at() {
 // keeps the policy width.
 #[test]
 fn an_argmax_index_survives_bf16_storage_by_minted_width() {
-    let profile = DeviceProfile::m1_pro().with_storage(Dtype::BF16);
+    let profile = DeviceSpecs::m1_pro().with_storage(Dtype::BF16);
     let v = axis("v", 4096);
     let mut rng = Lcg(0xA51);
     let mut scores = rand_tensor(&[v], &mut rng);

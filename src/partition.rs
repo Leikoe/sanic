@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::analyze::{Parallelism, StructureCache};
-use crate::cost::DeviceProfile;
+use crate::cost::DeviceSpecs;
 use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
@@ -149,7 +149,7 @@ pub struct Schedule {
 }
 
 /// Split `node` into a schedule of kernels for `dev`.
-pub fn partition(node: &Node, dev: &DeviceProfile) -> Schedule {
+pub fn partition(node: &Node, dev: &DeviceSpecs) -> Schedule {
     partition_many(&[(node.clone(), "Out")], dev)
 }
 
@@ -158,7 +158,7 @@ pub fn partition(node: &Node, dev: &DeviceProfile) -> Schedule {
 /// instead of recomputing them per output. Roots are emitted in order, and a
 /// root reachable from a *later* root is reused through its materialization
 /// (so put producers before consumers). Each root lands under its given name.
-pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Schedule {
+pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceSpecs) -> Schedule {
     partition_many_declared(roots, dev, &std::collections::HashMap::new())
 }
 
@@ -167,7 +167,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
 /// every all-f32 program.
 pub fn partition_many_declared(
     roots: &[(Node, &'static str)],
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     declared: &std::collections::HashMap<String, crate::ir::Dtype>,
 ) -> Schedule {
     // Everything below reads sharing through pointer-keyed maps (`parents`,
@@ -412,7 +412,7 @@ fn order_in_place(stages: Vec<Stage>, graph_inputs: &HashSet<String>) -> Vec<Sta
 }
 
 struct Partitioner<'a> {
-    dev: &'a DeviceProfile,
+    dev: &'a DeviceSpecs,
     stages: Vec<Stage>,
     /// Every fold the deriver declined while the partitioner stood at a
     /// node: an axis the classifier called MONOIDAL whose carrier did not
@@ -561,8 +561,8 @@ impl Partitioner<'_> {
         // takes the boundary policy like everything else, so the policy's
         // measured win is untouched. `None` (an unmintable exact value,
         // e.g. saturated bounds) stays a fact for the refusal.
-        if let Some(width) = crate::numeric::store_dtype(claim, self.dev.storage)
-            && width != self.dev.storage
+        if let Some(width) = crate::numeric::store_dtype(claim, self.dev.storage())
+            && width != self.dev.storage()
         {
             self.minted_dtypes.insert(name.to_string(), width);
         }
@@ -578,7 +578,7 @@ impl Partitioner<'_> {
             return dtype.bytes_per_element();
         }
         if self.produced.contains(name) {
-            return self.dev.storage.bytes_per_element();
+            return self.dev.storage().bytes_per_element();
         }
         crate::ir::Dtype::F32.bytes_per_element()
     }
@@ -2599,7 +2599,7 @@ mod tests {
             .map(|scored| {
                 let attn = matmul(softmax(scored, 1usize), v.clone());
                 let attn = crate::simplify::simplify_many(&[attn]).pop().unwrap();
-                let sched = partition(&attn, &DeviceProfile::toy());
+                let sched = partition(&attn, &DeviceSpecs::toy());
                 let Stage::Fused { spec, .. } = &sched.stages[sched.stages.len() - 1] else {
                     panic!("expected a fused flash stage")
                 };
@@ -2633,7 +2633,7 @@ mod tests {
             Some(1.0),
             false,
         );
-        let sched = partition(&attn, &DeviceProfile::toy());
+        let sched = partition(&attn, &DeviceSpecs::toy());
         assert_eq!(sched.stages.len(), 1);
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!("expected a fused stage")
@@ -2667,7 +2667,7 @@ mod tests {
         let scores = matmul(q, transpose(kk, 0usize, 1usize));
         let out = matmul(softmax(scores, 1usize), v);
 
-        let sched = partition(&out, &DeviceProfile::toy());
+        let sched = partition(&out, &DeviceSpecs::toy());
 
         // 3 GEMM producers + 1 flash kernel, producers first.
         assert_eq!(sched.stages.len(), 4);
@@ -2705,7 +2705,7 @@ mod tests {
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
 
-        let sched = partition(&norm, &DeviceProfile::toy());
+        let sched = partition(&norm, &DeviceSpecs::toy());
         assert_eq!(sched.stages.len(), 2);
         assert!(matches!(&sched.stages[0], Stage::Fused { spec, epilogue, .. }
             if spec.streaming_axis == stream
@@ -2729,7 +2729,7 @@ mod tests {
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
         let proj = matmul(norm, transpose(input("W", [f, d]), 0usize, 1usize));
 
-        let sched = partition(&proj, &DeviceProfile::toy());
+        let sched = partition(&proj, &DeviceSpecs::toy());
         assert_eq!(sched.stages.len(), 1, "norm + GEMM = one kernel");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!()
@@ -2764,7 +2764,7 @@ mod tests {
         );
         let projection = matmul(norm, transpose(input("W", [projected, hidden]), 0usize, 1usize));
 
-        let sum_sched = partition(&sum_square, &DeviceProfile::m1_pro());
+        let sum_sched = partition(&sum_square, &DeviceSpecs::m1_pro());
         assert!(
             sum_sched
                 .stages
@@ -2774,7 +2774,7 @@ mod tests {
             sum_sched.render()
         );
 
-        let sched = partition(&projection, &DeviceProfile::m1_pro());
+        let sched = partition(&projection, &DeviceSpecs::m1_pro());
         assert!(
             sched
                 .stages
@@ -2804,8 +2804,8 @@ mod tests {
             None,
             true,
         );
-        let sched = partition(&attention, &DeviceProfile::m1_pro());
-        crate::emit_metal::emit_schedule_metal_on(&DeviceProfile::m1_pro(), &sched);
+        let sched = partition(&attention, &DeviceSpecs::m1_pro());
+        crate::emit_metal::emit_schedule_metal_on(&DeviceSpecs::m1_pro(), &sched);
     }
 
     // The SAME norm-into-GEMM fusion at a 200k-vocab head is legal AND —
@@ -2831,7 +2831,7 @@ mod tests {
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
         let head = matmul(norm, transpose(input("W", [v, d]), 0usize, 1usize));
 
-        let sched = partition(&head, &DeviceProfile::m1_pro());
+        let sched = partition(&head, &DeviceSpecs::m1_pro());
         assert!(
             !sched.stages.iter().any(|st| matches!(st, Stage::Infeasible { .. })),
             "the retry must find a feasible schedule, not report Infeasible"
@@ -2863,7 +2863,7 @@ mod tests {
         let proj = matmul(h, w); // [s, dm]
         let y = map(MapOp::Add, vec![proj, x]); // residual
 
-        let sched = partition(&y, &DeviceProfile::toy());
+        let sched = partition(&y, &DeviceSpecs::toy());
         assert_eq!(sched.stages.len(), 1, "the add must not be its own kernel");
         let Stage::Fused {
             spec,
@@ -2899,7 +2899,7 @@ mod tests {
         let stream = axis_refs(&act)[1];
         let down = matmul(act, input("Wd", [f, dm]));
 
-        let sched = partition(&down, &DeviceProfile::toy());
+        let sched = partition(&down, &DeviceSpecs::toy());
         assert_eq!(
             sched.stages.len(),
             4,
@@ -2944,7 +2944,7 @@ mod tests {
         let lse = map(MapOp::Add, vec![m, map(MapOp::Log, vec![sumexp])]); // [b]
         let loss = reduce(lse, 0usize, add_r()); // scalar
 
-        let sched = partition(&loss, &DeviceProfile::toy());
+        let sched = partition(&loss, &DeviceSpecs::toy());
         assert_eq!(
             sched.stages.len(),
             2,
@@ -2992,7 +2992,7 @@ mod tests {
         let stream = axis_refs(&flattened)[1];
         let down = reduce(flattened, 1usize, add_r());
 
-        let sched = partition(&down, &DeviceProfile::toy());
+        let sched = partition(&down, &DeviceSpecs::toy());
         // The whole silu·up cone is one elementwise stage; the fold reads it.
         assert_eq!(sched.stages.len(), 2, "activation cone + down fold");
         let Stage::Elementwise { ops, .. } = &sched.stages[0] else {
@@ -3050,7 +3050,7 @@ mod tests {
         let flattened = flatten(prod, &[1usize, 2usize][..], fl);
         let down = reduce(flattened, 1usize, add_r());
 
-        let sched = partition(&down, &DeviceProfile::toy());
+        let sched = partition(&down, &DeviceSpecs::toy());
         assert_eq!(
             sched.stages.len(),
             2,
@@ -3071,7 +3071,7 @@ mod tests {
         let table = input("E", [v, dm]);
         let vocabulary = axis_refs(&table)[0];
         let emb = embedding(table, input("ids", [s]), 0usize);
-        let sched = partition(&emb, &DeviceProfile::toy());
+        let sched = partition(&emb, &DeviceSpecs::toy());
         assert_eq!(sched.stages.len(), 1);
         assert!(matches!(&sched.stages[0], Stage::Gather { axis, .. } if *axis == vocabulary));
     }
@@ -3103,7 +3103,7 @@ mod tests {
         let v = matmul(xn_t, transpose(input("Wv", [dv, dm]), 0usize, 1usize)); // [t, dv]
         let attn = matmul(softmax(matmul(q, transpose(k, 0usize, 1usize)), 1usize), v);
 
-        let sched = partition(&attn, &DeviceProfile::toy());
+        let sched = partition(&attn, &DeviceSpecs::toy());
 
         // Σx² fold + norm map + Q/K/V GEMMs + flash — the norm appears ONCE.
         assert_eq!(sched.stages.len(), 6);
@@ -3145,7 +3145,7 @@ mod tests {
         let projection_stream = axis_refs(&flat)[1];
         let o = matmul(flat, input("Wo", [dmv, dm])); // [s, dm]
 
-        let sched = partition(&o, &DeviceProfile::toy());
+        let sched = partition(&o, &DeviceSpecs::toy());
 
         assert_eq!(sched.stages.len(), 2, "flash kernel + projection GEMM");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
@@ -3173,7 +3173,7 @@ mod tests {
         );
         let out = matmul(softmax(masked, 1usize), input("V", [t, dv]));
 
-        let sched = partition(&out, &DeviceProfile::toy());
+        let sched = partition(&out, &DeviceSpecs::toy());
         assert_eq!(sched.stages.len(), 1, "mask and scale ride the lift");
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!()

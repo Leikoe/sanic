@@ -291,7 +291,7 @@ fn a_float_input_is_a_real() {
 
 #[test]
 fn the_law_mints_the_width_the_policy_cannot_supply() {
-    use sanic::cost::DeviceProfile;
+    use sanic::cost::DeviceSpecs;
     use sanic::partition::partition;
 
     let vocab = axis("vocab", 128_256);
@@ -303,7 +303,7 @@ fn the_law_mints_the_width_the_policy_cannot_supply() {
     // buffer — no refusal, no manual pin, and every other buffer keeps the
     // policy. This is the milestone: the defect that opened the arc is now
     // closed by construction rather than refused.
-    let narrow = DeviceProfile::toy().with_storage(Dtype::BF16);
+    let narrow = DeviceSpecs::toy().with_storage(Dtype::BF16);
     let schedule = partition(&index, &narrow);
 
     assert!(!schedule.exact_boundaries.is_empty(), "the fact is recorded");
@@ -322,7 +322,7 @@ fn the_law_mints_the_width_the_policy_cannot_supply() {
 
 #[test]
 fn an_unmintable_exact_boundary_is_still_refused() {
-    use sanic::cost::DeviceProfile;
+    use sanic::cost::DeviceSpecs;
     use sanic::partition::partition;
 
     // A product fold over coordinates saturates its bounds — no writable
@@ -332,7 +332,7 @@ fn an_unmintable_exact_boundary_is_still_refused() {
     let n = axis("n", 64);
     let product = reduce(iota(n), 0usize, Monoid::Mul);
 
-    let schedule = partition(&product, &DeviceProfile::toy().with_storage(Dtype::BF16));
+    let schedule = partition(&product, &DeviceSpecs::toy().with_storage(Dtype::BF16));
     assert!(!schedule.exact_boundaries.is_empty());
     assert!(schedule.minted_dtypes.is_empty(), "nothing lawful to mint");
     let refused = schedule.unstorable(Dtype::BF16);
@@ -342,7 +342,7 @@ fn an_unmintable_exact_boundary_is_still_refused() {
 
 #[test]
 fn a_pinned_output_is_judged_against_its_pin() {
-    use sanic::cost::DeviceProfile;
+    use sanic::cost::DeviceSpecs;
     use sanic::partition::partition;
 
     // The reconciliation with `output_at` (#21): the caller pinning an
@@ -353,7 +353,7 @@ fn a_pinned_output_is_judged_against_its_pin() {
     let scores = input("X", [vocab]);
     let index = argmax(scores, 0usize);
 
-    let mut schedule = partition(&index, &DeviceProfile::toy());
+    let mut schedule = partition(&index, &DeviceSpecs::toy());
     schedule.output_dtypes = vec![Some(Dtype::F32)];
     assert!(
         schedule.unstorable(Dtype::BF16).is_empty(),
@@ -370,7 +370,7 @@ fn a_pinned_output_is_judged_against_its_pin() {
 
 #[test]
 fn real_valued_boundaries_are_untouched_by_the_refusal() {
-    use sanic::cost::DeviceProfile;
+    use sanic::cost::DeviceSpecs;
     use sanic::partition::partition;
 
     // llama's shape: logits are reals, and the 16% lives on bf16 staying
@@ -382,7 +382,7 @@ fn real_valued_boundaries_are_untouched_by_the_refusal() {
     let w = input("W", [vocab, hidden]);
     let logits = reduce(map(MapOp::Mul, vec![unsqueeze(x, 0usize), w]), 1usize, Monoid::Add);
 
-    let schedule = partition(&logits, &DeviceProfile::toy());
+    let schedule = partition(&logits, &DeviceSpecs::toy());
     assert!(schedule.exact_boundaries.is_empty());
     assert!(schedule.unstorable(Dtype::BF16).is_empty());
 }

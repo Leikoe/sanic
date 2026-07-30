@@ -88,7 +88,7 @@ pub trait Backend: Clone + private::Sealed + 'static {
     type Buffer: Buffer;
     type Executable;
 
-    fn profile(&self) -> cost::DeviceProfile;
+    fn profile(&self) -> cost::DeviceSpecs;
     fn prepare(&self, schedule: &Schedule, output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError>;
     fn execute(
         &self,
@@ -393,7 +393,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .collect();
     // After the pins land: a pinned output is checked against ITS width,
     // everything else against the boundary policy.
-    refuse_unstorable(&schedule, backend.profile().storage)?;
+    refuse_unstorable(&schedule, backend.profile().storage())?;
     let executable = backend.prepare(&schedule, &output_shapes)?;
 
     Ok(Program {
@@ -589,8 +589,8 @@ impl Backend for CpuDevice {
     type Buffer = CpuBuffer;
     type Executable = ();
 
-    fn profile(&self) -> cost::DeviceProfile {
-        cost::DeviceProfile::toy()
+    fn profile(&self) -> cost::DeviceSpecs {
+        cost::DeviceSpecs::toy()
     }
 
     fn prepare(&self, _schedule: &Schedule, _output_shapes: &[Vec<usize>]) -> Result<Self::Executable, CompileError> {
@@ -679,8 +679,8 @@ mod metal_backend {
         type Buffer = MetalBuffer;
         type Executable = MetalExecutable;
 
-        fn profile(&self) -> cost::DeviceProfile {
-            cost::DeviceProfile::m1_pro().with_storage(self.storage())
+        fn profile(&self) -> cost::DeviceSpecs {
+            cost::DeviceSpecs::m1_pro().with_storage(self.storage())
         }
 
         fn prepare(

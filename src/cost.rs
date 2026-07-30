@@ -2,26 +2,50 @@
 //!
 //! The derivation layer settles *legality* — what can fuse, and the exact
 //! accumulator. This module is the other half, *profitability*, and it knows
-//! nothing about any particular computation: only `DeviceProfile`s and `Kernel`s.
+//! nothing about any particular computation: only `DeviceSpecs`s and `Kernel`s.
 //! Because every candidate handed in is already legal, the cost model only
 //! has to rank — it can pick a slow plan, never a wrong one. Ranking
 //! accuracy is the bar, not absolute accuracy.
 
-/// The device the scheduler is parameterized by. All hardware numbers live
-/// here; everything else is device-agnostic.
+/// The boundary-storage policy a compilation runs under: what a
+/// materialized intermediate (and every undeclared output) is written as.
+/// A POLICY, not a hardware fact — the caller attaches it to the specs, and
+/// per-value declarations outrank it (`Schedule::width_of`: pin → mint →
+/// declared → policy). One knob today, by design; anything richer is the
+/// deferred ℝ̄-precision question (number_systems_and_representations.md §12).
 #[derive(Debug, Clone, Copy)]
-pub struct DeviceProfile {
+pub struct Policy {
+    pub boundary: crate::scalar::Dtype,
+}
+
+impl Default for Policy {
+    fn default() -> Policy {
+        Policy {
+            boundary: crate::scalar::Dtype::F32,
+        }
+    }
+}
+
+/// The device the scheduler is parameterized by: hardware numbers and
+/// capabilities, plus the [`Policy`] the caller attached. Everything else is
+/// device-agnostic.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceSpecs {
     pub sram_bytes: f64,      // shared memory / SRAM per resident block
     pub regfile_bytes: f64,   // register file per block
     pub hbm_bandwidth: f64,   // bytes / second
     pub peak_flops: f64,      // flop / second
     pub launch_overhead: f64, // seconds per kernel launch
     pub dtype_bytes: f64,
-    /// STORAGE precision at kernel boundaries: what a materialized
-    /// intermediate (and every output) is written as. One policy for the
-    /// whole schedule; kernels always accumulate wide in registers and
-    /// narrow only at the store. `dtype_bytes` follows it.
-    pub storage: crate::scalar::Dtype,
+    /// The register width kernels COMPUTE at — a capability, identical for
+    /// every kernel this device runs. Accumulators are always this wide;
+    /// narrowing happens only at stores, under the policy or a declaration.
+    /// It also bounds exactness: integers survive computation only to
+    /// `compute.exact_integers_to()`.
+    pub compute: crate::scalar::Dtype,
+    /// The boundary-storage policy attached to this compilation.
+    /// `dtype_bytes` follows it (via [`DeviceSpecs::with_storage`]).
+    pub policy: Policy,
     /// Resident blocks needed to hide latency. Fewer than this and the kernel
     /// runs below peak (occupancy < 1).
     pub min_blocks: f64,
@@ -35,17 +59,18 @@ pub struct DeviceProfile {
     pub mem_latency_s: f64,
 }
 
-impl DeviceProfile {
+impl DeviceSpecs {
     /// A plausible accelerator-class toy (≈ A100 fp16, order of magnitude).
     pub fn toy() -> Self {
-        DeviceProfile {
+        DeviceSpecs {
             sram_bytes: 163_840.0, // 160 KiB
             regfile_bytes: 256_000.0,
             hbm_bandwidth: 2.0e12, // 2 TB/s
             peak_flops: 3.0e14,    // 300 TFLOP/s
             launch_overhead: 3.0e-6,
             dtype_bytes: 2.0,
-            storage: crate::scalar::Dtype::F32,
+            compute: crate::scalar::Dtype::F32,
+            policy: Policy::default(),
             min_blocks: 8.0,
             // fitted so 4-byte-per-lane kernels keep the pre-Little's-law
             // verdicts: 2048 lanes x 4 B saturate 2 TB/s.
@@ -53,12 +78,20 @@ impl DeviceProfile {
         }
     }
 
-    /// The same device with a different boundary-storage precision; the
-    /// pricing width follows, so round trips get honestly cheaper.
+    /// The same specs under a different boundary policy; the pricing width
+    /// follows, so round trips get honestly cheaper. (Retires at M14-final,
+    /// when the policy is handed to compilation directly instead of riding
+    /// the specs.)
     pub fn with_storage(mut self, storage: crate::scalar::Dtype) -> Self {
-        self.storage = storage;
+        self.policy = Policy { boundary: storage };
         self.dtype_bytes = storage.bytes_per_element();
         self
+    }
+
+    /// The policy's boundary width — the answer for every buffer nothing
+    /// pinned, minted or declared.
+    pub fn storage(&self) -> crate::scalar::Dtype {
+        self.policy.boundary
     }
 
     /// The Apple M1 Pro this repo measures on (16-core GPU, f32 compute).
@@ -69,14 +102,15 @@ impl DeviceProfile {
     /// fold reaches the DRAM ceiling while a 2.3k-lane one reaches ~2% of
     /// it — saturation needs tens of thousands of scalar load streams.
     pub fn m1_pro() -> Self {
-        DeviceProfile {
+        DeviceSpecs {
             sram_bytes: 32_768.0, // threadgroup memory
             regfile_bytes: 256_000.0,
             hbm_bandwidth: 2.0e11, // 200 GB/s unified
             peak_flops: 5.0e12,    // 16 cores × 128 lanes × FMA × ~1.3 GHz
             launch_overhead: 2.0e-6,
             dtype_bytes: 4.0,
-            storage: crate::scalar::Dtype::F32,
+            compute: crate::scalar::Dtype::F32,
+            policy: Policy::default(),
             min_blocks: 32.0, // ~2 resident threadgroups per core to hide latency
             // fitted from this machine's own measured points (see above):
             // 32768 lanes x 4 B / 200 GB/s = 655 ns effective.
@@ -115,7 +149,7 @@ pub struct Kernel {
 // ── feasibility ──────────────────────────────────────────────────────────────
 
 /// A kernel is feasible iff its per-block working set fits the device.
-pub fn feasible(dev: &DeviceProfile, k: &Kernel) -> bool {
+pub fn feasible(dev: &DeviceSpecs, k: &Kernel) -> bool {
     k.sram_per_block <= dev.sram_bytes && k.regs_per_block <= dev.regfile_bytes
 }
 
@@ -124,7 +158,7 @@ pub fn feasible(dev: &DeviceProfile, k: &Kernel) -> bool {
 /// Effective occupancy ∈ (0, 1]: how much of the machine the kernel keeps
 /// busy. Bounded by how many blocks fit in SRAM / registers and by how much
 /// independent work exists, normalized against the latency-hiding floor.
-pub fn occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
+pub fn occupancy(dev: &DeviceSpecs, k: &Kernel) -> f64 {
     let by_sram = (dev.sram_bytes / k.sram_per_block).floor();
     let by_reg = (dev.regfile_bytes / k.regs_per_block).floor();
     let resident = by_sram.min(by_reg).min(k.parallel_blocks).max(1.0);
@@ -139,13 +173,13 @@ pub fn occupancy(dev: &DeviceProfile, k: &Kernel) -> f64 {
 /// That is exactly why re-associating such a fold into a split reduction pays
 /// even when it is memory-bound, and why a contiguous `chunk` run beats one
 /// narrow load per lane. Anyone pricing traffic wants this, not the peak.
-pub fn sustainable_bandwidth(dev: &DeviceProfile, lanes: f64, bytes_in_flight_per_lane: f64) -> f64 {
+pub fn sustainable_bandwidth(dev: &DeviceSpecs, lanes: f64, bytes_in_flight_per_lane: f64) -> f64 {
     let outstanding = lanes.max(1.0) * bytes_in_flight_per_lane.max(1.0);
     dev.hbm_bandwidth * (outstanding / (dev.hbm_bandwidth * dev.mem_latency_s)).clamp(1.0 / 64.0, 1.0)
 }
 
 /// [`sustainable_bandwidth`] for a kernel whose shape is already parameterized.
-fn kernel_bandwidth(dev: &DeviceProfile, k: &Kernel) -> f64 {
+fn kernel_bandwidth(dev: &DeviceSpecs, k: &Kernel) -> f64 {
     sustainable_bandwidth(dev, k.parallel_blocks * k.lanes_per_block, k.bytes_in_flight_per_lane)
 }
 
@@ -154,7 +188,7 @@ fn kernel_bandwidth(dev: &DeviceProfile, k: &Kernel) -> f64 {
 /// hiding needs resident warps); traffic by the bandwidth the shape sustains,
 /// not the peak (saturation needs loads in flight). Right for kernels that
 /// overlap compute with traffic — the cooperative tiled kind this module ranks.
-pub fn kernel_time(dev: &DeviceProfile, k: &Kernel) -> f64 {
+pub fn kernel_time(dev: &DeviceSpecs, k: &Kernel) -> f64 {
     let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
     let memory = k.hbm_bytes / kernel_bandwidth(dev, k);
     compute.max(memory) + dev.launch_overhead
@@ -170,7 +204,7 @@ pub fn kernel_time(dev: &DeviceProfile, k: &Kernel) -> f64 {
 /// time for the kernels the emitter actually generates, whose serial
 /// per-thread stream loops overlap compute with traffic poorly; the roofline
 /// max stays the model for cooperative tiled kernels.
-pub fn kernel_time_additive(dev: &DeviceProfile, k: &Kernel) -> f64 {
+pub fn kernel_time_additive(dev: &DeviceSpecs, k: &Kernel) -> f64 {
     let compute = k.flops / (dev.peak_flops * occupancy(dev, k));
     let memory = k.hbm_bytes / kernel_bandwidth(dev, k);
     compute + memory + dev.launch_overhead
@@ -178,7 +212,7 @@ pub fn kernel_time_additive(dev: &DeviceProfile, k: &Kernel) -> f64 {
 
 /// Total time for a schedule. `None` if any kernel is infeasible — an
 /// infeasible schedule has no cost, it simply cannot run.
-pub fn schedule_time(dev: &DeviceProfile, kernels: &[Kernel]) -> Option<f64> {
+pub fn schedule_time(dev: &DeviceSpecs, kernels: &[Kernel]) -> Option<f64> {
     if kernels.iter().all(|k| feasible(dev, k)) {
         Some(kernels.iter().map(|k| kernel_time(dev, k)).sum())
     } else {
@@ -190,7 +224,7 @@ pub fn schedule_time(dev: &DeviceProfile, kernels: &[Kernel]) -> Option<f64> {
 
 /// Inner search: the cheapest feasible kernel from a family of candidates
 /// (typically one per tile size).
-pub fn best_tile<T>(dev: &DeviceProfile, candidates: impl IntoIterator<Item = (T, Kernel)>) -> Option<(T, Kernel)> {
+pub fn best_tile<T>(dev: &DeviceSpecs, candidates: impl IntoIterator<Item = (T, Kernel)>) -> Option<(T, Kernel)> {
     candidates
         .into_iter()
         .filter(|(_, k)| feasible(dev, k))
@@ -199,7 +233,7 @@ pub fn best_tile<T>(dev: &DeviceProfile, candidates: impl IntoIterator<Item = (T
 
 /// Outer search: the cheapest feasible schedule (fusion partition) among
 /// candidate plans. Returns its index and total cost; `None` if none fit.
-pub fn cheapest(dev: &DeviceProfile, plans: &[&[Kernel]]) -> Option<(usize, f64)> {
+pub fn cheapest(dev: &DeviceSpecs, plans: &[&[Kernel]]) -> Option<(usize, f64)> {
     plans
         .iter()
         .enumerate()
@@ -226,7 +260,7 @@ mod tests {
     // occupancy is bounded, and a worse working set never raises it.
     #[test]
     fn occupancy_is_bounded_and_monotone() {
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
         let small = occupancy(&dev, &kernel(1e9, 1e6, 8_000.0, 1e6));
         let big = occupancy(&dev, &kernel(1e9, 1e6, 80_000.0, 1e6));
         assert!(small > 0.0 && small <= 1.0);
@@ -236,7 +270,7 @@ mod tests {
     // schedule_time sums feasible kernels and rejects an infeasible one.
     #[test]
     fn schedule_time_rejects_infeasible() {
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
         let ok = kernel(1e9, 1e6, 16_000.0, 1e4);
         let too_big = kernel(1e9, 1e6, dev.sram_bytes + 1.0, 1e4);
         assert!(schedule_time(&dev, &[ok.clone(), ok.clone()]).is_some());
@@ -246,7 +280,7 @@ mod tests {
     // best_tile picks the minimum-time feasible candidate.
     #[test]
     fn best_tile_picks_cheapest_feasible() {
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
         // tile 4 is infeasible; among the feasible, more parallelism wins
         let cands = vec![
             (1usize, kernel(1e10, 1e6, 16_000.0, 1.0)),
@@ -260,7 +294,7 @@ mod tests {
     // cheapest picks the lower-cost feasible plan and skips infeasible ones.
     #[test]
     fn cheapest_plan_wins() {
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
         let cheap = vec![kernel(1e9, 1e6, 16_000.0, 1e4)];
         let dear = vec![kernel(1e12, 1e6, 16_000.0, 1e4)];
         let dead = vec![kernel(1e6, 1e6, dev.sram_bytes + 1.0, 1e4)];

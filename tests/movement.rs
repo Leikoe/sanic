@@ -9,7 +9,7 @@
 //! two ways: `eval` (the naive semantics) against a hand-written reference,
 //! and `partition(...).execute` (the compiled schedule) against `eval`.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::partition::{Stage, partition};
@@ -144,7 +144,7 @@ fn conv1d_is_one_derived_kernel_and_matches_hand() {
 
     // it partitions to ONE fused kernel (implicit GEMM over the flattened
     // reduction axis), and the schedule reproduces the reference
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "conv must be one kernel:\n{}", sched.render());
     let Stage::Fused { spec, .. } = &sched.stages[0] else {
         panic!("expected a fused stage")
@@ -205,7 +205,7 @@ fn conv2d_is_one_derived_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "conv2d must be one kernel:\n{}", sched.render());
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -252,7 +252,7 @@ fn padded_conv1d_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "padded conv is still one kernel");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -278,7 +278,7 @@ fn maxpool_is_one_kernel_and_matches_hand() {
     });
     assert_close(&got, &hand);
 
-    let sched = partition(&pool, &DeviceProfile::toy());
+    let sched = partition(&pool, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "pooling is one kernel");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
@@ -368,7 +368,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
     assert_close(&got, &hand);
 
     // one fused flash kernel streaming the WINDOW axis
-    let sched = partition(&attn, &DeviceProfile::toy());
+    let sched = partition(&attn, &DeviceSpecs::toy());
     assert_eq!(
         sched.stages.len(),
         1,

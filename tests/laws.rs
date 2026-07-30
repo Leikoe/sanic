@@ -715,7 +715,7 @@ fn embedding_is_opaque() {
 // ── Scan has complete scalar-monoid semantics and an honest fallback stage ─
 #[test]
 fn scalar_prefix_scan_executes_through_the_fallback() {
-    use sanic::cost::DeviceProfile;
+    use sanic::cost::DeviceSpecs;
     use sanic::interp::{Env, Value, eval};
     use sanic::partition::{Stage, partition};
 
@@ -725,7 +725,7 @@ fn scalar_prefix_scan_executes_through_the_fallback() {
     let prefix = scan(input("X", [n]), 0usize, Monoid::Add);
 
     assert_eq!(eval(&prefix, &env).data, vec![2.0, 1.0, 4.0, 4.5, 8.5]);
-    let schedule = partition(&prefix, &DeviceProfile::toy());
+    let schedule = partition(&prefix, &DeviceSpecs::toy());
     assert!(matches!(schedule.stages.as_slice(), [Stage::Fallback { .. }]));
     assert_eq!(schedule.execute(&env).data, vec![2.0, 1.0, 4.0, 4.5, 8.5]);
 }

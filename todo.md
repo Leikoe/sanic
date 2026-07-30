@@ -1589,7 +1589,21 @@ timings hold.
 
 ### M13 — *absorbed into M12* (minting-correct replaces widening; no separate pass)
 
-### M14 — Declarations replace the global · [todo] · retires *device-dependent numerics*
+### M14 — Declarations replace the global · [named LANDED · retirement open] · retires *device-dependent numerics*
+
+**Landed (M14a):** the device tells the truth. `DeviceProfile` is
+`DeviceSpecs`; the boundary storage is a typed `cost::Policy` the caller
+attaches (`with_storage` now constructs one), read through
+`DeviceSpecs::storage()`; and the struct gained its first capability fact,
+`compute: Dtype` — the register width, which is what bounds integer
+exactness in flight. "Profile" no longer collides with profiling, and the
+policy no longer masquerades as a hardware number.
+
+**Still open (M14-final):** retiring the device-attached policy itself —
+handing `Policy` to compilation directly, per-value `stored(d)` for the
+reals that want narrower-than-policy, ABBA on the 16%. Note §5.2's softening
+stands: a policy DEFAULT for undeclared reals is legitimate and stays; what
+retires is its attachment to the device.
 
 Retire `with_storage` for per-value `stored(d)`. The motivation is portability,
 not hygiene: today the interpreter rounds only at an explicit `RoundTo` while

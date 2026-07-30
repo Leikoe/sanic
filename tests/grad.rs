@@ -10,7 +10,7 @@
 //! **exactly like a forward graph** — the backward pass is just another
 //! dataflow program.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::grad::grad;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
@@ -282,7 +282,7 @@ fn gradient_schedules_like_any_graph() {
     for name in ["V", "Q"] {
         let g = &grads[name];
         let reference = eval(g, &env);
-        let sched = partition(g, &DeviceProfile::toy());
+        let sched = partition(g, &DeviceSpecs::toy());
         assert!(
             !sched.stages.is_empty(),
             "gradient of {name} must partition:\n{}",
@@ -333,8 +333,7 @@ fn sgd_training_loop_converges() {
     );
 
     // one schedule computes the loss AND the updated weights
-    let sched =
-        sanic::partition::partition_many(&[(loss_node.clone(), "loss"), (step, "w_next")], &DeviceProfile::toy());
+    let sched = sanic::partition::partition_many(&[(loss_node.clone(), "loss"), (step, "w_next")], &DeviceSpecs::toy());
 
     let mut sess = sanic::runtime::Session::new();
     sess.bind("X", xs);
@@ -527,7 +526,7 @@ fn backward_schedule_census() {
         .zip(grad_names)
         .filter_map(|(name, out)| grads.get(name).map(|g| (g.clone(), out)))
         .collect();
-    let schedule = partition_many(&roots, &DeviceProfile::m1_pro());
+    let schedule = partition_many(&roots, &DeviceSpecs::m1_pro());
 
     let mut census: std::collections::HashMap<&str, usize> = Default::default();
     for stage in &schedule.stages {

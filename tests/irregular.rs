@@ -15,7 +15,7 @@
 //! fold — outside the algebra this compiler trusts, and unneeded for
 //! inference.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::derive::{SlotKind, derive};
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
@@ -63,7 +63,7 @@ fn argmax_is_one_generic_product_fold() {
         ]
     ));
 
-    let schedule = partition(&node, &DeviceProfile::toy());
+    let schedule = partition(&node, &DeviceSpecs::toy());
     assert_eq!(
         schedule.stages.len(),
         1,
@@ -119,7 +119,7 @@ fn topk_partitions_and_executes() {
             [(v.clone(), vn), (i.clone(), in_)]
         })
         .collect();
-    let sched = partition_many(&names, &DeviceProfile::toy());
+    let sched = partition_many(&names, &DeviceSpecs::toy());
 
     let mut run_env = env.clone();
     sched.execute_env(&mut run_env);
@@ -163,10 +163,7 @@ fn topk_all_composition_matches_and_schedules() {
     }
 
     // The generic graph still runs through the ordinary partitioned pipeline.
-    let sched = partition_many(
-        &[(all_values, "values"), (all_indices, "indices")],
-        &DeviceProfile::toy(),
-    );
+    let sched = partition_many(&[(all_values, "values"), (all_indices, "indices")], &DeviceSpecs::toy());
     let mut run_env = env.clone();
     sched.execute_env(&mut run_env);
     let values = &run_env["values"];
@@ -267,7 +264,7 @@ fn scatter_add_matches_hand_with_collisions() {
     }
 
     // and through the pipeline: one fused kernel (a one-hot contraction)
-    let sched = partition(&sc, &DeviceProfile::toy());
+    let sched = partition(&sc, &DeviceSpecs::toy());
     assert_eq!(sched.stages.len(), 1, "scatter-add is one fold:\n{}", sched.render());
     let executed = sched.execute(&env);
     let exec_p = executed.permuted_to(&got.axes);

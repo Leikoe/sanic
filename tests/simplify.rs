@@ -4,7 +4,7 @@
 //! no stop-gradient. The winner-mask of the stabilizing max-shift cancels, and
 //! cross-root CSE lets the backward reuse the forward's logsumexp carrier.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::grad::grad;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
@@ -102,7 +102,7 @@ fn composed_logsumexp_backward_matches_the_primitive() {
         let roots = simplify_many(&[loss, dz]);
         partition_many(
             &[(roots[0].clone(), "loss"), (roots[1].clone(), "dZ")],
-            &DeviceProfile::toy(),
+            &DeviceSpecs::toy(),
         )
     };
     let composed = schedule(false);
@@ -165,7 +165,7 @@ fn partition_computes_a_structural_duplicate_once() {
     let shared = combine(shared_fold.clone(), shared_fold);
     let duplicated = combine(row_energy(x()), row_energy(x()));
 
-    let toy = DeviceProfile::toy();
+    let toy = DeviceSpecs::toy();
     let shared_schedule = partition_many(&[(shared.clone(), "Out")], &toy);
     let duplicated_schedule = partition_many(&[(duplicated.clone(), "Out")], &toy);
     assert_eq!(

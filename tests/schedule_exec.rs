@@ -11,7 +11,7 @@
 //! preserve the semantics — on a real multi-head transformer block, not a
 //! single kernel in isolation.
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::nn::scaled_dot_product_attention;
@@ -89,7 +89,7 @@ fn attention_block_schedule_executes_to_reference() {
     let o = matmul(attn, transpose(input("Wo", [dm, dv]), 0usize, 1usize)); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
-    let sched = partition(&y, &DeviceProfile::toy());
+    let sched = partition(&y, &DeviceSpecs::toy());
     let executed = sched.execute(&env);
     let reference = eval(&y, &env);
     assert_close(&executed, &reference);
@@ -163,7 +163,7 @@ fn full_transformer_block_schedule_executes_to_reference() {
 
     let logits = matmul(yb, transpose(input("W_lm", [v, dm]), 0usize, 1usize)); // [s, v]
 
-    let sched = partition(&logits, &DeviceProfile::toy());
+    let sched = partition(&logits, &DeviceSpecs::toy());
     assert!(sched.kernel_count() >= 2, "expected a multi-kernel schedule");
     let executed = sched.execute(&env);
     let reference = eval(&logits, &env);

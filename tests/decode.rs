@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::partition::{Schedule, partition_many};
@@ -92,7 +92,7 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
 
     partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
-        &DeviceProfile::toy(),
+        &DeviceSpecs::toy(),
     )
 }
 

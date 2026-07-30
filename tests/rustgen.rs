@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use sanic::cost::DeviceProfile;
+use sanic::cost::DeviceSpecs;
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::nn::scaled_dot_product_attention;
@@ -139,7 +139,7 @@ fn flash_attention_compiles_and_matches() {
         Some(1.0),
         false,
     );
-    let sched = partition(&attn, &DeviceProfile::toy());
+    let sched = partition(&attn, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&attn, &env);
     compile_and_verify("flash", &program, &env, &reference);
@@ -164,7 +164,7 @@ fn quantized_matmul_compiles_and_matches() {
         vec![input("qW", [o, dm]), unsqueeze(input("scale", [o]), 1usize)],
     );
     let y = matmul(input("X", [s, dm]), transpose(dw, 0usize, 1usize));
-    let sched = partition(&y, &DeviceProfile::toy());
+    let sched = partition(&y, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&y, &env);
     compile_and_verify("quant", &program, &env, &reference);
@@ -206,7 +206,7 @@ fn conv2d_compiles_and_matches() {
     );
     let conv = matmul(xf, wf);
 
-    let sched = partition(&conv, &DeviceProfile::toy());
+    let sched = partition(&conv, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&conv, &env);
     compile_and_verify("conv2d", &program, &env, &reference);
@@ -261,7 +261,7 @@ fn sliding_window_attention_compiles_and_matches() {
         add_r(),
     );
 
-    let sched = partition(&attn, &DeviceProfile::toy());
+    let sched = partition(&attn, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&attn, &env);
     compile_and_verify("swa", &program, &env, &reference);
@@ -338,7 +338,7 @@ fn transformer_block_compiles_and_matches() {
     let yb = map(MapOp::Add, vec![mlp, res1]);
     let logits = matmul(yb, transpose(input("W_lm", [v, dm]), 0usize, 1usize));
 
-    let sched = partition(&logits, &DeviceProfile::toy());
+    let sched = partition(&logits, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(&logits, &env);
     compile_and_verify("block", &program, &env, &reference);
@@ -368,7 +368,7 @@ fn attention_gradient_compiles_and_matches() {
 
     let grads = sanic::grad::grad(&loss, &["Q"]);
     let g = &grads["Q"];
-    let sched = partition(g, &DeviceProfile::toy());
+    let sched = partition(g, &DeviceSpecs::toy());
     let program = emit_schedule(&sched);
     let reference = eval(g, &env);
     compile_and_verify("dq", &program, &env, &reference);

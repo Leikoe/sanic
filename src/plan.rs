@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
+use crate::cost::{DeviceSpecs, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
 use crate::ir::{self, AxisRef, AxisSelector, Node as NodeKind, NodeRef as Node, input_axes, leaf_names};
 
@@ -35,7 +35,7 @@ pub fn plan_axis(
     node: &Node,
     streaming_axis: impl AxisSelector,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
 ) -> Option<KernelSpec> {
     plan_axis_with_groups(
         node,
@@ -84,7 +84,7 @@ pub fn plan_axis_with_groups(
     node: &Node,
     streaming_axis: impl AxisSelector,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     groups: &mut GroupCache,
     widths: &HashMap<&'static str, f64>,
 ) -> Option<KernelSpec> {
@@ -109,7 +109,7 @@ pub fn plan_axis_emitted(
     node: &Node,
     streaming_axis: impl AxisSelector,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     groups: &mut GroupCache,
     widths: &HashMap<&'static str, f64>,
 ) -> Option<KernelSpec> {
@@ -126,7 +126,7 @@ fn plan_axis_costed(
     node: &Node,
     streaming_axis: AxisRef,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     groups: &mut GroupCache,
     total_flops: f64,
     widths: &HashMap<&'static str, f64>,
@@ -575,7 +575,7 @@ pub fn fold_sched(
     fold_node: &Node,
     streaming_axis: AxisRef,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     widths: &HashMap<&'static str, f64>,
 ) -> FoldSched {
     best_fold_sched(fold_node, streaming_axis, carrier, dev, widths).0
@@ -603,7 +603,7 @@ pub fn priced_fold_sched_candidates(
     fold_node: &Node,
     streaming_axis: AxisRef,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     widths: &HashMap<&'static str, f64>,
 ) -> Vec<(FoldSched, Option<SchedPrice>)> {
     let ext = |ax: AxisRef| ax.extent() as f64;
@@ -756,7 +756,7 @@ fn best_fold_sched(
     fold_node: &Node,
     streaming_axis: AxisRef,
     carrier: &Carrier,
-    dev: &DeviceProfile,
+    dev: &DeviceSpecs,
     widths: &HashMap<&'static str, f64>,
 ) -> (FoldSched, f64, f64) {
     let s_ext = streaming_axis.extent();
@@ -909,7 +909,7 @@ fn count_flops_memo(node: &Node, resolver: &mut ir::Resolver, fc: &mut HashMap<*
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cost::DeviceProfile;
+    use crate::cost::DeviceSpecs;
     use crate::derive::{Expr, SlotKind, derive};
     use crate::ir::*;
     use crate::nn::scaled_dot_product_attention;
@@ -937,7 +937,7 @@ mod tests {
             false,
         );
         let c = derive(&attn, key_axis).unwrap();
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
         let spec = plan_axis(&attn, key_axis, &c, &dev).unwrap();
 
         assert_eq!(spec.streaming_axis, key_axis);
@@ -952,7 +952,7 @@ mod tests {
         let stream = axis_refs(&x)[0];
         let s = reduce(x, 0usize, Monoid::Add);
         let c = derive(&s, stream).unwrap();
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
         let spec = plan_axis(&s, stream, &c, &dev).unwrap();
 
         assert!(spec.cost > 0.0, "a scalar-output fold still plans");
@@ -976,7 +976,7 @@ mod tests {
         carrier.spans.push(Vec::new());
         carrier.kinds.push(SlotKind::Plain(Monoid::Add));
 
-        plan_axis(&dot, stream_axis, &carrier, &DeviceProfile::m1_pro())
+        plan_axis(&dot, stream_axis, &carrier, &DeviceSpecs::m1_pro())
             .expect("the output axis is a legal tile even if one slot is invariant");
     }
 
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn quantized_weights_price_less_bandwidth() {
         let (s, d, f) = (axis("s", 4), axis("d", 4096), axis("f", 4096));
-        let dev = DeviceProfile::toy();
+        let dev = DeviceSpecs::toy();
 
         // The declaration is a Γ fact now, so the test states it as one: the
         // same term, priced under three different bindings.
