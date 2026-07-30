@@ -52,20 +52,20 @@ fn linear_vector(x: NodeRef, weight: NodeRef) -> NodeRef {
 /// The single-head attention LM decode step: cache updates + logits.
 /// Axes: t = cache length (max sequence), dm = model, dk/dv = head, v = vocab.
 fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
-    let x = input("x", [dm], Dtype::F32); // current token's embedding
-    let pos = input("pos", [], Dtype::F32); // current position, as data
+    let x = input("x", [dm]); // current token's embedding
+    let pos = input("pos", []); // current position, as data
 
-    let new_k = linear_vector(x.clone(), input("Wk", [dk, dm], Dtype::F32)); // [dk]
-    let new_v = linear_vector(x.clone(), input("Wv", [dv, dm], Dtype::F32)); // [dv]
-    let q = linear_vector(x, input("Wq", [dk, dm], Dtype::F32)); // [dk]
+    let new_k = linear_vector(x.clone(), input("Wk", [dk, dm])); // [dk]
+    let new_v = linear_vector(x.clone(), input("Wv", [dv, dm])); // [dv]
+    let q = linear_vector(x, input("Wq", [dk, dm])); // [dk]
 
     // cache row writes: updated[t,·] = where(t == pos, new, cache[t,·])
-    let cache_k = input("cache_k", [t, dk], Dtype::F32);
+    let cache_k = input("cache_k", [t, dk]);
     let ck = map(
         MapOp::Where,
         vec![one_hot_like(cache_k.clone(), 0usize, pos.clone()), new_k, cache_k],
     ); // [t, dk]
-    let cache_v = input("cache_v", [t, dv], Dtype::F32);
+    let cache_v = input("cache_v", [t, dv]);
     let cv = map(
         MapOp::Where,
         vec![one_hot_like(cache_v.clone(), 0usize, pos.clone()), new_v, cache_v],
@@ -88,7 +88,7 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
         0usize,
         Monoid::Add,
     ); // [dv]
-    let logits = linear_vector(out, input("Wl", [v, dv], Dtype::F32)); // [v]
+    let logits = linear_vector(out, input("Wl", [v, dv])); // [v]
 
     partition_many(
         &[(ck, "ck_new"), (cv, "cv_new"), (logits, "logits")],
@@ -100,11 +100,11 @@ fn decode_step(t: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis) -> Schedule {
 /// evaluated by the oracle. Row `s` of its logits is what decode step `s`
 /// must produce.
 fn prefill_logits(s: Axis, t2: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis, env: &Env) -> Value {
-    let x = input("X", [s, dm], Dtype::F32);
+    let x = input("X", [s, dm]);
     let xt = rename(x.clone(), 0usize, t2);
-    let q = matmul(x, transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize)); // [s, dk]
-    let k = matmul(xt.clone(), transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize)); // [t2, dk]
-    let vv = matmul(xt, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [t2, dv]
+    let q = matmul(x, transpose(input("Wq", [dk, dm]), 0usize, 1usize)); // [s, dk]
+    let k = matmul(xt.clone(), transpose(input("Wk", [dk, dm]), 0usize, 1usize)); // [t2, dk]
+    let vv = matmul(xt, transpose(input("Wv", [dv, dm]), 0usize, 1usize)); // [t2, dv]
     let scale = konst(1.0 / (dk.extent() as f64).sqrt());
     let scores = map(MapOp::Mul, vec![matmul(q, transpose(k, 0usize, 1usize)), scale]);
     let masked = map(
@@ -113,7 +113,7 @@ fn prefill_logits(s: Axis, t2: Axis, dm: Axis, dk: Axis, dv: Axis, v: Axis, env:
     );
     let att = softmax(masked, 1usize);
     let out = matmul(att, vv); // [s, dv]
-    let logits = matmul(out, transpose(input("Wl", [v, dv], Dtype::F32), 0usize, 1usize)); // [s, v]
+    let logits = matmul(out, transpose(input("Wl", [v, dv]), 0usize, 1usize)); // [s, v]
     eval(&logits, env)
 }
 
@@ -186,8 +186,8 @@ fn incremental_decode_equals_prefill() {
     // and the caches now hold exactly the prefill K/V
     let k_ref = eval(
         &matmul(
-            rename(input("X", [s, dm], Dtype::F32), 0usize, t),
-            transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize),
+            rename(input("X", [s, dm]), 0usize, t),
+            transpose(input("Wk", [dk, dm]), 0usize, 1usize),
         ),
         &prefill_env,
     );

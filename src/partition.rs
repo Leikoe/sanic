@@ -37,7 +37,7 @@ use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, ite
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
     self, AxisRef, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ResolvedAffineIndex, all_axis_refs, input_axes,
-    input_dtypes, leaf_names,
+    leaf_names,
 };
 use crate::plan::{GroupCache, KernelSpec, SIMD, count_issue_ops, plan_axis_emitted, plan_axis_with_groups};
 
@@ -123,6 +123,12 @@ pub struct Schedule {
     /// ([`Schedule::output_dtypes`]) or the policy — see
     /// [`Schedule::width_of`].
     pub minted_dtypes: std::collections::HashMap<String, crate::ir::Dtype>,
+    /// The caller's storage declarations — Γ's Caller entries: input name →
+    /// the width its bound buffer uses (a bf16 checkpoint weight, packed
+    /// int4). Undeclared inputs are f32. Populated from the declarations a
+    /// program hands to [`partition_many_declared`]; every emission,
+    /// allocation and pricing question about an input resolves here.
+    pub declared_dtypes: std::collections::HashMap<String, crate::ir::Dtype>,
     /// The decline census: every MONOIDAL-classified axis the deriver could
     /// not compose at the node the partitioner stood on, in emission order.
     /// [`Schedule::decline_census`] buckets it.
@@ -153,6 +159,17 @@ pub fn partition(node: &Node, dev: &DeviceProfile) -> Schedule {
 /// root reachable from a *later* root is reused through its materialization
 /// (so put producers before consumers). Each root lands under its given name.
 pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Schedule {
+    partition_many_declared(roots, dev, &std::collections::HashMap::new())
+}
+
+/// [`partition_many`] with the program's storage declarations — Γ's Caller
+/// entries. The undeclared default is f32, so the short form is exact for
+/// every all-f32 program.
+pub fn partition_many_declared(
+    roots: &[(Node, &'static str)],
+    dev: &DeviceProfile,
+    declared: &std::collections::HashMap<String, crate::ir::Dtype>,
+) -> Schedule {
     // Everything below reads sharing through pointer-keyed maps (`parents`,
     // `done`), which is sound because construction interns: two separately
     // built but structurally identical subgraphs are already one node, and a
@@ -170,6 +187,8 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         declines: Vec::new(),
         exact_boundaries: Vec::new(),
         minted_dtypes: std::collections::HashMap::new(),
+        declared,
+        produced: std::collections::HashSet::new(),
         fresh: 0,
         done: HashMap::new(),
         keepalive: Vec::new(),
@@ -207,6 +226,7 @@ pub fn partition_many(roots: &[(Node, &'static str)], dev: &DeviceProfile) -> Sc
         agrees_in_place: Vec::new(),
         exact_boundaries: std::mem::take(&mut p.exact_boundaries),
         minted_dtypes: std::mem::take(&mut p.minted_dtypes),
+        declared_dtypes: declared.clone(),
         _keepalive: keepalive,
     };
     // SANIC_DEBUG >= 1: dump the schedule and each kernel's fusion, like
@@ -407,6 +427,11 @@ struct Partitioner<'a> {
     /// immediately so a consumer spliced LATER in this same partition reads
     /// the buffer at the width its producer writes.
     minted_dtypes: std::collections::HashMap<String, crate::ir::Dtype>,
+    /// The caller's declarations (see [`Schedule::declared_dtypes`]).
+    declared: &'a std::collections::HashMap<String, crate::ir::Dtype>,
+    /// Every buffer this partition has materialized — the names that price
+    /// at the boundary policy rather than the undeclared-input default.
+    produced: std::collections::HashSet<String>,
     fresh: usize,
     /// Nodes already materialized, by pointer → the name they live under.
     /// A DAG-shared producer (a residual, say) is cut once, not per consumer.
@@ -525,6 +550,7 @@ impl Partitioner<'_> {
     /// changes, so there is no producer/consumer agreement to maintain —
     /// decline, don't guess.
     fn note_boundary(&mut self, name: &str, node: &Node) {
+        self.produced.insert(name.to_string());
         let claim = crate::numeric::infer_root(node);
         if !claim.system.is_exact() {
             return;
@@ -542,11 +568,27 @@ impl Partitioner<'_> {
         }
     }
 
-    /// The width a consumer must read `name` at: the law's mint if one
-    /// exists, the boundary policy otherwise. (Pins are set after partition
-    /// returns and apply to terminal outputs, which no stage reads.)
-    fn read_width(&self, name: &str) -> crate::ir::Dtype {
-        self.minted_dtypes.get(name).copied().unwrap_or(self.dev.storage)
+    /// Bytes per element of `name` for pricing: the law's mint, else the
+    /// caller's declaration, else — for a buffer this partition produced —
+    /// the boundary policy, else f32, because undeclared inputs are f32.
+    /// (Pins are set after partition returns and apply to terminal outputs,
+    /// which no stage reads.)
+    fn byte_width(&self, name: &str) -> f64 {
+        if let Some(dtype) = self.minted_dtypes.get(name).or_else(|| self.declared.get(name)) {
+            return dtype.bytes_per_element();
+        }
+        if self.produced.contains(name) {
+            return self.dev.storage.bytes_per_element();
+        }
+        crate::ir::Dtype::F32.bytes_per_element()
+    }
+
+    /// The pricing widths of every leaf under `node`, for [`crate::plan`].
+    fn pricing_widths(&self, node: &Node) -> std::collections::HashMap<&'static str, f64> {
+        leaf_names(node)
+            .into_iter()
+            .map(|name| (name, self.byte_width(name)))
+            .collect()
     }
 
     /// Emit the stages that produce `node` under the name `out`.
@@ -765,7 +807,7 @@ impl Partitioner<'_> {
             }
             if let Some(&name) = self.done.get(&Arc::as_ptr(node)) {
                 // a materialized buffer read
-                let read = ir::input(name, node.shape(), self.read_width(name));
+                let read = ir::input(name, node.shape());
                 memo.insert(Arc::as_ptr(node), read.clone());
                 return read;
             }
@@ -1056,7 +1098,7 @@ impl Partitioner<'_> {
                 continue;
             }
             match current.as_ref() {
-                NodeKind::Input { dtype, .. } => bytes += volume * dtype.bytes_per_element(),
+                NodeKind::Input { name, .. } => bytes += volume * self.byte_width(name),
                 NodeKind::Const { .. } => {}
                 _ => {
                     ops += volume;
@@ -1210,7 +1252,8 @@ impl Partitioner<'_> {
             };
             // Rank by planned cost on the uncut graph; an unplannable axis
             // ranks last but is still a legal fold.
-            let cost = plan_axis_with_groups(node, axis, &c, self.dev, &mut self.plan_groups)
+            let widths = self.pricing_widths(node);
+            let cost = plan_axis_with_groups(node, axis, &c, self.dev, &mut self.plan_groups, &widths)
                 .map_or(f64::INFINITY, |s| s.cost);
             if best.as_ref().is_none_or(|(_, _, b)| cost < *b) {
                 best = Some((axis, c, cost));
@@ -1352,7 +1395,8 @@ impl Partitioner<'_> {
                 return leak(out);
             }
         };
-        match plan_axis_emitted(&cut_graph, cut_axis, &c2, self.dev, &mut self.plan_groups) {
+        let cut_widths = self.pricing_widths(&cut_graph);
+        match plan_axis_emitted(&cut_graph, cut_axis, &c2, self.dev, &mut self.plan_groups, &cut_widths) {
             Some(mut spec) => {
                 // Cost-driven cut placement at the carrier level: a deferred
                 // divisor keeps its whole normalizer fold in every output
@@ -1368,16 +1412,25 @@ impl Partitioner<'_> {
                 // fusion. Each retry removes one Div, so the recursion
                 // terminates.
                 if let Some(div) = smallest_div(&cut_graph) {
-                    let probe = ir::input("«div»", div.shape(), self.dev.storage);
+                    let probe = ir::input("«div»", div.shape());
                     let remainder = replace_many(&cut_graph, &[(div.clone(), probe)], &mut HashMap::new());
                     let alt_axis = relocate_axis(&cut_graph, &remainder, cut_axis, &c2.aliases).unwrap_or(cut_axis);
                     if let Ok(alt_carrier) = derive_with_structure_cache(&remainder, alt_axis, &mut self.structures)
-                        && let Some(alt) =
-                            plan_axis_emitted(&remainder, alt_axis, &alt_carrier, self.dev, &mut self.plan_groups)
+                        && let Some(alt) = {
+                            let alt_widths = self.pricing_widths(&remainder);
+                            plan_axis_emitted(
+                                &remainder,
+                                alt_axis,
+                                &alt_carrier,
+                                self.dev,
+                                &mut self.plan_groups,
+                                &alt_widths,
+                            )
+                        }
                     {
                         let dev = self.dev;
                         let div_floor = count_issue_ops(&div) / dev.peak_flops
-                            + subtree_read_bytes(&div) / dev.hbm_bandwidth
+                            + subtree_read_bytes(&div, &self.pricing_widths(&div)) / dev.hbm_bandwidth
                             + 2.0 * self.volume(&div) * dev.dtype_bytes / dev.hbm_bandwidth
                             + dev.launch_overhead;
                         if crate::debug_level() >= 3 {
@@ -1475,7 +1528,7 @@ impl Partitioner<'_> {
                 if i != hi {
                     let name = self.cut(p);
                     extra.push(name);
-                    let read = ir::input(name, p.shape(), self.read_width(name));
+                    let read = ir::input(name, p.shape());
                     subs.push((p.clone(), read));
                 }
             }
@@ -1493,10 +1546,6 @@ impl Partitioner<'_> {
                     self.emit(&producer, t)
                 }
             };
-            // The fold's minted width, under the name it was cut as — read
-            // BEFORE the rename below, so the epilogue reads the buffer at
-            // the width the fold actually writes it.
-            let fold_width = self.read_width(landed);
             if self.stages.len() > before
                 && let Some(Stage::Fused {
                     spec,
@@ -1522,7 +1571,7 @@ impl Partitioner<'_> {
                 } else {
                     leaked_out
                 };
-                subs.push((producer.clone(), ir::input(sentinel, producer.shape(), fold_width)));
+                subs.push((producer.clone(), ir::input(sentinel, producer.shape())));
                 let epi = replace_many(node, &subs, &mut HashMap::new());
                 spec.output_name = out.to_string();
                 // The rename moves the buffer's identity; the law's mint
@@ -1722,11 +1771,7 @@ impl<'c> CutPricing<'c> {
 /// still counted as its own subtree's reads: pricing an ancestor before the
 /// recursion reaches the materialized node overstates the recompute side,
 /// which only errs toward materializing the ancestor too.
-fn subtree_read_bytes(node: &Node) -> f64 {
-    let widths: HashMap<&'static str, f64> = input_dtypes(node)
-        .into_iter()
-        .map(|(name, dtype)| (name, dtype.bytes_per_element()))
-        .collect();
+fn subtree_read_bytes(node: &Node, widths: &HashMap<&'static str, f64>) -> f64 {
     let mut seen = HashSet::new();
     input_axes(node)
         .into_iter()
@@ -2077,6 +2122,7 @@ impl Schedule {
             .position(|output| output == name)
             .and_then(|index| self.output_dtypes.get(index).copied().flatten())
             .or_else(|| self.minted_dtypes.get(name).copied())
+            .or_else(|| self.declared_dtypes.get(name).copied())
             .unwrap_or(default)
     }
 
@@ -2463,7 +2509,7 @@ mod tests {
     #[test]
     fn stream_provenance_visits_a_shared_dag_once_per_axis_state() {
         let n = axis("n", 8);
-        let source = input("X", [n], Dtype::F32);
+        let source = input("X", [n]);
         let mut diamond = source.clone();
         for _ in 0..40 {
             diamond = map(MapOp::Add, vec![diamond.clone(), diamond]);
@@ -2474,20 +2520,19 @@ mod tests {
             stream_provenance(&diamond, &[stream], std::slice::from_ref(&source))[&Arc::as_ptr(&source)],
             vec![stream]
         );
-        assert_eq!(input_dtypes(&diamond), vec![("X", Dtype::F32)]);
     }
 
     #[test]
     fn fold_candidates_stop_at_the_nearest_reduction_frontier() {
         let old_axis = axis("old", 8);
         let new_axis = axis("new", 8);
-        let old = input("old", [old_axis], Dtype::F32);
+        let old = input("old", [old_axis]);
         let old_stream = source_axis(&old, 0);
         let mut history = reduce(old, 0usize, Monoid::Add);
         for _ in 0..40 {
             history = map(MapOp::Add, vec![history, konst(1.0)]);
         }
-        let new = input("new", [new_axis], Dtype::F32);
+        let new = input("new", [new_axis]);
         let new_stream = source_axis(&new, 0);
         let current = reduce(new, 0usize, Monoid::Add);
         let root = map(MapOp::Add, vec![history, current]);
@@ -2507,9 +2552,9 @@ mod tests {
     #[test]
     fn decanonicalized_gemm_simplifies_to_the_canonical_schedule() {
         let (s, k, d, e) = (axis("s", 1024), axis("k", 1024), axis("d", 64), axis("e", 64));
-        let q = input("Q", [s, d], Dtype::F32);
-        let kk = input("K", [k, d], Dtype::F32);
-        let v = input("V", [k, e], Dtype::F32);
+        let q = input("Q", [s, d]);
+        let kk = input("K", [k, d]);
+        let v = input("V", [k, e]);
         let q = unsqueeze(q, 1usize);
         let kk = unsqueeze(kk, 0usize);
         let scaled_scores: Vec<NodeRef> = vec![
@@ -2576,12 +2621,12 @@ mod tests {
     #[test]
     fn plain_attention_is_one_kernel() {
         let (s, k, d, e) = (axis("s", 1024), axis("k", 1024), axis("d", 64), axis("e", 64));
-        let key = input("K", [k, d], Dtype::F32);
+        let key = input("K", [k, d]);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
-            input("Q", [s, d], Dtype::F32),
+            input("Q", [s, d]),
             key,
-            input("V", [k, e], Dtype::F32),
+            input("V", [k, e]),
             None,
             0.0,
             false,
@@ -2610,17 +2655,14 @@ mod tests {
             axis("dq", 64),
             axis("dv", 64),
         );
-        let x_q = input("Xq", [s, dm], Dtype::F32);
-        let x_kv = input("Xkv", [k, dm], Dtype::F32);
+        let x_q = input("Xq", [s, dm]);
+        let x_kv = input("Xkv", [k, dm]);
         let query_stream = axis_refs(&x_q)[1];
         let kv_stream = axis_refs(&x_kv)[1];
         let key_axis = axis_refs(&x_kv)[0];
-        let q = matmul(x_q, transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize)); // [s, dq]
-        let kk = matmul(
-            x_kv.clone(),
-            transpose(input("Wk", [dq, dm], Dtype::F32), 0usize, 1usize),
-        ); // [k, dq]
-        let v = matmul(x_kv, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [k, dv]
+        let q = matmul(x_q, transpose(input("Wq", [dq, dm]), 0usize, 1usize)); // [s, dq]
+        let kk = matmul(x_kv.clone(), transpose(input("Wk", [dq, dm]), 0usize, 1usize)); // [k, dq]
+        let v = matmul(x_kv, transpose(input("Wv", [dv, dm]), 0usize, 1usize)); // [k, dv]
 
         let scores = matmul(q, transpose(kk, 0usize, 1usize));
         let out = matmul(softmax(scores, 1usize), v);
@@ -2653,11 +2695,11 @@ mod tests {
     #[test]
     fn rmsnorm_splits_into_fold_plus_map() {
         let (s, d) = (axis("s", 1024), axis("d", 1024));
-        let x = input("X", [s, d], Dtype::F32);
+        let x = input("X", [s, d]);
         let stream = axis_refs(&x)[1];
-        let g = input("G", [d], Dtype::F32);
-        let inv_d = input("inv_d", [], Dtype::F32);
-        let eps = input("eps", [], Dtype::F32);
+        let g = input("G", [d]);
+        let inv_d = input("inv_d", []);
+        let eps = input("eps", []);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, inv_d]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
@@ -2679,13 +2721,13 @@ mod tests {
     #[test]
     fn rmsnorm_fuses_into_a_projection_gemm() {
         let (s, d, f) = (axis("s", 1024), axis("d", 1024), axis("f", 512));
-        let x = input("X", [s, d], Dtype::F32);
-        let g = input("G", [d], Dtype::F32);
+        let x = input("X", [s, d]);
+        let g = input("G", [d]);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
-        let proj = matmul(norm, transpose(input("W", [f, d], Dtype::F32), 0usize, 1usize));
+        let proj = matmul(norm, transpose(input("W", [f, d]), 0usize, 1usize));
 
         let sched = partition(&proj, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "norm + GEMM = one kernel");
@@ -2704,8 +2746,8 @@ mod tests {
             axis("hidden", 2048),
             axis("projected", 256),
         );
-        let embedding = input("E", [vocab, hidden], Dtype::BF16);
-        let tokens = input("tokens", [token], Dtype::F32);
+        let embedding = input("E", [vocab, hidden]);
+        let tokens = input("tokens", [token]);
         let x = gather(embedding, tokens, 0usize);
         let sum_square = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean_square = map(
@@ -2716,14 +2758,11 @@ mod tests {
         let norm = map(
             MapOp::Div,
             vec![
-                map(MapOp::Mul, vec![x, input("G", [hidden], Dtype::BF16)]),
+                map(MapOp::Mul, vec![x, input("G", [hidden])]),
                 unsqueeze(denominator, 1usize),
             ],
         );
-        let projection = matmul(
-            norm,
-            transpose(input("W", [projected, hidden], Dtype::BF16), 0usize, 1usize),
-        );
+        let projection = matmul(norm, transpose(input("W", [projected, hidden]), 0usize, 1usize));
 
         let sum_sched = partition(&sum_square, &DeviceProfile::m1_pro());
         assert!(
@@ -2756,9 +2795,9 @@ mod tests {
             axis("head_dim", 64),
         );
         let attention = scaled_dot_product_attention(
-            input("q", [query_heads, query_sequence, head_dim], Dtype::F32),
-            input("k", [kv_heads, cache_sequence, head_dim], Dtype::F32),
-            input("v", [kv_heads, cache_sequence, head_dim], Dtype::F32),
+            input("q", [query_heads, query_sequence, head_dim]),
+            input("k", [kv_heads, cache_sequence, head_dim]),
+            input("v", [kv_heads, cache_sequence, head_dim]),
             None,
             0.0,
             false,
@@ -2783,14 +2822,14 @@ mod tests {
     #[test]
     fn norm_into_fat_head_cuts_at_the_divisor_by_price() {
         let (s, d, v) = (axis("s", 1), axis("d", 1024), axis("v", 200192));
-        let x = input("X", [s, d], Dtype::F32);
+        let x = input("X", [s, d]);
         let stream = axis_refs(&x)[1];
-        let g = input("G", [d], Dtype::F32);
+        let g = input("G", [d]);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, konst(1.0 / 1024.0)]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
         let norm = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
-        let head = matmul(norm, transpose(input("W", [v, d], Dtype::F32), 0usize, 1usize));
+        let head = matmul(norm, transpose(input("W", [v, d]), 0usize, 1usize));
 
         let sched = partition(&head, &DeviceProfile::m1_pro());
         assert!(
@@ -2817,10 +2856,10 @@ mod tests {
     #[test]
     fn residual_add_fuses_as_epilogue() {
         let (s, f, dm) = (axis("s", 1024), axis("f", 4096), axis("dm", 1024));
-        let x = input("X", [s, dm], Dtype::F32);
-        let h = input("H", [s, f], Dtype::F32);
+        let x = input("X", [s, dm]);
+        let h = input("H", [s, f]);
         let stream = axis_refs(&h)[1];
-        let w = input("W", [f, dm], Dtype::F32);
+        let w = input("W", [f, dm]);
         let proj = matmul(h, w); // [s, dm]
         let y = map(MapOp::Add, vec![proj, x]); // residual
 
@@ -2853,12 +2892,12 @@ mod tests {
     #[test]
     fn swiglu_activation_materializes_once_for_the_down_gemm() {
         let (s, dm, f) = (axis("s", 1024), axis("dm", 1024), axis("f", 4096));
-        let x = input("Xn", [s, dm], Dtype::F32);
-        let gate = matmul(x.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
-        let up = matmul(x, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
+        let x = input("Xn", [s, dm]);
+        let gate = matmul(x.clone(), transpose(input("Wg", [f, dm]), 0usize, 1usize)); // [s, f]
+        let up = matmul(x, transpose(input("Wu", [f, dm]), 0usize, 1usize)); // [s, f]
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let stream = axis_refs(&act)[1];
-        let down = matmul(act, input("Wd", [f, dm], Dtype::F32));
+        let down = matmul(act, input("Wd", [f, dm]));
 
         let sched = partition(&down, &DeviceProfile::toy());
         assert_eq!(
@@ -2891,7 +2930,7 @@ mod tests {
     #[test]
     fn composed_logsumexp_folds_as_one_carrier() {
         let (b, c) = (axis("b", 128), axis("c", 32));
-        let z = input("Z", [b, c], Dtype::F32);
+        let z = input("Z", [b, c]);
         let stream = axis_refs(&z)[1];
         let m = reduce(z.clone(), 1usize, Monoid::Max);
         let sumexp = reduce(
@@ -2938,15 +2977,15 @@ mod tests {
             axis("ri", 32),
             axis("fl", 4096),
         );
-        let gate = input("G", [f], Dtype::F32);
-        let up = input("U", [f], Dtype::F32);
+        let gate = input("G", [f]);
+        let up = input("U", [f]);
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let xs = split(act, 0usize, gi, ri);
         let prod = map(
             MapOp::Mul,
             vec![
-                map(MapOp::Mul, vec![input("Wd", [dm, gi, ri], Dtype::F32), xs]),
-                unsqueeze(input("Sc", [dm, gi], Dtype::F32), 2usize),
+                map(MapOp::Mul, vec![input("Wd", [dm, gi, ri]), xs]),
+                unsqueeze(input("Sc", [dm, gi]), 2usize),
             ],
         );
         let flattened = flatten(prod, &[1usize, 2usize][..], fl);
@@ -2992,10 +3031,10 @@ mod tests {
             axis("ri", 32),
             axis("fl", 4096),
         );
-        let x = input("Xn", [s, dm], Dtype::F32);
+        let x = input("Xn", [s, dm]);
         let stream = axis_refs(&x)[1];
-        let gate = matmul(x.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
-        let up = matmul(x, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
+        let gate = matmul(x.clone(), transpose(input("Wg", [f, dm]), 0usize, 1usize)); // [s, f]
+        let up = matmul(x, transpose(input("Wu", [f, dm]), 0usize, 1usize)); // [s, f]
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let coupled = crate::derive::derive(&act, stream)
             .unwrap_or_else(|decline| panic!("shared activation did not derive: {decline:?}"));
@@ -3004,8 +3043,8 @@ mod tests {
         let prod = map(
             MapOp::Mul,
             vec![
-                map(MapOp::Mul, vec![input("Wd", [dm, gi, ri], Dtype::F32), xs]),
-                unsqueeze(input("Sc", [dm, gi], Dtype::F32), 2usize),
+                map(MapOp::Mul, vec![input("Wd", [dm, gi, ri]), xs]),
+                unsqueeze(input("Sc", [dm, gi]), 2usize),
             ],
         );
         let flattened = flatten(prod, &[1usize, 2usize][..], fl);
@@ -3029,9 +3068,9 @@ mod tests {
     #[test]
     fn embedding_is_a_gather_stage() {
         let (v, dm, s) = (axis("v", 32000), axis("dm", 1024), axis("s", 1024));
-        let table = input("E", [v, dm], Dtype::F32);
+        let table = input("E", [v, dm]);
         let vocabulary = axis_refs(&table)[0];
-        let emb = embedding(table, input("ids", [s], Dtype::F32), 0usize);
+        let emb = embedding(table, input("ids", [s]), 0usize);
         let sched = partition(&emb, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1);
         assert!(matches!(&sched.stages[0], Stage::Gather { axis, .. } if *axis == vocabulary));
@@ -3049,22 +3088,19 @@ mod tests {
             axis("dq", 64),
             axis("dv", 64),
         );
-        let x = input("X", [s, dm], Dtype::F32);
-        let g = input("g", [dm], Dtype::F32);
-        let inv = input("inv_dm", [], Dtype::F32);
-        let eps = input("eps", [], Dtype::F32);
+        let x = input("X", [s, dm]);
+        let g = input("g", [dm]);
+        let inv = input("inv_dm", []);
+        let eps = input("eps", []);
         let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
         let mean = map(MapOp::Mul, vec![ss, inv]);
         let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, eps])]);
         let xn = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
         let xn_t = rename(xn.clone(), 0usize, t); // the key/value view
 
-        let q = matmul(xn, transpose(input("Wq", [dq, dm], Dtype::F32), 0usize, 1usize)); // [s, dq]
-        let k = matmul(
-            xn_t.clone(),
-            transpose(input("Wk", [dq, dm], Dtype::F32), 0usize, 1usize),
-        ); // [t, dq]
-        let v = matmul(xn_t, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [t, dv]
+        let q = matmul(xn, transpose(input("Wq", [dq, dm]), 0usize, 1usize)); // [s, dq]
+        let k = matmul(xn_t.clone(), transpose(input("Wk", [dq, dm]), 0usize, 1usize)); // [t, dq]
+        let v = matmul(xn_t, transpose(input("Wv", [dv, dm]), 0usize, 1usize)); // [t, dv]
         let attn = matmul(softmax(matmul(q, transpose(k, 0usize, 1usize)), 1usize), v);
 
         let sched = partition(&attn, &DeviceProfile::toy());
@@ -3093,12 +3129,12 @@ mod tests {
             axis("dmv", 512),
             axis("dm", 512),
         );
-        let key = input("K", [h, t, dk], Dtype::F32);
+        let key = input("K", [h, t, dk]);
         let key_axis = axis_refs(&key)[1];
         let attn = scaled_dot_product_attention(
-            input("Q", [h, s, dk], Dtype::F32),
+            input("Q", [h, s, dk]),
             key,
-            input("V", [h, t, dv], Dtype::F32),
+            input("V", [h, t, dv]),
             None,
             0.0,
             false,
@@ -3107,7 +3143,7 @@ mod tests {
         );
         let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv); // [s, dmv]
         let projection_stream = axis_refs(&flat)[1];
-        let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32)); // [s, dm]
+        let o = matmul(flat, input("Wo", [dmv, dm])); // [s, dm]
 
         let sched = partition(&o, &DeviceProfile::toy());
 
@@ -3129,16 +3165,13 @@ mod tests {
     #[test]
     fn computed_causal_mask_fuses_into_flash() {
         let (s, t, dk, dv) = (axis("s", 1024), axis("t", 1024), axis("dk", 64), axis("dv", 64));
-        let scores = matmul(
-            input("Q", [s, dk], Dtype::F32),
-            transpose(input("K", [t, dk], Dtype::F32), 0usize, 1usize),
-        );
+        let scores = matmul(input("Q", [s, dk]), transpose(input("K", [t, dk]), 0usize, 1usize));
         let scaled = map(MapOp::Mul, vec![scores, konst(0.125)]);
         let masked = map(
             MapOp::Add,
             vec![scaled.clone(), causal_mask_like(scaled, 0usize, 1usize)],
         );
-        let out = matmul(softmax(masked, 1usize), input("V", [t, dv], Dtype::F32));
+        let out = matmul(softmax(masked, 1usize), input("V", [t, dv]));
 
         let sched = partition(&out, &DeviceProfile::toy());
         assert_eq!(sched.stages.len(), 1, "mask and scale ride the lift");

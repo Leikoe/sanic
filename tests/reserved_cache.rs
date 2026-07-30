@@ -206,7 +206,7 @@ fn update_cache(cache: NodeRef, current: NodeRef, position: NodeRef) -> NodeRef 
 }
 
 fn projection(x: NodeRef, name: String, input_dim: Axis, output_dim: Axis) -> NodeRef {
-    let weight = input(leak(name), [output_dim, input_dim], Dtype::F32);
+    let weight = input(leak(name), [output_dim, input_dim]);
     matmul(x, transpose(weight, 0usize, 1usize))
 }
 
@@ -224,7 +224,7 @@ fn decode_block(axes: &Axes, cache_sequence: Axis, layer: usize, x: NodeRef, pos
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     let attn_input = rms_norm(
         x.clone(),
-        input(leak(name("input_layernorm.weight")), [axes.hidden], Dtype::F32),
+        input(leak(name("input_layernorm.weight")), [axes.hidden]),
         axes.hidden.extent(),
     );
 
@@ -265,7 +265,6 @@ fn decode_block(axes: &Axes, cache_sequence: Axis, layer: usize, x: NodeRef, pos
         input(
             leak(format!("cache.{layer}.key")),
             [axes.kv_heads, cache_sequence, axes.head_dim],
-            Dtype::F32,
         ),
         k,
         position.clone(),
@@ -274,7 +273,6 @@ fn decode_block(axes: &Axes, cache_sequence: Axis, layer: usize, x: NodeRef, pos
         input(
             leak(format!("cache.{layer}.value")),
             [axes.kv_heads, cache_sequence, axes.head_dim],
-            Dtype::F32,
         ),
         v,
         position.clone(),
@@ -299,7 +297,7 @@ fn decode_block(axes: &Axes, cache_sequence: Axis, layer: usize, x: NodeRef, pos
 
     let mlp_input = rms_norm(
         residual.clone(),
-        input(leak(name("post_attention_layernorm.weight")), [axes.hidden], Dtype::F32),
+        input(leak(name("post_attention_layernorm.weight")), [axes.hidden]),
         axes.hidden.extent(),
     );
     let gate = projection(
@@ -332,9 +330,9 @@ struct DecodeGraph {
 fn build_decode(config: Config, context_length: usize) -> DecodeGraph {
     let axes = Axes::new(config);
     let cache_sequence = axis("cache_sequence", context_length);
-    let position = input("position", [], Dtype::F32);
-    let tokens = input("tokens", [axes.sequence], Dtype::F32);
-    let embedding = input("model.embed_tokens.weight", [axes.vocab, axes.hidden], Dtype::F32);
+    let position = input("position", []);
+    let tokens = input("tokens", [axes.sequence]);
+    let embedding = input("model.embed_tokens.weight", [axes.vocab, axes.hidden]);
 
     let mut x = gather(embedding.clone(), tokens, 0usize);
     let mut cache_roots = Vec::with_capacity(config.layers * 2);
@@ -347,11 +345,7 @@ fn build_decode(config: Config, context_length: usize) -> DecodeGraph {
         cache_roots.push(decoded.value_cache);
         cache_names.push(leak(format!("cache.{layer}.value")));
     }
-    let x = rms_norm(
-        x,
-        input("model.norm.weight", [axes.hidden], Dtype::F32),
-        axes.hidden.extent(),
-    );
+    let x = rms_norm(x, input("model.norm.weight", [axes.hidden]), axes.hidden.extent());
     let logits = matmul(x, transpose(embedding, 0usize, 1usize));
     let logits_index = cache_roots.len();
     cache_roots.push(logits);
@@ -539,13 +533,13 @@ fn computed_iota_mask_reaches_the_fused_attention_fold() {
     .into_iter()
     .collect();
 
-    let position = input("position", [], Dtype::F32);
+    let position = input("position", []);
     let visible = binary(MapOp::Lt, iota(cache), add(position, konst(1.0)));
     let mask = map(MapOp::Where, vec![visible, konst(0.0), konst(f64::NEG_INFINITY)]);
     let attention = scaled_dot_product_attention(
-        input("q", [heads, sequence, features], Dtype::F32),
-        input("k", [heads, cache, features], Dtype::F32),
-        input("v", [heads, cache, features], Dtype::F32),
+        input("q", [heads, sequence, features]),
+        input("k", [heads, cache, features]),
+        input("v", [heads, cache, features]),
         Some(mask),
         0.0,
         false,

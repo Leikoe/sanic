@@ -17,9 +17,9 @@ fn scaled_dot_product_attention_uses_torch_layout_and_default_scale() {
     let sequence = axis("sequence", 2);
     let features = axis("features", 2);
     let output = scaled_dot_product_attention(
-        input("q", [sequence, features], Dtype::F32),
-        input("k", [sequence, features], Dtype::F32),
-        input("v", [sequence, features], Dtype::F32),
+        input("q", [sequence, features]),
+        input("k", [sequence, features]),
+        input("v", [sequence, features]),
         None,
         0.0,
         false,
@@ -55,10 +55,10 @@ fn additive_mask_and_explicit_scale_match_torch_semantics() {
     let key_sequence = axis("key_sequence", 3);
     let features = axis("features", 1);
     let output = scaled_dot_product_attention(
-        input("q", [query_sequence, features], Dtype::F32),
-        input("k", [key_sequence, features], Dtype::F32),
-        input("v", [key_sequence, features], Dtype::F32),
-        Some(input("mask", [query_sequence, key_sequence], Dtype::F32)),
+        input("q", [query_sequence, features]),
+        input("k", [key_sequence, features]),
+        input("v", [key_sequence, features]),
+        Some(input("mask", [query_sequence, key_sequence])),
         0.0,
         false,
         Some(2.0),
@@ -87,9 +87,9 @@ fn causal_attention_uses_an_upper_left_mask_for_rectangular_inputs() {
     let features = axis("features", 2);
     let value_features = axis("value_features", 1);
     let output = scaled_dot_product_attention(
-        input("q", [query_sequence, features], Dtype::F32),
-        input("k", [key_sequence, features], Dtype::F32),
-        input("v", [key_sequence, value_features], Dtype::F32),
+        input("q", [query_sequence, features]),
+        input("k", [key_sequence, features]),
+        input("v", [key_sequence, value_features]),
         None,
         0.0,
         true,
@@ -115,9 +115,9 @@ fn enable_gqa_repeats_key_and_value_heads_like_torch() {
     let sequence = axis("sequence", 1);
     let features = axis("features", 1);
     let output = scaled_dot_product_attention(
-        input("q", [query_heads, sequence, features], Dtype::F32),
-        input("k", [kv_heads, sequence, features], Dtype::F32),
-        input("v", [kv_heads, sequence, features], Dtype::F32),
+        input("q", [query_heads, sequence, features]),
+        input("k", [kv_heads, sequence, features]),
+        input("v", [kv_heads, sequence, features]),
         None,
         0.0,
         false,
@@ -142,9 +142,9 @@ fn nonzero_dropout_is_rejected_explicitly() {
     let sequence = axis("sequence", 1);
     let features = axis("features", 1);
     let _ = scaled_dot_product_attention(
-        input("q", [sequence, features], Dtype::F32),
-        input("k", [sequence, features], Dtype::F32),
-        input("v", [sequence, features], Dtype::F32),
+        input("q", [sequence, features]),
+        input("k", [sequence, features]),
+        input("v", [sequence, features]),
         None,
         0.1,
         false,

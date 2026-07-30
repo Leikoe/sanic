@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::cost::{DeviceProfile, Kernel, feasible, kernel_time};
 use crate::derive::{Carrier, Expr, SlotKind};
-use crate::ir::{self, AxisRef, AxisSelector, Node as NodeKind, NodeRef as Node, input_axes, input_dtypes, leaf_names};
+use crate::ir::{self, AxisRef, AxisSelector, Node as NodeKind, NodeRef as Node, input_axes, leaf_names};
 
 /// Elements streamed per step along the folded axis.
 const TILE_N: usize = 64;
@@ -37,7 +37,14 @@ pub fn plan_axis(
     carrier: &Carrier,
     dev: &DeviceProfile,
 ) -> Option<KernelSpec> {
-    plan_axis_with_groups(node, streaming_axis, carrier, dev, &mut GroupCache::default())
+    plan_axis_with_groups(
+        node,
+        streaming_axis,
+        carrier,
+        dev,
+        &mut GroupCache::default(),
+        &HashMap::new(),
+    )
 }
 
 /// Flatten-group membership across a retained DAG, collected once per node:
@@ -79,11 +86,12 @@ pub fn plan_axis_with_groups(
     carrier: &Carrier,
     dev: &DeviceProfile,
     groups: &mut GroupCache,
+    widths: &HashMap<&'static str, f64>,
 ) -> Option<KernelSpec> {
     let streaming_axis = streaming_axis
         .resolve_axis(node, "plan_axis")
         .expect("planning axis is absent from the selected node");
-    plan_axis_costed(node, streaming_axis, carrier, dev, groups, count_flops(node))
+    plan_axis_costed(node, streaming_axis, carrier, dev, groups, count_flops(node), widths)
 }
 
 /// [`plan_axis_with_groups`], costed as the kernel will actually run. The
@@ -103,12 +111,13 @@ pub fn plan_axis_emitted(
     carrier: &Carrier,
     dev: &DeviceProfile,
     groups: &mut GroupCache,
+    widths: &HashMap<&'static str, f64>,
 ) -> Option<KernelSpec> {
     let streaming_axis = streaming_axis
         .resolve_axis(node, "plan_axis")
         .expect("planning axis is absent from the selected node");
-    let (_, flops, time) = best_fold_sched(node, streaming_axis, carrier, dev);
-    let mut spec = plan_axis_costed(node, streaming_axis, carrier, dev, groups, flops)?;
+    let (_, flops, time) = best_fold_sched(node, streaming_axis, carrier, dev, widths);
+    let mut spec = plan_axis_costed(node, streaming_axis, carrier, dev, groups, flops, widths)?;
     spec.cost = time;
     Some(spec)
 }
@@ -120,6 +129,7 @@ fn plan_axis_costed(
     dev: &DeviceProfile,
     groups: &mut GroupCache,
     total_flops: f64,
+    widths: &HashMap<&'static str, f64>,
 ) -> Option<KernelSpec> {
     let b_bytes = dev.dtype_bytes;
     // A streamed slab never exceeds the axis itself (a 7-token KV cache is
@@ -189,18 +199,16 @@ fn plan_axis_costed(
             .filter(|(n, _)| seen.insert(*n))
             .collect()
     };
-    // Per-input storage bytes. Every input declares its representation, so
-    // int8/int4 weights earn their bandwidth win without a device-dependent
-    // fallback.
-    let declared: HashMap<&'static str, f64> = input_dtypes(node)
-        .into_iter()
-        .map(|(n, d)| (n, d.bytes_per_element()))
-        .collect();
+    // Per-input storage bytes: a Γ fact, resolved by name — int8/int4
+    // weights earn their bandwidth win through their declaration, not
+    // through the term.
     let in_bytes = |name: &'static str| {
-        declared
+        // Callers thread Γ-resolved widths; a name outside the map is an
+        // undeclared graph input, and undeclared means f32.
+        widths
             .get(name)
             .copied()
-            .expect("every input must declare a storage dtype")
+            .unwrap_or_else(|| crate::ir::Dtype::F32.bytes_per_element())
     };
 
     groups.collect(node);
@@ -563,8 +571,14 @@ fn has_simd_reduce(node: &Node) -> bool {
 /// lanes. Traffic is schedule-invariant; parallelism and merge scratch are
 /// per-candidate. Scalar wins ties, so a fold that already fills the
 /// machine (a 200k-row head) keeps today's kernel.
-pub fn fold_sched(fold_node: &Node, streaming_axis: AxisRef, carrier: &Carrier, dev: &DeviceProfile) -> FoldSched {
-    best_fold_sched(fold_node, streaming_axis, carrier, dev).0
+pub fn fold_sched(
+    fold_node: &Node,
+    streaming_axis: AxisRef,
+    carrier: &Carrier,
+    dev: &DeviceProfile,
+    widths: &HashMap<&'static str, f64>,
+) -> FoldSched {
+    best_fold_sched(fold_node, streaming_axis, carrier, dev, widths).0
 }
 
 /// What the roofline says one schedule costs.
@@ -590,6 +604,7 @@ pub fn priced_fold_sched_candidates(
     streaming_axis: AxisRef,
     carrier: &Carrier,
     dev: &DeviceProfile,
+    widths: &HashMap<&'static str, f64>,
 ) -> Vec<(FoldSched, Option<SchedPrice>)> {
     let ext = |ax: AxisRef| ax.extent() as f64;
     let s_ext = ext(streaming_axis);
@@ -599,20 +614,14 @@ pub fn priced_fold_sched_candidates(
 
     // Traffic — identical across schedules; only needed so memory-bound
     // kernels rank by memory occupancy rather than flop noise.
-    let declared: HashMap<&'static str, f64> = input_dtypes(fold_node)
-        .into_iter()
-        .map(|(n, d)| (n, d.bytes_per_element()))
-        .collect();
+
     let mut seen = HashSet::new();
     let hbm: f64 = input_axes(fold_node)
         .into_iter()
         .filter(|(n, _)| seen.insert(*n))
         .map(|(n, axes)| {
             let vol: f64 = axes.iter().map(|&a| ext(a)).product();
-            vol * declared
-                .get(n)
-                .copied()
-                .expect("every input must declare a storage dtype")
+            vol * widths.get(n).copied().unwrap_or(b_bytes)
         })
         .sum::<f64>()
         + out_vol * b_bytes;
@@ -629,7 +638,7 @@ pub fn priced_fold_sched_candidates(
             axes.iter()
                 .any(|a| carrier.aliases.get(a).copied().unwrap_or(*a) == streaming_axis)
         })
-        .map(|(n, _)| declared[n])
+        .map(|(n, _)| widths.get(n).copied().unwrap_or(b_bytes))
         .sum::<f64>()
         .max(1.0);
 
@@ -748,6 +757,7 @@ fn best_fold_sched(
     streaming_axis: AxisRef,
     carrier: &Carrier,
     dev: &DeviceProfile,
+    widths: &HashMap<&'static str, f64>,
 ) -> (FoldSched, f64, f64) {
     let s_ext = streaming_axis.extent();
     let mut best = FoldSched::scalar();
@@ -756,7 +766,7 @@ fn best_fold_sched(
     // fall back to the naive bill so the caller still has a finite figure.
     let mut best_flops = count_flops(fold_node);
     let mut best_add = f64::INFINITY;
-    for (c, priced) in priced_fold_sched_candidates(fold_node, streaming_axis, carrier, dev) {
+    for (c, priced) in priced_fold_sched_candidates(fold_node, streaming_axis, carrier, dev, widths) {
         // A tie-break the roofline cannot make: at equal price, a
         // lane-stream split beats the scalar schedule. Scalar hands each
         // thread its own output point, so a warp's 32 loads land whole rows
@@ -914,12 +924,12 @@ mod tests {
             axis("d", 64),
             axis("e", 64),
         );
-        let key = input("K", [b, h, k, d], Dtype::F32);
+        let key = input("K", [b, h, k, d]);
         let key_axis = axis_refs(&key)[2];
         let attn = scaled_dot_product_attention(
-            input("Q", [b, h, sq, d], Dtype::F32),
+            input("Q", [b, h, sq, d]),
             key,
-            input("V", [b, h, k, e], Dtype::F32),
+            input("V", [b, h, k, e]),
             None,
             0.0,
             false,
@@ -938,7 +948,7 @@ mod tests {
     fn a_scalar_output_fold_still_plans() {
         // Reduce(X[n], n, Add) → scalar output; no row axis.
         let n = axis("n", 4096);
-        let x = input("X", [n], Dtype::F32);
+        let x = input("X", [n]);
         let stream = axis_refs(&x)[0];
         let s = reduce(x, 0usize, Monoid::Add);
         let c = derive(&s, stream).unwrap();
@@ -951,11 +961,11 @@ mod tests {
     #[test]
     fn a_partial_span_axis_can_still_be_tiled() {
         let (stream, singleton, output) = (axis("stream", 2048), axis("singleton", 1), axis("output", 2048));
-        let x = input("X", [stream, singleton], Dtype::F32);
+        let x = input("X", [stream, singleton]);
         let stream_axis = axis_refs(&x)[0];
         let dot = matmul(
             transpose(x, 0usize, 1usize),
-            transpose(input("W", [output, stream], Dtype::BF16), 0usize, 1usize),
+            transpose(input("W", [output, stream]), 0usize, 1usize),
         );
         let mut carrier = derive(&dot, stream_axis).unwrap();
         let invariant = carrier.slots;
@@ -978,16 +988,26 @@ mod tests {
         let (s, d, f) = (axis("s", 4), axis("d", 4096), axis("f", 4096));
         let dev = DeviceProfile::toy();
 
-        let cost_of = |w: NodeRef| {
-            let x = input("X", [s, d], Dtype::F32);
+        // The declaration is a Γ fact now, so the test states it as one: the
+        // same term, priced under three different bindings.
+        let cost_of = |w: NodeRef, weight_dtype: Dtype| {
+            let x = input("X", [s, d]);
             let stream = axis_refs(&x)[1];
             let g = matmul(x, transpose(w, 0usize, 1usize));
             let c = derive(&g, stream).unwrap();
-            plan_axis(&g, stream, &c, &dev).unwrap().cost
+            let widths: HashMap<&'static str, f64> = [
+                ("X", Dtype::F32.bytes_per_element()),
+                ("W", weight_dtype.bytes_per_element()),
+            ]
+            .into_iter()
+            .collect();
+            plan_axis_with_groups(&g, stream, &c, &dev, &mut GroupCache::default(), &widths)
+                .unwrap()
+                .cost
         };
-        let full = cost_of(input("W", [f, d], Dtype::F32));
-        let int8 = cost_of(input("W8", [f, d], Dtype::I8));
-        let int4 = cost_of(input("W4", [f, d], Dtype::I4));
+        let full = cost_of(input("W", [f, d]), Dtype::F32);
+        let int8 = cost_of(input("W", [f, d]), Dtype::I8);
+        let int4 = cost_of(input("W", [f, d]), Dtype::I4);
         assert!(int8 < full, "int8 weights must price below f32: {int8} vs {full}");
         assert!(int4 < int8, "int4 must price below int8: {int4} vs {int8}");
     }

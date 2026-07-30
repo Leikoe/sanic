@@ -56,9 +56,13 @@ use sanic::numeric::{Bounds, Inferred, NumberSystem, infer_root, may_store, stor
 
 /// A free variable of the calculus: a name and a shape. **There is no dtype
 /// field, and that absence is the contract** — representation is a fact
-/// *about* a name, decided in Γ, never a part of the term. When M12 lands,
-/// `ir::Node::Input` takes this shape and `shallow_key` loses its dtype
-/// component, making CSE identity pure structure.
+/// *about* a name, decided in Γ, never a part of the term.
+///
+/// FULFILLED by M12b: `ir::Node::Input` took exactly this shape,
+/// `shallow_key` lost its dtype component (CSE identity is pure structure —
+/// see `tests/tensor.rs`, one variable one node), and the structure ledger
+/// holds `ir.rs` at zero storage mentions. This mirror stays as the record
+/// of what was promised before it was true.
 #[allow(dead_code)]
 pub struct Var {
     pub name: &'static str,
@@ -279,7 +283,7 @@ impl<'id> Gamma<'id> {
 #[test]
 fn the_argmax_buffer_is_minted_lawful_under_a_bf16_policy() {
     let vocab = axis("vocab", 128_256);
-    let scores = input("X", [vocab], Dtype::F32);
+    let scores = input("X", [vocab]);
     let claim = infer_root(&argmax(scores, 0usize));
     let policy = Policy {
         default_real: Dtype::BF16,
@@ -299,7 +303,7 @@ fn the_argmax_buffer_is_minted_lawful_under_a_bf16_policy() {
 #[test]
 fn an_undeclared_real_takes_the_policy_default() {
     let hidden = axis("hidden", 2048);
-    let x = input("X", [hidden], Dtype::F32);
+    let x = input("X", [hidden]);
     let logits_like = map(MapOp::Exp, vec![x]);
     let claim = infer_root(&logits_like);
     let policy = Policy {

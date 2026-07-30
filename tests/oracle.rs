@@ -106,12 +106,12 @@ fn multihead_flash_matches_naive() {
     .into_iter()
     .collect();
 
-    let key = input("K", [b, h, k, d], Dtype::F32);
+    let key = input("K", [b, h, k, d]);
     let key_axis = axis_refs(&key)[2];
     let mha = scaled_dot_product_attention(
-        input("Q", [b, h, sq, d], Dtype::F32),
+        input("Q", [b, h, sq, d]),
         key,
-        input("V", [b, h, k, e], Dtype::F32),
+        input("V", [b, h, k, e]),
         None,
         0.0,
         false,
@@ -138,14 +138,14 @@ fn rmsnorm_fused_projection_matches_naive() {
     .into_iter()
     .collect();
 
-    let x = input("X", [s, dm], Dtype::F32);
+    let x = input("X", [s, dm]);
     let stream = axis_refs(&x)[1];
-    let g = input("g", [dm], Dtype::F32);
+    let g = input("g", [dm]);
     let ss = reduce(map(MapOp::Mul, vec![x.clone(), x.clone()]), 1usize, add_r());
     let mean = map(MapOp::Mul, vec![ss, konst(1.0 / n)]);
     let denom = map(MapOp::Sqrt, vec![map(MapOp::Add, vec![mean, konst(1e-5)])]);
     let xn = map(MapOp::Div, vec![map(MapOp::Mul, vec![x, g]), unsqueeze(denom, 1usize)]);
-    let q = matmul(xn, transpose(input("W", [f, dm], Dtype::F32), 0usize, 1usize));
+    let q = matmul(xn, transpose(input("W", [f, dm]), 0usize, 1usize));
 
     assert_kernel_matches_reference(&q, stream, &env);
 }
@@ -166,12 +166,9 @@ fn standalone_broadcast_denominator_keeps_the_stream_axis() {
         vec![
             map(
                 MapOp::Add,
-                vec![
-                    input("a", [sequence, hidden], Dtype::F32),
-                    input("b", [singleton, hidden], Dtype::F32),
-                ],
+                vec![input("a", [sequence, hidden]), input("b", [singleton, hidden])],
             ),
-            input("c", [singleton, hidden], Dtype::F32),
+            input("c", [singleton, hidden]),
         ],
     );
     let stream = axis_refs(&residual)[1];
@@ -196,7 +193,7 @@ fn logsumexp_matches_naive() {
     let (r, k) = (axis("r", 4), axis("k", 9));
     let mut rng = Lcg(0x15E);
     let env: Env = [("X", rand_tensor(&[r, k], &mut rng))].into_iter().collect();
-    let x = input("X", [r, k], Dtype::F32);
+    let x = input("X", [r, k]);
     let stream = axis_refs(&x)[1];
     let lse = reduce(x, 1usize, Monoid::LogSumExp);
     assert_kernel_matches_reference(&lse, stream, &env);
@@ -223,12 +220,9 @@ fn quantized_matmul_dequant_fuses() {
 
     let dw = map(
         MapOp::Mul,
-        vec![
-            input("qW", [o, dm], Dtype::F32),
-            unsqueeze(input("scale", [o], Dtype::F32), 1usize),
-        ],
+        vec![input("qW", [o, dm]), unsqueeze(input("scale", [o]), 1usize)],
     );
-    let x = input("X", [s, dm], Dtype::F32);
+    let x = input("X", [s, dm]);
     let stream = axis_refs(&x)[1];
     let y = matmul(x, transpose(dw, 0usize, 1usize));
 
@@ -249,9 +243,9 @@ fn matmul_kernel_matches_naive() {
     ]
     .into_iter()
     .collect();
-    let a = input("A", [i, k], Dtype::F32);
+    let a = input("A", [i, k]);
     let stream = axis_refs(&a)[1];
-    let mm = matmul(a, input("B", [k, j], Dtype::F32));
+    let mm = matmul(a, input("B", [k, j]));
     assert_kernel_matches_reference(&mm, stream, &env);
 }
 
@@ -273,7 +267,7 @@ fn argmax_matches_hand() {
     }
     let env: Env = [("L", logits.clone())].into_iter().collect();
 
-    let am = argmax(input("L", [r, v], Dtype::F32), 1usize);
+    let am = argmax(input("L", [r, v]), 1usize);
     let got = eval(&am, &env);
 
     let want = Value::from_shape_fn(&[r.extent()], |c| {
@@ -310,10 +304,10 @@ fn kv_cache_write_matches_hand() {
     .into_iter()
     .collect();
 
-    let cache_node = input("cache", [t, d], Dtype::F32);
-    let pos_in = input("pos", [], Dtype::F32);
+    let cache_node = input("cache", [t, d]);
+    let pos_in = input("pos", []);
     let is_pos = one_hot_like(cache_node.clone(), 0usize, pos_in);
-    let updated = map(MapOp::Where, vec![is_pos, input("new_k", [d], Dtype::F32), cache_node]);
+    let updated = map(MapOp::Where, vec![is_pos, input("new_k", [d]), cache_node]);
     let got = eval(&updated, &env);
 
     let want = Value::from_shape_fn(&[t.extent(), d.extent()], |c| {
@@ -338,10 +332,7 @@ fn rope_rotation_is_correct() {
     // rotated_Q[s,p,j] = Σ_i R[s,p,j,i]·Q[s,p,i]
     let r = rope_rotation(s, p, j, i, c);
     let qr = reduce(
-        map(
-            MapOp::Mul,
-            vec![unsqueeze(input("Q", [s, p, i], Dtype::F32), 2usize), r],
-        ),
+        map(MapOp::Mul, vec![unsqueeze(input("Q", [s, p, i]), 2usize), r]),
         3usize,
         add_r(),
     );
@@ -388,8 +379,8 @@ fn rope_flash_attention_matches_naive() {
     .into_iter()
     .collect();
 
-    let q = input("Q", [s, p, i], Dtype::F32);
-    let k_input = input("K", [t, p, i], Dtype::F32);
+    let q = input("Q", [s, p, i]);
+    let k_input = input("K", [t, p, i]);
     let key_axis = axis_refs(&k_input)[0];
     let rq = rope_rotation(s, p, j, i, c);
     let rk = rope_rotation(t, p, j, i, c);
@@ -398,7 +389,7 @@ fn rope_flash_attention_matches_naive() {
     let qr = flatten(qr, &[1usize, 2usize][..], dk);
     let kr = flatten(kr, &[1usize, 2usize][..], dk);
     let scores = matmul(qr, transpose(kr, 0usize, 1usize)); // [s, t]
-    let attn = matmul(softmax(scores, 1usize), input("V", [t, e], Dtype::F32));
+    let attn = matmul(softmax(scores, 1usize), input("V", [t, e]));
 
     let carrier = derive(&attn, key_axis).expect("RoPE flash derives");
     assert!(carrier.rules.contains(&"rescale"), "online-softmax coupling present");
@@ -422,16 +413,16 @@ fn cosine_relative_bias_attention_matches_naive() {
     .into_iter()
     .collect();
 
-    let key = input("K", [t, dk], Dtype::F32);
+    let key = input("K", [t, dk]);
     let key_axis = axis_refs(&key)[0];
-    let scores = matmul(input("Q", [s, dk], Dtype::F32), transpose(key, 0usize, 1usize));
+    let scores = matmul(input("Q", [s, dk]), transpose(key, 0usize, 1usize));
     let rel = map(
         MapOp::Sub,
         vec![coordinate(scores.clone(), 0usize), coordinate(scores.clone(), 1usize)],
     );
     let bias = map(MapOp::Cos, vec![map(MapOp::Mul, vec![rel, konst(0.1)])]);
     let biased = map(MapOp::Add, vec![scores, bias]);
-    let attn = matmul(softmax(biased, 1usize), input("V", [t, dv], Dtype::F32));
+    let attn = matmul(softmax(biased, 1usize), input("V", [t, dv]));
 
     assert_kernel_matches_reference(&attn, key_axis, &env);
 }

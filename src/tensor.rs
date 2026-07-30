@@ -24,8 +24,11 @@ pub struct Tensor {
 
 impl Tensor {
     /// A named graph input with a declared storage dtype.
-    pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> Tensor {
-        ir::input(name, shape, dtype).into()
+    /// A free variable: name and shape. Its storage is declared where the
+    /// program binds it — [`crate::Graph::input`] for a graph, a compile
+    /// call's declarations otherwise; undeclared inputs are f32.
+    pub fn input(name: impl Into<String>, shape: impl AsRef<[Axis]>) -> Tensor {
+        ir::input(name, shape).into()
     }
 
     /// A scalar constant.
@@ -350,7 +353,7 @@ mod tests {
     #[test]
     fn named_dimensions_resolve_and_operators_build_the_same_graph() {
         let (s, d) = (axis("s", 3), axis("d", 4));
-        let x = Tensor::input("x", [s, d], Dtype::F32);
+        let x = Tensor::input("x", [s, d]);
 
         // name and position resolve to the same reduction — and interning
         // makes them literally the same node
@@ -375,7 +378,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "no axis named")]
     fn unknown_axis_name_panics_with_the_shape() {
-        let x = Tensor::input("x", [axis("s", 3)], Dtype::F32);
+        let x = Tensor::input("x", [axis("s", 3)]);
         let _ = x.sum("hidden");
     }
 }

@@ -80,13 +80,13 @@ fn attention_block_schedule_executes_to_reference() {
     .into_iter()
     .collect();
 
-    let x = input("X", [s, dm], Dtype::F32);
+    let x = input("X", [s, dm]);
     let xk = rename(x.clone(), 0usize, t);
-    let q = matmul(x.clone(), transpose(input("Wq", [dk, dm], Dtype::F32), 0usize, 1usize)); // [s, dk]
-    let k = matmul(xk.clone(), transpose(input("Wk", [dk, dm], Dtype::F32), 0usize, 1usize)); // [t, dk]
-    let v = matmul(xk, transpose(input("Wv", [dv, dm], Dtype::F32), 0usize, 1usize)); // [t, dv]
+    let q = matmul(x.clone(), transpose(input("Wq", [dk, dm]), 0usize, 1usize)); // [s, dk]
+    let k = matmul(xk.clone(), transpose(input("Wk", [dk, dm]), 0usize, 1usize)); // [t, dk]
+    let v = matmul(xk, transpose(input("Wv", [dv, dm]), 0usize, 1usize)); // [t, dv]
     let attn = scaled_dot_product_attention(q, k, v, None, 0.0, false, Some(1.0), false);
-    let o = matmul(attn, transpose(input("Wo", [dm, dv], Dtype::F32), 0usize, 1usize)); // [s, dm]
+    let o = matmul(attn, transpose(input("Wo", [dm, dv]), 0usize, 1usize)); // [s, dm]
     let y = map(MapOp::Add, vec![o, x]); // residual
 
     let sched = partition(&y, &DeviceProfile::toy());
@@ -131,13 +131,13 @@ fn full_transformer_block_schedule_executes_to_reference() {
     .into_iter()
     .collect();
 
-    let x = input("X", [s, dm], Dtype::F32);
-    let xn = rmsnorm(x.clone(), input("g1", [dm], Dtype::F32), n);
+    let x = input("X", [s, dm]);
+    let xn = rmsnorm(x.clone(), input("g1", [dm]), n);
     let xn_kv = rename(xn.clone(), 0usize, t);
 
-    let q = head_projection(xn, input("Wq", [h, dk, dm], Dtype::F32)); // [h, s, dk]
-    let k = head_projection(xn_kv.clone(), input("Wk", [h, dk, dm], Dtype::F32)); // [h, t, dk]
-    let vv = head_projection(xn_kv, input("Wv", [h, dv, dm], Dtype::F32)); // [h, t, dv]
+    let q = head_projection(xn, input("Wq", [h, dk, dm])); // [h, s, dk]
+    let k = head_projection(xn_kv.clone(), input("Wk", [h, dk, dm])); // [h, t, dk]
+    let vv = head_projection(xn_kv, input("Wv", [h, dv, dm])); // [h, t, dv]
 
     let attn = scaled_dot_product_attention(
         q,
@@ -151,17 +151,17 @@ fn full_transformer_block_schedule_executes_to_reference() {
     ); // [h, s, dv]
 
     let flat = flatten(transpose(attn, 0usize, 1usize), &[1usize, 2usize][..], dmv); // [s, dmv]
-    let o = matmul(flat, input("Wo", [dmv, dm], Dtype::F32)); // [s, dm]
+    let o = matmul(flat, input("Wo", [dmv, dm])); // [s, dm]
     let res1 = map(MapOp::Add, vec![o, x]);
 
-    let hn = rmsnorm(res1.clone(), input("g2", [dm], Dtype::F32), n);
-    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
-    let up = matmul(hn, transpose(input("Wu", [f, dm], Dtype::F32), 0usize, 1usize)); // [s, f]
+    let hn = rmsnorm(res1.clone(), input("g2", [dm]), n);
+    let gate = matmul(hn.clone(), transpose(input("Wg", [f, dm]), 0usize, 1usize)); // [s, f]
+    let up = matmul(hn, transpose(input("Wu", [f, dm]), 0usize, 1usize)); // [s, f]
     let act = map(MapOp::Mul, vec![silu(gate), up]);
-    let mlp = matmul(act, input("Wd", [f, dm], Dtype::F32));
+    let mlp = matmul(act, input("Wd", [f, dm]));
     let yb = map(MapOp::Add, vec![mlp, res1]);
 
-    let logits = matmul(yb, transpose(input("W_lm", [v, dm], Dtype::F32), 0usize, 1usize)); // [s, v]
+    let logits = matmul(yb, transpose(input("W_lm", [v, dm]), 0usize, 1usize)); // [s, v]
 
     let sched = partition(&logits, &DeviceProfile::toy());
     assert!(sched.kernel_count() >= 2, "expected a multi-kernel schedule");

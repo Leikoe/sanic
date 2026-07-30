@@ -42,7 +42,7 @@ fn a_row_write_state_keeps_what_earlier_steps_wrote() {
     };
     let mut graph = Graph::new();
     let state = graph.state("s", [axis("seq", 4)], Dtype::F32);
-    let position = Tensor::input("position", [], Dtype::F32);
+    let position = Tensor::input("position", []);
     let index = state.coordinate(0usize);
     let here = index.lt(&position + 1.0) * position.lt(&index + 1.0);
     let successor = here.select(&position + 10.0, &state);

@@ -218,11 +218,10 @@ fn the_structural_debt_ledger_is_exact() {
     // changed, this ledger changes in the same commit — growth is a
     // regression caught, shrinkage is milestone progress recorded.
     const LEDGER: &[(&str, &str, usize, &str)] = &[
-        // The consumer read sites minting `Input(name, shape, GLOBAL)` into
-        // spliced stage bodies. M12 replaces them with reads of Γ on
-        // `Schedule` — whose first entries already exist: `output_dtypes`
-        // (#21's caller pins) and `exact_boundaries` (the analysis' facts).
-        ("partition", "dev.storage", 4, "M12"),
+        // What remains of the boundary policy in partition: the mint's
+        // preferred width, produced-buffer pricing, and the «div» probe.
+        // The policy itself retires with M14's per-value declarations.
+        ("partition", "dev.storage", 3, "M14"),
         // Allocation width, output/readback dtype stamps, nanscan and
         // bandwidth accounting, all from one global. M12 moves them to Γ.
         ("compile", "program.storage", 10, "M12"),
@@ -235,10 +234,10 @@ fn the_structural_debt_ledger_is_exact() {
         // DeviceSpecs, leaving hardware facts only).
         ("cost", "with_storage", 1, "M14"),
         ("metal", "with_storage", 1, "M14"),
-        // The expression IR still carries a Dtype on its free variables —
-        // the field M12 evicts, along with `input_dtypes` and the
-        // `shallow_key` component that makes storage part of CSE identity.
-        ("ir", "dtype", 7, "M12"),
+        // RETIRED by M12b, kept at zero as the doctrine it became: the
+        // expression IR mentions no storage, anywhere. An Input is a name
+        // and a shape; identity is structure; Γ owns every width.
+        ("ir", "dtype", 0, "retired — keep it so"),
     ];
     for (file, needle, expected, retires) in LEDGER {
         let count = code_of(file).matches(needle).count();

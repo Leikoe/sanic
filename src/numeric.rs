@@ -286,14 +286,11 @@ fn infer_node(node: &NodeRef, known: &mut HashMap<*const Node, Inferred>) -> Inf
 
 fn derive_node(node: &NodeRef, known: &mut HashMap<*const Node, Inferred>) -> Inferred {
     match node.as_ref() {
-        // An input's system is whatever its declared storage can tell us,
-        // which for a float format is only "a real". A caller that knows
-        // better — `tokens` is an index stored as f32 — has no way to say so
-        // yet; that is the open question this analysis waits on.
-        Node::Input { dtype, .. } => match dtype {
-            Dtype::I8 | Dtype::I4 => Inferred::exact(NumberSystem::Integer, Bounds::UNBOUNDED),
-            _ => Inferred::real(),
-        },
+        // A free variable carries no storage, and storage never implied a
+        // system anyway (a quantized weight is a REAL, scaled). A caller who
+        // knows better — `tokens` is an index — will say so through Γ_system
+        // declarations when they exist; until then every input is a real.
+        Node::Input { .. } => Inferred::real(),
 
         Node::Const { v } => constant(*v),
 

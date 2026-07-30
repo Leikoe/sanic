@@ -18,20 +18,11 @@ fn acc_per_lane(d: f64) -> f64 {
     // Distinct non-singleton toy extents keep positional broadcasting honest;
     // the real symbolic sizes are supplied to `acc_scalars` below.
     let (sq, k, dd, e) = (axis("sq", 2), axis("k", 3), axis("d", 4), axis("e", 5));
-    let key = input("K", [k, dd], Dtype::F32);
+    let key = input("K", [k, dd]);
     let stream = axis_refs(&key)[0];
-    let value = input("V", [k, e], Dtype::F32);
+    let value = input("V", [k, e]);
     let value_axis = axis_refs(&value)[1];
-    let attn = scaled_dot_product_attention(
-        input("Q", [sq, dd], Dtype::F32),
-        key,
-        value,
-        None,
-        0.0,
-        false,
-        Some(1.0),
-        false,
-    );
+    let attn = scaled_dot_product_attention(input("Q", [sq, dd]), key, value, None, 0.0, false, Some(1.0), false);
     sanic::derive::derive(&attn, stream)
         .unwrap()
         .acc_scalars(|axis| if axis == value_axis { d } else { 1.0 })

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::cost;
 use crate::interp::{Env, Value};
 use crate::ir::{self, Axis, AxisRef, Dtype, Extent, Node, NodeRef};
-use crate::partition::{Schedule, partition_many};
+use crate::partition::{Schedule, partition_many_declared};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
@@ -335,7 +335,7 @@ tuple_roots!(
 /// Extension trait for compiling one or more roots.
 pub trait Compile: Roots {
     fn compile<B: Backend>(&self, backend: &B) -> Result<Program<B>, CompileError> {
-        compile_roots_in_place(self.roots(), Vec::new(), Vec::new(), backend)
+        compile_roots_in_place(self.roots(), Vec::new(), Vec::new(), HashMap::new(), backend)
     }
 }
 
@@ -354,6 +354,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
     roots: Vec<NodeRef>,
     in_place: Vec<(usize, &'static str)>,
     output_dtypes: Vec<Option<Dtype>>,
+    declared: HashMap<String, Dtype>,
     backend: &B,
 ) -> Result<Program<B>, CompileError> {
     if roots.is_empty() {
@@ -365,7 +366,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
 
     // Constructors intern: structurally identical subtrees are already one
     // immutable DAG node, across roots and across the whole process.
-    let inputs = collect_inputs(&roots)?;
+    let inputs = collect_inputs(&roots, &declared)?;
     let output_shapes = roots
         .iter()
         .map(|root| root.shape().into_iter().map(Axis::extent).collect())
@@ -377,7 +378,7 @@ pub(crate) fn compile_roots_in_place<B: Backend>(
         .map(|index| leak(format!("Out{index}")))
         .collect::<Vec<_>>();
     let named_roots = roots.iter().cloned().zip(output_names).collect::<Vec<_>>();
-    let mut schedule = partition_many(&named_roots, &backend.profile());
+    let mut schedule = partition_many_declared(&named_roots, &backend.profile(), &declared);
     if !output_dtypes.is_empty() {
         assert_eq!(
             output_dtypes.len(),
@@ -466,20 +467,25 @@ fn contains_dynamic(roots: &[NodeRef]) -> bool {
     roots.iter().any(|root| visit(root, &mut seen))
 }
 
-fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
-    fn visit(node: &NodeRef, seen: &mut HashSet<*const Node>, inputs: &mut Vec<InputSpec>) -> Result<(), CompileError> {
+fn collect_inputs(roots: &[NodeRef], declared: &HashMap<String, Dtype>) -> Result<Vec<InputSpec>, CompileError> {
+    fn visit(
+        node: &NodeRef,
+        seen: &mut HashSet<*const Node>,
+        inputs: &mut Vec<InputSpec>,
+        declared: &HashMap<String, Dtype>,
+    ) -> Result<(), CompileError> {
         if !seen.insert(Arc::as_ptr(node)) {
             return Ok(());
         }
         match node.as_ref() {
-            Node::Input { name, shape, dtype } => {
+            Node::Input { name, shape } => {
                 if name.is_empty() {
                     return Err(CompileError::InvalidInput("input names cannot be empty".into()));
                 }
                 if let Some(previous) = inputs.iter().find(|input| input.name == *name) {
                     let previous_extents = previous.shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
                     let extents = shape.iter().map(|axis| axis.extent).collect::<Vec<_>>();
-                    if previous_extents != extents || previous.dtype != *dtype {
+                    if previous_extents != extents {
                         return Err(CompileError::InvalidInput(format!(
                             "`{name}` was declared incompatibly"
                         )));
@@ -490,7 +496,7 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
                         lowered_name: name,
                         shape: shape.clone(),
                         axes: ir::axis_refs(node),
-                        dtype: *dtype,
+                        dtype: declared.get(*name).copied().unwrap_or(Dtype::F32),
                     });
                 }
             }
@@ -499,15 +505,15 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
             | Node::Reduce { src, .. }
             | Node::Scan { src, .. }
             | Node::View { src, .. }
-            | Node::Reindex { src, .. } => visit(src, seen, inputs)?,
+            | Node::Reindex { src, .. } => visit(src, seen, inputs, declared)?,
             Node::Map { inputs: children, .. } => {
                 for child in children {
-                    visit(child, seen, inputs)?;
+                    visit(child, seen, inputs, declared)?;
                 }
             }
             Node::Gather { src, index, .. } => {
-                visit(src, seen, inputs)?;
-                visit(index, seen, inputs)?;
+                visit(src, seen, inputs, declared)?;
+                visit(index, seen, inputs, declared)?;
             }
         }
         Ok(())
@@ -516,7 +522,7 @@ fn collect_inputs(roots: &[NodeRef]) -> Result<Vec<InputSpec>, CompileError> {
     let mut inputs = Vec::new();
     let mut seen = HashSet::new();
     for root in roots {
-        visit(root, &mut seen, &mut inputs)?;
+        visit(root, &mut seen, &mut inputs, declared)?;
     }
     Ok(inputs)
 }
@@ -1421,6 +1427,7 @@ mod metal_backend {
                 FoldSched::scalar(),
                 epi,
                 device.storage(),
+                &tuner_resolved(schedule, device.storage()),
             );
             if probe.inputs.len() + 1 > METAL_MAX_BUFFERS {
                 continue; // bindless stage: keep the analytic choice
@@ -1435,14 +1442,45 @@ mod metal_backend {
         // A family whose whole planned time is a sliver of the step cannot
         // win more than measurement noise — don't spend replays on it (the
         // norm folds are ~33 single-stage families of ~25µs each).
+
+        /// Pricing widths of a fold's leaves from the schedule's Γ.
+        fn tuner_widths(
+            schedule: &Schedule,
+            fold_node: &crate::ir::NodeRef,
+            storage: Dtype,
+        ) -> HashMap<&'static str, f64> {
+            crate::ir::leaf_names(fold_node)
+                .into_iter()
+                .map(|name| (name, schedule.width_of(name, storage).bytes_per_element()))
+                .collect()
+        }
+
+        /// Γ resolved for probe/candidate emission — the same construction
+        /// emission itself uses.
+        fn tuner_resolved(schedule: &Schedule, storage: Dtype) -> HashMap<String, Dtype> {
+            let mut resolved = schedule.declared_dtypes.clone();
+            for stage in &schedule.stages {
+                let out = crate::partition::stage_output(stage);
+                resolved.insert(out.to_string(), schedule.width_of(out, storage));
+            }
+            resolved
+        }
+
         let family_price = |stage_indices: &[usize]| -> f64 {
             let Stage::Fused { spec, fold_node, .. } = &schedule.stages[stage_indices[0]] else {
                 unreachable!("families hold fused stages");
             };
-            let best = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &device.profile())
-                .into_iter()
-                .filter_map(|(_, priced)| priced.map(|price| price.time))
-                .fold(f64::INFINITY, f64::min);
+            let widths = tuner_widths(schedule, fold_node, device.storage());
+            let best = priced_fold_sched_candidates(
+                fold_node,
+                spec.streaming_axis,
+                &spec.carrier,
+                &device.profile(),
+                &widths,
+            )
+            .into_iter()
+            .filter_map(|(_, priced)| priced.map(|price| price.time))
+            .fold(f64::INFINITY, f64::min);
             if best.is_finite() {
                 best * stage_indices.len() as f64
             } else {
@@ -1470,8 +1508,21 @@ mod metal_backend {
             else {
                 unreachable!("families hold fused stages");
             };
-            let analytic = fold_sched(fold_node, spec.streaming_axis, &spec.carrier, &device.profile());
-            let priced = priced_fold_sched_candidates(fold_node, spec.streaming_axis, &spec.carrier, &device.profile());
+            let widths = tuner_widths(schedule, fold_node, device.storage());
+            let analytic = fold_sched(
+                fold_node,
+                spec.streaming_axis,
+                &spec.carrier,
+                &device.profile(),
+                &widths,
+            );
+            let priced = priced_fold_sched_candidates(
+                fold_node,
+                spec.streaming_axis,
+                &spec.carrier,
+                &device.profile(),
+                &widths,
+            );
             let best_price = priced
                 .iter()
                 .filter_map(|(_, priced)| priced.map(|price| price.time))
@@ -1497,6 +1548,7 @@ mod metal_backend {
                     candidate,
                     epi,
                     device.storage(),
+                    &tuner_resolved(schedule, device.storage()),
                 );
                 msl.push_str(&kernel.msl.replace(MSL_HEADER, ""));
                 msl.push('\n');
@@ -1649,9 +1701,9 @@ mod positional_lowering_tests {
     fn direct_attention_lowers_to_one_kernel() {
         let sequence = axis("sequence", 2);
         let features = axis("features", 2);
-        let q = input("q", [sequence, features], Dtype::F32);
-        let k = input("k", [sequence, features], Dtype::F32);
-        let v = input("v", [sequence, features], Dtype::F32);
+        let q = input("q", [sequence, features]);
+        let k = input("k", [sequence, features]);
+        let v = input("v", [sequence, features]);
         let output = scaled_dot_product_attention(q, k, v, None, 0.0, false, None, false);
         let program = output.compile(&CpuDevice::new()).unwrap();
         assert_eq!(program.kernel_count(), 1, "{}", program.schedule.render());
@@ -1663,9 +1715,9 @@ mod positional_lowering_tests {
         let key_sequence = axis("key_sequence", 3);
         let features = axis("features", 2);
         let output = scaled_dot_product_attention(
-            input("q", [query_sequence, features], Dtype::F32),
-            input("k", [key_sequence, features], Dtype::F32),
-            input("v", [key_sequence, features], Dtype::F32),
+            input("q", [query_sequence, features]),
+            input("k", [key_sequence, features]),
+            input("v", [key_sequence, features]),
             None,
             0.0,
             true,

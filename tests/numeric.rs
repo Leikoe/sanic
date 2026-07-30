@@ -92,7 +92,7 @@ fn coordinates_are_natural_and_bounded_by_the_extent() {
 #[test]
 fn comparison_is_a_predicate_whatever_its_operands() {
     let (env, x) = random("X", 16, 7);
-    let scores = input("X", [x], Dtype::F32);
+    let scores = input("X", [x]);
     let mask = map(MapOp::Lt, vec![scores.clone(), konst(0.0)]);
     let claim = infer_root(&mask);
     assert_eq!(claim.system, NumberSystem::Bool);
@@ -105,7 +105,7 @@ fn summing_predicates_leaves_bool() {
     // 1 + 1 = 2, so `Add` cannot floor at 𝔹. The mask-summing idiom is live
     // in `grad.rs`, which folds a 0/1 winner mask to count ties.
     let (env, x) = random("X", 16, 11);
-    let scores = input("X", [x], Dtype::F32);
+    let scores = input("X", [x]);
     let mask = map(MapOp::Lt, vec![scores.clone(), konst(0.0)]);
     let two = map(MapOp::Add, vec![mask.clone(), mask.clone()]);
     let claim = infer_root(&two);
@@ -146,7 +146,7 @@ fn the_argmax_sentinel_does_not_destroy_exactness() {
     // The shape `first_index_of_maximum` builds: a coordinate guarded by a
     // comparison, with +∞ on the rejected branch.
     let vocab = axis("vocab", 128_256);
-    let scores = input("X", [vocab], Dtype::F32);
+    let scores = input("X", [vocab]);
     let maximum = reduce(scores.clone(), 0usize, Monoid::Max);
     let guarded = map(
         MapOp::Where,
@@ -176,7 +176,7 @@ fn argmax_is_an_index_that_bf16_cannot_hold() {
     // GPU: a vocabulary index needs an exact representation, and bf16 is
     // exact only to 256.
     let vocab = axis("vocab", 128_256);
-    let scores = input("X", [vocab], Dtype::F32);
+    let scores = input("X", [vocab]);
     let index = argmax(scores, 0usize);
     let claim = infer_root(&index);
 
@@ -197,7 +197,7 @@ fn a_small_index_fits_a_narrow_float() {
     // Narrowing is not forbidden for exact values, only unsound ones — a
     // 200-element axis indexes fine in bf16.
     let small = axis("small", 200);
-    let scores = input("X", [small], Dtype::F32);
+    let scores = input("X", [small]);
     let claim = infer_root(&argmax(scores, 0usize));
     assert!(may_store(claim, Dtype::BF16));
 }
@@ -207,7 +207,7 @@ fn integer_formats_are_refused_when_a_value_can_be_infinite() {
     // An order fold injects its identity, so the result's range carries ±∞ —
     // and no integer representation holds it.
     let vocab = axis("vocab", 1024);
-    let scores = input("X", [vocab], Dtype::F32);
+    let scores = input("X", [vocab]);
     let claim = infer_root(&argmax(scores, 0usize));
     assert!(!claim.bounds.is_finite());
     assert!(!may_store(claim, Dtype::I8));
@@ -280,7 +280,7 @@ fn sub_byte_sizes_round_up_rather_than_truncate() {
 #[test]
 fn a_float_input_is_a_real() {
     let n = axis("n", 4);
-    assert_eq!(infer_root(&input("W", [n], Dtype::BF16)).system, NumberSystem::Real);
+    assert_eq!(infer_root(&input("W", [n])).system, NumberSystem::Real);
 }
 
 // ── the refusal: M11's second half, on the compiled program ─────────────────
@@ -295,7 +295,7 @@ fn the_law_mints_the_width_the_policy_cannot_supply() {
     use sanic::partition::partition;
 
     let vocab = axis("vocab", 128_256);
-    let scores = input("X", [vocab], Dtype::F32);
+    let scores = input("X", [vocab]);
     let index = argmax(scores, 0usize);
 
     // Partitioned FOR a bf16 boundary policy: the argmax output is an exact
@@ -350,7 +350,7 @@ fn a_pinned_output_is_judged_against_its_pin() {
     // respect it even under a bf16 boundary policy — pins are the Caller
     // row of the who-chooses table, the policy is only the default.
     let vocab = axis("vocab", 128_256);
-    let scores = input("X", [vocab], Dtype::F32);
+    let scores = input("X", [vocab]);
     let index = argmax(scores, 0usize);
 
     let mut schedule = partition(&index, &DeviceProfile::toy());
@@ -378,8 +378,8 @@ fn real_valued_boundaries_are_untouched_by_the_refusal() {
     // every writable float carries them, so they can never fail the law.
     let vocab = axis("vocab", 128_256);
     let hidden = axis("hidden", 64);
-    let x = input("X", [hidden], Dtype::F32);
-    let w = input("W", [vocab, hidden], Dtype::BF16);
+    let x = input("X", [hidden]);
+    let w = input("W", [vocab, hidden]);
     let logits = reduce(map(MapOp::Mul, vec![unsqueeze(x, 0usize), w]), 1usize, Monoid::Add);
 
     let schedule = partition(&logits, &DeviceProfile::toy());

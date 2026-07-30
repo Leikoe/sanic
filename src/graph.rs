@@ -33,6 +33,10 @@ pub struct Graph {
     /// `(name, value, storage override)`. `None` stores at the target's
     /// boundary width, which is what almost everything wants.
     outputs: Vec<(&'static str, Tensor, Option<Dtype>)>,
+    /// Γ's Caller entries: input name → the storage its bound buffer uses.
+    /// A term is a free variable; how the buffer that binds it is stored is
+    /// declared HERE, at the program layer, by whoever owns the buffer.
+    declared: std::collections::HashMap<String, Dtype>,
 }
 
 impl Graph {
@@ -45,7 +49,7 @@ impl Graph {
     /// it must match the target's boundary policy, which
     /// [`Graph::compile_for`] checks.
     pub fn state(&mut self, name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> Tensor {
-        let input = Tensor::input(name, shape, dtype);
+        let input = self.input(name, shape, dtype);
         let crate::ir::Node::Input { name, .. } = input.node().as_ref() else {
             unreachable!("Tensor::input builds an Input node")
         };
@@ -55,6 +59,24 @@ impl Graph {
             successor: None,
         });
         input
+    }
+
+    /// Declare an input and the storage its buffer will be bound at — Γ's
+    /// Caller row. The term itself carries only name and shape; a bf16
+    /// checkpoint weight is bf16 because THIS says so, not because the
+    /// mathematics knows.
+    pub fn input(&mut self, name: impl Into<String>, shape: impl AsRef<[Axis]>, dtype: Dtype) -> Tensor {
+        let input = Tensor::input(name, shape);
+        let crate::ir::Node::Input { name, .. } = input.node().as_ref() else {
+            unreachable!("Tensor::input builds an Input node")
+        };
+        self.declared.insert((*name).to_string(), dtype);
+        input
+    }
+
+    /// The declared storage of every input registered on this graph.
+    pub fn declarations(&self) -> &std::collections::HashMap<String, Dtype> {
+        &self.declared
     }
 
     /// Declare `successor` as the value `state` carries into the next step.
@@ -201,9 +223,7 @@ mod metal_target {
         /// target admits. State feedback is wired here, not by the caller.
         pub fn compile_for(&self, device: &MetalDevice) -> Result<StepProgram, CompileError> {
             for state in &self.states {
-                let declared = crate::ir::input_dtypes(state.input.node())
-                    .first()
-                    .map(|(_, dtype)| *dtype);
+                let declared = self.declared.get(state.name).copied();
                 if declared != Some(device.storage()) {
                     return Err(CompileError::Backend(format!(
                         "state `{}` is declared {:?} but the target stores step \
@@ -219,7 +239,13 @@ mod metal_target {
             // states store at the boundary policy; only declared outputs may pin
             let mut output_dtypes = vec![None; self.states.len()];
             output_dtypes.extend(self.outputs.iter().map(|(_, _, dtype)| *dtype));
-            let program = crate::compile::compile_roots_in_place(roots, overwritable, output_dtypes, device)?;
+            let program = crate::compile::compile_roots_in_place(
+                roots,
+                overwritable,
+                output_dtypes,
+                self.declared.clone(),
+                device,
+            )?;
             let feedback = self
                 .states
                 .iter()

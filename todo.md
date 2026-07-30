@@ -1529,7 +1529,7 @@ closure errors surfaced), and integrality is tested with `fract() == 0.0`, not
 just containment. The regression test asserts on the *compiled program*, not a
 computed value: CI's macOS runners have no GPU.
 
-### M12 — Evict `Dtype` from `Input`; Γ on `Schedule` · [minting LANDED · eviction open] · retires *layer leakage*
+### M12 — Evict `Dtype` from `Input`; Γ on `Schedule` · [LANDED] · retires *layer leakage*
 
 **Landed (M12a):** the law mints widths at partition time.
 `Schedule.minted_dtypes` records each exact boundary the policy cannot carry
@@ -1545,8 +1545,17 @@ pins narrower than the law. Proven on device:
 `an_argmax_index_survives_bf16_storage_by_minted_width` — index 3333 under a
 bf16 policy survives exactly, where the policy width would reload 3328.
 
-**Still open (M12b):** the eviction itself — `Node::Input` loses its dtype,
-`shallow_key` its dtype component, declarations move to the program layer.
+**Landed (M12b):** the eviction. `Node::Input { name, shape }` — a free
+variable; `shallow_key` is pure structure (one variable, one node — the
+same-name-different-dtype conflict is unrepresentable and its checks are
+deleted); `input_dtypes` is gone. Declarations live at the program layer:
+`Graph::input(name, shape, dtype)` registers Γ's Caller entries,
+`Schedule.declared_dtypes` carries them, and `width_of` resolves
+pin → mint → declared → policy for every consumer — emission, splices,
+pricing (threaded through `plan` as Γ-resolved widths), the tuner,
+allocation, readback. Undeclared inputs are f32, stated once. The structure
+ledger's `ir.rs` entry retired at zero. 555 call sites; llama declares its
+checkpoint weights bf16 through the graph and runs both modes at full speed.
 
 The former "two graphs" milestone, shrunk to its true size — and it no longer
 reverses `ir.rs`'s doctrine, it vindicates it: stage bodies stay `ir::Node`

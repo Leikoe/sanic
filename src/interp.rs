@@ -113,7 +113,7 @@ impl Value {
             .iter()
             .map(|&extent| ir::axis("value", extent))
             .collect::<Vec<_>>();
-        let holder = ir::input("__detached_value", &descriptors, crate::ir::Dtype::F64);
+        let holder = ir::input("__detached_value", &descriptors);
         let axes = ir::axis_refs(&holder);
         let total = shape.iter().product::<usize>().max(1);
         let mut data = Vec::with_capacity(total);
@@ -688,7 +688,7 @@ mod tests {
         let b = rand_tensor(&[k, j], &mut rng);
         let env: Env = [("A", a.clone()), ("B", b.clone())].into_iter().collect();
 
-        let mm = matmul(input("A", [i, k], Dtype::F32), input("B", [k, j], Dtype::F32));
+        let mm = matmul(input("A", [i, k]), input("B", [k, j]));
         let got = eval(&mm, &env);
 
         let want = Value::from_shape_fn(&[i.extent(), j.extent()], |c| {
@@ -707,7 +707,7 @@ mod tests {
         let mut rng = Lcg(9);
         let x = rand_tensor(&[r, k], &mut rng);
         let env: Env = [("X", x)].into_iter().collect();
-        let sm = eval(&softmax(input("X", [r, k], Dtype::F32), 1usize), &env);
+        let sm = eval(&softmax(input("X", [r, k]), 1usize), &env);
         for r_i in 0..4 {
             let mut s = 0.0;
             for k_i in 0..7 {
@@ -730,12 +730,12 @@ mod tests {
         let v = rand_tensor(&[k, e], &mut rng);
         let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
 
-        let key = input("K", [k, d], Dtype::F32);
+        let key = input("K", [k, d]);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
-            input("Q", [sq, d], Dtype::F32),
+            input("Q", [sq, d]),
             key,
-            input("V", [k, e], Dtype::F32),
+            input("V", [k, e]),
             None,
             0.0,
             false,
@@ -761,12 +761,12 @@ mod tests {
         let v = rand_tensor(&[t, dv], &mut rng);
         let env: Env = [("Q", q), ("K", kk), ("V", v)].into_iter().collect();
 
-        let key = input("K", [t, dk], Dtype::F32);
+        let key = input("K", [t, dk]);
         let key_axis = axis_refs(&key)[0];
         let attn = scaled_dot_product_attention(
-            input("Q", [s, dk], Dtype::F32),
+            input("Q", [s, dk]),
             key,
-            input("V", [t, dv], Dtype::F32),
+            input("V", [t, dv]),
             None,
             0.0,
             true,
@@ -789,7 +789,7 @@ mod tests {
         let ids = Value::from_shape_fn(&[s.extent()], |c| [2.0, 7.0, 0.0][c[0]]);
         let env: Env = [("E", table.clone()), ("ids", ids)].into_iter().collect();
 
-        let emb = embedding(input("E", [v, dm], Dtype::F32), input("ids", [s], Dtype::F32), 0usize);
+        let emb = embedding(input("E", [v, dm]), input("ids", [s]), 0usize);
         let got = eval(&emb, &env);
         // Gather replaces the selected source dimension with the index shape.
         for (row, &id) in [2usize, 7, 0].iter().enumerate() {
@@ -806,7 +806,7 @@ mod tests {
         let mut rng = Lcg(3);
         let x = rand_tensor(&[h, dv], &mut rng);
         let env: Env = [("X", x.clone())].into_iter().collect();
-        let flat = eval(&flatten(input("X", [h, dv], Dtype::F32), &[0, 1][..], dmv), &env);
+        let flat = eval(&flatten(input("X", [h, dv]), &[0, 1][..], dmv), &env);
         assert_eq!(flat.shape, vec![6]);
         for hh in 0..2 {
             for dd in 0..3 {
