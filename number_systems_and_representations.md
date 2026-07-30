@@ -1,8 +1,14 @@
 # Number Systems and Representations
 
-**Status:** design, plus the first implementation. The analysis is landed —
-`src/numeric.rs`, held by `tests/numeric.rs`, 235 tests green — and wired to
-nothing yet. The defect in §1 is still latent on `main`.
+**Status:** implemented. Every milestone below is landed on
+`feat/number-systems` — the analysis and the refusal (M11), Γ and the
+eviction (M12, with widths minted at partition), `DeviceSpecs` and the policy
+as a compilation parameter (M14), u32 indices with saturating stores and
+signed infinities (M15), Q8 quantized stores with the scale in the type
+(M16 v1), and Γ itself promoted from the contract file into `src/gamma.rs`,
+sealed. The §1 defect is closed by construction: the law mints the width the
+policy cannot supply. 265 tests; the structure ledger holds four retired
+doctrines at zero and two growth guards.
 
 `Dtype` is two things wearing one name: the *number system* a value inhabits
 (𝔹, ℕ̄, ℤ̄, ℝ̄) and the *representation* a buffer stores it in (f32, bf16,
@@ -336,7 +342,7 @@ dtype carry that expression's system", not "does it equal the global".
 
 ## 9. Staging
 
-### M11 — the analysis, and refuse · [analysis LANDED; refusal open]
+### M11 — the analysis, and refuse · [LANDED]
 
 Landed: `src/numeric.rs` (system, bounds, inference, `may_store`),
 `tests/numeric.rs` (16 tests, held to the interpreter), the `Dtype` layout
@@ -354,7 +360,7 @@ buffer; f32 still compiles; llama byte-identical; the 16% untouched. The
 regression test asserts on the compiled program, not a computed value — CI's
 macOS runners have no GPU.
 
-### M12 — evict `Dtype` from `Input`; Γ on `Schedule` · [todo]
+### M12 — evict `Dtype` from `Input`; Γ on `Schedule` · [LANDED]
 
 The whole of the former "two graphs" milestone, shrunk to its true size:
 `Node::Input` loses its dtype (and `shallow_key` its dtype component — CSE
@@ -374,7 +380,7 @@ agreement assert exists and passes.
 ### M13 — *absorbed into M12.* Minting-correct replaces widening; there is no
 separate pass.
 
-### M14 — declarations replace the global · [todo]
+### M14 — declarations replace the global · [LANDED — as `Policy`, a compilation parameter]
 
 Retire `with_storage` for per-value `stored(d)`. Motivation is **device
 portability**, not hygiene: today the interpreter rounds only at explicit
@@ -388,7 +394,7 @@ leaves, the struct is finally the hardware numbers its doc promises (plus the
 capabilities it is missing: compute precision, accumulator precision,
 writable dtypes).
 
-### M15 — integer buffers; u32 indices · [todo]
+### M15 — integer buffers; u32 indices · [LANDED]
 
 Writable integer dtypes (`out_ty`/`store_expr` panic today; `write_f64`
 hardcodes `*mut f32`). Indices get **one width, u32**, never
@@ -396,7 +402,7 @@ lowest-provable — an index buffer is one element per row, so width selection
 saves nothing and each extra writable dtype is another disagreement surface.
 Saturating store for the sentinel: `+∞ → u32::MAX`.
 
-### M16 — quantized stores · [todo] · the trigger the arc predicts
+### M16 — quantized stores · [v1 LANDED] · the trigger the arc predicted, fired
 
 i8-with-a-scale is a representation *of ℝ̄*, not a rounding of one —
 `round_to` panics on exactly this today. It is also the point `Dtype` must
