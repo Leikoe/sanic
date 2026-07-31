@@ -670,6 +670,18 @@ pub fn emit_fused_metal_with(
     }
 }
 
+/// One polarity of a lane-sliced slot partition, in slot order. Every
+/// sliced/unsliced mirror in the sched emitter iterates through this — the
+/// accessor closures (`a_at`, `a_tg`, …) already pick per-slot names, so
+/// the polarity loop was the only thing the mirrors ever differed in.
+fn slots_where(partition: &[bool], lane_sliced: bool) -> impl Iterator<Item = usize> + '_ {
+    partition
+        .iter()
+        .enumerate()
+        .filter(move |&(_, &sliced)| sliced == lane_sliced)
+        .map(|(index, _)| index)
+}
+
 /// [`emit_fused_metal_with`] under a cooperative [`FoldSched`]: the streamed
 /// axis splits across simdgroups and/or lanes, an optional lane-distributed
 /// output axis vectorizes the slots that span it (slots that don't are
@@ -768,22 +780,18 @@ pub fn emit_fused_metal_sched_with(
     if sgs > 1 {
         // threadgroup partial arrays, declared at kernel scope
         body.push(format!("threadgroup float tgu[{}];", slots * sgs));
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if sliced {
-                body.push(format!("threadgroup float tgs_{j}[{}];", sgs * e_a));
-            }
+        for j in slots_where(&sliced_slot, true) {
+            body.push(format!("threadgroup float tgs_{j}[{}];", sgs * e_a));
         }
     }
 
     let ident: Vec<String> = carrier.identity.iter().map(|v| METAL.lit(*v)).collect();
     body.push(format!("float accu[{slots}] = {{ {} }};", ident.join(", ")));
-    for (j, &sliced) in sliced_slot.iter().enumerate() {
-        if sliced {
-            body.push(format!(
-                "float accs_{j}[{v_cnt}]; for (uint v_ = 0; v_ < {v_cnt}u; v_++) accs_{j}[v_] = {};",
-                ident[j]
-            ));
-        }
+    for j in slots_where(&sliced_slot, true) {
+        body.push(format!(
+            "float accs_{j}[{v_cnt}]; for (uint v_ = 0; v_ < {v_cnt}u; v_++) accs_{j}[v_] = {};",
+            ident[j]
+        ));
     }
 
     // ── the stream loop, strided over the split units ────────────────────────
@@ -877,23 +885,13 @@ pub fn emit_fused_metal_sched_with(
                 format!("elu_{k}_{jj}")
             }
         };
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if sliced {
-                continue;
+        for (exprs, name) in [(&carrier.into, "elu"), (&carrier.combine, "nau")] {
+            for j in slots_where(&sliced_slot, false) {
+                inner.push(format!(
+                    "float {name}_{j}_{jj} = {};",
+                    carrier_expr_map(&METAL, &exprs[j], &|i| item_at(i, false), &a_at, &b_el)
+                ));
             }
-            inner.push(format!(
-                "float elu_{j}_{jj} = {};",
-                carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, false), &a_at, &b_el)
-            ));
-        }
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if sliced {
-                continue;
-            }
-            inner.push(format!(
-                "float nau_{j}_{jj} = {};",
-                carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, false), &a_at, &b_el)
-            ));
         }
         if sliced_slot.iter().any(|&s| s) || sliced_leaf.iter().any(|&s| s) {
             inner.push(format!("for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
@@ -910,36 +908,22 @@ pub fn emit_fused_metal_sched_with(
                 vstmts.extend(stmts);
                 vstmts.push(format!("float xs_{i} = {v};"));
             }
-            for (j, &sliced) in sliced_slot.iter().enumerate() {
-                if !sliced {
-                    continue;
+            for (exprs, name) in [(&carrier.into, "els"), (&carrier.combine, "nas")] {
+                for j in slots_where(&sliced_slot, true) {
+                    vstmts.push(format!(
+                        "float {name}_{j} = {};",
+                        carrier_expr_map(&METAL, &exprs[j], &|i| item_at(i, true), &a_at, &b_el)
+                    ));
                 }
-                vstmts.push(format!(
-                    "float els_{j} = {};",
-                    carrier_expr_map(&METAL, &carrier.into[j], &|i| item_at(i, true), &a_at, &b_el)
-                ));
             }
-            for (j, &sliced) in sliced_slot.iter().enumerate() {
-                if !sliced {
-                    continue;
-                }
-                vstmts.push(format!(
-                    "float nas_{j} = {};",
-                    carrier_expr_map(&METAL, &carrier.combine[j], &|i| item_at(i, true), &a_at, &b_el)
-                ));
-            }
-            for (j, &sliced) in sliced_slot.iter().enumerate() {
-                if sliced {
-                    vstmts.push(format!("accs_{j}[v_] = nas_{j};"));
-                }
+            for j in slots_where(&sliced_slot, true) {
+                vstmts.push(format!("accs_{j}[v_] = nas_{j};"));
             }
             inner.extend(vstmts.into_iter().map(|s| format!("    {s}")));
             inner.push("}".into());
         }
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if !sliced {
-                inner.push(format!("accu[{j}] = nau_{j}_{jj};"));
-            }
+        for j in slots_where(&sliced_slot, false) {
+            inner.push(format!("accu[{j}] = nau_{j}_{jj};"));
         }
     }
     body.extend(inner.into_iter().map(|s| format!("    {s}")));
@@ -969,28 +953,22 @@ pub fn emit_fused_metal_sched_with(
     }
     if sgs > 1 {
         body.push("if (lane == 0) {".into());
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if !sliced {
-                body.push(format!("    tgu[{j} * {sgs}u + sgid] = accu[{j}];"));
-            }
+        for j in slots_where(&sliced_slot, false) {
+            body.push(format!("    tgu[{j} * {sgs}u + sgid] = accu[{j}];"));
         }
         body.push("}".into());
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if sliced {
-                body.push(format!(
-                    "for (uint v_ = 0; v_ < {v_cnt}u; v_++) tgs_{j}[sgid * {e_a}u + lane + v_ * {SIMD}u] = accs_{j}[v_];"
-                ));
-            }
+        for j in slots_where(&sliced_slot, true) {
+            body.push(format!(
+                "for (uint v_ = 0; v_ < {v_cnt}u; v_++) tgs_{j}[sgid * {e_a}u + lane + v_ * {SIMD}u] = accs_{j}[v_];"
+            ));
         }
         body.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
         body.push(format!("for (uint off_ = {}; off_ > 0; off_ >>= 1) {{", sgs / 2));
         body.push("    if (sgid < off_) {".into());
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if !sliced {
-                body.push(format!(
-                    "        float au_{j} = tgu[{j} * {sgs}u + sgid]; float bu_{j} = tgu[{j} * {sgs}u + sgid + off_];"
-                ));
-            }
+        for j in slots_where(&sliced_slot, false) {
+            body.push(format!(
+                "        float au_{j} = tgu[{j} * {sgs}u + sgid]; float bu_{j} = tgu[{j} * {sgs}u + sgid + off_];"
+            ));
         }
         let a_tg = |k: usize| -> String {
             if sliced_slot[k] {
@@ -1006,44 +984,36 @@ pub fn emit_fused_metal_sched_with(
                 format!("bu_{k}")
             }
         };
+        // The combine, rendered once for both polarities: the accessors
+        // above already pick the sliced/unsliced name per slot.
+        let tg_combine = |j: usize, name: &str| -> String {
+            format!(
+                "            float {name}_{j} = {};",
+                carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &a_tg, &b_tg)
+            )
+        };
         if sliced_slot.iter().any(|&s| s) {
             body.push(format!("        for (uint v_ = 0; v_ < {v_cnt}u; v_++) {{"));
             body.push(format!("            uint la_ = lane + v_ * {SIMD}u;"));
-            for (j, &sliced) in sliced_slot.iter().enumerate() {
-                if sliced {
-                    body.push(format!(
-                        "            float as_{j} = tgs_{j}[sgid * {e_a}u + la_]; float bs_{j} = tgs_{j}[(sgid + off_) * {e_a}u + la_];"
-                    ));
-                }
+            for j in slots_where(&sliced_slot, true) {
+                body.push(format!(
+                    "            float as_{j} = tgs_{j}[sgid * {e_a}u + la_]; float bs_{j} = tgs_{j}[(sgid + off_) * {e_a}u + la_];"
+                ));
             }
-            for (j, &sliced) in sliced_slot.iter().enumerate() {
-                if sliced {
-                    body.push(format!(
-                        "            float nms_{j} = {};",
-                        carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &a_tg, &b_tg)
-                    ));
-                }
+            for j in slots_where(&sliced_slot, true) {
+                body.push(tg_combine(j, "nms"));
             }
-            for (j, &sliced) in sliced_slot.iter().enumerate() {
-                if sliced {
-                    body.push(format!("            tgs_{j}[sgid * {e_a}u + la_] = nms_{j};"));
-                }
+            for j in slots_where(&sliced_slot, true) {
+                body.push(format!("            tgs_{j}[sgid * {e_a}u + la_] = nms_{j};"));
             }
             body.push("        }".into());
         }
         body.push("        if (lane == 0) {".into());
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if !sliced {
-                body.push(format!(
-                    "            float nmu_{j} = {};",
-                    carrier_expr_map(&METAL, &carrier.combine[j], &no_item, &a_tg, &b_tg)
-                ));
-            }
+        for j in slots_where(&sliced_slot, false) {
+            body.push(tg_combine(j, "nmu"));
         }
-        for (j, &sliced) in sliced_slot.iter().enumerate() {
-            if !sliced {
-                body.push(format!("            tgu[{j} * {sgs}u + sgid] = nmu_{j};"));
-            }
+        for j in slots_where(&sliced_slot, false) {
+            body.push(format!("            tgu[{j} * {sgs}u + sgid] = nmu_{j};"));
         }
         body.push("        }".into());
         body.push("    }".into());
