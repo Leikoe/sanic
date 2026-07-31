@@ -254,8 +254,129 @@ fn plan_axis_costed(
     let mut by_extent: Vec<AxisRef> = span_schedulable.clone();
     by_extent.sort_by(|&a, &b| ext(b).total_cmp(&ext(a)));
 
-    let mut best_cost: Option<f64> = None;
+    // The roofline bill of ONE role assignment — row/col tiled at tm/tc,
+    // `batch` on the grid, every other span axis resident — or None when no
+    // block of that shape fits the device. Pure: everything it reads is
+    // fixed before the enumeration below.
+    let price = |row: Option<AxisRef>, col: Option<AxisRef>, batch: &[AxisRef], tm: f64, tc: f64| -> Option<f64> {
+        // What one block holds of a tensor spanning `axes`, given the tile
+        // sizes: the streamed axis contributes a TILE_N slab, the row/col
+        // axes their tiles, batch axes nothing, and resident axes their
+        // full extent.
+        let per_block = |axes: &[AxisRef]| -> f64 {
+            let scheduled = |ax: AxisRef| -> Option<f64> {
+                if ax == streaming_axis {
+                    Some(tn)
+                } else if Some(ax) == row {
+                    Some(tm)
+                } else if Some(ax) == col {
+                    Some(tc)
+                } else if batch.contains(&ax) {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            };
+            axes.iter()
+                .map(|&ax| {
+                    if let Some(tile) = scheduled(ax) {
+                        tile
+                    } else if let Some(&(grouped, share)) = group_member.get(&ax) {
+                        // a block covering a tile of the grouped axis
+                        // touches only that tile's share of the member
+                        match scheduled(grouped) {
+                            Some(tile) => (tile * share).clamp(1.0, ext(ax)),
+                            None => ext(ax),
+                        }
+                    } else {
+                        ext(ax)
+                    }
+                })
+                .product()
+        };
 
+        // SRAM: input slabs (at their storage width) + the accumulator +
+        // the inner-contraction intermediate.
+        let mut sram = 0.0f64;
+        for (nm, axes) in &inputs {
+            sram += per_block(axes) * in_bytes(nm);
+        }
+        sram += carrier.acc_scalars(|ax| {
+            if Some(ax) == row {
+                tm
+            } else if Some(ax) == col {
+                tc
+            } else if batch.contains(&ax) {
+                1.0
+            } else {
+                ext(ax)
+            }
+        }) * b_bytes;
+        if has_inner_contraction {
+            sram += tm * tc * tn * b_bytes;
+        }
+
+        // HBM: every input is re-read once per grid instance it does not
+        // carry — row blocks, col blocks, batch — each moving its own
+        // storage width.
+        let row_blocks = row.map_or(1.0, |r| (ext(r) / tm).ceil());
+        let col_blocks = col.map_or(1.0, |c| (ext(c) / tc).ceil());
+        // "Carries the axis" includes carrying a group member coupled to
+        // it: each block of the grouped axis reads its own slice of the
+        // member, not the whole tensor again.
+        let carries = |axes: &[AxisRef], scheduled: AxisRef| -> bool {
+            axes.iter()
+                .any(|&ax| ax == scheduled || group_member.get(&ax).is_some_and(|&(grouped, _)| grouped == scheduled))
+        };
+        let mut hbm = output_vol * b_bytes;
+        for (nm, axes) in &inputs {
+            let vol: f64 = axes.iter().map(|&ax| ext(ax)).product();
+            let mut factor = 1.0;
+            if let Some(r) = row
+                && !carries(axes, r)
+            {
+                factor *= row_blocks;
+            }
+            if let Some(c) = col
+                && !carries(axes, c)
+            {
+                factor *= col_blocks;
+            }
+            for &b in batch {
+                if !carries(axes, b) {
+                    factor *= ext(b);
+                }
+            }
+            hbm += vol * factor * in_bytes(nm);
+        }
+
+        // one lane per output point of the block: the tile area times the
+        // col span held resident in it
+        let resident_cols: f64 = col_axes
+            .iter()
+            .filter(|&&ax| Some(ax) != row && Some(ax) != col && !batch.contains(&ax))
+            .map(|&ax| ext(ax))
+            .product();
+        let batch_volume: f64 = batch.iter().map(|&ax| ext(ax)).product();
+        let k = Kernel {
+            flops: total_flops,
+            hbm_bytes: hbm,
+            sram_per_block: sram,
+            // Registers are not modeled separately; reuse SRAM.
+            regs_per_block: sram,
+            parallel_blocks: batch_volume * row_blocks * col_blocks,
+            lanes_per_block: tm * tc * resident_cols,
+            // the cooperative-tile fiction is a feasibility gate, not a
+            // committed cost: keep it at the pre-Little's-law 4 B so its
+            // verdicts are stable
+            bytes_in_flight_per_lane: 4.0,
+        };
+        feasible(dev, &k).then(|| kernel_time(dev, &k))
+    };
+
+    // The enumeration; the FIRST minimum wins, so the order above (large
+    // rows first, no col tile first, all-batch first) is the tie-breaker.
+    let mut best_cost: Option<f64> = None;
     let row_options: Vec<Option<AxisRef>> = by_extent.iter().map(|&a| Some(a)).chain([None]).collect();
     for &row in &row_options {
         let col_options: Vec<Option<AxisRef>> = [None]
@@ -277,130 +398,11 @@ fn plan_axis_costed(
                     .map(|(_, a)| *a)
                     .collect();
                 // (everything in `rest` not chosen as batch stays resident)
-                let batch_volume: f64 = batch.iter().map(|&ax| ext(ax)).product();
-
-                // What one block holds of a tensor spanning `axes`, given the
-                // tile sizes: the streamed axis contributes a TILE_N slab, the
-                // row/col axes their tiles, batch axes nothing, and resident
-                // axes their full extent.
-                let per_block = |axes: &[AxisRef], tm: f64, tc: f64| -> f64 {
-                    let scheduled = |ax: AxisRef| -> Option<f64> {
-                        if ax == streaming_axis {
-                            Some(tn)
-                        } else if Some(ax) == row {
-                            Some(tm)
-                        } else if Some(ax) == col {
-                            Some(tc)
-                        } else if batch.contains(&ax) {
-                            Some(1.0)
-                        } else {
-                            None
-                        }
-                    };
-                    axes.iter()
-                        .map(|&ax| {
-                            if let Some(tile) = scheduled(ax) {
-                                tile
-                            } else if let Some(&(grouped, share)) = group_member.get(&ax) {
-                                // a block covering a tile of the grouped axis
-                                // touches only that tile's share of the member
-                                match scheduled(grouped) {
-                                    Some(tile) => (tile * share).clamp(1.0, ext(ax)),
-                                    None => ext(ax),
-                                }
-                            } else {
-                                ext(ax)
-                            }
-                        })
-                        .product()
-                };
-
-                let tms = pows(row.map_or(1.0, ext));
-                let tcs = pows(col.map_or(1.0, ext));
-                for &tm in &tms {
-                    for &tc in &tcs {
-                        // SRAM: input slabs (at their storage width) + the
-                        // accumulator + the inner-contraction intermediate.
-                        let mut sram = 0.0f64;
-                        for (nm, axes) in &inputs {
-                            sram += per_block(axes, tm, tc) * in_bytes(nm);
-                        }
-                        sram += carrier.acc_scalars(|ax| {
-                            if Some(ax) == row {
-                                tm
-                            } else if Some(ax) == col {
-                                tc
-                            } else if batch.contains(&ax) {
-                                1.0
-                            } else {
-                                ext(ax)
-                            }
-                        }) * b_bytes;
-                        if has_inner_contraction {
-                            sram += tm * tc * tn * b_bytes;
-                        }
-
-                        // HBM: every input is re-read once per grid instance
-                        // it does not carry — row blocks, col blocks, batch —
-                        // each moving its own storage width.
-                        let row_blocks = row.map_or(1.0, |r| (ext(r) / tm).ceil());
-                        let col_blocks = col.map_or(1.0, |c| (ext(c) / tc).ceil());
-                        // "Carries the axis" includes carrying a group member
-                        // coupled to it: each block of the grouped axis reads
-                        // its own slice of the member, not the whole tensor
-                        // again.
-                        let carries = |axes: &[AxisRef], scheduled: AxisRef| -> bool {
-                            axes.iter().any(|&ax| {
-                                ax == scheduled
-                                    || group_member.get(&ax).is_some_and(|&(grouped, _)| grouped == scheduled)
-                            })
-                        };
-                        let mut hbm = output_vol * b_bytes;
-                        for (nm, axes) in &inputs {
-                            let vol: f64 = axes.iter().map(|&ax| ext(ax)).product();
-                            let mut factor = 1.0;
-                            if let Some(r) = row
-                                && !carries(axes, r)
-                            {
-                                factor *= row_blocks;
-                            }
-                            if let Some(c) = col
-                                && !carries(axes, c)
-                            {
-                                factor *= col_blocks;
-                            }
-                            for &b in &batch {
-                                if !carries(axes, b) {
-                                    factor *= ext(b);
-                                }
-                            }
-                            hbm += vol * factor * in_bytes(nm);
-                        }
-
-                        // one lane per output point of the block: the tile
-                        // area times the col span held resident in it
-                        let resident_cols: f64 = col_axes
-                            .iter()
-                            .filter(|&&ax| Some(ax) != row && Some(ax) != col && !batch.contains(&ax))
-                            .map(|&ax| ext(ax))
-                            .product();
-                        let k = Kernel {
-                            flops: total_flops,
-                            hbm_bytes: hbm,
-                            sram_per_block: sram,
-                            // Registers are not modeled separately; reuse SRAM.
-                            regs_per_block: sram,
-                            parallel_blocks: batch_volume * row_blocks * col_blocks,
-                            lanes_per_block: tm * tc * resident_cols,
-                            // the cooperative-tile fiction is a feasibility
-                            // gate, not a committed cost: keep it at the
-                            // pre-Little's-law 4 B so its verdicts are stable
-                            bytes_in_flight_per_lane: 4.0,
-                        };
-                        if !feasible(dev, &k) {
+                for &tm in &pows(row.map_or(1.0, ext)) {
+                    for &tc in &pows(col.map_or(1.0, ext)) {
+                        let Some(cost) = price(row, col, &batch, tm, tc) else {
                             continue;
-                        }
-                        let cost = kernel_time(dev, &k);
+                        };
                         if best_cost.is_none_or(|b| cost < b) {
                             best_cost = Some(cost);
                         }
