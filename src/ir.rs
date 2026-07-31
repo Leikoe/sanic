@@ -364,6 +364,70 @@ impl Resolver {
             })
             .collect()
     }
+
+    /// Translate an axis set DOWN through one structural boundary — the
+    /// `support` query (`shapes_and_indexing.md` §3): every source
+    /// occurrence whose index involves one of `axes`. Below a flatten the
+    /// stream lives on the group members; below a split or window, on the
+    /// mapped source axes its terms drive; a gather whose index varies
+    /// with the stream spreads it onto the gathered axis. Anything the
+    /// boundary doesn't touch passes through, and a non-structural node
+    /// passes everything through.
+    ///
+    /// Without this translation everything under a flattened fold looks
+    /// stream-invariant, and a SwiGLU's exp stays in-body of the down
+    /// projection — recomputed once per output row instead of once per
+    /// element. (`partition`'s `entanglers` and `analyze::structure`
+    /// translate a single axis the same way but also stop at an axis
+    /// *consumed* below the boundary, so they don't reuse this.)
+    pub(crate) fn support_below(&mut self, node: &NodeRef, axes: &[AxisRef]) -> Vec<AxisRef> {
+        match node.as_ref() {
+            Node::View { .. } => {
+                let groups = self.view_groups(node);
+                let mut below = Vec::new();
+                for &axis in axes {
+                    match groups.iter().find(|(_, to)| *to == axis) {
+                        Some((members, _)) => below.extend(members.iter().copied()),
+                        None => below.push(axis),
+                    }
+                }
+                below
+            }
+            Node::Reindex { .. } => {
+                let map = self.resolved_reindex(node);
+                let mut below = Vec::new();
+                for &axis in axes {
+                    let mut driving = map
+                        .iter()
+                        .filter(|(_, terms, _)| terms.iter().any(|(_, term)| *term == axis))
+                        .map(|(mapped, _, _)| *mapped)
+                        .peekable();
+                    if driving.peek().is_none() {
+                        below.push(axis);
+                    } else {
+                        below.extend(driving);
+                    }
+                }
+                below
+            }
+            Node::Gather { src, index, dim } => {
+                let gathered = self.source_axis(src, *dim);
+                let index_axes = all_axis_refs(index);
+                let mut below = axes.to_vec();
+                if axes.iter().any(|axis| index_axes.contains(axis)) && !below.contains(&gathered) {
+                    below.push(gathered);
+                }
+                below
+            }
+            _ => axes.to_vec(),
+        }
+    }
+}
+
+/// [`Resolver::support_below`] for `&self` walks, with a per-call resolver —
+/// the same free-function form as [`view_groups`] and [`resolved_reindex`].
+pub fn support_below(node: &NodeRef, axes: &[AxisRef]) -> Vec<AxisRef> {
+    Resolver::default().support_below(node, axes)
 }
 
 fn own_axis(node: &NodeRef, dim: usize, descriptor: Axis) -> AxisRef {

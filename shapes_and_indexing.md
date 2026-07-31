@@ -359,10 +359,13 @@ carries its *driver* — the thing that bleeds without it — because a step
 without one is speculation, however elegant. Nothing here bleeds today;
 M-C bleeds first.
 
-- **M-A — finish Resolver.** The `identity`/`support`/`transpose` queries
-  as Resolver methods; port `stream_below_*` to them. Gate: kernel census
-  on llama unchanged (311), tests green. *Driver: prerequisite for M-B/M-C;
-  near-zero risk.*
+- **M-A — finish Resolver.** *[LANDED 2026-07-30 — the `support` half:
+  `Resolver::support_below` replaces `stream_below_{view,reindex,gather}`,
+  and their three duplicated dispatch arms in `leaf_cuts`, `hot_volume`,
+  and `stream_provenance` collapse to one query. Gate held: llama MSL
+  byte-identical, all correctness targets green. `identity` already lives
+  as `axis_refs_rc`'s pass-through rule; `transpose` waits for its first
+  consumer (M-C) — a query with no caller is dead surface, not progress.]*
 - **M-B — the folds.** `axis_aliases` and `stream_provenance` become folds
   over the queries; during transition, assert old == new on the llama
   graph, then delete the old arms. *Driver: the §1a contradiction stays

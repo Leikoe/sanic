@@ -36,8 +36,7 @@ use crate::cost::DeviceSpecs;
 use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
-    self, AxisRef, MapOp, Monoid, Node as NodeKind, NodeRef as Node, ResolvedAffineIndex, all_axis_refs, input_axes,
-    leaf_names,
+    self, AxisRef, MapOp, Monoid, Node as NodeKind, NodeRef as Node, all_axis_refs, input_axes, leaf_names,
 };
 use crate::plan::{GroupCache, KernelSpec, SIMD, count_issue_ops, plan_axis_emitted, plan_axis_with_groups};
 
@@ -889,20 +888,13 @@ impl Partitioner<'_> {
             // makes planning price the gather's whole backing tensor as a
             // resident input instead of the selected rows.
             NodeKind::Gather { .. } if self.shared(node) => push_cut(node, out),
-            NodeKind::Gather { src, index, dim } => {
-                let gathered = ir::source_axis(src, *dim);
-                self.leaf_cuts(src, &stream_below_gather(axes, index, gathered), pricing, out);
+            NodeKind::Gather { src, index, .. } => {
+                self.leaf_cuts(src, &ir::support_below(node, axes), pricing, out);
                 self.leaf_cuts(index, axes, pricing, out);
             }
-            NodeKind::View { src, .. } => {
-                self.leaf_cuts(src, &stream_below_view(axes, &ir::view_groups(node)), pricing, out)
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+                self.leaf_cuts(src, &ir::support_below(node, axes), pricing, out)
             }
-            NodeKind::Reindex { src, .. } => self.leaf_cuts(
-                src,
-                &stream_below_reindex(axes, &ir::resolved_reindex(node)),
-                pricing,
-                out,
-            ),
             _ => push_cut(node, out),
         }
     }
@@ -1106,16 +1098,12 @@ impl Partitioner<'_> {
                 }
                 hot
             }
-            NodeKind::Gather { src, index, dim } => {
-                let gathered = ir::source_axis(src, *dim);
-                max(
-                    self.hot_volume(src, &stream_below_gather(axes, index, gathered)),
-                    self.hot_volume(index, axes),
-                )
-            }
-            NodeKind::View { src, .. } => self.hot_volume(src, &stream_below_view(axes, &ir::view_groups(node))),
-            NodeKind::Reindex { src, .. } => {
-                self.hot_volume(src, &stream_below_reindex(axes, &ir::resolved_reindex(node)))
+            NodeKind::Gather { src, index, .. } => max(
+                self.hot_volume(src, &ir::support_below(node, axes)),
+                self.hot_volume(index, axes),
+            ),
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+                self.hot_volume(src, &ir::support_below(node, axes))
             }
             // Fold-bearing subtrees are pushed whole by `leaf_cuts` — their
             // interior is not this cut's concern. Free sources carry no work.
@@ -1868,34 +1856,15 @@ fn stream_provenance(root: &Node, axes: &[AxisRef], leaves: &[Node]) -> HashMap<
                     walk(input, &input_axes, leaves, local_axes, seen, resolver);
                 }
             }
-            NodeKind::Gather { src, index, dim } => {
-                let gathered = resolver.source_axis(src, *dim);
-                walk(
-                    src,
-                    &stream_below_gather(axes, index, gathered),
-                    leaves,
-                    local_axes,
-                    seen,
-                    resolver,
-                );
+            NodeKind::Gather { src, index, .. } => {
+                let below = resolver.support_below(node, axes);
+                walk(src, &below, leaves, local_axes, seen, resolver);
                 walk(index, axes, leaves, local_axes, seen, resolver);
             }
-            NodeKind::View { src, .. } => walk(
-                src,
-                &stream_below_view(axes, &resolver.view_groups(node)),
-                leaves,
-                local_axes,
-                seen,
-                resolver,
-            ),
-            NodeKind::Reindex { src, .. } => walk(
-                src,
-                &stream_below_reindex(axes, &resolver.resolved_reindex(node)),
-                leaves,
-                local_axes,
-                seen,
-                resolver,
-            ),
+            NodeKind::View { src, .. } | NodeKind::Reindex { src, .. } => {
+                let below = resolver.support_below(node, axes);
+                walk(src, &below, leaves, local_axes, seen, resolver);
+            }
         }
     }
 
@@ -1911,54 +1880,6 @@ fn stream_provenance(root: &Node, axes: &[AxisRef], leaves: &[Node]) -> HashMap<
         &mut ir::Resolver::default(),
     );
     local_axes
-}
-
-/// Translate a streamed axis set DOWN through one structural boundary — the
-/// rule [`Partitioner::leaf_cuts`] and [`Partitioner::hot_volume`] share as they
-/// descend. Below a flatten the stream lives on the group members; below a
-/// split/window, on the mapped source axes its terms drive; a gather whose
-/// index varies with the stream spreads it onto the gathered axis. Anything the
-/// boundary doesn't touch passes through. ([`Partitioner::entanglers`] and
-/// [`crate::analyze::structure`] translate a single axis the same way, but also
-/// stop at an axis *consumed* below the boundary, so they don't reuse this.)
-/// Without the translation everything under a flattened fold looks
-/// stream-invariant, and a SwiGLU's exp stays in-body of the down projection —
-/// recomputed once per output row instead of once per element.
-fn stream_below_view(axes: &[AxisRef], groups: &[(Vec<AxisRef>, AxisRef)]) -> Vec<AxisRef> {
-    let mut below = Vec::new();
-    for &a in axes {
-        match groups.iter().find(|(_, to)| *to == a) {
-            Some((members, _)) => below.extend(members.iter().copied()),
-            None => below.push(a),
-        }
-    }
-    below
-}
-
-fn stream_below_reindex(axes: &[AxisRef], map: &[ResolvedAffineIndex]) -> Vec<AxisRef> {
-    let mut below = Vec::new();
-    for &a in axes {
-        let mut driving = map
-            .iter()
-            .filter(|(_, terms, _)| terms.iter().any(|(_, t)| *t == a))
-            .map(|(m, _, _)| *m)
-            .peekable();
-        if driving.peek().is_none() {
-            below.push(a);
-        } else {
-            below.extend(driving);
-        }
-    }
-    below
-}
-
-fn stream_below_gather(axes: &[AxisRef], index: &Node, gathered: AxisRef) -> Vec<AxisRef> {
-    let index_axes = all_axis_refs(index);
-    let mut below = axes.to_vec();
-    if axes.iter().any(|a| index_axes.contains(a)) && !below.contains(&gathered) {
-        below.push(gathered);
-    }
-    below
 }
 
 /// The smallest-volume normalizer APPLICATION site in the graph — a `Div`,
