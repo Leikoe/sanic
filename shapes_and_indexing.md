@@ -366,10 +366,18 @@ M-C bleeds first.
   byte-identical, all correctness targets green. `identity` already lives
   as `axis_refs_rc`'s pass-through rule; `transpose` waits for its first
   consumer (M-C) — a query with no caller is dead surface, not progress.]*
-- **M-B — the folds.** `axis_aliases` and `stream_provenance` become folds
-  over the queries; during transition, assert old == new on the llama
-  graph, then delete the old arms. *Driver: the §1a contradiction stays
-  latent until a pass trips it; this closes it for good.*
+- **M-B — the folds.** *[TRANSITIONAL 2026-07-30 — `axis_aliases` now
+  runs twice: the hand-written arms (authoritative) beside
+  `axis_aliases_via_transport`, a fold over `Resolver::frame_below` (the
+  down identity transport, `FrameSlot::{Parent, Consumed, Broken}`), with
+  `debug_assert_eq!` on every derivation the suite compiles — the
+  assertion held across the whole suite on the first run. The swap
+  (delete the arms, keep the fold, drop the double compute) is its own
+  reviewed commit. What stayed in derive, correctly: the consumed-dim
+  alias choice and `alias_collapsed`'s broadcast-back — semantics, not
+  transport. `stream_provenance` already thinned to `support_below`
+  queries at M-A; folding its walk skeleton further is churn, not
+  simplification — left alone deliberately.]*
 - **M-C — the adjoint.** Classified transpose in `grad`; dense corner only
   for non-injective and data cases. Gate: `tests/grad.rs` + randomized
   movement chains, classified vs dense vs interp, bit-agreement in f64;

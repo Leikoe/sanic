@@ -764,39 +764,127 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     out
 }
 
+/// The broadcast-back pattern: re-inserting a singleton at a reduction's
+/// old position is how a frontend broadcasts that collapsed value back
+/// over the dimension it summarizes. Alias the collapsed occurrence to the
+/// insertion's canonical axis so a consuming fold can recognize both
+/// reductions as carrying the same loop occurrence. Derive semantics, not
+/// transport — shared by the reference walk and the M-B fold.
+fn alias_collapsed(
+    node: &Node,
+    insertion: usize,
+    target: AxisRef,
+    aliases: &mut HashMap<AxisRef, AxisRef>,
+    resolver: &mut ir::Resolver,
+) {
+    match node.as_ref() {
+        NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
+            let collapsed = resolver.source_axis(src, *dim);
+            if collapsed.extent == target.extent {
+                aliases.insert(collapsed, target);
+            }
+        }
+        NodeKind::Map { inputs, .. } => {
+            let output_rank = resolver.shape(node).len();
+            for input in inputs {
+                let input_rank = resolver.shape(input).len();
+                let lead = output_rank - input_rank;
+                if insertion >= lead && insertion - lead <= input_rank {
+                    alias_collapsed(input, insertion - lead, target, aliases, resolver);
+                }
+            }
+        }
+        NodeKind::View { src, dims } => {
+            let source_insertion = dims.iter().take(insertion).map(|dim| dim.sources.len()).sum();
+            alias_collapsed(src, source_insertion, target, aliases, resolver);
+        }
+        _ => {}
+    }
+}
+
+/// M-B, transitional (`shapes_and_indexing.md` §8): the hand-written arms
+/// remain the answer, and the frame-transport fold runs beside them —
+/// every graph the suite derives asserts their agreement. The swap
+/// (delete the arms, keep the fold) is its own reviewed commit.
 fn axis_aliases(root: &Node, stream: AxisRef, resolver: &mut ir::Resolver) -> HashMap<AxisRef, AxisRef> {
-    fn alias_collapsed(
+    let reference = axis_aliases_reference(root, stream, resolver);
+    let via_transport = axis_aliases_via_transport(root, stream, resolver);
+    debug_assert_eq!(
+        via_transport, reference,
+        "M-B transitional: the frame transport must reproduce the reference aliases"
+    );
+    let _ = via_transport;
+    reference
+}
+
+/// [`axis_aliases`] as a fold over [`ir::Resolver::frame_below`]: the
+/// per-kind transport is the resolver's, and only the derive-owned choices
+/// remain — what a consumed dimension aliases to (the running table, else
+/// the stream, else itself) and [`alias_collapsed`] under a singleton
+/// reinsertion.
+fn axis_aliases_via_transport(root: &Node, stream: AxisRef, resolver: &mut ir::Resolver) -> HashMap<AxisRef, AxisRef> {
+    fn fold(
         node: &Node,
-        insertion: usize,
-        target: AxisRef,
+        canonical: Vec<Option<AxisRef>>,
+        stream: AxisRef,
         aliases: &mut HashMap<AxisRef, AxisRef>,
+        seen: &mut std::collections::HashSet<*const NodeKind>,
         resolver: &mut ir::Resolver,
     ) {
-        match node.as_ref() {
-            NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
-                let collapsed = resolver.source_axis(src, *dim);
-                if collapsed.extent == target.extent {
-                    aliases.insert(collapsed, target);
+        let axes = resolver.axes(node);
+        for (&local, target) in axes.iter().zip(&canonical) {
+            if let Some(target) = target {
+                aliases.entry(local).or_insert(*target);
+            }
+        }
+        if !seen.insert(Arc::as_ptr(node)) {
+            return;
+        }
+        if let NodeKind::View { src, dims } = node.as_ref() {
+            for (inserted, dim) in dims.iter().enumerate() {
+                if dim.sources.is_empty()
+                    && let Some(target) = canonical[inserted]
+                {
+                    alias_collapsed(src, inserted, target, aliases, resolver);
                 }
             }
-            NodeKind::Map { inputs, .. } => {
-                let output_rank = resolver.shape(node).len();
-                for input in inputs {
-                    let input_rank = resolver.shape(input).len();
-                    let lead = output_rank - input_rank;
-                    if insertion >= lead && insertion - lead <= input_rank {
-                        alias_collapsed(input, insertion - lead, target, aliases, resolver);
-                    }
-                }
-            }
-            NodeKind::View { src, dims } => {
-                let source_insertion = dims.iter().take(insertion).map(|dim| dim.sources.len()).sum();
-                alias_collapsed(src, source_insertion, target, aliases, resolver);
-            }
-            _ => {}
+        }
+        for (child, slots) in resolver.frame_below(node) {
+            let child_frame =
+                slots
+                    .iter()
+                    .map(|slot| match slot {
+                        ir::FrameSlot::Parent(parent_dim) => canonical[*parent_dim],
+                        ir::FrameSlot::Consumed(axis) => Some(
+                            aliases
+                                .get(axis)
+                                .copied()
+                                .unwrap_or(if *axis == stream { stream } else { *axis }),
+                        ),
+                        ir::FrameSlot::Broken => None,
+                    })
+                    .collect();
+            fold(&child, child_frame, stream, aliases, seen, resolver);
         }
     }
 
+    let root_axes = resolver.axes(root);
+    let canonical = root_axes.iter().copied().map(Some).collect();
+    let mut aliases = HashMap::new();
+    fold(
+        root,
+        canonical,
+        stream,
+        &mut aliases,
+        &mut std::collections::HashSet::new(),
+        resolver,
+    );
+    aliases.insert(stream, stream);
+    aliases
+}
+
+/// The hand-written arms — authoritative until the M-B swap commit.
+fn axis_aliases_reference(root: &Node, stream: AxisRef, resolver: &mut ir::Resolver) -> HashMap<AxisRef, AxisRef> {
     fn walk(
         node: &Node,
         canonical: Vec<Option<AxisRef>>,
