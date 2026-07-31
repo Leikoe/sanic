@@ -514,6 +514,105 @@ fn leaf_widths(node: &Node, resolved: &HashMap<String, Dtype>) -> HashMap<&'stat
         .collect()
 }
 
+/// What both fold emitters build before any body line: the buffer list and
+/// resolved widths (the fold's leaves plus the epilogue's extra reads — the
+/// fold's own output excluded, its projection lands in a register), and a
+/// [`Gen`] whose aliases map the epilogue's local axes onto the fold's grid.
+struct KernelFrame {
+    bufs: Vec<(&'static str, Vec<AxisRef>)>,
+    dtypes: HashMap<&'static str, Dtype>,
+    g: Gen,
+}
+
+fn fold_kernel_frame(
+    carrier: &Carrier,
+    fold_node: &Node,
+    epi: Option<(&Node, &str)>,
+    grid: &[AxisRef],
+    resolved: &HashMap<String, Dtype>,
+) -> KernelFrame {
+    let mut bufs = buffers(fold_node);
+    let mut dtypes: HashMap<&'static str, Dtype> = leaf_widths(fold_node, resolved);
+    if let Some((e, out_name)) = epi {
+        for (n, ax) in buffers(e) {
+            if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
+                bufs.push((n, ax));
+            }
+        }
+        dtypes.extend(leaf_widths(e, resolved));
+    }
+    let mut g = Gen::new();
+    g.axis_aliases = carrier.aliases.clone();
+    if let Some((epilogue, _)) = epi {
+        for (local, canonical) in ir::axis_refs(epilogue).into_iter().zip(grid) {
+            g.axis_aliases.insert(local, *canonical);
+        }
+    }
+    g.dtypes = dtypes.clone();
+    KernelFrame { bufs, dtypes, g }
+}
+
+/// The honest window's clamped edge, when the carrier has one: a
+/// prefix-masked rescale fold stops at the mask edge (bit-identical — the
+/// masked tail is an exact f32 no-op). `floor` clamps the bound UP so
+/// every cooperative lane folds at least one element (an identity-valued
+/// accumulator must never reach the rescale merge: the −∞ edge);
+/// positions between the edge and the clamp are exact no-ops, so the
+/// clamp only costs work, never correctness. `None` when the fold has no
+/// mask edge — the caller streams the whole extent.
+fn honest_window_edge(
+    carrier: &Carrier,
+    stream: AxisRef,
+    floor: Option<usize>,
+    coord: &HashMap<AxisRef, String>,
+    g: &mut Gen,
+    body: &mut Vec<String>,
+) -> Option<String> {
+    let edge = prefix_mask_edge(carrier, stream)?;
+    let e = value(&METAL, &carrier.leaves[edge], coord, g, body);
+    let v = g.fresh("hi");
+    body.push(match floor {
+        Some(f) => format!(
+            "uint {v} = min({}u, max((uint)({e} + 0.5f) + 1u, {f}u));",
+            stream.extent()
+        ),
+        None => format!("uint {v} = min({}u, (uint)({e} + 0.5f) + 1u);", stream.extent()),
+    });
+    Some(v)
+}
+
+/// The projection's store, shared by both fold emitters. An epilogue
+/// renders in the same kernel: projection → register, the epilogue's read
+/// of the fold's own output resolves to it (`Gen::local_inputs`), then one
+/// `outb` write of the (possibly narrowed) value.
+struct ProjectionStore<'a> {
+    epi: Option<(&'a Node, &'a str)>,
+    projection: String,
+    grid: &'a [AxisRef],
+    storage: Dtype,
+}
+
+impl ProjectionStore<'_> {
+    fn render(&self, coords: &HashMap<AxisRef, String>, g: &mut Gen, out: &mut Vec<String>, indent: &str) {
+        let stored = match self.epi {
+            None => self.projection.clone(),
+            Some((e, out_name)) => {
+                let fv = g.fresh("fv");
+                let mut tmp = vec![format!("float {fv} = {};", self.projection)];
+                g.local_inputs.insert(out_name.to_string(), fv);
+                let ev = value(&METAL, e, coords, g, &mut tmp);
+                out.extend(tmp.into_iter().map(|s| format!("{indent}{s}")));
+                ev
+            }
+        };
+        out.push(format!(
+            "{indent}outb[{}] = {};",
+            offset(self.grid, coords),
+            store_expr(self.storage, &stored)
+        ));
+    }
+}
+
 /// Emit an MSL kernel for one fused, scalar-projecting carrier: one thread
 /// per output grid point, streaming `stream` in registers. The optional
 /// fused EPILOGUE is an elementwise node of the fold's own shape that reads
@@ -532,25 +631,7 @@ pub fn emit_fused_metal_with(
 ) -> MetalKernel {
     assert_eq!(carrier.project.len(), 1, "metal kernel needs a scalar projection");
     let (grid, grid_size) = grid_of(fold_node);
-    let mut bufs = buffers(fold_node);
-    let mut dtypes: HashMap<&'static str, Dtype> = leaf_widths(fold_node, resolved);
-    if let Some((e, out_name)) = epi {
-        for (n, ax) in buffers(e) {
-            if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
-                bufs.push((n, ax));
-            }
-        }
-        dtypes.extend(leaf_widths(e, resolved));
-    }
-
-    let mut g = Gen::new();
-    g.axis_aliases = carrier.aliases.clone();
-    if let Some((epilogue, _)) = epi {
-        for (local, canonical) in ir::axis_refs(epilogue).into_iter().zip(&grid) {
-            g.axis_aliases.insert(local, *canonical);
-        }
-    }
-    g.dtypes = dtypes.clone();
+    let KernelFrame { bufs, dtypes, mut g } = fold_kernel_frame(carrier, fold_node, epi, &grid, resolved);
     let mut body: Vec<String> = vec![format!("if (gid >= {grid_size}) return;")];
     let coord = thread_grid_decode(&METAL, &grid, &mut g, &mut body);
 
@@ -563,20 +644,8 @@ pub fn emit_fused_metal_with(
         .join(", ");
     body.push(format!("float acc[{slots}] = {{ {ident} }};"));
 
-    // honest window: a prefix-masked rescale fold stops at the mask edge
-    // (bit-identical — the masked tail is an exact f32 no-op)
-    let s_bound = match prefix_mask_edge(carrier, stream) {
-        Some(p) => {
-            let e = value(&METAL, &carrier.leaves[p], &coord, &mut g, &mut body);
-            let v = g.fresh("hi");
-            body.push(format!(
-                "uint {v} = min({}u, (uint)({e} + 0.5f) + 1u);",
-                stream.extent()
-            ));
-            v
-        }
-        None => format!("{}", stream.extent()),
-    };
+    let s_bound = honest_window_edge(carrier, stream, None, &coord, &mut g, &mut body)
+        .unwrap_or_else(|| format!("{}", stream.extent()));
 
     let sv = g.fresh("s");
     let mut cs = coord.clone();
@@ -645,20 +714,13 @@ pub fn emit_fused_metal_with(
         &|i| format!("acc[{i}]"),
         &|_| unreachable!("B slot in a projection"),
     );
-    let stored = match epi {
-        None => proj,
-        Some((e, out_name)) => {
-            let fv = g.fresh("fv");
-            body.push(format!("float {fv} = {proj};"));
-            g.local_inputs.insert(out_name.to_string(), fv);
-            value(&METAL, e, &coord, &mut g, &mut body)
-        }
+    let store = ProjectionStore {
+        epi,
+        projection: proj,
+        grid: &grid,
+        storage,
     };
-    body.push(format!(
-        "outb[{}] = {};",
-        offset(&grid, &coord),
-        store_expr(storage, &stored)
-    ));
+    store.render(&coord, &mut g, &mut body, "");
 
     MetalKernel {
         msl: format!("{MSL_HEADER}{}", wrap(name, signature(&bufs, &dtypes, storage), body)),
@@ -749,24 +811,7 @@ pub fn emit_fused_metal_sched_with(
         }
     }
 
-    let mut bufs = buffers(fold_node);
-    let mut dtypes: HashMap<&'static str, Dtype> = leaf_widths(fold_node, resolved);
-    if let Some((e, out_name)) = epi {
-        for (n, ax) in buffers(e) {
-            if n != out_name && !bufs.iter().any(|(m, _)| *m == n) {
-                bufs.push((n, ax));
-            }
-        }
-        dtypes.extend(leaf_widths(e, resolved));
-    }
-    let mut g = Gen::new();
-    g.axis_aliases = carrier.aliases.clone();
-    if let Some((epilogue, _)) = epi {
-        for (local, canonical) in ir::axis_refs(epilogue).into_iter().zip(&grid) {
-            g.axis_aliases.insert(local, *canonical);
-        }
-    }
-    g.dtypes = dtypes.clone();
+    let KernelFrame { bufs, dtypes, mut g } = fold_kernel_frame(carrier, fold_node, epi, &grid, resolved);
 
     let tgt = sched.tg_threads();
     let sgs = sched.sgs;
@@ -817,23 +862,8 @@ pub fn emit_fused_metal_sched_with(
             s_ext / chunk
         ));
     } else {
-        // honest window: a prefix-masked rescale fold stops at the mask
-        // edge — clamped UP to the split width so every lane folds at
-        // least one element (an identity-valued accumulator must never
-        // reach the rescale merge: the −∞ edge). Positions between the
-        // edge and the clamp are exact f32 no-ops, so the clamp only
-        // costs work, never correctness.
-        let s_bound = match prefix_mask_edge(carrier, stream) {
-            Some(p) => {
-                let e = value(&METAL, &carrier.leaves[p], &coord, &mut g, &mut body);
-                let v = g.fresh("hi");
-                body.push(format!(
-                    "uint {v} = min({s_ext}u, max((uint)({e} + 0.5f) + 1u, {f_split}u));"
-                ));
-                v
-            }
-            None => format!("{s_ext}u"),
-        };
+        let s_bound = honest_window_edge(carrier, stream, Some(f_split), &coord, &mut g, &mut body)
+            .unwrap_or_else(|| format!("{s_ext}u"));
         body.push(format!("for (uint s_ = {unit}; s_ < {s_bound}; s_ += {f_split}u) {{"));
     }
     if sched.lane_axis.is_some() {
@@ -1033,25 +1063,11 @@ pub fn emit_fused_metal_sched_with(
     let proj = carrier_expr_map(&METAL, &carrier.project[0], &no_item, &proj_a, &|_| {
         unreachable!("B slot in a projection")
     });
-    // an epilogue renders in the same kernel: projection → register, the
-    // epilogue's read of the fold's own output resolves to it
-    let store = |wc: &HashMap<AxisRef, String>, g: &mut Gen, out: &mut Vec<String>, indent: &str| {
-        let stored = match epi {
-            None => proj.clone(),
-            Some((e, out_name)) => {
-                let fv = g.fresh("fv");
-                let mut tmp = vec![format!("float {fv} = {proj};")];
-                g.local_inputs.insert(out_name.to_string(), fv);
-                let ev = value(&METAL, e, wc, g, &mut tmp);
-                out.extend(tmp.into_iter().map(|s| format!("{indent}{s}")));
-                ev
-            }
-        };
-        out.push(format!(
-            "{indent}outb[{}] = {};",
-            offset(&grid, wc),
-            store_expr(storage, &stored)
-        ));
+    let store = ProjectionStore {
+        epi,
+        projection: proj,
+        grid: &grid,
+        storage,
     };
     if let Some(lane_axis) = sched.lane_axis {
         body.push("if (sgid == 0) {".into());
@@ -1059,12 +1075,12 @@ pub fn emit_fused_metal_sched_with(
         body.push(format!("        uint la_ = lane + v_ * {SIMD}u;"));
         let mut wc = coord.clone();
         wc.insert(lane_axis, "la_".into());
-        store(&wc, &mut g, &mut body, "        ");
+        store.render(&wc, &mut g, &mut body, "        ");
         body.push("    }".into());
         body.push("}".into());
     } else {
         body.push("if (sgid == 0 && lane == 0) {".into());
-        store(&coord.clone(), &mut g, &mut body, "    ");
+        store.render(&coord, &mut g, &mut body, "    ");
         body.push("}".into());
     }
 
