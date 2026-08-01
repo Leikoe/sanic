@@ -764,40 +764,55 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     out
 }
 
-fn axis_aliases(root: &Node, stream: AxisRef, resolver: &mut ir::Resolver) -> HashMap<AxisRef, AxisRef> {
-    fn alias_collapsed(
-        node: &Node,
-        insertion: usize,
-        target: AxisRef,
-        aliases: &mut HashMap<AxisRef, AxisRef>,
-        resolver: &mut ir::Resolver,
-    ) {
-        match node.as_ref() {
-            NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
-                let collapsed = resolver.source_axis(src, *dim);
-                if collapsed.extent == target.extent {
-                    aliases.insert(collapsed, target);
-                }
+/// The broadcast-back pattern: re-inserting a singleton at a reduction's
+/// old position is how a frontend broadcasts that collapsed value back
+/// over the dimension it summarizes. Alias the collapsed occurrence to the
+/// insertion's canonical axis so a consuming fold can recognize both
+/// reductions as carrying the same loop occurrence. Derive semantics, not
+/// transport — the one insertion the fold leaves to its caller.
+fn alias_collapsed(
+    node: &Node,
+    insertion: usize,
+    target: AxisRef,
+    aliases: &mut HashMap<AxisRef, AxisRef>,
+    resolver: &mut ir::Resolver,
+) {
+    match node.as_ref() {
+        NodeKind::Reduce { src, dim, .. } if *dim == insertion => {
+            let collapsed = resolver.source_axis(src, *dim);
+            if collapsed.extent == target.extent {
+                aliases.insert(collapsed, target);
             }
-            NodeKind::Map { inputs, .. } => {
-                let output_rank = resolver.shape(node).len();
-                for input in inputs {
-                    let input_rank = resolver.shape(input).len();
-                    let lead = output_rank - input_rank;
-                    if insertion >= lead && insertion - lead <= input_rank {
-                        alias_collapsed(input, insertion - lead, target, aliases, resolver);
-                    }
-                }
-            }
-            NodeKind::View { src, dims } => {
-                let source_insertion = dims.iter().take(insertion).map(|dim| dim.sources.len()).sum();
-                alias_collapsed(src, source_insertion, target, aliases, resolver);
-            }
-            _ => {}
         }
+        NodeKind::Map { inputs, .. } => {
+            let output_rank = resolver.shape(node).len();
+            for input in inputs {
+                let input_rank = resolver.shape(input).len();
+                let lead = output_rank - input_rank;
+                if insertion >= lead && insertion - lead <= input_rank {
+                    alias_collapsed(input, insertion - lead, target, aliases, resolver);
+                }
+            }
+        }
+        NodeKind::View { src, dims } => {
+            let source_insertion = dims.iter().take(insertion).map(|dim| dim.sources.len()).sum();
+            alias_collapsed(src, source_insertion, target, aliases, resolver);
+        }
+        _ => {}
     }
+}
 
-    fn walk(
+/// The alias table for one derivation, as a fold over
+/// [`ir::Resolver::frame_below`]: the per-kind transport is the resolver's,
+/// and only the derive-owned choices live here — what a consumed dimension
+/// aliases to (the running table, else the stream, else itself) and
+/// [`alias_collapsed`] under a singleton reinsertion.
+///
+/// M-B of `shapes_and_indexing.md`, landed: the hand-written arms this
+/// replaced ran beside the fold for one transitional commit, asserted
+/// equal on every derivation the suite compiles.
+fn axis_aliases(root: &Node, stream: AxisRef, resolver: &mut ir::Resolver) -> HashMap<AxisRef, AxisRef> {
+    fn fold(
         node: &Node,
         canonical: Vec<Option<AxisRef>>,
         stream: AxisRef,
@@ -814,127 +829,38 @@ fn axis_aliases(root: &Node, stream: AxisRef, resolver: &mut ir::Resolver) -> Ha
         if !seen.insert(Arc::as_ptr(node)) {
             return;
         }
-
-        match node.as_ref() {
-            NodeKind::Input { .. } | NodeKind::Const { .. } | NodeKind::Iota { .. } => {}
-            NodeKind::Coordinate { src, .. } => {
-                walk(src, canonical, stream, aliases, seen, resolver);
-            }
-            NodeKind::Map { inputs, .. } => {
-                let output_shape = resolver.shape(node);
-                for input in inputs {
-                    let input_shape = resolver.shape(input);
-                    let lead = output_shape.len() - input_shape.len();
-                    let child = input_shape
-                        .iter()
-                        .enumerate()
-                        .map(|(input_dim, descriptor)| {
-                            let output_dim = lead + input_dim;
-                            if descriptor.extent == crate::ir::Extent::Static(1)
-                                && output_shape[output_dim].extent != crate::ir::Extent::Static(1)
-                            {
-                                None
-                            } else {
-                                canonical[output_dim]
-                            }
-                        })
-                        .collect();
-                    walk(input, child, stream, aliases, seen, resolver);
+        if let NodeKind::View { src, dims } = node.as_ref() {
+            for (inserted, dim) in dims.iter().enumerate() {
+                if dim.sources.is_empty()
+                    && let Some(target) = canonical[inserted]
+                {
+                    alias_collapsed(src, inserted, target, aliases, resolver);
                 }
             }
-            NodeKind::Reduce { src, dim, .. } => {
-                let source_axes = resolver.axes(src);
-                let child = source_axes
+        }
+        for (child, slots) in resolver.frame_below(node) {
+            let child_frame =
+                slots
                     .iter()
-                    .enumerate()
-                    .map(|(source_dim, source_axis)| {
-                        if source_dim < *dim {
-                            canonical[source_dim]
-                        } else if source_dim == *dim {
-                            Some(aliases.get(source_axis).copied().unwrap_or(if *source_axis == stream {
-                                stream
-                            } else {
-                                *source_axis
-                            }))
-                        } else {
-                            canonical[source_dim - 1]
-                        }
+                    .map(|slot| match slot {
+                        ir::FrameSlot::Parent(parent_dim) => canonical[*parent_dim],
+                        ir::FrameSlot::Consumed(axis) => Some(
+                            aliases
+                                .get(axis)
+                                .copied()
+                                .unwrap_or(if *axis == stream { stream } else { *axis }),
+                        ),
+                        ir::FrameSlot::Broken => None,
                     })
                     .collect();
-                walk(src, child, stream, aliases, seen, resolver);
-            }
-            NodeKind::Scan { src, .. } => {
-                walk(src, canonical, stream, aliases, seen, resolver);
-            }
-            NodeKind::Gather { src, index, dim } => {
-                let source_axes = resolver.axes(src);
-                let index_rank = resolver.axes(index).len();
-                let source = source_axes
-                    .iter()
-                    .enumerate()
-                    .map(|(source_dim, source_axis)| {
-                        if source_dim < *dim {
-                            canonical[source_dim]
-                        } else if source_dim == *dim {
-                            Some(aliases.get(source_axis).copied().unwrap_or(if *source_axis == stream {
-                                stream
-                            } else {
-                                *source_axis
-                            }))
-                        } else {
-                            canonical[source_dim - 1 + index_rank]
-                        }
-                    })
-                    .collect();
-                walk(src, source, stream, aliases, seen, resolver);
-                walk(
-                    index,
-                    canonical[*dim..*dim + index_rank].to_vec(),
-                    stream,
-                    aliases,
-                    seen,
-                    resolver,
-                );
-            }
-            NodeKind::View { src, dims } => {
-                let mut source = vec![None; resolver.axes(src).len()];
-                for (output_dim, dim) in dims.iter().enumerate() {
-                    if let [source_dim] = dim.sources.as_slice() {
-                        source[*source_dim] = canonical[output_dim];
-                    }
-                }
-                // Re-inserting a singleton at a reduction's old position is
-                // how a frontend broadcasts that collapsed value back over
-                // the dimension it summarizes. Preserve that positional
-                // provenance so a consuming fold can recognize both
-                // reductions as carrying the same loop occurrence.
-                for (inserted, dim) in dims.iter().enumerate() {
-                    if dim.sources.is_empty()
-                        && let Some(target) = canonical[inserted]
-                    {
-                        alias_collapsed(src, inserted, target, aliases, resolver);
-                    }
-                }
-                walk(src, source, stream, aliases, seen, resolver);
-            }
-            NodeKind::Reindex { src, map, .. } => {
-                let mut source = vec![None; resolver.axes(src).len()];
-                for (source_dim, terms, offset) in map {
-                    if *offset == 0
-                        && let [(1, output_dim)] = terms.as_slice()
-                    {
-                        source[*source_dim] = canonical[*output_dim];
-                    }
-                }
-                walk(src, source, stream, aliases, seen, resolver);
-            }
+            fold(&child, child_frame, stream, aliases, seen, resolver);
         }
     }
 
     let root_axes = resolver.axes(root);
     let canonical = root_axes.iter().copied().map(Some).collect();
     let mut aliases = HashMap::new();
-    walk(
+    fold(
         root,
         canonical,
         stream,

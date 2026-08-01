@@ -88,10 +88,8 @@ rustup target add x86_64-unknown-linux-gnu
 ```
 
 The current frontend constructs immutable nodes directly and compiles one or
-more output roots; no explicit graph builder is required. Larger historical
-model fixtures are parked in `examples/attic/` while they migrate to this
-surface. The engine still derives the streaming attention carrier from the
-naive graph:
+more output roots; no explicit graph builder is required. The engine derives
+the streaming attention carrier from the naive graph:
 
 ```
 structure map

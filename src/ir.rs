@@ -364,6 +364,196 @@ impl Resolver {
             })
             .collect()
     }
+
+    /// Translate an axis set DOWN through one structural boundary — the
+    /// `support` query (`shapes_and_indexing.md` §3): every source
+    /// occurrence whose index involves one of `axes`. Below a flatten the
+    /// stream lives on the group members; below a split or window, on the
+    /// mapped source axes its terms drive; a gather whose index varies
+    /// with the stream spreads it onto the gathered axis. Anything the
+    /// boundary doesn't touch passes through, and a non-structural node
+    /// passes everything through.
+    ///
+    /// Without this translation everything under a flattened fold looks
+    /// stream-invariant, and a SwiGLU's exp stays in-body of the down
+    /// projection — recomputed once per output row instead of once per
+    /// element. (`partition`'s `entanglers` and `analyze::structure`
+    /// translate a single axis the same way but also stop at an axis
+    /// *consumed* below the boundary, so they don't reuse this.)
+    pub(crate) fn support_below(&mut self, node: &NodeRef, axes: &[AxisRef]) -> Vec<AxisRef> {
+        match node.as_ref() {
+            Node::View { .. } => {
+                let groups = self.view_groups(node);
+                let mut below = Vec::new();
+                for &axis in axes {
+                    match groups.iter().find(|(_, to)| *to == axis) {
+                        Some((members, _)) => below.extend(members.iter().copied()),
+                        None => below.push(axis),
+                    }
+                }
+                below
+            }
+            Node::Reindex { .. } => {
+                let map = self.resolved_reindex(node);
+                let mut below = Vec::new();
+                for &axis in axes {
+                    let mut driving = map
+                        .iter()
+                        .filter(|(_, terms, _)| terms.iter().any(|(_, term)| *term == axis))
+                        .map(|(mapped, _, _)| *mapped)
+                        .peekable();
+                    if driving.peek().is_none() {
+                        below.push(axis);
+                    } else {
+                        below.extend(driving);
+                    }
+                }
+                below
+            }
+            Node::Gather { src, index, dim } => {
+                let gathered = self.source_axis(src, *dim);
+                let index_axes = all_axis_refs(index);
+                let mut below = axes.to_vec();
+                if axes.iter().any(|axis| index_axes.contains(axis)) && !below.contains(&gathered) {
+                    below.push(gathered);
+                }
+                below
+            }
+            _ => axes.to_vec(),
+        }
+    }
+}
+
+/// [`Resolver::support_below`] for `&self` walks, with a per-call resolver —
+/// the same free-function form as [`view_groups`] and [`resolved_reindex`].
+pub fn support_below(node: &NodeRef, axes: &[AxisRef]) -> Vec<AxisRef> {
+    Resolver::default().support_below(node, axes)
+}
+
+/// One dimension of a child frame under the DOWN identity transport
+/// (`shapes_and_indexing.md` §3): where a child dimension's loop variable
+/// comes from, structurally. What the caller *does* with a consumed or
+/// broken slot is the caller's semantics — the transport only states the
+/// structure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FrameSlot {
+    /// The child dimension carries the parent's dimension — the identity
+    /// component (coefficient 1, offset 0). No sole-reader requirement:
+    /// on a diagonal reindex both source dimensions genuinely share the
+    /// parent's loop variable, which is exactly what aliasing records.
+    Parent(usize),
+    /// The dimension a reduce or gather consumes at this position: no
+    /// parent dimension corresponds; the occurrence is the consumed axis
+    /// itself.
+    Consumed(AxisRef),
+    /// The identity is broken: a Map broadcast over a 1-extent input
+    /// dimension, or a transformed View/Reindex dimension.
+    Broken,
+}
+
+impl Resolver {
+    /// The DOWN identity transport, one structural step: each child of
+    /// `node` with its frame — per child dimension, where its loop
+    /// variable comes from. The per-kind rules are `axis_refs_rc`'s upward
+    /// rules minus its two refinements — descriptor equality and the
+    /// sole-reader check: Map right-aligns and breaks at broadcast, View
+    /// keeps 1:1 dimensions, Reindex keeps identity-mapped dimensions,
+    /// Reduce/Gather consume one and shift the rest. A RELABELED 1:1
+    /// dimension keeps its slot here even though it mints a fresh
+    /// occurrence upward — reconnecting relabels is exactly what aliasing
+    /// is for — and so does each arm of a double-read identity.
+    pub(crate) fn frame_below(&mut self, node: &NodeRef) -> Vec<(NodeRef, Vec<FrameSlot>)> {
+        match node.as_ref() {
+            Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => Vec::new(),
+            Node::Coordinate { src, .. } | Node::Scan { src, .. } => {
+                let rank = self.shape(src).len();
+                vec![(src.clone(), (0..rank).map(FrameSlot::Parent).collect())]
+            }
+            Node::Map { inputs, .. } => {
+                let output_shape = self.shape(node);
+                inputs
+                    .iter()
+                    .map(|input| {
+                        let input_shape = self.shape(input);
+                        let lead = output_shape.len() - input_shape.len();
+                        let frame = input_shape
+                            .iter()
+                            .enumerate()
+                            .map(|(input_dim, descriptor)| {
+                                let output_dim = lead + input_dim;
+                                if descriptor.extent == Extent::Static(1)
+                                    && output_shape[output_dim].extent != Extent::Static(1)
+                                {
+                                    FrameSlot::Broken
+                                } else {
+                                    FrameSlot::Parent(output_dim)
+                                }
+                            })
+                            .collect();
+                        (input.clone(), frame)
+                    })
+                    .collect()
+            }
+            Node::Reduce { src, dim, .. } => {
+                let source_axes = self.axes(src);
+                let frame = source_axes
+                    .iter()
+                    .enumerate()
+                    .map(|(source_dim, source_axis)| {
+                        if source_dim < *dim {
+                            FrameSlot::Parent(source_dim)
+                        } else if source_dim == *dim {
+                            FrameSlot::Consumed(*source_axis)
+                        } else {
+                            FrameSlot::Parent(source_dim - 1)
+                        }
+                    })
+                    .collect();
+                vec![(src.clone(), frame)]
+            }
+            Node::Gather { src, index, dim } => {
+                let source_axes = self.axes(src);
+                let index_rank = self.axes(index).len();
+                let source_frame = source_axes
+                    .iter()
+                    .enumerate()
+                    .map(|(source_dim, source_axis)| {
+                        if source_dim < *dim {
+                            FrameSlot::Parent(source_dim)
+                        } else if source_dim == *dim {
+                            FrameSlot::Consumed(*source_axis)
+                        } else {
+                            FrameSlot::Parent(source_dim - 1 + index_rank)
+                        }
+                    })
+                    .collect();
+                let index_frame = (0..index_rank).map(|j| FrameSlot::Parent(dim + j)).collect();
+                vec![(src.clone(), source_frame), (index.clone(), index_frame)]
+            }
+            Node::View { src, dims } => {
+                let rank = self.axes(src).len();
+                let mut frame = vec![FrameSlot::Broken; rank];
+                for (output_dim, view_dim) in dims.iter().enumerate() {
+                    if let [source_dim] = view_dim.sources.as_slice() {
+                        frame[*source_dim] = FrameSlot::Parent(output_dim);
+                    }
+                }
+                vec![(src.clone(), frame)]
+            }
+            Node::Reindex { src, map, .. } => {
+                let rank = self.axes(src).len();
+                let mut frame = vec![FrameSlot::Broken; rank];
+                for (source_dim, terms, offset) in map {
+                    if *offset == 0
+                        && let [(1, output_dim)] = terms.as_slice()
+                    {
+                        frame[*source_dim] = FrameSlot::Parent(*output_dim);
+                    }
+                }
+                vec![(src.clone(), frame)]
+            }
+        }
+    }
 }
 
 fn own_axis(node: &NodeRef, dim: usize, descriptor: Axis) -> AxisRef {
