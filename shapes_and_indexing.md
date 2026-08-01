@@ -366,18 +366,20 @@ M-C bleeds first.
   byte-identical, all correctness targets green. `identity` already lives
   as `axis_refs_rc`'s pass-through rule; `transpose` waits for its first
   consumer (M-C) — a query with no caller is dead surface, not progress.]*
-- **M-B — the folds.** *[TRANSITIONAL 2026-07-30 — `axis_aliases` now
-  runs twice: the hand-written arms (authoritative) beside
-  `axis_aliases_via_transport`, a fold over `Resolver::frame_below` (the
-  down identity transport, `FrameSlot::{Parent, Consumed, Broken}`), with
-  `debug_assert_eq!` on every derivation the suite compiles — the
-  assertion held across the whole suite on the first run. The swap
-  (delete the arms, keep the fold, drop the double compute) is its own
-  reviewed commit. What stayed in derive, correctly: the consumed-dim
-  alias choice and `alias_collapsed`'s broadcast-back — semantics, not
-  transport. `stream_provenance` already thinned to `support_below`
-  queries at M-A; folding its walk skeleton further is churn, not
-  simplification — left alone deliberately.]*
+- **M-B — the folds.** *[LANDED 2026-08-01, in two commits as designed —
+  transitional first (`axis_aliases` ran the hand-written arms beside a
+  fold over `Resolver::frame_below`, `FrameSlot::{Parent, Consumed,
+  Broken}`, with `debug_assert_eq!` on every derivation the suite
+  compiles; the assertion held across the whole suite on the first run),
+  then the swap (arms deleted, fold authoritative, llama MSL
+  byte-identical with the fold answering). What stayed in derive,
+  correctly: the consumed-dim alias choice and `alias_collapsed`'s
+  broadcast-back — semantics, not transport. The transport surfaced one
+  law worth naming: aliasing is `axis_refs_rc`'s rule MINUS descriptor
+  equality — relabels keep their loop variable, because reconnecting
+  relabels is what aliasing is for. `stream_provenance` already thinned
+  to `support_below` at M-A; folding its walk skeleton further is churn,
+  not simplification — left alone deliberately.]*
 - **M-C — the adjoint.** Classified transpose in `grad`; dense corner only
   for non-injective and data cases. Gate: `tests/grad.rs` + randomized
   movement chains, classified vs dense vs interp, bit-agreement in f64;
