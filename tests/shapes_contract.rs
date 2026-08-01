@@ -10,7 +10,9 @@
 //!   [`Correspondence::mint`] is the one constructor. A pass may query a
 //!   map, never build one, so six mechanisms disagreeing about it becomes
 //!   unwritable. In src this is `ir::Resolver` finished, not a second
-//!   mechanism beside it.
+//!   mechanism beside it. (Privacy binds at promotion: inside this one
+//!   module a struct literal could bypass `mint`; what the file pins now
+//!   is the vocabulary's shape, and that the zoo never needs the bypass.)
 //! - **Law 3, structure stays stated** — [`AffineDim`] is coefficient
 //!   terms and an offset. There is no division, no modulus, and no data
 //!   term: a reshape cannot be erased into arithmetic here, and a gather
@@ -23,11 +25,15 @@
 //!   must earn (shared support within one index form). Bijective,
 //!   injective, and broadcast maps cannot reach it, and every verdict is
 //!   checked against the enumerated preimage structure of the actual
-//!   relation, which is what makes the verdict a theorem and not a vibe:
-//!   the adjoint's value at a source point is the sum of the cotangent
-//!   over that point's preimages, so preimage structure IS the recipe —
-//!   all size 1 and covering means one movement read, uniform fibers mean
-//!   sum-then-move, anything else is the contraction.
+//!   relation, which is what keeps the verdict honest: the adjoint's
+//!   value at a source point is the sum of the cotangent over that
+//!   point's preimages, so preimage structure IS the recipe — all size 1
+//!   and covering means one movement read, uniform fibers mean
+//!   sum-then-move, anything else is the contraction. The check is
+//!   pointwise over the zoo — the maps the pipeline actually mints — not
+//!   a proof over the vocabulary; off the zoo the symbolic side can
+//!   widen to `Dense`, the direction that costs work, never correctness
+//!   (`off_the_zoo_the_symbolic_verdict_widens_to_dense`).
 
 // ── Law 5: the one integer form ──────────────────────────────────────────────
 
@@ -95,7 +101,7 @@ enum Side {
 }
 
 /// A movement's map: the one object behind `axis_refs_rc`,
-/// `axis_aliases`, `stream_below_*`, `relocate_axis`, `preserve_shape`,
+/// `axis_aliases`, `support_below`, `relocate_axis`, `preserve_shape`,
 /// and the grad shape helpers. Private fields; [`Correspondence::mint`]
 /// is the only constructor.
 #[derive(Clone, Debug, PartialEq)]
@@ -108,10 +114,14 @@ struct Correspondence {
 }
 
 impl Correspondence {
-    /// The one minting site. A write map must be a partition of the source
-    /// dimensions — each consumed exactly once, `positional_view`'s own law
-    /// (ir.rs:708-711) — which is what makes every `View` bijective by
-    /// construction and its adjoint exact.
+    /// The one minting site. A write map must be a mixed-radix partition of
+    /// the source dimensions — each consumed exactly once, strides the
+    /// suffix products, each output extent its group's product:
+    /// `positional_view`'s own law, stated here in full because this model
+    /// stores coefficients where `View` stores groups. All three clauses
+    /// are what make every `View` bijective by construction and its
+    /// adjoint exact; consumption alone is not enough (see
+    /// `write_maps_must_fill_their_output`).
     fn mint(
         functional: Functional,
         dims: Vec<AffineDim>,
@@ -135,13 +145,26 @@ impl Correspondence {
         }
         if functional == Functional::Output {
             let mut consumed = vec![false; other_len];
-            for dim in &dims {
-                for &(_, source_dim) in &dim.terms {
+            for (mapped, &out_extent) in dims.iter().zip(&out_shape) {
+                assert_eq!(mapped.offset, 0, "a write map is a recomposition — no offset");
+                let mut sorted = mapped.terms.clone();
+                sorted.sort_by_key(|&(coefficient, _)| -coefficient);
+                let mut suffix_product = 1i64;
+                for &(coefficient, source_dim) in sorted.iter().rev() {
                     assert!(
                         !std::mem::replace(&mut consumed[source_dim], true),
                         "write map consumes a source dimension twice"
                     );
+                    assert_eq!(
+                        coefficient, suffix_product,
+                        "write map strides must be the group's suffix products"
+                    );
+                    suffix_product *= src_shape[source_dim] as i64;
                 }
+                assert_eq!(
+                    out_extent as i64, suffix_product,
+                    "write map output extent must equal its source group's product"
+                );
             }
             assert!(
                 consumed.into_iter().all(|c| c),
@@ -193,8 +216,9 @@ impl Correspondence {
     }
 
     /// The dependency component: every other-side dimension whose
-    /// coordinate `dim`'s index involves — `stream_below_view/reindex`'s
-    /// question (partition.rs:1927-1953), from either side.
+    /// coordinate `dim`'s index involves — `Resolver::support_below`'s
+    /// question (ir.rs; born as `stream_below_*`, folded at M-A), from
+    /// either side.
     fn support(&self, side: Side, dim: usize) -> Vec<usize> {
         if side == self.functional_side() {
             self.dims[dim].terms.iter().map(|&(_, other)| other).collect()
@@ -251,8 +275,9 @@ impl Correspondence {
     /// structure of the actual relation — which is the whole claim: the
     /// classification is decidable without enumerating anything.
     fn adjoint_class(&self) -> Adjoint {
-        // A write map is a partition of the source dimensions: bijective
-        // by construction, adjoint is one movement. (ir.rs:708-711.)
+        // A write map is a mixed-radix partition of the source dimensions
+        // — all three clauses enforced at the mint, so bijective by
+        // construction and the adjoint is one movement (`positional_view`).
         if self.functional == Functional::Output {
             return Adjoint::Movement;
         }
@@ -413,8 +438,21 @@ fn enumerated_verdict(map: &Correspondence) -> Adjoint {
         .map(|src| preimages.get(src).copied().unwrap_or(0))
         .collect();
 
+    // A summed dimension, read off the relation itself (not the
+    // coefficients — the oracle must not restate the classifier): the
+    // relation is invariant under sliding the output point along it.
+    let pairs: std::collections::HashSet<(Vec<usize>, Vec<usize>)> = relation.iter().cloned().collect();
     let summed: Vec<usize> = (0..map.out_shape.len())
-        .filter(|&out_dim| map.readers_of(out_dim) == 0)
+        .filter(|&out_dim| {
+            relation.iter().all(|(out, src)| {
+                (0..map.out_shape[out_dim]).all(|slid| {
+                    let mut moved = out.clone();
+                    moved[out_dim] = slid;
+                    pairs.contains(&(moved, src.clone()))
+                })
+            })
+        })
+        .filter(|&out_dim| map.out_shape[out_dim] > 1) // extent 1: sliding is vacuous, no fiber to sum
         .collect();
     let fiber: usize = summed.iter().map(|&out_dim| map.out_shape[out_dim]).product();
 
@@ -433,10 +471,12 @@ fn enumerated_verdict(map: &Correspondence) -> Adjoint {
 // ── M-D, scoped: a rewrite states its frame ──────────────────────────────────
 
 /// What a rank- or order-changing rewrite must return beside its node:
-/// where each replacement dimension came from. There is no constructor
-/// from shapes — `preserve_shape`'s extent-matching arm
-/// (simplify.rs:317-321), the one that contradicts `relocate_axis`'s
-/// positional law, is unwritable against this type.
+/// where each replacement dimension came from. The field is
+/// position → origin, so `preserve_shape`'s extent-matching arm
+/// (simplify.rs:317-321) — the one that contradicts `relocate_axis`'s
+/// positional law — has nothing to match against; like `mint`'s privacy,
+/// that becomes enforced (not merely stated) at promotion, when the type
+/// lands behind a module boundary and rewrites must produce one.
 struct Frame {
     /// Replacement dimension → original dimension; `None` is a minted
     /// dimension the rewrite introduced.
@@ -504,9 +544,28 @@ fn transpose_is_free_and_involutive() {
 #[test]
 #[should_panic(expected = "consumes a source dimension twice")]
 fn write_maps_must_be_partitions() {
-    // positional_view's law (ir.rs:708-711), enforced at the mint: a
-    // write map reading one source dimension twice is not a View.
+    // positional_view's law, enforced at the mint: a write map reading
+    // one source dimension twice is not a View.
     Correspondence::mint(Functional::Output, vec![term(1, 0), term(1, 0)], vec![2, 2], vec![2]);
+}
+
+#[test]
+#[should_panic(expected = "output extent must equal its source group's product")]
+fn write_maps_must_fill_their_output() {
+    // The law's other half: consumption alone is not bijectivity. out=[5]
+    // cannot hold the 2×3 mixed radix — source point (1,2) would land at
+    // 5, out of range — so "bijective by construction" would be a lie the
+    // classifier repeats (`Movement`) and the enumerated relation refutes
+    // (`Padded`). The mint refuses the map instead.
+    Correspondence::mint(
+        Functional::Output,
+        vec![AffineDim {
+            terms: vec![(3, 0), (1, 1)],
+            offset: 0,
+        }],
+        vec![5],
+        vec![2, 3],
+    );
 }
 
 #[test]
@@ -514,7 +573,7 @@ fn identity_and_support_answer_the_six_mechanisms() {
     let split = split_6_into_2x3();
     // axis_aliases' question: no identity through a split's transformed dim…
     assert_eq!(split.identity(Side::Source, 0), None);
-    // …stream_below_reindex's question: the stream lands on both drivers.
+    // …support_below's question: the stream lands on both drivers.
     assert_eq!(split.support(Side::Source, 0), vec![0, 1]);
     assert_eq!(split.support(Side::Output, 1), vec![0]);
 
@@ -602,6 +661,27 @@ fn adjoint_verdicts_match_the_enumerated_preimage_structure() {
         assert_eq!(map.adjoint_class(), expected, "symbolic verdict for {name}");
         assert_eq!(enumerated_verdict(&map), expected, "enumerated structure for {name}");
     }
+}
+
+#[test]
+fn off_the_zoo_the_symbolic_verdict_widens_to_dense() {
+    // src0 = out0 + 3·out1 over out=[3,2]: a mixed radix whose span (6)
+    // overshoots the source (3). The symbolic classifier, reading
+    // coefficients alone, says Dense; the actual relation is a movement —
+    // out1=1 is entirely out of range, out1=0 reads each source point
+    // once. Where the two diverge, Dense is the safe side: it costs
+    // work, never correctness. The zoo pins where they must agree; this
+    // pins the direction of disagreement.
+    let overshoot = read_map(
+        vec![AffineDim {
+            terms: vec![(1, 0), (3, 1)],
+            offset: 0,
+        }],
+        vec![3, 2],
+        vec![3],
+    );
+    assert_eq!(overshoot.adjoint_class(), Adjoint::Dense);
+    assert_eq!(enumerated_verdict(&overshoot), Adjoint::Movement);
 }
 
 #[test]

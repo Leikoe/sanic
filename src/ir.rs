@@ -438,11 +438,13 @@ pub fn support_below(node: &NodeRef, axes: &[AxisRef]) -> Vec<AxisRef> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FrameSlot {
     /// The child dimension carries the parent's dimension — the identity
-    /// component (coefficient 1, offset 0, sole reader).
+    /// component (coefficient 1, offset 0). No sole-reader requirement:
+    /// on a diagonal reindex both source dimensions genuinely share the
+    /// parent's loop variable, which is exactly what aliasing records.
     Parent(usize),
-    /// The dimension a reduce, scan boundary, or gather consumes at this
-    /// position: no parent dimension corresponds; the occurrence is the
-    /// consumed axis itself.
+    /// The dimension a reduce or gather consumes at this position: no
+    /// parent dimension corresponds; the occurrence is the consumed axis
+    /// itself.
     Consumed(AxisRef),
     /// The identity is broken: a Map broadcast over a 1-extent input
     /// dimension, or a transformed View/Reindex dimension.
@@ -453,12 +455,13 @@ impl Resolver {
     /// The DOWN identity transport, one structural step: each child of
     /// `node` with its frame — per child dimension, where its loop
     /// variable comes from. The per-kind rules are `axis_refs_rc`'s upward
-    /// rules minus the descriptor-equality refinement: Map right-aligns
-    /// and breaks at broadcast, View keeps 1:1 dimensions, Reindex keeps
-    /// identity-mapped dimensions, Reduce/Gather consume one and shift the
-    /// rest. A RELABELED 1:1 dimension keeps its slot here even though it
-    /// mints a fresh occurrence upward — reconnecting relabels is exactly
-    /// what aliasing is for.
+    /// rules minus its two refinements — descriptor equality and the
+    /// sole-reader check: Map right-aligns and breaks at broadcast, View
+    /// keeps 1:1 dimensions, Reindex keeps identity-mapped dimensions,
+    /// Reduce/Gather consume one and shift the rest. A RELABELED 1:1
+    /// dimension keeps its slot here even though it mints a fresh
+    /// occurrence upward — reconnecting relabels is exactly what aliasing
+    /// is for — and so does each arm of a double-read identity.
     pub(crate) fn frame_below(&mut self, node: &NodeRef) -> Vec<(NodeRef, Vec<FrameSlot>)> {
         match node.as_ref() {
             Node::Input { .. } | Node::Const { .. } | Node::Iota { .. } => Vec::new(),

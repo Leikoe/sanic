@@ -769,7 +769,7 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
 /// over the dimension it summarizes. Alias the collapsed occurrence to the
 /// insertion's canonical axis so a consuming fold can recognize both
 /// reductions as carrying the same loop occurrence. Derive semantics, not
-/// transport — shared by the reference walk and the M-B fold.
+/// transport — the one insertion the fold leaves to its caller.
 fn alias_collapsed(
     node: &Node,
     insertion: usize,

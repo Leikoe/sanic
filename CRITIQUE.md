@@ -182,7 +182,8 @@ No CI. With a suite this good, an Actions matrix (Linux check+test, macOS
 +Metal, clippy, fmt) is disproportionately high-value — the macOS leg is the
 only thing standing between "tests pass" and "the GPU path still works."
 ~25 mechanical clippy lints (indexed loops → iterators). Dead code in
-`examples/` from the attic migration. `Cargo.toml` lacks `repository`/
+`examples/` from the attic migration (resolved: the attic was deleted,
+8e71994, 2026-07-30). `Cargo.toml` lacks `repository`/
 `keywords` if crates.io is ever the plan.
 
 ---

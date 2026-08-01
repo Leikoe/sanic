@@ -559,7 +559,10 @@ fn fold_kernel_frame(
 /// accumulator must never reach the rescale merge: the −∞ edge);
 /// positions between the edge and the clamp are exact no-ops, so the
 /// clamp only costs work, never correctness. `None` when the fold has no
-/// mask edge — the caller streams the whole extent.
+/// mask edge — the caller streams the whole extent, and each caller keeps
+/// its own fallback literal style (`343` scalar, `343u` sched) on
+/// purpose: both are preserved bytes, and byte-identical MSL is the
+/// refactor gate.
 fn honest_window_edge(
     carrier: &Carrier,
     stream: AxisRef,

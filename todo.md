@@ -92,12 +92,13 @@ page is substrate we need so the moat is usable on real workloads.
   every example on every surface change is too costly, so `llama3.rs` is the
   ONE example kept current. It is the graph-builder fixture: a compact Llama
   3 decoder graph used to iterate on modeling ergonomics. Everything
-  else — gpt2, trinity, mnist, shakespeare, and the guided tours — is parked
-  UNMIGRATED in `examples/attic/` (cargo doesn't build it; see its README for
-  the revival recipe). The TESTS are the API-correctness net and stay fully
-  green — the capstone claims those examples established (HF-matching logits,
-  tok/s ladders) are history in this file, not things re-verified per commit.
-  Revive the attic in one batch when the surface settles.
+  else — gpt2, trinity, mnist, shakespeare, and the guided tours — was parked
+  UNMIGRATED in `examples/attic/`, then deleted outright (8e71994,
+  2026-07-30): the surface drifted too far for a batch revival to beat
+  rewriting from the tests, and git history keeps the originals. The TESTS
+  are the API-correctness net and stay fully green — the capstone claims
+  those examples established (HF-matching logits, tok/s ladders) are history
+  in this file, not things re-verified per commit.
 
 - **Movement ops (`Reindex`)** *(new)* — slice / zero-pad / reshape-split /
   windows as ONE affine-reindex operator beside `View`. Convolution is

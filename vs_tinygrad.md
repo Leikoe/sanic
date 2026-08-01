@@ -397,8 +397,8 @@ against 9.1). Simplification and verification land on it exactly — at
 parity once style is removed. **Autodiff is double the baseline**, and the
 excess over it is ~259 lines.
 
-Shape bookkeeping is 205 of them: `invert_view` 56, `broadcast_to` 46,
-`reduce_to` 41, `transpose_reindex` 34, `scatter_add` 28 — 79% of the
+Shape bookkeeping is 179 of them: `invert_view` 50, `broadcast_to` 41,
+`reduce_to` 36, `transpose_reindex` 29, `scatter_add` 23 — 69% of the
 anomaly. tinygrad writes none of it, and the reason is worth stating
 precisely, because it is **not** the symbolic index language. Autodiff runs
 at the tensor level, where movement ops are still first-class nodes, and

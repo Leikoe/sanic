@@ -36,7 +36,7 @@ matching: equal names/extents on unrelated dimensions remain unrelated."*
 reconciles them because nothing owns the question.
 
 Each answerer also re-implements the walk itself: the six carry five
-near-identical match skeletons over the nine node kinds. A new node kind
+near-identical match skeletons over the ten node kinds. A new node kind
 today means six edits; a forgotten one means a silent wrong answer in
 whichever pass forgot.
 
@@ -77,13 +77,15 @@ The pipeline knows all of this and says none of it:
 `padded: bool` means "out-of-range reads produce 0" — and every consumer
 rediscovers what that implies:
 
-- interp clamps and substitutes 0.0 (interp.rs:402-420);
+- interp substitutes 0.0 on out-of-range (interp.rs:402-420; the clamp is
+  codegen's move, by its own comment);
 - codegen clamps the index and discards the load (codegen.rs:380-406);
 - simplify **refuses padded maps wholesale** (cancel_view_reindex bails at
   simplify.rs:207) because it cannot see which region is valid;
 - the emitter's honest window re-derives an index interval from mask
   arithmetic (emit_metal.rs:566);
-- verify rechecks dynamic affine bounds after inputs bind (verify.rs:337).
+- verify bounds static affine reads at compile time and skips dynamic
+  extents entirely (verify.rs:283-296) — there is no bind-time recheck.
 
 Five sites doing interval reasoning on affine index forms — while
 `numeric.rs` already owns exactly that algebra for values (`Bounds`,
@@ -165,10 +167,13 @@ types and the laws as passing tests. Law 1 is privacy (`mint` is the one
 constructor), Law 3 is the field list (`AffineDim` has no div, no mod, no
 data term — a gather is not a value of the type), Law 5 is
 `cap()` total / `at(bindings)` partial (the panic is absent from the
-vocabulary), and §5's classification is a theorem there: the symbolic
-verdict from coefficients alone equals the enumerated preimage structure
-of the actual relation, over the whole zoo — permute, flip, pad, slice,
-strided slice, split, merge, broadcast, overlapping window. Transpose as
+vocabulary), and §5's classification is checked against ground truth
+there: the symbolic verdict from coefficients alone equals the enumerated
+preimage structure of the actual relation, over the whole zoo — permute,
+flip, pad, slice, strided slice, split, merge, broadcast, overlapping
+window — with one off-zoo pin showing that where the two diverge, the
+symbolic side widens to Dense, the direction that costs work, never
+correctness. Transpose as
 data reinterpretation is a passing test (`merge.transposed() == split`),
 not a claim. Promotion moves the laws into `ir::Resolver`/`grad` and
 deletes the file, exactly as Γ's model was promoted:
@@ -219,7 +224,10 @@ when the composite is affine in one direction — and `cancel_view_reindex`
 is its one caller today; it stays exactly that size (§7). Consequence: an
 adjoint stays inside the vocabulary whenever the map is injective (§5).
 This is the half of tinygrad worth stealing (six one-line movement
-gradients, `mixin/gradient.py:69-76`) without the substrate.
+gradients, `mixin/gradient.py:69-76`) without the substrate. (The
+contract file has no `compose` on purpose — one caller does not earn an
+algebra; the substitution law gets its test when a second caller
+exists.)
 
 The trade, stated against their substitution engine. For permute, flip,
 shrink, expand, tinygrad's `apply_movement_op` and this vocabulary are the
@@ -305,21 +313,30 @@ corner to where it is the mathematics, instead of the default.
 
 ## 6. What it deletes
 
-Priced against `vs_tinygrad.md`'s accounting (autodiff 4.4× the density
-baseline; ~390 lines of standing shape tax):
+Priced against `vs_tinygrad.md`'s accounting (autodiff 4.4× tinygrad
+absolute — double the 2.1× density baseline; ~390 lines of standing shape
+tax):
 
 | site | today | after |
 |---|---|---|
-| `stream_below_{view,reindex,gather}` (partition.rs:1927-1962) | 35 | queries on `support` |
-| `axis_aliases` walk arms (derive.rs:767) | ~100 of 181 | a fold over `identity` |
-| `stream_provenance` walk arms (partition.rs:1835) | ~50 of 80 | the same fold, `support` mode |
+| `stream_below_{view,reindex,gather}` (partition.rs:1927-1962) | 35 | queries on `support` — *landed, M-A* |
+| `axis_aliases` walk arms (derive.rs:767) | ~100 of 181 | a fold over `identity` — *landed, M-B* |
+| `stream_provenance` walk arms (partition.rs:1835) | ~50 of 80 | *abandoned at M-B: churn, not simplification (§8)* |
 | `preserve_shape` heuristics (simplify.rs:259) | ~40 | rewrites return their frame (M-D) |
 | `grad` helpers: `invert_view`, `transpose_reindex`, `scatter_add`, `broadcast_to`, `reduce_to` | ~205 | one classified adjoint, ~80 |
 | duplicated walk skeletons | 5 copies | callers fold; the map lives once |
 
-Net estimate: **250–350 lines out of src**, the dense-adjoint work blowup
-gone for every injective map, and — the actual point — one law where there
-were six answerers, two of them contradictory.
+Net, measured after M-A+M-B (`git diff main` on the three files the
+program touches): derive −74, partition −79, ir +187 — **+34 lines**, the
+Resolver investment paid once against two transport mechanisms deleted.
+The first estimate here read 250–350 out; it double-counted the walk
+skeletons against the transport they carried and booked the
+`stream_provenance` row this section's own staging later declined. What
+remains priced is grad (~205 → ~80 at M-C) and `preserve_shape` (~40 at
+M-D) — a projected net of roughly −130 from today. The dense-adjoint work
+blowup still dies for every injective map, and — the actual point,
+untouched by the arithmetic — one law where there were six answerers, two
+of them contradictory.
 
 Estimate honesty: the walk *skeletons* are the duplication; the per-pass
 semantics inside each walk (derive's broadcast-back aliasing, partition's
@@ -354,7 +371,7 @@ the abstraction is on trial here, not the arm.
 
 ## 8. Staging
 
-Each step lands green (`cargo test --all-targets`, 227) and alone. Each
+Each step lands green (`cargo test --all-targets`) and alone. Each
 carries its *driver* — the thing that bleeds without it — because a step
 without one is speculation, however elegant. Nothing here bleeds today;
 M-C bleeds first.
@@ -392,8 +409,10 @@ M-C bleeds first.
   instead of `preserve_shape` guessing it. NOT a crate-wide interface
   change; if that is what it turns into, stop and reconsider. Gate:
   simplify + laws suites.
-- **M-E — `Sym{id, cap}`** (independent of A-D). Verify's recheck-at-bind
-  extends; `compile_for` accepts a symbolic length; allocation at cap
+- **M-E — `Sym{id, cap}`** (independent of A-D). A bind-time bounds
+  recheck gets built — today's affine-bounds check (verify.rs:283) is
+  static-only and compile-time, so there is nothing to extend;
+  `compile_for` accepts a symbolic length; allocation at cap
   (precedent: tinygrad allocates at `vmax` and shrinks). Gate: decode
   context sweep matches static-extent compiles token-for-token. *Driver:
   none measured yet — honest-window masks carry decode. Build when
