@@ -49,21 +49,18 @@ forces.
 
 ## What runs today, end to end
 
-**GPT-2 (124M), real OpenAI weights, on the GPU, matching HuggingFace.**
-`cargo run --release --example gpt2 --prompt "…"` loads the official
-safetensors, builds the 12-layer network as plain IR, partitions the KV-cache
-decode step into ~220 kernels in **0.04 s**, and streams greedy tokens on Metal
-at **~125 tok/s** — the weight tables bind **zero-copy** from the checkpoint on
-unified memory, no upload. Logits match a `transformers` reference to
-**max |Δlogit| = 1e-4, with 24/24 greedy tokens identical**.
+**Llama 3.2 1B, real Meta weights, on the GPU, at mlx-lm's speed.**
 
-**Trinity-Nano (5.5B AFMoE), int4-packed, on a 16 GB laptop.**
-`cargo run --release --example trinity` compiles a 56-layer, 128-expert MoE
-with grouped-query attention into **1,478 dispatches / ~30 unique kernels** per
-step (~46% fewer than mlx-lm, with zero primitives) and streams *"The capital
-of France is Paris."* at **~45 tok/s** — nibbles unpack inside the GEMM folds
-and the 3.8 GB checkpoint never dequantizes. Greedy output matches the HF
-reference token-for-token. The measured climb from 26 ms is in `vs_mlx.md`.
+```
+cargo run --release --example llama3_2 -- "The capital of France is" -n 32 --bf16
+```
+
+Compiles one KV-cache decode step into **344 kernels** and binds **146 weight
+tensors (2.47 GB) zero-copy** — no upload, no dequantization. On an M1 Pro:
+**~52 tok/s** bf16, **~46 tok/s** f32 default. Absolute ms/step drifts 15.6→19
+with heat and power, so the durable claim is the head-to-head, measured in one
+session against mlx-lm: **parity** (`vs_mlx.md`). Measure warm, on AC, ABBA —
+`cost-model-cache-term.md` § Traps.
 
 Everything else is verified numerically against a reference interpreter (and
 dispatched on an Apple GPU where it says GPU): flash attention (causal / RoPE /
@@ -71,16 +68,20 @@ sliding-window), quantized matmul, convolution as `window + flatten + matmul`,
 autoregressive decode with an in-place KV cache, reverse-mode training with an
 SGD loop that converges, and split reductions.
 
+GPT-2 124M and Trinity-Nano (5.5B int4 MoE) ran here once; their examples were
+deleted 2026-08-01 (`4a642f3`) after rotting unbuilt in `examples/attic/` since
+2026-07-17. Results stand in `vs_mlx.md`; nothing in this tree reproduces them.
+
 ## Run it
 
 ```
 cargo run --example direct_attention
-cargo test
+cargo test --all-targets          # --all-targets: plain `cargo test` skips the examples' test modules
 ```
 
-Once per clone, so CI's checks run at commit time rather than fourteen minutes
-later — the linux target matters, because everything Metal is `cfg`'d out there
-and macOS-only code turns into dead-code errors a host-only clippy cannot see:
+Once per clone, to run CI's checks at commit time. The linux target matters:
+Metal is `cfg`'d out there, so macOS-only code becomes dead-code errors a
+host-only clippy cannot see.
 
 ```
 git config core.hooksPath .githooks

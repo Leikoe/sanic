@@ -103,7 +103,10 @@ Open design questions, in the order they bite:
    on a llama step.
 2. The 32 q-norm kernels disappear; gate/up's shared norm **stays**
    materialized. This is the acceptance test above.
-3. `cargo test --release` — 225 pass, 0 fail.
+3. `cargo test --all-targets` — 0 fail. (Use `--all-targets`: a bare
+   `cargo test --release` silently skips the `#[cfg(test)]` modules in
+   `examples/`. The suite was 225 tests when this was written and 273 on
+   2026-08-01, so pin the failure count, never the total.)
 4. Both dtypes, text byte-identical:
    `./target/release/examples/llama3_2 "The capital of France is" -n 32 --bf16`
    should still print `…is Paris. It is the most populous city in France and

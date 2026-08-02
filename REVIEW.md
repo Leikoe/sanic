@@ -1,7 +1,9 @@
 # Framework Review
 
 Reviewed against the vendored Tinygrad source and specification on July 18,
-2026; repository-contract findings refreshed after the July 20 core audit.
+2026; repository-contract findings refreshed after the July 20 core audit, and
+re-verified against the tree on 2026-08-01 (findings 1, 4 and 5 closed, the
+Llama paragraph in 4 marked stale).
 
 ## Verdict
 
@@ -24,22 +26,27 @@ However, Sanic currently has important gaps between:
 | Scheduling | Prototype; partially disconnected from code generation |
 | Lowering and memory | Substantially behind Tinygrad |
 | Frontend and runtime | Useful fixture, not yet framework-quality |
-| Correctness evidence | Good focused and full-suite coverage; no CI enforcement |
-| Documentation | Overstates current capabilities |
+| Correctness evidence | Good focused and full-suite coverage; CI enforces it (no GPU on the runners) |
+| Documentation | Theory docs are honest and cite real code; the README overstated what the tree builds (fixed 2026-08-01) |
 
 ## Most serious problems
 
-### 1. The planner does not describe the kernel actually emitted
+### 1. The planner does not describe the kernel actually emitted ~~(open)~~ — RESOLVED
 
-`KernelSpec` claims to be a fully resolved physical plan and contains tile sizes, row and column axes, batch roles, and resource estimates. The Metal emitter largely ignores those fields and independently chooses a `FoldSched`.
+*Resolved by deletion, not by wiring.* `KernelSpec` no longer claims to be a
+resolved physical plan: it carries five fields — streaming axis, carrier, input
+names, output name, cost — and its own docstring now states that the physical
+schedule is chosen downstream by `fold_sched`. The tile sizes, row/column axes,
+batch roles, and SRAM/register estimates that nothing read were removed rather
+than plumbed through, so the planner can no longer score choices that never
+reach generated code. The measured tuner (`SANIC_TUNE=1`) is the sanctioned way
+the device overrules the cost model, and it is on the ordinary execution path.
 
-Consequences:
-
-- The cost model can score tile choices that never reach generated code.
-- Reported SRAM and register estimates do not necessarily describe the emitted kernel.
-- Autotuning and split scheduling exist in pieces but are not wired into the ordinary execution path.
-
-This is the highest-priority architectural issue. A schedule should be executable, not advisory.
+The original finding, for the record: `KernelSpec` contained tile sizes, row and
+column axes, batch roles, and resource estimates that the Metal emitter ignored
+while independently choosing a `FoldSched` — so the cost model could score tile
+choices that never reached code, and reported SRAM/register estimates did not
+necessarily describe the emitted kernel.
 
 Relevant code:
 
@@ -103,19 +110,38 @@ Several choices will become painful as models get larger:
 - Dynamic dimensions are narrowly supported; many shape paths require static extents.
 - Most failures panic instead of returning structured diagnostics.
 
-The current Llama example only constructs a graph. It does not load weights, compile, or run inference. On the review machine, cached graph construction took roughly 2.7 seconds in release and 24 seconds in debug. That strongly suggests repeated whole-DAG analysis.
+~~The current Llama example only constructs a graph. It does not load weights, compile, or run inference. On the review machine, cached graph construction took roughly 2.7 seconds in release and 24 seconds in debug. That strongly suggests repeated whole-DAG analysis.~~
+
+*Stale as of 2026-08-01.* `examples/llama3_2.rs` now loads a real Meta
+checkpoint, binds 146 tensors (2.47 GB) zero-copy, compiles 344 kernels, and
+runs greedy inference at 62 tok/s bf16. Graph construction is **0.01 s**, not
+2.7 s — the repeated whole-DAG analysis this paragraph inferred was real and
+was fixed. Compilation is now the slow step at ~5.2 s, which is a different
+problem from the one described here. The frontend concerns above it (leaked
+`'static` input names, narrow dynamic-dimension support, panics instead of
+structured diagnostics) still stand.
 
 Relevant code:
 
 - [`src/ir.rs`](src/ir.rs)
 - [`examples/llama3_2.rs`](examples/llama3_2.rs)
 
-### 5. The repository contract is not enforced continuously
+### 5. The repository contract is not enforced continuously ~~(open)~~ — RESOLVED
 
-The stale removed-API call sites have been fixed. On July 20, `cargo test`
-passed 157 tests plus the doctest (one diagnostic-only test ignored), and
-`cargo clippy --all-targets -- -D warnings` passed. The remaining process gap
-is that no CI configuration continuously enforces that contract.
+`.github/workflows/ci.yml` (added 2026-07-20) now enforces the contract on every
+push: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
+`cargo test --all-targets` on both the host and the Linux target. A
+`.githooks` pre-commit hook runs the same checks at commit time. As of
+2026-08-01 the suite is **273 tests across 30 suites**, all passing.
+
+Two caveats the config cannot fix, both worth knowing before trusting a green
+check: CI's macOS runners have **no GPU**, so the Metal path is never exercised
+there — only local runs cover it. And `cargo test --release` alone silently
+skips the `#[cfg(test)]` modules inside `examples/`; `--all-targets` is what
+picks them up, which is why CI specifies it.
+
+The original finding, for the record: as of July 20 the suite passed but no CI
+configuration continuously enforced it.
 
 ## What Sanic does better than Tinygrad
 
@@ -177,10 +203,10 @@ The schedule plan must be the sole source of tiling and placement decisions cons
 
 ## Priority order
 
-1. Add CI that continuously runs the current full-suite and clippy contract.
+1. ~~Add CI that continuously runs the current full-suite and clippy contract.~~ Resolved: `.github/workflows/ci.yml`, plus a pre-commit hook running the same checks.
 2. ~~Fix the top-k/tree-fold correctness hole and stop classifying unsupported affine values as executable monoids.~~ Resolved: both shortcuts were removed; Argmax fusion was recovered generically.
 3. State the floating-point reordering contract explicitly.
-4. Unify `KernelSpec` and `FoldSched` into one schedule representation that Metal actually consumes.
+4. ~~Unify `KernelSpec` and `FoldSched` into one schedule representation that Metal actually consumes.~~ Resolved by deletion: the unread physical fields were removed, leaving `fold_sched` the single owner of the physical schedule.
 5. Keep node-relative occurrence metadata pass-local, with explicit ownership and scoped caches; do not add persistent node IDs.
 6. Separate semantic axes, layout order, and hardware iteration ranges.
 7. Add typed scalar, index, and product values plus a proper command/effect plan.
