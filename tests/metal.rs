@@ -1471,7 +1471,7 @@ fn run_coop_on_gpu(label: &str, kernel: &MetalKernel, env: &Env, reference: &Val
 }
 
 /// The coupled (m, ℓ, o) carrier with the stream split over lanes AND
-/// simdgroups: the ExpShifted rescale merge runs through the shuffle
+/// simdgroups: the indexed exponential-rebase merge runs through the shuffle
 /// butterfly and then threadgroup rounds.
 #[test]
 fn coop_lane_stream_flash_matches_oracle() {
@@ -1597,7 +1597,7 @@ fn coop_lane_axis_flash_matches_oracle() {
     eprintln!("lane-axis flash (e→lanes, sgs=8) on GPU: {}", out.trim());
 }
 
-/// A two-slot Plain(Add) carrier (RMSNorm fused into a matvec, trinity's
+/// A two-component primitive-add carrier (RMSNorm fused into a matvec, trinity's
 /// projection shape): lane-distributed output rows with the norm slot
 /// uniform — the mixed sliced/uniform bookkeeping without a threadgroup
 /// merge — plus the lane-stream form.

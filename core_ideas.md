@@ -194,7 +194,7 @@ Completeness asks the opposite question:
 
 This is the idea behind [`tests/completeness.rs`](tests/completeness.rs).
 
-### Prefixes are equivalent when no future can distinguish them
+### Prefix futures measure sequential state
 
 For a function `h`, associate each prefix `x` with its behavior under every
 possible suffix:
@@ -209,9 +209,9 @@ Two prefixes are equivalent when every continuation produces the same answer:
 x ≡ₕ x'    iff    for every y, h(x ++ y) = h(x' ++ y)
 ```
 
-This is a Myhill–Nerode-style view of streaming state. A correct state summary
-must retain exactly the distinctions between prefixes that some future can
-observe.
+This is a Myhill–Nerode-style view of **one-way streaming state**. A correct
+sequential summary must retain exactly the distinctions between prefixes that
+some future can observe.
 
 A sketch `σ` is sufficient when
 
@@ -233,11 +233,24 @@ visible result
       ↓ perhaps still insufficient
 (visible result, auxiliary fold₁, auxiliary fold₂, …)
       ↓
-future-determining carrier candidate
+future-determining sequential-state candidate
 ```
 
-This is the classical tupling idea viewed as a search for sufficient streaming
-state.
+This is the classical tupling idea viewed as a search for sufficient sequential
+state. It is a necessary first stage of carrier discovery, but not the whole
+construction: suffix equivalence is only a right congruence, so concatenation
+of its classes need not be well-defined.
+
+For associative chunk merging, the relevant equivalence must allow contexts on
+both sides:
+
+```text
+u ≈ₕ v    iff    for every x and z, h(x ++ u ++ z) = h(x ++ v ++ z)
+```
+
+This **syntactic congruence** is two-sided. Its quotient is the canonical merge
+monoid. Equivalently, represent each chunk by the transformation it induces on
+the sequential state and compose those transformations in program order.
 
 ### What the completeness probe does
 
@@ -251,8 +264,8 @@ The test turns that semantic idea into a bounded experiment:
 5. If one suffix produces different results, it is a concrete separating
    witness: the sketch forgot necessary state.
 6. If many sketch collisions survive every sampled suffix, the tuple is a
-   constructive carrier candidate. Its components suggest the slots the
-   deriver is missing.
+   constructive sequential-state candidate. Its components suggest a state on
+   which the next phase can synthesize chunk transformations.
 
 This changes a derivation decline from an unquestioned answer into a checkable
 claim. A declined program with a strong bounded-state candidate is a possible
@@ -270,14 +283,22 @@ The probe is a detector, not a proof of completeness.
 A separating suffix proves that one candidate sketch is insufficient. It does
 not prove that no other bounded carrier exists.
 
-A sketch that survives sampled suffixes is evidence for a carrier, not yet a
-certificate. The next steps are still required:
+A sketch that survives sampled suffixes is evidence for bounded sequential
+state, not yet a merge carrier or certificate. The next steps are still
+required:
 
-1. Define how one element is lifted into the state.
-2. Construct a general combine for two states.
-3. Check identity and associativity.
-4. Prove or test equivalence with the original function.
-5. State the numerical and ordering contract.
+1. Determine the transformation that an arbitrary chunk induces on the
+   sequential state.
+2. Choose a finite representation grammar for those transformations and prove
+   it is closed under composition.
+3. Define `identity`, one-element `into`, a general `combine`, and `project`.
+4. Check identity, associativity, and equivalence with the original function.
+5. State the exactness, numerical-error, and ordering contract.
+
+The distinction matters even for tiny recurrences. For `q ← a·q+b`, one-way
+state is the single scalar `q`, but an independently computed chunk must carry
+the affine transformation `(A,B)` so chunks can compose. In the general case,
+the transition monoid can be much larger than the sequential state.
 
 The probe is deliberately bounded by its alphabet, candidate pool, tuple size,
 and sample budget. Those bounds should remain visible.
@@ -401,7 +422,11 @@ derivation declined
           ↓
 search for a bounded sketch that determines every future
           ↓
-carrier candidate or separating witness
+sequential-state candidate or separating witness
+          ↓
+extract and close chunk transformations
+          ↓
+associative carrier or representation-relative wall
 ```
 
 Contextual composition determines the right result boundary:

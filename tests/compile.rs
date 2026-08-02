@@ -1,5 +1,5 @@
 use sanic::cost::DeviceSpecs;
-use sanic::derive::{SlotKind, derive};
+use sanic::derive::{ComponentConstruction, derive};
 use sanic::partition::{Stage, partition, partition_many};
 use sanic::{
     Buffer, Compile, CompileError, CpuDevice, Dtype, Extent, MapOp, Monoid, ViewDim, argmax, axis, axis_refs, input,
@@ -143,21 +143,16 @@ fn positional_argmax_is_one_generic_key_payload_fold() {
     let index = argmax(x, -1isize);
 
     let carrier = derive(&index, stream).expect("argmax composition should derive");
+    assert_eq!(carrier.primitive_monoid(0), Some(Monoid::Max));
     assert!(matches!(
-        carrier.kinds.as_slice(),
-        [
-            SlotKind::Plain(Monoid::Max),
-            SlotKind::AtExtremum {
-                key_slot: 0,
-                key: Monoid::Max,
-                ties: Monoid::Min,
-            }
-        ]
+        carrier.schema.components[1].construction,
+        ComponentConstruction::IndexedPayload
     ));
+    assert_eq!(carrier.schema.components[1].dependencies, [0]);
     let schedule = partition(&index, &DeviceSpecs::toy());
     assert!(matches!(
         schedule.stages.as_slice(),
-        [Stage::Fused { spec, .. }] if spec.carrier.slots == 2
+        [Stage::Fused { spec, .. }] if spec.carrier.slot_count() == 2
     ));
 
     let cpu = CpuDevice::new();

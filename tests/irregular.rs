@@ -16,7 +16,7 @@
 //! inference.
 
 use sanic::cost::DeviceSpecs;
-use sanic::derive::{SlotKind, derive};
+use sanic::derive::{ComponentConstruction, derive};
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
 use sanic::partition::{Stage, partition, partition_many};
@@ -49,19 +49,15 @@ fn argmax_is_one_generic_product_fold() {
     let node = argmax(x, 0usize);
 
     let carrier = derive(&node, stream).expect("argmax composition should derive");
-    assert_eq!(carrier.slots, 2, "Acc = (maximum value, minimum tied index)");
+    assert_eq!(carrier.slot_count(), 2, "Acc = (maximum value, minimum tied index)");
     assert!(carrier.rules.contains(&"extremum-filter"));
+    assert_eq!(carrier.primitive_monoid(0), Some(Monoid::Max));
     assert!(matches!(
-        carrier.kinds.as_slice(),
-        [
-            SlotKind::Plain(Monoid::Max),
-            SlotKind::AtExtremum {
-                key_slot: 0,
-                key: Monoid::Max,
-                ties: Monoid::Min,
-            }
-        ]
+        carrier.schema.components[1].construction,
+        ComponentConstruction::IndexedPayload
     ));
+    assert_eq!(carrier.schema.components[1].dependencies, [0]);
+    assert!(carrier.mergeable_out_of_order());
 
     let schedule = partition(&node, &DeviceSpecs::toy());
     assert_eq!(
@@ -70,7 +66,7 @@ fn argmax_is_one_generic_product_fold() {
         "argmax composition should be one product fold:\n{}",
         schedule.render()
     );
-    assert!(matches!(&schedule.stages[0], Stage::Fused { spec, .. } if spec.carrier.slots == 2));
+    assert!(matches!(&schedule.stages[0], Stage::Fused { spec, .. } if spec.carrier.slot_count() == 2));
     assert_eq!(schedule.execute(&env).data, vec![1.0]);
 }
 

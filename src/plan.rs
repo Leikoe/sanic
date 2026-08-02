@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::cost::{DeviceSpecs, Kernel, feasible, kernel_time};
-use crate::derive::{Carrier, Expr, SlotKind};
+use crate::derive::{Carrier, Expr};
 use crate::ir::{self, AxisRef, AxisSelector, Node as NodeKind, NodeRef as Node, input_axes, leaf_names};
 
 /// Elements streamed per step along the folded axis.
@@ -146,8 +146,7 @@ fn plan_axis_costed(
     // sq, column e).
     let span_union: Vec<AxisRef> =
         carrier
-            .spans
-            .iter()
+            .spans()
             .flat_map(|span| span.iter().copied())
             .fold(Vec::new(), |mut axes, axis| {
                 if !axes.contains(&axis) {
@@ -157,7 +156,7 @@ fn plan_axis_costed(
             });
     let span_intersection: HashSet<AxisRef> = {
         let mut inter: HashSet<AxisRef> = span_union.iter().copied().collect();
-        for s in &carrier.spans {
+        for s in carrier.spans() {
             let s_set: HashSet<AxisRef> = s.iter().copied().collect();
             inter.retain(|ax| s_set.contains(ax));
         }
@@ -475,18 +474,6 @@ impl FoldSched {
     }
 }
 
-/// Can this carrier's partial states be merged out of stream order? Every
-/// `Monoid` is commutative; ExpShifted rescaling and extremal-key payload
-/// selection are symmetric, so all three split freely.
-pub fn mergeable_out_of_order(carrier: &Carrier) -> bool {
-    carrier.kinds.iter().all(|k| {
-        matches!(
-            k,
-            SlotKind::Plain(_) | SlotKind::ExpShifted { .. } | SlotKind::AtExtremum { .. }
-        )
-    })
-}
-
 /// Operation count of a carrier expression (for pricing slot updates).
 fn expr_ops(e: &Expr) -> f64 {
     match e {
@@ -658,7 +645,7 @@ pub fn priced_fold_sched_candidates(
             (per_eval, axes, has_simd_reduce(l))
         })
         .collect();
-    let slot_ops: Vec<f64> = (0..carrier.slots)
+    let slot_ops: Vec<f64> = (0..carrier.slot_count())
         .map(|j| expr_ops(&carrier.into[j]) + expr_ops(&carrier.combine[j]))
         .collect();
 
@@ -687,7 +674,7 @@ pub fn priced_fold_sched_candidates(
             flops += issues * per_eval * s_ext;
         }
         for (j, ops) in slot_ops.iter().enumerate() {
-            let sliced = sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a));
+            let sliced = sched.lane_axis.is_some_and(|a| carrier.span(j).contains(&a));
             let issues = if sched.lane_axis.is_some() && !sliced {
                 groups * simd
             } else {
@@ -705,9 +692,9 @@ pub fn priced_fold_sched_candidates(
             flops += (sched.sgs as f64).log2() * merge_ops * groups * lane_vol;
         }
         // scratch: the threadgroup partial arrays
-        let sliced_scratch: f64 = (0..carrier.slots)
+        let sliced_scratch: f64 = (0..carrier.slot_count())
             .map(|j| {
-                if sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a)) {
+                if sched.lane_axis.is_some_and(|a| carrier.span(j).contains(&a)) {
                     lane_vol
                 } else {
                     1.0
@@ -717,13 +704,13 @@ pub fn priced_fold_sched_candidates(
         let sram = if sched.sgs > 1 {
             sched.sgs as f64 * sliced_scratch * b_bytes
         } else {
-            carrier.slots as f64 * b_bytes
+            carrier.slot_count() as f64 * b_bytes
         };
         let k = Kernel {
             flops,
             hbm_bytes: hbm,
             sram_per_block: sram,
-            regs_per_block: (sched.tg_threads() * carrier.slots) as f64 * b_bytes,
+            regs_per_block: (sched.tg_threads() * carrier.slot_count()) as f64 * b_bytes,
             parallel_blocks: if sched.is_scalar() { out_vol } else { groups },
             lanes_per_block: sched.tg_threads() as f64,
             bytes_in_flight_per_lane: streamed_bytes_per_lane * sched.chunk as f64,
@@ -809,7 +796,7 @@ fn best_fold_sched(
 /// only the scalar entry, exactly as the chooser treats them.
 fn fold_sched_candidates(fold_node: &Node, streaming_axis: AxisRef, carrier: &Carrier) -> Vec<FoldSched> {
     let mut cands = vec![FoldSched::scalar()];
-    if !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
+    if !carrier.mergeable_out_of_order() || carrier.project.len() != 1 {
         return cands;
     }
     let ext = |ax: AxisRef| ax.extent() as f64;
@@ -912,7 +899,7 @@ fn count_flops_memo(node: &Node, resolver: &mut ir::Resolver, fc: &mut HashMap<*
 mod tests {
     use super::*;
     use crate::cost::DeviceSpecs;
-    use crate::derive::{Expr, SlotKind, derive};
+    use crate::derive::{ComponentConstruction, Expr, StateComponent, derive};
     use crate::ir::*;
     use crate::nn::scaled_dot_product_attention;
 
@@ -970,13 +957,17 @@ mod tests {
             transpose(input("W", [output, stream]), 0usize, 1usize),
         );
         let mut carrier = derive(&dot, stream_axis).unwrap();
-        let invariant = carrier.slots;
-        carrier.slots += 1;
+        let invariant = carrier.slot_count();
         carrier.into.push(Expr::Const(0.0));
-        carrier.combine.push(Expr::A(invariant));
+        carrier
+            .combine
+            .push(Expr::Add(Box::new(Expr::A(invariant)), Box::new(Expr::B(invariant))));
         carrier.identity.push(0.0);
-        carrier.spans.push(Vec::new());
-        carrier.kinds.push(SlotKind::Plain(Monoid::Add));
+        carrier.schema.components.push(StateComponent {
+            span: Vec::new(),
+            dependencies: Vec::new(),
+            construction: ComponentConstruction::Primitive { monoid: Monoid::Add },
+        });
 
         plan_axis(&dot, stream_axis, &carrier, &DeviceSpecs::m1_pro())
             .expect("the output axis is a legal tile even if one slot is invariant");

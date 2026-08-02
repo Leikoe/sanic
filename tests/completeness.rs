@@ -8,11 +8,16 @@
 //!
 //! "Fusable" has a semantic definition that does not mention the deriver:
 //!
-//! > h streams in one kernel iff it factors through constant-size state —
-//! > there exist `into`, an associative `⊕` and `project` with
-//! > `h = project ∘ fold(⊕) ∘ map(into)` (a list homomorphism into a small
-//! > carrier). Equivalently, Myhill–Nerode-style: some bounded sketch
-//! > `σ(xs)` determines `h(xs ++ ys)` for every suffix `ys`.
+//! > h admits arbitrary chunking and tree reduction iff it factors through a
+//! > constant-size recognizing monoid: there exist `into`, an associative
+//! > `⊕`, and `project` with
+//! > `h = project ∘ fold(⊕) ∘ map(into)`.
+//!
+//! A necessary (but not equivalent) one-way condition is Myhill–Nerode-style:
+//! some bounded sketch `σ(xs)` determines `h(xs ++ ys)` for every suffix
+//! `ys`. The suffix quotient is minimal sequential state; a merge carrier must
+//! additionally represent chunk actions on that state, or equivalently refine
+//! the two-sided syntactic congruence.
 //!
 //! The right-hand form is testable WITHOUT knowing the carrier. Streams are
 //! drawn from a small quantized alphabet, so exact sketch collisions occur
@@ -21,28 +26,30 @@
 //! classic *tupling* method), by collision testing:
 //!
 //! * σ-colliding prefix pairs whose h-futures agree on every sampled suffix,
-//!   across enough pairs → σ is a *carrier candidate*: if `derive` declines
-//!   this function, that is a FUSION MISS — the ledger fails unless the
-//!   entry is pinned with the op or rewrite that covers it.
+//!   across enough pairs → σ is a *sequential-state candidate*. If `derive`
+//!   declines, this is an alarm: synthesize a closed chunk action/combine
+//!   before calling it a fusion miss.
 //! * every candidate σ separated by a concrete `(p, q, suffix)` witness →
 //!   the decline is *justified relative to the pool*, witness printed.
 //!
 //! The probe is a detector, not a prover: a pass is strong evidence plus a
-//! constructive candidate (σ's components name the slots a carrier needs);
-//! the derivation itself — oracle-checked against `eval` — remains the
-//! proof. The pool, the alphabet, and the collision budget bound what the
-//! probe can see, and those bounds are printed rather than hidden.
+//! constructive sequential-state candidate. A derivation still has to produce
+//! a closed associative combine and pass the oracle checks against `eval`.
+//! The pool, alphabet, and collision budget bound what the probe can see, and
+//! those bounds are printed rather than hidden.
 //!
 //! Argmax's generic extremal-key/payload carrier is derived from composition.
 //! Bounded ordered selection remains an explicit compiler gap after removing
-//! its semantic IR shortcut. The probe finds that carrier mechanically, which
-//! is exactly the alarm that should fire before a kernel-count comparison
+//! its semantic IR shortcut. The probe finds a strong sequential-state
+//! candidate; the independently known ordered-list merge confirms the carrier.
+//! That is exactly the alarm that should fire before a kernel-count comparison
 //! does. Run with `--nocapture` to read the ledger.
 //!
 //! The probe's admitted blind spot is its pool. The SECOND oracle at the
 //! bottom of this file — the Hankel rank test of the theory doc's §5.7 —
-//! needs no pool: carrier dimension is measured as the numerical rank of
-//! the futures matrix H[p, s] = h(p·s), exact per coordinate system.
+//! needs no sketch pool. It estimates minimal *linear sequential-state*
+//! dimension from H[p,s] = h(p·s); it does not by itself measure a general
+//! nonlinear carrier or certify associative merging.
 
 use std::collections::HashMap;
 
@@ -133,7 +140,8 @@ fn run_h(build: Build, xs: &[f64]) -> f64 {
 // ── the sketch pool: known bounded-state stream functions ────────────────────
 
 /// Everything here is itself computable by a small fold — that is what makes
-/// a passing σ constructive: its components name the slots a carrier needs.
+/// a passing σ constructive as sequential state. A merge may need a larger
+/// representation of the chunk action on these components.
 const POOL: &[(&str, Sketch)] = &[
     ("len", |xs| xs.len() as f64),
     ("sum", |xs| xs.iter().sum()),
@@ -173,12 +181,11 @@ const MIN_PAIRS: usize = 30;
 // ── the probe ────────────────────────────────────────────────────────────────
 
 enum Verdict {
-    /// A determining sketch was found. The count is the sketch's COMPONENT
-    /// COUNT — an upper bound on carrier dimension, not the dimension
-    /// itself (argmax's passing σ has three components; the known product
-    /// carrier has two slots). The rank oracle at the bottom of this file
-    /// measures the real number.
-    Carrier(usize, Vec<&'static str>),
+    /// A determining sequential sketch was found. A survivor is not a merge
+    /// carrier until a closed chunk action/combine is constructed. The count
+    /// is merely this sketch's component count (argmax's passing σ has three
+    /// components while its known product carrier has two slots).
+    State(usize, Vec<&'static str>),
     /// Every conclusive candidate was separated; one witness kept, shrunk
     /// to the shortest (p, q, suffix) that still collides and splits.
     Separated {
@@ -277,7 +284,7 @@ fn probe_with(build: Build, seed: u64, n_pres: usize, n_sufs: usize) -> Verdict 
         if pairs >= MIN_PAIRS {
             let mut sigma = vec!["h"];
             sigma.extend(names);
-            return Verdict::Carrier(1 + cand.len(), sigma);
+            return Verdict::State(1 + cand.len(), sigma);
         }
         // too few conclusive collisions: this σ proves nothing either way
     }
@@ -344,10 +351,12 @@ fn shrink_witness(
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Expect {
-    /// `derive` succeeds AND the probe confirms a small carrier.
+    /// `derive` supplies the carrier; the probe independently finds bounded
+    /// sequential state.
     Derived,
-    /// `derive` declines and the probe exhibits a carrier. This is accepted
-    /// only as named compiler debt, never hidden behind a semantic IR op.
+    /// `derive` declines, the probe finds sequential state, and an independent
+    /// construction named in the reason supplies the merge carrier. This is
+    /// accepted only as compiler debt, never hidden behind a semantic IR op.
     KnownFusionGap(&'static str),
     /// `derive` declines and the probe must produce a separating witness.
     JustifiedDecline,
@@ -429,16 +438,15 @@ fn median_graph(x: NodeRef, n: usize) -> NodeRef {
 
 // ── the ledger ───────────────────────────────────────────────────────────────
 
-/// §3.4: a Carrier verdict is survival under one sample of streams — seed
-/// luck can starve the collisions that would have killed a wrong sketch. A
-/// carrier claim therefore has to survive independent draws at the same
-/// budget. (The dual is NOT checked across seeds on purpose: a separation
-/// is a concrete evaluated counterexample and certifies itself.)
-fn confirm_carrier_across_seeds(name: &str, build: Build, failures: &mut Vec<String>) {
+/// §3.4: a surviving state candidate is based on one stream sample — seed
+/// luck can starve the collisions that would have killed a wrong sketch. It
+/// therefore has to survive independent draws at the same budget. (The dual
+/// is NOT checked across seeds: a separation is a concrete counterexample.)
+fn confirm_state_across_seeds(name: &str, build: Build, failures: &mut Vec<String>) {
     for seed in [0xACE1u64, 0xBEEF] {
         if let Verdict::Separated { p, q, suffix, sigma } = probe_with(build, seed, 2000, 23) {
             failures.push(format!(
-                "{name}: probe found a carrier under the primary seed, but seed {seed:#x} \
+                "{name}: probe found sequential state under the primary seed, but seed {seed:#x} \
                  separated every sketch — e.g. σ = ({}) on {p:?} / {q:?} via {suffix:?}",
                 sigma.join(", ")
             ));
@@ -450,10 +458,10 @@ fn confirm_carrier_across_seeds(name: &str, build: Build, failures: &mut Vec<Str
 fn every_decline_is_justified_or_pinned() {
     let n = axis("n", 8);
     let mut report = String::from(
-        "\nLEDGER — semantic carrier probe vs the deriver\n\
+        "\nLEDGER — sequential-state probe vs the carrier deriver\n\
          (pool: 9 bounded-state folds; sketches h + ≤4 slots; alphabet 9 × [-2,2];\n\
           2000 random + 500 adversarial prefixes × 24 suffixes; a σ passes only on\n\
-          ≥30 distinct collisions; carrier verdicts must SURVIVE two more seeds —\n\
+          ≥30 distinct collisions; state candidates must SURVIVE two more seeds —\n\
           a separation is a self-certifying witness, a survival is only evidence)\n\n",
     );
     let mut failures = Vec::new();
@@ -470,18 +478,18 @@ fn every_decline_is_justified_or_pinned() {
             .filter(|c| c.leaves.iter().all(|l| !contains_fold(l)));
         let verdict = probe(build);
         let line = match (&derived, &verdict, expect) {
-            (Some(c), Verdict::Carrier(comps, sigma), Expect::Derived) => {
-                confirm_carrier_across_seeds(name, build, &mut failures);
+            (Some(c), Verdict::State(comps, sigma), Expect::Derived) => {
+                confirm_state_across_seeds(name, build, &mut failures);
                 format!(
                     "  DERIVED     {name:22} {} slot(s); probe agrees (3 seeds): σ = ({}), {comps} sketch slot(s)\n",
-                    c.slots,
+                    c.slot_count(),
                     sigma.join(", ")
                 )
             }
-            (None, Verdict::Carrier(comps, sigma), Expect::KnownFusionGap(reason)) => {
-                confirm_carrier_across_seeds(name, build, &mut failures);
+            (None, Verdict::State(comps, sigma), Expect::KnownFusionGap(reason)) => {
+                confirm_state_across_seeds(name, build, &mut failures);
                 format!(
-                    "  OPEN GAP    {name:22} graph declines; carrier exists (3 seeds: σ = ({}), ≤ {comps} slots) — {reason}\n",
+                    "  OPEN GAP    {name:22} graph declines; state candidate survives 3 seeds: σ = ({}), ≤ {comps} slots; known merge: {reason}\n",
                     sigma.join(", ")
                 )
             }
@@ -492,14 +500,14 @@ fn every_decline_is_justified_or_pinned() {
             ),
             (d, v, e) => {
                 let got = match (d.is_some(), v) {
-                    (true, Verdict::Carrier(comps, s)) => {
+                    (true, Verdict::State(comps, s)) => {
                         format!("derives; probe agrees via ({}), ≤ {comps} slots", s.join(", "))
                     }
                     (true, Verdict::Separated { .. }) => {
                         "derives, but the probe separated every sketch (pool too weak)".into()
                     }
-                    (false, Verdict::Carrier(comps, s)) => format!(
-                        "DECLINED, but σ = ({}) is a ≤{comps}-slot carrier — FUSION MISS",
+                    (false, Verdict::State(comps, s)) => format!(
+                        "DECLINED, but σ = ({}) is a ≤{comps}-slot state candidate — NEEDS TRANSITION CLOSURE",
                         s.join(", ")
                     ),
                     (false, Verdict::Separated { .. }) => "declined; probe separated".into(),
@@ -560,9 +568,9 @@ fn random_declines_survive_the_probe() {
             continue; // sound by the existing oracle; nothing to check
         }
         match probe(build) {
-            Verdict::Carrier(comps, sigma) => {
+            Verdict::State(comps, sigma) => {
                 let line = format!(
-                    "  seed {seed:2}: declined, σ = ({}) is a ≤{comps}-slot carrier — {}\n",
+                    "  seed {seed:2}: declined, σ = ({}) is a ≤{comps}-slot state candidate — {}\n",
                     sigma.join(", "),
                     pinned.get(&seed).copied().unwrap_or("UNPINNED MISS")
                 );
@@ -774,10 +782,10 @@ fn fooling_families_grow_only_at_true_walls() {
 // ── the second oracle: the Hankel rank test (pool-free) ──────────────────────
 //
 // The collision probe sees only through its sketch pool, and says so. The
-// dimension criterion (kernel_fusion_theory.md §5.7) needs no pool: the
-// Nerode quotient is itself the minimal carrier, so carrier dimension is the
-// numerical rank of the futures matrix H[p, s] = h(p·s). Practice notes, all
-// load-bearing:
+// linear realization test (kernel_fusion_theory.md §5.7) needs no pool: the
+// numerical rank of H[p,s] = h(p·s) measures minimal linear sequential-state
+// dimension in the chosen coordinates. It is not a general carrier dimension.
+// Practice notes, all load-bearing:
 //
 // * columns are CENTERED — an additive carrier produces the affine family
 //   H[p,s] = state(p)·w(s) + g(s), whose raw rank exceeds the parameter
@@ -788,13 +796,15 @@ fn fooling_families_grow_only_at_true_walls() {
 //   softmax·V — the trailing division curves the futures). Appendix A of the
 //   theory doc: the loop is rewrite-candidate → rank → extract, never
 //   rank → extract. Both halves are pinned as regressions below;
-// * run right-to-left too — bidirectional low rank certifies an associative
-//   merge exists (third homomorphism theorem) with no carrier vocabulary;
+// * running right-to-left is a useful harness symmetry check, but with complete
+//   word families it is merely the transpose construction and gives no
+//   independent merge certificate; a merge-aware oracle needs two-sided
+//   contexts C[u,(x,z)] = h(x·u·z), or an extracted transition algebra;
 // * rank GROWING with prefix length is the refutation trend of a true wall.
 
 /// H rows = prefixes, columns = suffix × output-coordinate (multi-output
-/// functions stack column blocks). `reversed` streams right-to-left:
-/// h(suffix · prefix) — the merge-existence direction.
+/// functions stack column blocks). `reversed` streams right-to-left,
+/// h(suffix · prefix), as a symmetry check rather than a merge proof.
 fn futures_matrix(
     builds: &[Build],
     plen: usize,
@@ -886,6 +896,21 @@ fn relative_spectrum(mut h: Vec<Vec<f64>>) -> Vec<f64> {
     sv
 }
 
+/// Generic continuous words for the pool-free linear-state/context oracles.
+fn continuous_words(rng: &mut Lcg, count: usize, length: usize) -> Vec<Vec<f64>> {
+    (0..count).map(|_| (0..length).map(|_| rng.c()).collect()).collect()
+}
+
+/// A scalar recurrence with one sequential coordinate. Every chunk acts on
+/// an incoming state by an affine map, which generically needs two parameters.
+fn affine_recurrence(xs: &[f64]) -> f64 {
+    xs.iter().fold(0.0, |q, &x| {
+        let scale = 1.1 + 0.2 * x;
+        let bias = x - 0.3 * x * x;
+        scale * q + bias
+    })
+}
+
 /// Numerical rank at relative threshold `tol`. A cut must show a decade of
 /// gap; a spectrum that never crosses `tol` is full rank (no tail at all).
 fn rank_with_gap(spectrum: &[f64], tol: f64) -> Option<usize> {
@@ -900,8 +925,8 @@ fn rank_with_gap(spectrum: &[f64], tol: f64) -> Option<usize> {
 }
 
 #[test]
-fn rank_oracle_measures_small_carriers() {
-    // Σx — one slot; centering pays the affine unit, the rank is the carrier.
+fn rank_oracle_measures_small_linear_states() {
+    // Σx — one linear state coordinate; centering removes the affine unit.
     let sum: Build = |x, n| reduce(x, n, Monoid::Add);
     let spec = relative_spectrum(futures_matrix(&[sum], 6, 40, 12, false, 0xA11CE));
     assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σ spectrum: {spec:?}");
@@ -910,6 +935,60 @@ fn rank_oracle_measures_small_carriers() {
     let sumsq: Build = |x, n| reduce(map(MapOp::Mul, vec![x.clone(), x]), n, Monoid::Add);
     let spec = relative_spectrum(futures_matrix(&[sumsq], 6, 40, 12, false, 0xB0B));
     assert_eq!(rank_with_gap(&spec, 1e-8), Some(1), "Σx² spectrum: {spec:?}");
+}
+
+#[test]
+fn two_sided_context_rank_separates_state_from_chunk_action() {
+    let mut rng = Lcg(0x00C0_7E57);
+    let prefixes = continuous_words(&mut rng, 40, 4);
+    let suffixes = continuous_words(&mut rng, 16, 3);
+
+    // Ordinary suffix futures depend on a prefix only through its current q.
+    // After column centering, the linear one-way-state rank is therefore one.
+    let hankel: Vec<Vec<f64>> = prefixes
+        .iter()
+        .map(|prefix| {
+            suffixes
+                .iter()
+                .map(|suffix| {
+                    let word: Vec<_> = prefix.iter().chain(suffix).copied().collect();
+                    affine_recurrence(&word)
+                })
+                .collect()
+        })
+        .collect();
+    let state_spec = relative_spectrum(hankel);
+    assert_eq!(
+        rank_with_gap(&state_spec, 1e-8),
+        Some(1),
+        "affine recurrence one-way spectrum: {state_spec:?}"
+    );
+
+    // Put each candidate chunk between independently varied left and right
+    // contexts. Its effect depends on both affine parameters (A,B), so the
+    // centered two-sided context matrix has rank two.
+    let middles = continuous_words(&mut rng, 40, 4);
+    let lefts = continuous_words(&mut rng, 16, 2);
+    let rights = continuous_words(&mut rng, 16, 3);
+    let contexts: Vec<_> = lefts.into_iter().zip(rights).collect();
+    let context_matrix: Vec<Vec<f64>> = middles
+        .iter()
+        .map(|middle| {
+            contexts
+                .iter()
+                .map(|(left, right)| {
+                    let word: Vec<_> = left.iter().chain(middle).chain(right).copied().collect();
+                    affine_recurrence(&word)
+                })
+                .collect()
+        })
+        .collect();
+    let action_spec = relative_spectrum(context_matrix);
+    assert_eq!(
+        rank_with_gap(&action_spec, 1e-8),
+        Some(2),
+        "affine recurrence two-sided spectrum: {action_spec:?}"
+    );
 }
 
 #[test]
@@ -940,10 +1019,9 @@ fn rank_oracle_reports_attention_ambiguous_raw_and_small_deferred() {
     );
 
     // One rewrite collapses it (Theorem 5.2 + the exp homomorphism): in the
-    // DEFERRED coordinates (ℓ, o) = (Σeˣ, Σeˣ·v) the measured rank is
-    // exactly 2 — the carrier as a number, not a design. The running max
-    // contributes nothing here: it is numerical stabilization, not semantic
-    // state (Appendix A).
+    // DEFERRED coordinates (ℓ, o) = (Σeˣ, Σeˣ·v) the measured linear-state
+    // rank is exactly 2. The running max contributes nothing here: it is
+    // numerical stabilization, not exact-real semantic state (Appendix A).
     let ell: Build = |x, n| reduce(map(MapOp::Exp, vec![x]), n, Monoid::Add);
     let o: Build = |x, n| {
         let e = map(MapOp::Exp, vec![x.clone()]);
@@ -957,9 +1035,9 @@ fn rank_oracle_reports_attention_ambiguous_raw_and_small_deferred() {
         "deferred (ℓ, o) spectrum: {spec:?}"
     );
 
-    // Right-to-left, same coordinates: low rank in BOTH directions is the
-    // merge-existence certificate (third homomorphism theorem) — an
-    // associative ⊗ exists before anyone writes it down.
+    // Right-to-left, same coordinates: the rank agrees as a symmetry
+    // regression. This does not independently certify a merge; the explicit
+    // additive combine for (ℓ, o) supplies that certificate.
     let spec = relative_spectrum(futures_matrix(&[ell, o], 6, 40, 12, true, 0xF1A5));
     assert_eq!(
         rank_with_gap(&spec, 1e-8),
@@ -973,11 +1051,12 @@ fn rank_oracle_corroborates_the_median_wall() {
     // Median: the measured rank tracks the SAMPLE SIZE — every enlargement
     // of the futures matrix finds new independent directions, the spectrum
     // never plateaus. That is the refutation trend of a true wall, read with
-    // no sketch vocabulary at all; a streamable function's rank plateaus at
-    // its carrier dimension no matter how many samples are thrown at it
-    // (the (ℓ, o) test above: 2, at every size). The collision probe's
-    // separating witness and the fooling family settle the claim; this
-    // corroborates it from a second, independent instrument.
+    // no sketch vocabulary at all; a finite-dimensional linear realization's
+    // rank plateaus no matter how many samples are thrown at it (the deferred
+    // (ℓ, o) coordinates above: 2 at every size). Rank growth alone would not
+    // exclude an arbitrary nonlinear carrier. The collision probe's separating
+    // witness and the fooling family settle the claim; this corroborates it
+    // from a second, independent instrument.
     let effective_rank = |n_sufs: usize| {
         let spec = relative_spectrum(futures_matrix(&[median_graph], 8, n_sufs + 8, n_sufs, false, 0x3D1A));
         spec.iter().take_while(|&&v| v > 1e-8).count()

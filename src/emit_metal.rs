@@ -19,10 +19,10 @@ use crate::codegen::{
     Gen, LaneBody, Lang, buffers, carrier_expr, carrier_expr_map, grid_of, map_input_coord, offset, san,
     thread_grid_decode, thread_grid_decode_from, value,
 };
-use crate::derive::{Carrier, Expr, SlotKind};
+use crate::derive::{Carrier, Expr};
 use crate::ir::{self, Axis, AxisRef, Dtype, MapOp, Monoid, Node as NodeKind, NodeRef as Node, volume};
 use crate::partition::{Schedule, Stage};
-use crate::plan::{FoldSched, SIMD, fold_sched, mergeable_out_of_order};
+use crate::plan::{FoldSched, SIMD, fold_sched};
 
 // ── the Metal target ─────────────────────────────────────────────────────────
 
@@ -443,34 +443,20 @@ fn expr_refs(e: &Expr, items: &mut std::collections::HashSet<usize>, slots: &mut
 /// the mask edge (`pos`), when every masked stream position is an EXACT
 /// f32 no-op so the stream loop may stop at `pos + 1`.
 ///
-/// Detected structurally, and only for the carrier shape where the claim is
-/// provable: exactly one `Plain(Max)` slot whose lift carries an additive
+/// Detected structurally, and only when the schema plus executable programs
+/// prove exactly one max key whose lift carries an additive
 /// `where(edge < iota(stream), K, 0)` with `K ≤ -1e29`, and every other
-/// slot `ExpShifted` riding it. Then, in f32: a masked score rounds to K
+/// component is transported by exp(old_key-new_key). Then, in f32: a masked
+/// score rounds to K
 /// exactly (|score| ≪ ulp(K)); K never wins the max as long as one unmasked
 /// element was folded first (a PREFIX mask guarantees the unmasked elements
 /// come first, and the emitters keep the bound ≥ the split width so no lane
-/// folds an empty range — the −∞ merge edge); and each ExpShifted slot's
+/// folds an empty range — the −∞ merge edge); and each transported payload's
 /// contribution is its lift TIMES `exp(K − m)`, which underflows to exactly
 /// 0.0f. Skipping the masked tail is bit-identical, not approximate — dead
 /// work the algebra already knows is dead.
 fn prefix_mask_edge(carrier: &Carrier, stream: AxisRef) -> Option<usize> {
-    let max_slots: Vec<usize> = carrier
-        .kinds
-        .iter()
-        .enumerate()
-        .filter(|(_, k)| matches!(k, SlotKind::Plain(Monoid::Max)))
-        .map(|(j, _)| j)
-        .collect();
-    let [ms] = max_slots[..] else { return None };
-    if !carrier
-        .kinds
-        .iter()
-        .enumerate()
-        .all(|(j, k)| j == ms || matches!(k, SlotKind::ExpShifted { max_slot } if *max_slot == ms))
-    {
-        return None;
-    }
+    let ms = carrier.stable_rebase_key()?;
     fn edge_of(e: &Expr, carrier: &Carrier, stream: AxisRef) -> Option<usize> {
         let leaves = &carrier.leaves;
         if let Expr::Where(c, a, b) = e
@@ -638,7 +624,7 @@ pub fn emit_fused_metal_with(
     let mut body: Vec<String> = vec![format!("if (gid >= {grid_size}) return;")];
     let coord = thread_grid_decode(&METAL, &grid, &mut g, &mut body);
 
-    let slots = carrier.slots;
+    let slots = carrier.slot_count();
     let ident = carrier
         .identity
         .iter()
@@ -769,7 +755,7 @@ pub fn emit_fused_metal_sched_with(
 ) -> MetalKernel {
     use std::collections::HashSet;
     let scalar = || emit_fused_metal_with(name, carrier, stream, fold_node, epi, storage, resolved);
-    if sched.is_scalar() || !mergeable_out_of_order(carrier) || carrier.project.len() != 1 {
+    if sched.is_scalar() || !carrier.mergeable_out_of_order() || carrier.project.len() != 1 {
         return scalar();
     }
     let s_ext = stream.extent();
@@ -784,9 +770,9 @@ pub fn emit_fused_metal_sched_with(
         return scalar();
     }
 
-    let slots = carrier.slots;
+    let slots = carrier.slot_count();
     let sliced_slot: Vec<bool> = (0..slots)
-        .map(|j| sched.lane_axis.is_some_and(|a| carrier.spans[j].contains(&a)))
+        .map(|j| sched.lane_axis.is_some_and(|a| carrier.span(j).contains(&a)))
         .collect();
     let sliced_leaf: Vec<bool> = carrier
         .leaves

@@ -202,6 +202,25 @@ fn no_core_rule_names_a_frontend_operation() {
     }
 }
 
+/// Carrier consumers receive algebraic rights and logical dependencies, not
+/// a closed vocabulary of workload-shaped component cases.
+#[test]
+fn carrier_backends_query_laws_and_schema() {
+    for file in ["plan", "partition", "emit_metal"] {
+        let code = code_of(file);
+        assert_eq!(
+            named(&code, "SlotKind"),
+            0,
+            "{file}.rs resurrected the retired slot-kind vocabulary"
+        );
+        assert_eq!(
+            named(&code, "ComponentConstruction"),
+            0,
+            "{file}.rs matches construction provenance; consume law/schema queries instead"
+        );
+    }
+}
+
 /// `ir.rs`'s doctrine, held: *"there is no second graph IR."* Stage bodies
 /// reuse the one `Node`; annotations are derived, memoised side tables; the
 /// Γ design (M12) adds a bindings table, not a second term type.

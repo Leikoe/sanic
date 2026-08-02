@@ -511,8 +511,9 @@ models.
 A prefix-masked rescale fold now stops its stream loop at the mask edge,
 read from `pos` at runtime — the graph stays fixed-shape for capture, the
 kernel skips the masked tail. Detected structurally where the claim is
-PROVABLE (one Plain(Max) slot with an additive `where(edge < iota, −1e30,
-0)` lift, all other slots ExpShifted riding it), and the skip is
+PROVABLE (the schema and executable programs prove one primitive max key
+with an additive `where(edge < iota, −1e30, 0)` lift and all other components
+transported by `exp(old_key−new_key)`), and the skip is
 bit-identical, not approximate: a masked score rounds to −1e30 exactly in
 f32, never wins the max (the prefix guarantees an unmasked element folded
 first, and the cooperative form clamps the bound up to the split width so

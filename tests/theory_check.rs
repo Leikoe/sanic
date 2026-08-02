@@ -78,7 +78,7 @@ fn decode_cone_bisection() {
         match derive(&attention, stream) {
             Ok(carrier) => eprintln!(
                 "{label:10} DERIVES: {} slots [{}]",
-                carrier.kinds.len(),
+                carrier.slot_count(),
                 carrier.rules.join("+")
             ),
             Err(decline) => eprintln!("{label:10} declines: {decline}"),
@@ -136,7 +136,7 @@ fn decode_attention_cone_derives_as_one_kernel() {
     };
     eprintln!(
         "decode cone carrier: {} slots, rules [{}]",
-        carrier.kinds.len(),
+        carrier.slot_count(),
         carrier.rules.join("+")
     );
 
