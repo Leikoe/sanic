@@ -1688,7 +1688,7 @@ mod metal_backend {
         }
     }
 
-    pub use MetalBuffer as PublicMetalBuffer;
+    pub use self::MetalBuffer as PublicMetalBuffer;
 }
 
 #[cfg(target_os = "macos")]
