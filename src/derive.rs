@@ -298,12 +298,70 @@ impl LogicalStateSchema {
     }
 }
 
-/// Execution rights proved by the carrier construction.
+/// Why reassociation is sound for this carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociativityEvidence {
+    /// Product and semilattice-indexed-total monoid theorems used by `derive`.
+    PrimitiveAndIndexedMonoids,
+    /// Generated chunks denote state transformations; merge is composition.
+    TransitionComposition,
+}
+
+/// Which relative orders of independently produced chunks are licensed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOrderEvidence {
+    /// The construction proves commutativity, so chunk order may change.
+    CommutativeConstruction,
+    /// Only order-preserving parenthesization is licensed.
+    ProgramOrder,
+}
+
+/// Why a partial state may cross a split-reduction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerializationEvidence {
+    /// Every logical coordinate is represented explicitly as a scalar.
+    ScalarCoordinates,
+}
+
+/// Execution rights accompanied by the theorem/construction that grants them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LawCertificate {
-    pub associative: bool,
-    pub commutative: bool,
-    pub serializable: bool,
+    pub associativity: AssociativityEvidence,
+    pub merge_order: MergeOrderEvidence,
+    pub serialization: SerializationEvidence,
+}
+
+impl LawCertificate {
+    pub const fn primitive_and_indexed() -> Self {
+        Self {
+            associativity: AssociativityEvidence::PrimitiveAndIndexedMonoids,
+            merge_order: MergeOrderEvidence::CommutativeConstruction,
+            serialization: SerializationEvidence::ScalarCoordinates,
+        }
+    }
+
+    pub const fn transition_composition() -> Self {
+        Self {
+            associativity: AssociativityEvidence::TransitionComposition,
+            merge_order: MergeOrderEvidence::ProgramOrder,
+            serialization: SerializationEvidence::ScalarCoordinates,
+        }
+    }
+
+    pub const fn is_associative(self) -> bool {
+        matches!(
+            self.associativity,
+            AssociativityEvidence::PrimitiveAndIndexedMonoids | AssociativityEvidence::TransitionComposition
+        )
+    }
+
+    pub const fn is_commutative(self) -> bool {
+        matches!(self.merge_order, MergeOrderEvidence::CommutativeConstruction)
+    }
+
+    pub const fn is_serializable(self) -> bool {
+        matches!(self.serialization, SerializationEvidence::ScalarCoordinates)
+    }
 }
 
 /// A concrete, executable streaming accumulator:
@@ -351,7 +409,7 @@ impl Carrier {
 
     /// Whether independently computed chunks may be merged in either order.
     pub fn mergeable_out_of_order(&self) -> bool {
-        self.laws.associative && self.laws.commutative
+        self.laws.is_associative() && self.laws.is_commutative()
     }
 
     /// The primitive operation of a component, only when provenance and the
@@ -1124,11 +1182,7 @@ pub(crate) fn derive_with_structure_cache(
         identity,
         project,
         schema,
-        laws: LawCertificate {
-            associative: true,
-            commutative: true,
-            serializable: true,
-        },
+        laws: LawCertificate::primitive_and_indexed(),
         rules: ctx.rules.into_iter().collect(),
         aliases,
         _keepalive: node.clone(),

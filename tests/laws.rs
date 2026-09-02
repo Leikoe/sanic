@@ -8,7 +8,9 @@
 //! correctness in one assertion.
 
 use sanic::analyze::{Parallelism, analyze, analyze_all, streamable, structure};
-use sanic::derive::{Carrier, ComponentConstruction, Expr, derive};
+use sanic::derive::{
+    AssociativityEvidence, Carrier, ComponentConstruction, Expr, MergeOrderEvidence, SerializationEvidence, derive,
+};
 use sanic::ir::*;
 use sanic::nn::scaled_dot_product_attention;
 
@@ -369,7 +371,13 @@ fn logsumexp_carrier() {
     ));
     assert_eq!(car.schema.components[1].dependencies, [0]);
     assert_eq!(car.stable_rebase_key(), Some(0));
-    assert!(car.laws.associative && car.laws.commutative && car.laws.serializable);
+    assert_eq!(
+        car.laws.associativity,
+        AssociativityEvidence::PrimitiveAndIndexedMonoids
+    );
+    assert_eq!(car.laws.merge_order, MergeOrderEvidence::CommutativeConstruction);
+    assert_eq!(car.laws.serialization, SerializationEvidence::ScalarCoordinates);
+    assert!(car.laws.is_associative() && car.laws.is_commutative() && car.laws.is_serializable());
     let mut forged = car.clone();
     forged.combine[1] = Expr::Add(Box::new(Expr::A(1)), Box::new(Expr::B(1)));
     assert_eq!(
