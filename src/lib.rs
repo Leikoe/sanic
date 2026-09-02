@@ -80,6 +80,8 @@ mod scalar;
 pub mod simplify;
 pub mod tensor;
 #[doc(hidden)]
+pub mod transition;
+#[doc(hidden)]
 pub mod verify;
 
 pub use compile::{Backend, Buffer, Compile, CompileError, CpuBuffer, CpuDevice, Program, RootItem, Roots, RunError};

@@ -1,4 +1,4 @@
-//! Prototype: the general chunk carrier is a state transformation.
+//! The general chunk carrier is a state transformation.
 //!
 //! A one-way machine has state `Q` and one-element transitions `Q -> Q`.
 //! Every chunk denotes the composition of its element transitions. Those
@@ -10,51 +10,17 @@
 //! 3. a one-scalar recurrence can have transformation complexity that grows
 //!    without bound in a chosen presentation grammar.
 //!
+//! The affine case uses Sanic's transition-family closure rather than a
+//! handwritten special carrier.
+//!
 //! Run with:
 //!
 //! ```text
 //! cargo run --example transition_monoid_carrier
 //! ```
 
-use std::fmt::Debug;
-
-/// A finite presentation of transformations on a sequential state.
-///
-/// `compose(left, right)` means “run the left chunk, then the right chunk”.
-/// The law that makes this a carrier is:
-///
-/// ```text
-/// apply(compose(a,b), q) = apply(b, apply(a,q)).
-/// ```
-trait TransitionMonoid {
-    type State: Clone + Debug;
-    type Input;
-    type Transform: Clone + Debug;
-
-    fn identity(&self) -> Self::Transform;
-    fn singleton(&self, input: &Self::Input) -> Self::Transform;
-    fn compose(&self, left: &Self::Transform, right: &Self::Transform) -> Self::Transform;
-    fn apply(&self, transform: &Self::Transform, state: &Self::State) -> Self::State;
-}
-
-fn fold_transform<M: TransitionMonoid>(monoid: &M, inputs: &[M::Input]) -> M::Transform {
-    inputs.iter().fold(monoid.identity(), |acc, input| {
-        monoid.compose(&acc, &monoid.singleton(input))
-    })
-}
-
-fn tree_transform<M: TransitionMonoid>(monoid: &M, inputs: &[M::Input]) -> M::Transform {
-    match inputs {
-        [] => monoid.identity(),
-        [input] => monoid.singleton(input),
-        _ => {
-            let middle = inputs.len() / 2;
-            let left = tree_transform(monoid, &inputs[..middle]);
-            let right = tree_transform(monoid, &inputs[middle..]);
-            monoid.compose(&left, &right)
-        }
-    }
-}
+use sanic::derive::{AssociativityEvidence, ComponentConstruction, Expr, MergeOrderEvidence};
+use sanic::transition::affine_transition_carrier;
 
 // ── right-future state is not automatically a monoid ───────────────────────
 
@@ -132,82 +98,49 @@ fn demonstrate_two_sided_contexts() {
 
 // ── affine recurrence: state dimension != carrier dimension ────────────────
 
-#[derive(Clone, Copy, Debug)]
-struct Affine {
-    scale: f64,
-    bias: f64,
-}
-
-#[derive(Clone, Copy)]
-struct AffineTransitions;
-
-impl TransitionMonoid for AffineTransitions {
-    type State = f64;
-    type Input = Affine;
-    type Transform = Affine;
-
-    fn identity(&self) -> Self::Transform {
-        Affine { scale: 1.0, bias: 0.0 }
-    }
-
-    fn singleton(&self, input: &Self::Input) -> Self::Transform {
-        *input
-    }
-
-    fn compose(&self, left: &Self::Transform, right: &Self::Transform) -> Self::Transform {
-        // right(left(q))
-        Affine {
-            scale: right.scale * left.scale,
-            bias: right.scale * left.bias + right.bias,
-        }
-    }
-
-    fn apply(&self, transform: &Self::Transform, state: &Self::State) -> Self::State {
-        transform.scale * state + transform.bias
-    }
-}
-
 fn close(left: f64, right: f64) -> bool {
     (left - right).abs() <= 1e-12 * left.abs().max(right.abs()).max(1.0)
 }
 
 fn demonstrate_affine_transition_carrier() {
-    let monoid = AffineTransitions;
-    let steps = [
-        Affine { scale: 2.0, bias: 1.0 },
-        Affine { scale: -0.5, bias: 3.0 },
-        Affine {
-            scale: 1.25,
-            bias: -2.0,
-        },
-        Affine { scale: 0.75, bias: 0.5 },
-    ];
+    let carrier = affine_transition_carrier(Expr::Item(0), Expr::Item(1), 4.0).unwrap();
+    let steps = vec![vec![2.0, 1.0], vec![-0.5, 3.0], vec![1.25, -2.0], vec![0.75, 0.5]];
     let initial = 4.0;
 
-    let sequential = steps.iter().fold(initial, |state, step| monoid.apply(step, &state));
-    let left = fold_transform(&monoid, &steps);
-    let tree = tree_transform(&monoid, &steps);
-    let left_result = monoid.apply(&left, &initial);
-    let tree_result = monoid.apply(&tree, &initial);
+    let sequential = steps.iter().fold(initial, |state, step| step[0] * state + step[1]);
+    let left_result = carrier.fold(&steps)[0];
+    let tree_result = carrier.tree_fold(&steps)[0];
 
     assert!(close(sequential, left_result));
     assert!(close(sequential, tree_result));
+    assert_eq!(carrier.slot_count(), 2);
+    assert_eq!(carrier.laws.associativity, AssociativityEvidence::TransitionComposition);
+    assert_eq!(carrier.laws.merge_order, MergeOrderEvidence::ProgramOrder);
+    assert!(!carrier.mergeable_out_of_order());
+    assert!(
+        carrier
+            .schema
+            .components
+            .iter()
+            .all(|component| component.construction == ComponentConstruction::GeneratedTransition)
+    );
 
     // Composition law on arbitrary incoming state: this is stronger than
     // agreement only at the chosen initial value.
-    let a = fold_transform(&monoid, &steps[..2]);
-    let b = fold_transform(&monoid, &steps[2..]);
-    let composed = monoid.compose(&a, &b);
+    let a_coordinates = carrier.fold_acc(&steps[..2]);
+    let b_coordinates = carrier.fold_acc(&steps[2..]);
+    let composed_coordinates = carrier.merge(&a_coordinates, &b_coordinates);
+    let a = carrier.decoded_transform(&a_coordinates);
+    let b = carrier.decoded_transform(&b_coordinates);
+    let composed = carrier.decoded_transform(&composed_coordinates);
     for q in [-3.0, 0.0, 2.5, 100.0] {
-        assert!(close(
-            monoid.apply(&composed, &q),
-            monoid.apply(&b, &monoid.apply(&a, &q))
-        ));
+        let state = [q, 1.0];
+        assert!(close(composed.apply(&state)[0], b.apply(&a.apply(&state))[0]));
     }
 
     println!("affine recurrence");
     println!("  sequential state: one scalar q");
-    println!("  chunk carrier: two scalars (A, B) denoting q -> A*q + B");
+    println!("  generated chunk carrier: two scalars (A, B) denoting q -> A*q + B");
     println!("  tree and sequential result: {tree_result}");
 }
 
@@ -230,7 +163,7 @@ fn demonstrate_unbounded_polynomial_closure() {
 }
 
 fn main() {
-    println!("syntactic transition-monoid carrier prototype\n");
+    println!("syntactic transition-monoid carrier\n");
     demonstrate_two_sided_contexts();
     println!();
     demonstrate_affine_transition_carrier();

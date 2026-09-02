@@ -53,9 +53,10 @@
 
 use std::collections::HashMap;
 
-use sanic::derive::derive;
+use sanic::derive::{AssociativityEvidence, Expr, MergeOrderEvidence, derive};
 use sanic::interp::{Env, Value, eval};
 use sanic::ir::*;
+use sanic::transition::affine_transition_carrier;
 
 // ── streams over a quantized alphabet ────────────────────────────────────────
 
@@ -989,6 +990,36 @@ fn two_sided_context_rank_separates_state_from_chunk_action() {
         Some(2),
         "affine recurrence two-sided spectrum: {action_spec:?}"
     );
+
+    // The context oracle is now constructive in the affine stratum: close
+    // the discovered singleton transformation family under composition and
+    // require its executable carrier dimension to match the measured rank.
+    let item = Expr::Item(0);
+    let scale = Expr::Add(
+        Box::new(Expr::Const(1.1)),
+        Box::new(Expr::Mul(Box::new(Expr::Const(0.2)), Box::new(item.clone()))),
+    );
+    let bias = Expr::Sub(
+        Box::new(item.clone()),
+        Box::new(Expr::Mul(
+            Box::new(Expr::Const(0.3)),
+            Box::new(Expr::Mul(Box::new(item.clone()), Box::new(item))),
+        )),
+    );
+    let generated = affine_transition_carrier(scale, bias, 0.0).unwrap();
+    assert_eq!(generated.slot_count(), rank_with_gap(&action_spec, 1e-8).unwrap());
+    assert_eq!(
+        generated.laws.associativity,
+        AssociativityEvidence::TransitionComposition
+    );
+    assert_eq!(generated.laws.merge_order, MergeOrderEvidence::ProgramOrder);
+    assert!(!generated.mergeable_out_of_order());
+    for word in prefixes.iter().chain(&middles).chain(&suffixes) {
+        let items: Vec<_> = word.iter().map(|value| vec![*value]).collect();
+        let expected = affine_recurrence(word);
+        assert!((generated.fold(&items)[0] - expected).abs() <= 1e-10);
+        assert!((generated.tree_fold(&items)[0] - expected).abs() <= 1e-10);
+    }
 }
 
 #[test]

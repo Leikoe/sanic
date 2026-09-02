@@ -646,13 +646,13 @@ from floating-point error and deterministic-order claims.
 
 ### Step 5 — expose realization rights
 
-The semantic certificate records:
+The semantic certificate carries the construction evidence for:
 
 ```text
-associative
-commutative or order-sensitive
+associativity reason (primitive/indexed theorem or transition composition)
+merge-order right (commutative construction or program order)
 identity and empty-chunk behavior
-serializable partial-state representation
+serialization reason (explicit scalar coordinates)
 decoded-equality contract
 ```
 
@@ -704,12 +704,9 @@ CarrierLaw {
 }
 
 LawCertificate {
-    construction
-    equality_contract
-    associative
-    commutative
-    order_constraints
-    serializable
+    associativity: PrimitiveAndIndexedMonoids | TransitionComposition
+    merge_order: CommutativeConstruction | ProgramOrder
+    serialization: ScalarCoordinates
 }
 
 construction :=
@@ -733,6 +730,12 @@ Implemented consequences:
   an exhaustive match over current variants.
 - prefix-mask elimination becomes a proved optimization over `lift/combine`
   plus range facts, not recognition of one slot arrangement.
+- `transition::TransitionFamily` closes matrix directions under multiplication,
+  computes structure constants, and emits executable scalar carrier programs.
+- the affine recurrence is generated as the two-coordinate `(A,B)` carrier;
+  its certificate permits reassociation but preserves program order.
+- the two-sided context-rank regression now checks that measured action rank
+  against the generated carrier dimension and its executable fold.
 
 The migration touched every former `SlotKind` consumer:
 
@@ -799,6 +802,9 @@ ResourceCertificate
 - The indexed max/payload cases share one functorial construction.
 - Linear synthesis has a concrete extraction algorithm: Hankel realization,
   transition-algebra closure, structure constants.
+- Finite-dimensional transition closure and structure-constant emission are
+  implemented; the graph-to-singleton-family extractor remains a separate
+  symbolic-front-end problem.
 - Stable machine states are refinements through a decode homomorphism.
 
 ### Necessarily partial
@@ -832,12 +838,15 @@ an honest, scoped claim.
    detector; reversed Hankel rank is not a merge certificate.
 3. **Done:** add a sampled two-sided context-matrix oracle alongside the current Hankel
    test.
-4. Refactor the indexed prototype around `F : J→Mon`, allowing different
-   fiber representations.
+4. **Done:** refactor the indexed prototype around `F : J→Mon`, including an
+   example whose bottom and live fibers use different payload representations.
 5. **Done:** introduce construction provenance and law certificates beside the current
    executable carrier, without changing emission yet.
 6. **Done:** replace `SlotKind` consumers one at a time with certificate/schema queries.
 7. **Done:** remove `SlotKind` and pin its absence with a structural test.
+8. **Done:** implement finite-dimensional transition-family closure, executable
+   generated carrier programs, and the affine `(A,B)` bridge from the
+   two-sided context oracle.
 
 ---
 
