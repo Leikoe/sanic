@@ -16,6 +16,8 @@
 //!          + transport(key' -> joined, payload'))
 //!
 //! `ExpShifted` and extremum-filtered payloads are two transport instances.
+//! The fiber operation receives the joined key, so a family may use genuinely
+//! different identities, operations, and representations at different keys.
 
 use std::fmt::Debug;
 
@@ -25,6 +27,18 @@ trait Monoid {
 
     fn identity(&self) -> Self::Value;
     fn combine(&self, left: &Self::Value, right: &Self::Value) -> Self::Value;
+}
+
+/// A key-dependent family `F : Key -> Mon`.
+///
+/// Rust stores the possible fiber representations in one payload envelope,
+/// while `identity_at` and `combine_at` select the lawful representation and
+/// operation for the requested key.
+trait MonoidFamily<Key> {
+    type Payload: Clone + Debug;
+
+    fn identity_at(&self, key: &Key) -> Self::Payload;
+    fn combine_at(&self, key: &Key, left: &Self::Payload, right: &Self::Payload) -> Self::Payload;
 }
 
 /// The key algebra used to choose a common fiber for two payloads.
@@ -53,24 +67,25 @@ struct IndexedState<Key, Payload> {
 }
 
 /// The total monoid obtained from a semilattice-indexed payload monoid.
-struct IndexedMonoid<Keys, Payloads, Movement> {
+struct IndexedMonoid<Keys, Fibers, Movement> {
     keys: Keys,
-    payloads: Payloads,
+    fibers: Fibers,
     movement: Movement,
 }
 
-impl<Keys, Payloads, Movement> Monoid for IndexedMonoid<Keys, Payloads, Movement>
+impl<Keys, Fibers, Movement> Monoid for IndexedMonoid<Keys, Fibers, Movement>
 where
     Keys: JoinSemilattice,
-    Payloads: Monoid,
-    Movement: Transport<Keys::Key, Payloads::Value>,
+    Fibers: MonoidFamily<Keys::Key>,
+    Movement: Transport<Keys::Key, Fibers::Payload>,
 {
-    type Value = IndexedState<Keys::Key, Payloads::Value>;
+    type Value = IndexedState<Keys::Key, Fibers::Payload>;
 
     fn identity(&self) -> Self::Value {
+        let key = self.keys.bottom();
         IndexedState {
-            key: self.keys.bottom(),
-            payload: self.payloads.identity(),
+            payload: self.fibers.identity_at(&key),
+            key,
         }
     }
 
@@ -79,8 +94,8 @@ where
         let left_payload = self.movement.move_to(&left.key, &joined, &left.payload);
         let right_payload = self.movement.move_to(&right.key, &joined, &right.payload);
         IndexedState {
+            payload: self.fibers.combine_at(&joined, &left_payload, &right_payload),
             key: joined,
-            payload: self.payloads.combine(&left_payload, &right_payload),
         }
     }
 }
@@ -169,6 +184,18 @@ impl<const WIDTH: usize> Monoid for AddVector<WIDTH> {
     }
 }
 
+impl<Key, const WIDTH: usize> MonoidFamily<Key> for AddVector<WIDTH> {
+    type Payload = [f64; WIDTH];
+
+    fn identity_at(&self, _key: &Key) -> Self::Payload {
+        self.identity()
+    }
+
+    fn combine_at(&self, _key: &Key, left: &Self::Payload, right: &Self::Payload) -> Self::Payload {
+        self.combine(left, right)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MinimumIndex;
 
@@ -181,6 +208,18 @@ impl Monoid for MinimumIndex {
 
     fn combine(&self, left: &Self::Value, right: &Self::Value) -> Self::Value {
         (*left).min(*right)
+    }
+}
+
+impl<Key> MonoidFamily<Key> for MinimumIndex {
+    type Payload = usize;
+
+    fn identity_at(&self, _key: &Key) -> Self::Payload {
+        self.identity()
+    }
+
+    fn combine_at(&self, _key: &Key, left: &Self::Payload, right: &Self::Payload) -> Self::Payload {
+        self.combine(left, right)
     }
 }
 
@@ -222,7 +261,7 @@ type EarliestMaximum = IndexedMonoid<MaximumKey, MinimumIndex, KeepWinner<usize>
 fn stable_statistics<const WIDTH: usize>() -> StableStatistics<WIDTH> {
     IndexedMonoid {
         keys: MaximumScore,
-        payloads: AddVector,
+        fibers: AddVector,
         movement: ExponentialRebase,
     }
 }
@@ -230,7 +269,7 @@ fn stable_statistics<const WIDTH: usize>() -> StableStatistics<WIDTH> {
 fn earliest_maximum() -> EarliestMaximum {
     IndexedMonoid {
         keys: MaximumKey,
-        payloads: MinimumIndex,
+        fibers: MinimumIndex,
         movement: KeepWinner {
             discarded: MinimumIndex.identity(),
         },
@@ -424,11 +463,108 @@ fn demonstrate_extremal_filter() {
     println!("  laws: identity, commutativity, associativity");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Activation {
+    Bottom,
+    Live,
+}
+
+#[derive(Clone, Copy)]
+struct ActivationKeys;
+
+impl JoinSemilattice for ActivationKeys {
+    type Key = Activation;
+
+    fn bottom(&self) -> Self::Key {
+        Activation::Bottom
+    }
+
+    fn join(&self, left: &Self::Key, right: &Self::Key) -> Self::Key {
+        (*left).max(*right)
+    }
+}
+
+/// One payload envelope holding two genuinely different fiber
+/// representations: the bottom fiber is a unit value, while the live fiber
+/// contains an additive counter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ActivationPayload {
+    Bottom,
+    Live(u64),
+}
+
+#[derive(Clone, Copy)]
+struct ActivationFibers;
+
+impl MonoidFamily<Activation> for ActivationFibers {
+    type Payload = ActivationPayload;
+
+    fn identity_at(&self, key: &Activation) -> Self::Payload {
+        match key {
+            Activation::Bottom => ActivationPayload::Bottom,
+            Activation::Live => ActivationPayload::Live(0),
+        }
+    }
+
+    fn combine_at(&self, key: &Activation, left: &Self::Payload, right: &Self::Payload) -> Self::Payload {
+        match (key, left, right) {
+            (Activation::Bottom, ActivationPayload::Bottom, ActivationPayload::Bottom) => ActivationPayload::Bottom,
+            (Activation::Live, ActivationPayload::Live(left), ActivationPayload::Live(right)) => {
+                ActivationPayload::Live(left + right)
+            }
+            _ => panic!("payload does not belong to the selected fiber"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Activate;
+
+impl Transport<Activation, ActivationPayload> for Activate {
+    fn move_to(&self, from: &Activation, to: &Activation, payload: &ActivationPayload) -> ActivationPayload {
+        match (from, to, payload) {
+            (Activation::Bottom, Activation::Bottom, ActivationPayload::Bottom) => ActivationPayload::Bottom,
+            (Activation::Bottom, Activation::Live, ActivationPayload::Bottom) => ActivationPayload::Live(0),
+            (Activation::Live, Activation::Live, ActivationPayload::Live(value)) => ActivationPayload::Live(*value),
+            _ => panic!("transport must follow the semilattice order"),
+        }
+    }
+}
+
+fn demonstrate_key_dependent_fibers() {
+    let family = IndexedMonoid {
+        keys: ActivationKeys,
+        fibers: ActivationFibers,
+        movement: Activate,
+    };
+    assert_eq!(family.identity().payload, ActivationPayload::Bottom);
+
+    let values = [
+        IndexedState {
+            key: Activation::Live,
+            payload: ActivationPayload::Live(2),
+        },
+        IndexedState {
+            key: Activation::Live,
+            payload: ActivationPayload::Live(5),
+        },
+    ];
+    let result = fold_tree(&family, &values);
+    assert_eq!(result.key, Activation::Live);
+    assert_eq!(result.payload, ActivationPayload::Live(7));
+
+    println!("key-dependent fibers");
+    println!("  bottom representation: unit payload");
+    println!("  live representation: additive counter {result:?}");
+}
+
 fn main() {
     println!("indexed-monoid carrier prototype\n");
     demonstrate_stable_statistics();
     println!();
     demonstrate_extremal_filter();
+    println!();
+    demonstrate_key_dependent_fibers();
 }
 
 #[cfg(test)]
@@ -436,8 +572,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generic_construction_covers_both_instances() {
+    fn generic_construction_covers_uniform_and_key_dependent_fibers() {
         demonstrate_stable_statistics();
         demonstrate_extremal_filter();
+        demonstrate_key_dependent_fibers();
     }
 }
