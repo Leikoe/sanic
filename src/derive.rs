@@ -41,11 +41,12 @@
 //! carrier is executable data, run against the interpreter (`tests/laws.rs`
 //! holds each rule to `run_carrier == eval`, ties and sign flips included).
 //! Completeness: "fusable" has a semantic definition independent of this
-//! file — h streams iff some constant-size sketch of the prefix determines
-//! every extension (a list homomorphism into a small carrier, tested
-//! Myhill–Nerode-style by collision probing) — and `tests/completeness.rs`
-//! holds DECLINES to it: a declined program whose carrier the probe can
-//! exhibit is a red test, not a benchmark surprise waiting to happen. The
+//! file — h factors through a bounded recognizing monoid. Suffix-future
+//! probing finds necessary one-way state; transition closure then determines
+//! whether that state has a bounded merge presentation. `tests/completeness.rs`
+//! holds DECLINES to this staged claim: a declined program with a surviving
+//! state sketch is an alarm to attempt transition closure, not silent evidence
+//! that no carrier exists. The
 //! `invariant`/`lattice`/`defer-add`/`defer-scale` rules above were found
 //! exactly that way.
 //!
@@ -254,13 +255,121 @@ fn eval(e: &Expr, env: &Env) -> f64 {
 
 // ── the derived carrier ──────────────────────────────────────────────────────
 
+/// A universal construction used to obtain one logical state component.
+///
+/// These variants describe algebraic provenance, not workload-specific
+/// behavior. The executable `combine` expression remains the semantic truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentConstruction {
+    /// A scalar monoid component lifted directly from one reduction.
+    Primitive { monoid: Monoid },
+    /// A payload in a fiber selected by another component. Its transport and
+    /// fiber operation are represented by the executable combine expression.
+    IndexedPayload,
+    /// A component produced by transition closure or another general
+    /// construction whose operation is represented directly by `combine`.
+    GeneratedTransition,
+}
+
+/// One component of the logical carrier state.
+#[derive(Debug, Clone)]
+pub struct StateComponent {
+    /// Free axes this component spans (the streamed axis is excluded).
+    pub span: Vec<AxisRef>,
+    /// Other state components whose values this component's combine reads.
+    pub dependencies: Vec<usize>,
+    /// How this component was constructed.
+    pub construction: ComponentConstruction,
+}
+
+/// Logical state shape, independent of storage placement and scheduling.
+#[derive(Debug, Clone)]
+pub struct LogicalStateSchema {
+    pub components: Vec<StateComponent>,
+}
+
+impl LogicalStateSchema {
+    pub fn len(&self) -> usize {
+        self.components.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.components.is_empty()
+    }
+}
+
+/// Why reassociation is sound for this carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociativityEvidence {
+    /// Product and semilattice-indexed-total monoid theorems used by `derive`.
+    PrimitiveAndIndexedMonoids,
+    /// Generated chunks denote state transformations; merge is composition.
+    TransitionComposition,
+}
+
+/// Which relative orders of independently produced chunks are licensed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOrderEvidence {
+    /// The construction proves commutativity, so chunk order may change.
+    CommutativeConstruction,
+    /// Only order-preserving parenthesization is licensed.
+    ProgramOrder,
+}
+
+/// Why a partial state may cross a split-reduction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerializationEvidence {
+    /// Every logical coordinate is represented explicitly as a scalar.
+    ScalarCoordinates,
+}
+
+/// Execution rights accompanied by the theorem/construction that grants them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LawCertificate {
+    pub associativity: AssociativityEvidence,
+    pub merge_order: MergeOrderEvidence,
+    pub serialization: SerializationEvidence,
+}
+
+impl LawCertificate {
+    pub const fn primitive_and_indexed() -> Self {
+        Self {
+            associativity: AssociativityEvidence::PrimitiveAndIndexedMonoids,
+            merge_order: MergeOrderEvidence::CommutativeConstruction,
+            serialization: SerializationEvidence::ScalarCoordinates,
+        }
+    }
+
+    pub const fn transition_composition() -> Self {
+        Self {
+            associativity: AssociativityEvidence::TransitionComposition,
+            merge_order: MergeOrderEvidence::ProgramOrder,
+            serialization: SerializationEvidence::ScalarCoordinates,
+        }
+    }
+
+    pub const fn is_associative(self) -> bool {
+        matches!(
+            self.associativity,
+            AssociativityEvidence::PrimitiveAndIndexedMonoids | AssociativityEvidence::TransitionComposition
+        )
+    }
+
+    pub const fn is_commutative(self) -> bool {
+        matches!(self.merge_order, MergeOrderEvidence::CommutativeConstruction)
+    }
+
+    pub const fn is_serializable(self) -> bool {
+        matches!(self.serialization, SerializationEvidence::ScalarCoordinates)
+    }
+}
+
 /// A concrete, executable streaming accumulator:
 /// `into` lifts one element in, `combine` is the associative merge, `project`
 /// turns the final state into the answer. When extra state was needed to make
 /// the fold associative, `project` is what discards it again.
 #[derive(Debug, Clone)]
 pub struct Carrier {
-    pub slots: usize,
     /// The fold's per-element inputs, in `Item` index order: the maximal
     /// sub-expressions that are FREE along the streamed axis. This is the
     /// fusion boundary — a leaf that is not a raw `Input` must either be
@@ -271,15 +380,14 @@ pub struct Carrier {
     pub combine: Vec<Expr>,
     pub identity: Vec<f64>,
     pub project: Vec<Expr>,
-    /// The free axes each slot spans (streamed axis excluded). The exact
-    /// accumulator size for a tile is `Σ_slots Π extents[span]` — `acc_scalars`.
-    pub spans: Vec<Vec<AxisRef>>,
+    /// Logical component shape and construction provenance. Storage layout,
+    /// placement, and scheduling are deliberately not part of this schema.
+    pub schema: LogicalStateSchema,
+    /// Algebraic rights exposed to planners and emitters.
+    pub laws: LawCertificate,
     /// Which of the five derivation moves fired, in plain words (see the
     /// module doc): `fold`, `fused-map`, `tuple`, `rescale`, `defer-div`.
     pub rules: Vec<&'static str>,
-    /// What kind of reduction each slot is. The emitters read this to pick the
-    /// intra-tile operation without pattern-matching the computation.
-    pub kinds: Vec<SlotKind>,
     pub(crate) aliases: HashMap<AxisRef, AxisRef>,
     // `AxisRef` is intentionally just `(node pointer, dimension)`. Retain the
     // graph that owns every such pointer for as long as the carrier exists.
@@ -287,6 +395,74 @@ pub struct Carrier {
 }
 
 impl Carrier {
+    pub fn slot_count(&self) -> usize {
+        self.schema.len()
+    }
+
+    pub fn span(&self, slot: usize) -> &[AxisRef] {
+        &self.schema.components[slot].span
+    }
+
+    pub fn spans(&self) -> impl Iterator<Item = &[AxisRef]> {
+        self.schema.components.iter().map(|component| component.span.as_slice())
+    }
+
+    /// Whether independently computed chunks may be merged in either order.
+    pub fn mergeable_out_of_order(&self) -> bool {
+        self.laws.is_associative() && self.laws.is_commutative()
+    }
+
+    /// The primitive operation of a component, only when provenance and the
+    /// executable expression agree. Consumers never trust provenance alone.
+    pub fn primitive_monoid(&self, slot: usize) -> Option<Monoid> {
+        let ComponentConstruction::Primitive { monoid } = self.schema.components.get(slot)?.construction else {
+            return None;
+        };
+        if monoid == Monoid::LogSumExp {
+            return None;
+        }
+        (self.combine.get(slot)? == &primitive_combine(monoid, slot)
+            && self.identity.get(slot).copied() == Some(monoid.identity()))
+        .then_some(monoid)
+    }
+
+    /// Components read by other component combines. These are the algebraic
+    /// keys whose producer leaves must remain available in the fold body.
+    pub fn coupled_key_slots(&self) -> Vec<usize> {
+        (0..self.slot_count())
+            .filter(|slot| {
+                self.schema
+                    .components
+                    .iter()
+                    .any(|component| component.dependencies.contains(slot))
+            })
+            .collect()
+    }
+
+    /// Prove that the whole carrier is one max key plus payloads transported
+    /// by exp(old_key-new_key). This query checks schema, identities, and the
+    /// actual combine programs; it is not a workload or slot-kind tag.
+    pub fn stable_rebase_key(&self) -> Option<usize> {
+        let keys: Vec<_> = self
+            .coupled_key_slots()
+            .into_iter()
+            .filter(|&slot| self.primitive_monoid(slot) == Some(Monoid::Max))
+            .collect();
+        let [key_slot] = keys.as_slice() else {
+            return None;
+        };
+        let key_slot = *key_slot;
+        (self.slot_count() > 1
+            && self.schema.components.iter().enumerate().all(|(slot, component)| {
+                slot == key_slot
+                    || matches!(component.construction, ComponentConstruction::IndexedPayload)
+                        && component.dependencies.as_slice() == [key_slot]
+                        && self.identity[slot] == 0.0
+                        && self.combine[slot] == exp_rebased_combine(slot, key_slot)
+            }))
+        .then_some(key_slot)
+    }
+
     /// Fold left-to-right, O(1) state — the streaming path.
     pub fn fold(&self, items: &[Vec<f64>]) -> Vec<f64> {
         self.project(&self.fold_acc(items))
@@ -359,8 +535,7 @@ impl Carrier {
     /// free axes is one scalar; a slot spanning `{sq, e}` is
     /// `extent(sq)·extent(e)`.
     pub fn acc_scalars(&self, extent: impl Fn(AxisRef) -> f64) -> f64 {
-        self.spans
-            .iter()
+        self.spans()
             .map(|span| span.iter().map(|&a| extent(a)).product::<f64>())
             .sum()
     }
@@ -378,7 +553,7 @@ impl Carrier {
         };
         format!(
             "carrier ({} slots) [{}]\n  into:    {}\n  combine: {}\n  project: {}",
-            self.slots,
+            self.slot_count(),
             self.rules.join(", "),
             row(&self.into),
             row(&self.combine),
@@ -510,23 +685,12 @@ fn node_head(n: &Node) -> String {
 
 /// One accumulator slot under construction.
 struct Slot {
-    kind: SlotKind,
-    into: Expr,         // per-element contribution, over `Item`
+    construction: ComponentConstruction,
+    dependencies: Vec<usize>,
+    into: Expr,    // per-element contribution, over `Item`
+    combine: Expr, // merge program, over `A` and `B`
+    identity: f64,
     span: Vec<AxisRef>, // free axes this slot ranges over (streamed axis excluded)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum SlotKind {
-    /// Combine by a monoid directly: `A ⊕ B`.
-    Plain(Monoid),
-    /// The exp-domain sum of an online softmax: accumulated as
-    /// `Σ exp(score − running_max)·raw`, where the running max is slot
-    /// `max_slot`. On merge it telescopes — rescale by `exp(m − M_new)`.
-    ExpShifted { max_slot: usize },
-    /// A payload accumulated only among elements tied at an extremal key.
-    /// The pair forms a product monoid: `key` chooses the winning group and
-    /// `ties` combines payloads when both groups have the same key.
-    AtExtremum { key_slot: usize, key: Monoid, ties: Monoid },
 }
 
 /// What streaming a sub-expression over the axis produced so far.
@@ -698,15 +862,17 @@ impl Ctx<'_> {
         }
     }
 
-    fn push_slot(&mut self, kind: SlotKind, into: Expr) -> usize {
+    fn push_slot(&mut self, construction: ComponentConstruction, into: Expr, combine: Expr, identity: f64) -> usize {
+        let slot = self.slots.len();
+        let dependencies = combine_dependencies(&combine, slot);
         // A compound contribution means elementwise work was fused into the
         // lift instead of materializing an intermediate.
         if !matches!(into, Expr::Item(_) | Expr::Const(_)) {
             self.rules.insert("fused-map");
         }
         self.rules.insert("fold");
-        // A slot spans the free axes of every leaf it reads, plus — for an
-        // exp-shifted slot — the axes of the max slot it rides.
+        // A component spans the free axes of every leaf it reads, plus the
+        // axes of every component its combine depends on.
         let mut span: Vec<AxisRef> = Vec::new();
         for i in items_of(&into) {
             for &a in &self.leaves[i].1 {
@@ -715,23 +881,56 @@ impl Ctx<'_> {
                 }
             }
         }
-        let dependency = match kind {
-            SlotKind::ExpShifted { max_slot } => Some(max_slot),
-            SlotKind::AtExtremum { key_slot, .. } => Some(key_slot),
-            _ => None,
-        };
-        if let Some(dependency) = dependency {
+        for &dependency in &dependencies {
+            assert!(
+                dependency < self.slots.len(),
+                "component dependencies must point backward"
+            );
             for &a in &self.slots[dependency].span {
                 if !span.contains(&a) {
                     span.push(a);
                 }
             }
         }
-        self.slots.push(Slot { kind, into, span });
+        self.slots.push(Slot {
+            construction,
+            dependencies,
+            into,
+            combine,
+            identity,
+            span,
+        });
         if self.slots.len() > 1 {
             self.rules.insert("tuple");
         }
         self.slots.len() - 1
+    }
+
+    fn push_primitive(&mut self, monoid: Monoid, into: Expr) -> usize {
+        let slot = self.slots.len();
+        self.push_slot(
+            ComponentConstruction::Primitive { monoid },
+            into,
+            primitive_combine(monoid, slot),
+            monoid.identity(),
+        )
+    }
+
+    fn push_indexed_payload(
+        &mut self,
+        key_slot: usize,
+        into: Expr,
+        identity: f64,
+        combine: impl FnOnce(usize) -> Expr,
+    ) -> usize {
+        let slot = self.slots.len();
+        let pushed = self.push_slot(ComponentConstruction::IndexedPayload, into, combine(slot), identity);
+        assert_eq!(
+            self.slots[pushed].dependencies.as_slice(),
+            [key_slot],
+            "an indexed payload combine must read exactly its key component"
+        );
+        pushed
     }
 }
 
@@ -762,6 +961,45 @@ pub(crate) fn items_of(e: &Expr) -> Vec<usize> {
     }
     walk(e, &mut out);
     out
+}
+
+/// Other accumulator components read by one component's combine expression.
+/// Dependencies are derived from the executable program so schema metadata
+/// cannot silently disagree with the actual law.
+fn combine_dependencies(e: &Expr, own_slot: usize) -> Vec<usize> {
+    let mut references = Vec::new();
+    fn walk(e: &Expr, references: &mut Vec<usize>) {
+        match e {
+            Expr::A(slot) | Expr::B(slot) => {
+                if !references.contains(slot) {
+                    references.push(*slot);
+                }
+            }
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Max(a, b)
+            | Expr::Min(a, b)
+            | Expr::Lt(a, b) => {
+                walk(a, references);
+                walk(b, references);
+            }
+            Expr::Exp(a) | Expr::Log(a) | Expr::Sqrt(a) | Expr::Tanh(a) | Expr::Sin(a) | Expr::Cos(a) => {
+                walk(a, references)
+            }
+            Expr::Where(c, a, b) => {
+                walk(c, references);
+                walk(a, references);
+                walk(b, references);
+            }
+            Expr::Const(_) | Expr::Item(_) | Expr::F(_) => {}
+        }
+    }
+    walk(e, &mut references);
+    references.retain(|slot| *slot != own_slot);
+    references.sort_unstable();
+    references
 }
 
 /// The broadcast-back pattern: re-inserting a singleton at a reduction's
@@ -924,20 +1162,28 @@ pub(crate) fn derive_with_structure_cache(
     };
 
     let (into, combine, identity) = assemble(&ctx.slots);
-    let spans = ctx.slots.iter().map(|s| s.span.clone()).collect();
-    let kinds = ctx.slots.iter().map(|s| s.kind).collect();
+    let schema = LogicalStateSchema {
+        components: ctx
+            .slots
+            .iter()
+            .map(|slot| StateComponent {
+                span: slot.span.clone(),
+                dependencies: slot.dependencies.clone(),
+                construction: slot.construction,
+            })
+            .collect(),
+    };
     let leaves = ctx.leaves.iter().map(|(n, _)| n.clone()).collect();
     let aliases = ctx.aliases.clone();
     Ok(Carrier {
-        slots: ctx.slots.len(),
         leaves,
         into,
         combine,
         identity,
         project,
-        spans,
+        schema,
+        laws: LawCertificate::primitive_and_indexed(),
         rules: ctx.rules.into_iter().collect(),
-        kinds,
         aliases,
         _keepalive: node.clone(),
     })
@@ -1162,21 +1408,16 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
         let Some(key_into) = plain_pe(&key_state) else {
             return Err(decline(node, axis, "coupled-extremum-key", reached(&key_state)));
         };
-        let key_slot = ctx.push_slot(SlotKind::Plain(key_monoid), key_into);
+        let key_slot = ctx.push_primitive(key_monoid, key_into);
 
         let payload_state = go(&payload, axis, ctx)?;
         let Some(payload_into) = plain_pe(&payload_state) else {
             return Err(decline(node, axis, "coupled-extremum-payload", reached(&payload_state)));
         };
         ctx.rules.insert("extremum-filter");
-        let payload_slot = ctx.push_slot(
-            SlotKind::AtExtremum {
-                key_slot,
-                key: key_monoid,
-                ties: m,
-            },
-            payload_into,
-        );
+        let payload_slot = ctx.push_indexed_payload(key_slot, payload_into, m.identity(), |slot| {
+            extremum_payload_combine(slot, key_slot, key_monoid, m)
+        });
         return Ok(S::Coll(Expr::F(payload_slot)));
     }
 
@@ -1190,14 +1431,14 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
             // never needs to know it. Found by the completeness probe.
             if let Some(e) = as_coll(&s) {
                 ctx.rules.insert("invariant");
-                let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
+                let cnt = ctx.push_primitive(Monoid::Add, cst(1.0));
                 return Ok(S::Coll(pmul(e, Expr::F(cnt))));
             }
             // Σ(z + c) = Σz + n·c — the offset leaves through a count slot.
             if let S::PeAdd { raw, off } = s {
                 ctx.rules.insert("defer-add");
-                let slot = ctx.push_slot(SlotKind::Plain(Monoid::Add), raw);
-                let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
+                let slot = ctx.push_primitive(Monoid::Add, raw);
+                let cnt = ctx.push_primitive(Monoid::Add, cst(1.0));
                 return Ok(S::Coll(padd(Expr::F(slot), pmul(off, Expr::F(cnt)))));
             }
             let (raw, shift, post) = match s {
@@ -1205,14 +1446,13 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
                 // a max-coupled intermediate only exp / max/min may consume
                 other => return Err(decline(node, axis, "sum-of-coupled", reached(&other))),
             };
-            let kind = match shift {
+            let slot = match shift {
                 Some(max_slot) => {
                     ctx.rules.insert("rescale"); // rides a running max
-                    SlotKind::ExpShifted { max_slot }
+                    ctx.push_indexed_payload(max_slot, raw, 0.0, |slot| exp_rebased_combine(slot, max_slot))
                 }
-                None => SlotKind::Plain(Monoid::Add),
+                None => ctx.push_primitive(Monoid::Add, raw),
             };
-            let slot = ctx.push_slot(kind, raw);
             if !is1(&post) {
                 // A normalizer factored out of this linear reduction; it is
                 // applied once, in `project`.
@@ -1225,15 +1465,16 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
             // LSE over an invariant = value + ln n (n from a count slot).
             if let Some(e) = as_coll(&s) {
                 ctx.rules.insert("invariant");
-                let cnt = ctx.push_slot(SlotKind::Plain(Monoid::Add), cst(1.0));
+                let cnt = ctx.push_primitive(Monoid::Add, cst(1.0));
                 return Ok(S::Coll(padd(e, log(Expr::F(cnt)))));
             }
             let Some(raw) = plain_pe(&s) else {
                 return Err(decline(node, axis, "lse-of-coupled", reached(&s)));
             };
-            let max_slot = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw);
+            let max_slot = ctx.push_primitive(Monoid::Max, raw);
             ctx.rules.insert("rescale");
-            let sum_slot = ctx.push_slot(SlotKind::ExpShifted { max_slot }, cst(1.0));
+            let sum_slot =
+                ctx.push_indexed_payload(max_slot, cst(1.0), 0.0, |slot| exp_rebased_combine(slot, max_slot));
             Ok(S::Coll(padd(log(Expr::F(sum_slot)), Expr::F(max_slot))))
         }
 
@@ -1262,7 +1503,7 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
                 && let S::PeExt { raw, coll, is_max } = &s
             {
                 ctx.rules.insert("lattice");
-                let slot = ctx.push_slot(SlotKind::Plain(m), raw.clone());
+                let slot = ctx.push_primitive(m, raw.clone());
                 return Ok(S::Coll(if *is_max {
                     emax(Expr::F(slot), coll.clone())
                 } else {
@@ -1274,7 +1515,7 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
                 && let S::PeAdd { raw, off } = &s
             {
                 ctx.rules.insert("defer-add");
-                let slot = ctx.push_slot(SlotKind::Plain(m), raw.clone());
+                let slot = ctx.push_primitive(m, raw.clone());
                 return Ok(S::Coll(padd(Expr::F(slot), off.clone())));
             }
             let (raw, post) = match s {
@@ -1288,7 +1529,7 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
                 }
             };
             if is1(&post) {
-                let slot = ctx.push_slot(SlotKind::Plain(m), raw);
+                let slot = ctx.push_primitive(m, raw);
                 return Ok(S::Coll(Expr::F(slot)));
             }
             // Deferred scale under an order reduction: the sign of the
@@ -1305,8 +1546,8 @@ fn reduce_op(node: &Node, src: &Node, m: Monoid, axis: AxisRef, ctx: &mut Ctx<'_
                 ));
             }
             ctx.rules.insert("defer-scale");
-            let mx = ctx.push_slot(SlotKind::Plain(Monoid::Max), raw.clone());
-            let mn = ctx.push_slot(SlotKind::Plain(Monoid::Min), raw);
+            let mx = ctx.push_primitive(Monoid::Max, raw.clone());
+            let mn = ctx.push_primitive(Monoid::Min, raw);
             let (pos, neg) = match m {
                 Monoid::Max => (mx, mn),
                 Monoid::Min => (mn, mx),
@@ -1544,7 +1785,11 @@ fn binop(
         // Per-element minus the collapsed running max over the same axis:
         // the online-softmax shift intermediate, consumed by Exp.
         (Bin::Sub, S::Pe { raw, shift: None, post }, S::Coll(Expr::F(i)))
-            if is1(&post) && matches!(ctx.slots[i].kind, SlotKind::Plain(Monoid::Max)) =>
+            if is1(&post)
+                && matches!(
+                    ctx.slots[i].construction,
+                    ComponentConstruction::Primitive { monoid: Monoid::Max }
+                ) =>
         {
             Ok(S::PeOff { raw, max_slot: i })
         }
@@ -1684,64 +1929,56 @@ fn merge_shift(a: Option<usize>, b: Option<usize>) -> Option<Option<usize>> {
     }
 }
 
-/// Turn the registered slots into `(into, combine, identity)`.
+/// Executable combine for one primitive scalar monoid component.
+fn primitive_combine(monoid: Monoid, slot: usize) -> Expr {
+    match monoid {
+        Monoid::Add => padd(Expr::A(slot), Expr::B(slot)),
+        Monoid::Mul => Expr::Mul(Box::new(Expr::A(slot)), Box::new(Expr::B(slot))),
+        Monoid::Max => emax(Expr::A(slot), Expr::B(slot)),
+        Monoid::Min => emin(Expr::A(slot), Expr::B(slot)),
+        Monoid::LogSumExp => unreachable!("logsumexp uses a stable indexed carrier"),
+    }
+}
+
+/// Payload transport for the max-indexed exponential-statistics monoid.
+fn exp_rebased_combine(slot: usize, key_slot: usize) -> Expr {
+    // s' = sₐ·exp(mₐ − M) + s_b·exp(m_b − M),  M = max(mₐ, m_b).
+    // A side whose max is −∞ carries no weight, and its factor is FORCED to
+    // zero: `exp(−∞ − M)` is NaN when M is also −∞, exactly the identity
+    // accumulator of a lane that folded only masked elements.
+    let big = emax(Expr::A(key_slot), Expr::B(key_slot));
+    let rescale = |m: Expr, big: Expr| ewhere(elt(cst(f64::NEG_INFINITY), m.clone()), exp(sub(m, big)), cst(0.0));
+    let ra = rescale(Expr::A(key_slot), big.clone());
+    let rb = rescale(Expr::B(key_slot), big);
+    padd(pmul(Expr::A(slot), ra), pmul(Expr::B(slot), rb))
+}
+
+/// Payload combine in the fiber selected by an extremal key. This and
+/// `exp_rebased_combine` are two executable transports through the same
+/// semilattice-indexed payload construction.
+fn extremum_payload_combine(slot: usize, key_slot: usize, key: Monoid, ties: Monoid) -> Expr {
+    let tied = primitive_combine(ties, slot);
+    match key {
+        Monoid::Max => ewhere(
+            elt(Expr::A(key_slot), Expr::B(key_slot)),
+            Expr::B(slot),
+            ewhere(elt(Expr::B(key_slot), Expr::A(key_slot)), Expr::A(slot), tied),
+        ),
+        Monoid::Min => ewhere(
+            elt(Expr::A(key_slot), Expr::B(key_slot)),
+            Expr::A(slot),
+            ewhere(elt(Expr::B(key_slot), Expr::A(key_slot)), Expr::B(slot), tied),
+        ),
+        _ => unreachable!("an extremal key is max or min"),
+    }
+}
+
+/// The slots already contain their executable operations. Assembly only
+/// transposes construction records into the carrier's parallel programs.
 fn assemble(slots: &[Slot]) -> (Vec<Expr>, Vec<Expr>, Vec<f64>) {
-    let into = slots.iter().map(|s| s.into.clone()).collect();
-    let combine = slots
-        .iter()
-        .enumerate()
-        .map(|(i, s)| match s.kind {
-            SlotKind::Plain(Monoid::Add) | SlotKind::Plain(Monoid::LogSumExp) => {
-                Expr::Add(Box::new(Expr::A(i)), Box::new(Expr::B(i)))
-            }
-            SlotKind::Plain(Monoid::Mul) => Expr::Mul(Box::new(Expr::A(i)), Box::new(Expr::B(i))),
-            SlotKind::Plain(Monoid::Max) => emax(Expr::A(i), Expr::B(i)),
-            SlotKind::Plain(Monoid::Min) => emin(Expr::A(i), Expr::B(i)),
-            SlotKind::ExpShifted { max_slot: mx } => {
-                // s' = sₐ·exp(mₐ − M) + s_b·exp(m_b − M),  M = max(mₐ, m_b).
-                // A side whose max is −∞ carries no weight, and its factor is
-                // FORCED to zero: `exp(−∞ − M)` is NaN when M is also −∞,
-                // which is exactly the identity accumulator of a lane that
-                // folded only masked elements (softmax masking past the
-                // visible prefix). The guard makes the identity absorbing.
-                let big = emax(Expr::A(mx), Expr::B(mx));
-                let rescale =
-                    |m: Expr, big: Expr| ewhere(elt(cst(f64::NEG_INFINITY), m.clone()), exp(sub(m, big)), cst(0.0));
-                let ra = rescale(Expr::A(mx), big.clone());
-                let rb = rescale(Expr::B(mx), big);
-                padd(pmul(Expr::A(i), ra), pmul(Expr::B(i), rb))
-            }
-            SlotKind::AtExtremum { key_slot, key, ties } => {
-                let tied = match ties {
-                    Monoid::Add => padd(Expr::A(i), Expr::B(i)),
-                    Monoid::Mul => Expr::Mul(Box::new(Expr::A(i)), Box::new(Expr::B(i))),
-                    Monoid::Max => emax(Expr::A(i), Expr::B(i)),
-                    Monoid::Min => emin(Expr::A(i), Expr::B(i)),
-                    Monoid::LogSumExp => unreachable!("excluded by extremum_filtered_payload"),
-                };
-                match key {
-                    Monoid::Max => ewhere(
-                        elt(Expr::A(key_slot), Expr::B(key_slot)),
-                        Expr::B(i),
-                        ewhere(elt(Expr::B(key_slot), Expr::A(key_slot)), Expr::A(i), tied),
-                    ),
-                    Monoid::Min => ewhere(
-                        elt(Expr::A(key_slot), Expr::B(key_slot)),
-                        Expr::A(i),
-                        ewhere(elt(Expr::B(key_slot), Expr::A(key_slot)), Expr::B(i), tied),
-                    ),
-                    _ => unreachable!("an extremal key is max or min"),
-                }
-            }
-        })
-        .collect();
-    let identity = slots
-        .iter()
-        .map(|s| match s.kind {
-            SlotKind::Plain(m) => m.identity(),
-            SlotKind::ExpShifted { .. } => 0.0,
-            SlotKind::AtExtremum { ties, .. } => ties.identity(),
-        })
-        .collect();
-    (into, combine, identity)
+    (
+        slots.iter().map(|slot| slot.into.clone()).collect(),
+        slots.iter().map(|slot| slot.combine.clone()).collect(),
+        slots.iter().map(|slot| slot.identity).collect(),
+    )
 }

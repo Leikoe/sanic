@@ -379,7 +379,7 @@ fn sliding_window_attention_is_one_flash_kernel() {
         panic!("expected a fused stage")
     };
     assert_eq!(spec.streaming_axis, stream, "streams the window axis, not the sequence");
-    assert_eq!(spec.carrier.slots, 3, "the online-softmax (m, ℓ, o) carrier");
+    assert_eq!(spec.carrier.slot_count(), 3, "the online-softmax (m, ℓ, o) carrier");
     let executed = sched.execute(&env);
     assert_close(&executed, &hand);
 }

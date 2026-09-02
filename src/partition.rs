@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use crate::analyze::{Parallelism, StructureCache};
 use crate::cost::DeviceSpecs;
-use crate::derive::{Carrier, Decline, SlotKind, derive_with_structure_cache, items_of};
+use crate::derive::{Carrier, Decline, derive_with_structure_cache, items_of};
 use crate::interp::{Env, Value, eval, run_carrier};
 use crate::ir::{
     self, AxisRef, MapOp, Monoid, Node as NodeKind, NodeRef as Node, all_axis_refs, input_axes, leaf_names,
@@ -1210,20 +1210,13 @@ impl Partitioner<'_> {
     /// One streaming kernel at `node` over `axis`: cut the carrier leaves the
     /// kernel cannot compute in-body, re-plan on the cut graph, push a stage.
     fn emit_fold(&mut self, node: &Node, axis: AxisRef, carrier: &Carrier, out: &str) -> &'static str {
-        // The score contraction of an online-softmax coupling is computed
-        // in-body (FlashAttention's QKᵀ): the leaves the coupled max reads.
+        // A coupled key's producer is computed in-body (FlashAttention's QKᵀ
+        // score is one instance): these are exactly the leaves read by a
+        // component on which another component's combine depends.
         let in_body: Vec<usize> = carrier
-            .kinds
-            .iter()
-            .enumerate()
-            .filter(|(i, k)| {
-                matches!(k, SlotKind::Plain(Monoid::Max))
-                    && carrier.kinds.iter().any(|k2| {
-                        matches!(k2, SlotKind::ExpShifted { max_slot } if max_slot == i)
-                            || matches!(k2, SlotKind::AtExtremum { key_slot, .. } if key_slot == i)
-                    })
-            })
-            .flat_map(|(i, _)| items_of(&carrier.into[i]))
+            .coupled_key_slots()
+            .into_iter()
+            .flat_map(|slot| items_of(&carrier.into[slot]))
             .collect();
 
         // Carrier leaves are the fusion boundary. Resolve the stream down to
@@ -1689,7 +1682,7 @@ impl<'c> CutPricing<'c> {
             .product::<f64>()
             .max(1.0);
         let mut union: Vec<AxisRef> = Vec::new();
-        for span in &carrier.spans {
+        for span in carrier.spans() {
             for &axis in span {
                 if !union.contains(&axis) {
                     union.push(axis);
@@ -1698,7 +1691,7 @@ impl<'c> CutPricing<'c> {
         }
         let lane_sharable = union
             .into_iter()
-            .filter(|axis| carrier.spans.iter().any(|span| !span.contains(axis)))
+            .filter(|axis| carrier.spans().any(|span| !span.contains(axis)))
             .collect();
         CutPricing {
             out_vol,
@@ -2196,7 +2189,7 @@ impl Schedule {
                         spec.output_name,
                         spec.streaming_axis.name,
                         spec.input_names.join(", "),
-                        spec.carrier.slots,
+                        spec.carrier.slot_count(),
                         spec.carrier.rules.join(", "),
                         epi,
                     )
@@ -2472,7 +2465,7 @@ mod tests {
                 let Stage::Fused { spec, .. } = &sched.stages[sched.stages.len() - 1] else {
                     panic!("expected a fused flash stage")
                 };
-                (sched.stages.len(), spec.streaming_axis, spec.carrier.slots)
+                (sched.stages.len(), spec.streaming_axis, spec.carrier.slot_count())
             })
             .collect();
         assert!(
@@ -2509,7 +2502,7 @@ mod tests {
         };
         assert_eq!(spec.streaming_axis.extent, key_axis.extent);
         assert_eq!(spec.streaming_axis.name, key_axis.name);
-        assert_eq!(spec.carrier.slots, 3);
+        assert_eq!(spec.carrier.slot_count(), 3);
     }
 
     // Attention over *projections*: the QKV GEMMs are cut into producer
@@ -2545,14 +2538,14 @@ mod tests {
                 panic!("producers are fused folds")
             };
             assert_eq!(spec.streaming_axis, expected);
-            assert_eq!(spec.carrier.slots, 1);
+            assert_eq!(spec.carrier.slot_count(), 1);
         }
         let Stage::Fused { spec, .. } = &sched.stages[3] else {
             panic!()
         };
         assert_eq!(spec.streaming_axis.extent, key_axis.extent);
         assert_eq!(spec.streaming_axis.name, key_axis.name);
-        assert_eq!(spec.carrier.slots, 3, "flash fold survives the cuts");
+        assert_eq!(spec.carrier.slot_count(), 3, "flash fold survives the cuts");
         // its inputs are the materialized intermediates
         assert!(spec.input_names.iter().filter(|n| n.starts_with('t')).count() >= 3);
     }
@@ -2578,7 +2571,7 @@ mod tests {
         assert_eq!(sched.stages.len(), 2);
         assert!(matches!(&sched.stages[0], Stage::Fused { spec, epilogue, .. }
             if spec.streaming_axis == stream
-                && spec.carrier.slots == 1
+                && spec.carrier.slot_count() == 1
                 && epilogue.contains(&"sqrt")));
         assert!(matches!(&sched.stages[1], Stage::Elementwise { ops, .. }
             if ops.contains(&"div")));
@@ -2603,7 +2596,7 @@ mod tests {
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!()
         };
-        assert_eq!(spec.carrier.slots, 2, "dot product + Σx²");
+        assert_eq!(spec.carrier.slot_count(), 2, "dot product + Σx²");
         assert!(spec.carrier.rules.contains(&"defer-div"));
     }
 
@@ -2711,7 +2704,8 @@ mod tests {
         assert_eq!(spec.streaming_axis.extent, stream.extent);
         assert_eq!(spec.streaming_axis.name, stream.name);
         assert_eq!(
-            spec.carrier.slots, 1,
+            spec.carrier.slot_count(),
+            1,
             "plain GEMV after the cut, not a deferred-normalizer coupling"
         );
         assert!(
@@ -2824,7 +2818,7 @@ mod tests {
         };
         assert_eq!(spec.streaming_axis.extent, stream.extent);
         assert_eq!(spec.streaming_axis.name, stream.name);
-        assert_eq!(spec.carrier.slots, 2, "one (max, Σexp) rescale carrier");
+        assert_eq!(spec.carrier.slot_count(), 2, "one (max, Σexp) rescale carrier");
     }
 
     // The FLATTENED variant of the down projection (the W4-matvec shape: the
@@ -2907,7 +2901,7 @@ mod tests {
         let act = map(MapOp::Mul, vec![silu(gate), up]);
         let coupled = crate::derive::derive(&act, stream)
             .unwrap_or_else(|decline| panic!("shared activation did not derive: {decline:?}"));
-        assert!(coupled.slots >= 2, "both projections must share one carrier");
+        assert!(coupled.slot_count() >= 2, "both projections must share one carrier");
         let xs = split(act, 1usize, gi, ri);
         let prod = map(
             MapOp::Mul,
@@ -2930,7 +2924,7 @@ mod tests {
             panic!("the activation derives as one fold")
         };
         assert_eq!(spec.streaming_axis, stream);
-        assert!(spec.carrier.slots >= 2, "both dot products in one carrier");
+        assert!(spec.carrier.slot_count() >= 2, "both dot products in one carrier");
     }
 
     // An embedding lookup is its own OPAQUE gather stage.
@@ -3021,7 +3015,7 @@ mod tests {
             panic!()
         };
         assert_eq!(spec.streaming_axis, key_axis);
-        assert_eq!(spec.carrier.slots, 3, "the multi-head flash fold");
+        assert_eq!(spec.carrier.slot_count(), 3, "the multi-head flash fold");
         let Stage::Fused { spec, .. } = &sched.stages[1] else {
             panic!()
         };
@@ -3047,7 +3041,7 @@ mod tests {
         let Stage::Fused { spec, .. } = &sched.stages[0] else {
             panic!()
         };
-        assert_eq!(spec.carrier.slots, 3);
+        assert_eq!(spec.carrier.slot_count(), 3);
         assert!(spec.carrier.rules.contains(&"fused-map"));
         assert_eq!(spec.input_names, vec!["Q", "K", "V"], "no mask tensor is read");
     }

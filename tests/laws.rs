@@ -8,7 +8,9 @@
 //! correctness in one assertion.
 
 use sanic::analyze::{Parallelism, analyze, analyze_all, streamable, structure};
-use sanic::derive::{Carrier, Expr, derive};
+use sanic::derive::{
+    AssociativityEvidence, Carrier, ComponentConstruction, Expr, MergeOrderEvidence, SerializationEvidence, derive,
+};
 use sanic::ir::*;
 use sanic::nn::scaled_dot_product_attention;
 
@@ -92,7 +94,7 @@ fn dot_product_carrier() {
     let mm = reduce(map(MapOp::Mul, vec![a, b]), 0usize, Monoid::Add);
 
     let car = derive(&mm, stream).expect("dot-product dimension is derivable");
-    assert_eq!(car.slots, 1);
+    assert_eq!(car.slot_count(), 1);
 
     let mut rng = Lcg::new(1);
     let items: Vec<Vec<f64>> = (0..17).map(|_| vec![rng.next_f64(), rng.next_f64()]).collect();
@@ -143,7 +145,7 @@ fn structure_map_for_attention() {
 
     let rk = &report.axes[1];
     assert_eq!(rk.structure.level, Parallelism::Monoidal);
-    assert_eq!(rk.carrier.as_ref().unwrap().slots, 3, "(m, ℓ, o) attached to k");
+    assert_eq!(rk.carrier.as_ref().unwrap().slot_count(), 3, "(m, ℓ, o) attached to k");
 }
 
 // Zero-config: the engine discovers every axis itself and classifies it. For
@@ -170,7 +172,7 @@ fn structure_map_auto_discovers_axes() {
 
     let report = analyze_all(&attn);
     let by = |axis: AxisRef| report.axes.iter().find(|report| report.axis == axis).unwrap();
-    assert_eq!(by(key_axis).carrier.as_ref().unwrap().slots, 3); // the fusion axis
+    assert_eq!(by(key_axis).carrier.as_ref().unwrap().slot_count(), 3); // the fusion axis
     assert_eq!(by(contract_axis).structure.level, Parallelism::Monoidal);
     assert!(
         by(contract_axis).carrier.is_none(),
@@ -206,7 +208,7 @@ fn carrier_knows_its_accumulator_size() {
 
     let car = derive(&attn, stream).unwrap();
     let span = |i: usize| {
-        car.spans[i]
+        car.span(i)
             .iter()
             .map(|axis| (axis.name, axis.extent))
             .collect::<BTreeSet<_>>()
@@ -255,10 +257,10 @@ fn multi_head_attention_derives_identically_to_single_head() {
     assert_eq!(format!("{:?}", cm.into), format!("{:?}", cs.into));
     assert_eq!(format!("{:?}", cm.combine), format!("{:?}", cs.combine));
     assert_eq!(format!("{:?}", cm.project), format!("{:?}", cs.project));
-    assert_eq!(cm.slots, 3);
+    assert_eq!(cm.slot_count(), 3);
 
     // only the spans differ: MHA's output slot carries the batch & head axes
-    let o_span: std::collections::HashSet<_> = cm.spans[2].iter().copied().collect();
+    let o_span: std::collections::HashSet<_> = cm.span(2).iter().copied().collect();
     assert!(
         [batch_axis, head_axis, value_axis]
             .iter()
@@ -284,7 +286,7 @@ fn attention_axis_tags_and_carrier() {
     // The headline: derive the (m, ℓ, o) accumulator from the rules, by the
     // generic compositional fold — no FlashAttention-shaped template.
     let car = derive(&attn, key_axis).expect("attention key dimension is derivable");
-    assert_eq!(car.slots, 3, "Acc = (m, ℓ, o)");
+    assert_eq!(car.slot_count(), 3, "Acc = (m, ℓ, o)");
     // `rescale` = the online-softmax coupling; `defer-div` = the ÷ℓ
     // normalizer applied once at the end.
     assert_eq!(car.rules, vec!["defer-div", "fold", "rescale", "tuple"]);
@@ -311,7 +313,7 @@ fn mean_carrier() {
     let mean = map(MapOp::Div, vec![sum, count]);
 
     let car = derive(&mean, stream).expect("mean is derivable");
-    assert_eq!(car.slots, 2, "Acc = (sum, count)");
+    assert_eq!(car.slot_count(), 2, "Acc = (sum, count)");
     assert!(car.rules.contains(&"tuple")); // more than one slot needed
 
     let mut rng = Lcg::new(7);
@@ -336,7 +338,7 @@ fn variance_carrier() {
     let var = map(MapOp::Sub, vec![ex2, map(MapOp::Mul, vec![ex.clone(), ex])]);
 
     let car = derive(&var, stream).expect("variance is derivable");
-    assert_eq!(car.slots, 3, "Acc = (Σx², Σx, count)");
+    assert_eq!(car.slot_count(), 3, "Acc = (Σx², Σx, count)");
 
     let mut rng = Lcg::new(99);
     let xs: Vec<f64> = (0..40).map(|_| rng.next_f64()).collect();
@@ -360,8 +362,29 @@ fn logsumexp_carrier() {
     let lse = map(MapOp::Add, vec![map(MapOp::Log, vec![s]), m]);
 
     let car = derive(&lse, stream).expect("logsumexp is derivable");
-    assert_eq!(car.slots, 2, "Acc = (max, Σexp)");
+    assert_eq!(car.slot_count(), 2, "Acc = (max, Σexp)");
     assert!(car.rules.contains(&"rescale")); // the max/exp coupling
+    assert_eq!(car.primitive_monoid(0), Some(Monoid::Max));
+    assert!(matches!(
+        car.schema.components[1].construction,
+        ComponentConstruction::IndexedPayload
+    ));
+    assert_eq!(car.schema.components[1].dependencies, [0]);
+    assert_eq!(car.stable_rebase_key(), Some(0));
+    assert_eq!(
+        car.laws.associativity,
+        AssociativityEvidence::PrimitiveAndIndexedMonoids
+    );
+    assert_eq!(car.laws.merge_order, MergeOrderEvidence::CommutativeConstruction);
+    assert_eq!(car.laws.serialization, SerializationEvidence::ScalarCoordinates);
+    assert!(car.laws.is_associative() && car.laws.is_commutative() && car.laws.is_serializable());
+    let mut forged = car.clone();
+    forged.combine[1] = Expr::Add(Box::new(Expr::A(1)), Box::new(Expr::B(1)));
+    assert_eq!(
+        forged.stable_rebase_key(),
+        None,
+        "provenance alone must not authorize the Metal rebase optimization"
+    );
 
     let mut rng = Lcg::new(123);
     let xs: Vec<f64> = (0..29).map(|_| rng.next_f64()).collect();
@@ -389,8 +412,19 @@ fn payloads_at_an_extremal_key_derive_generically() {
     let sum_at_maximum = reduce(at_maximum, 0usize, add_r());
 
     let carrier = derive(&sum_at_maximum, stream).expect("extremal payloads are derivable");
-    assert_eq!(carrier.slots, 2, "Acc = (maximum key, tied payload sum)");
+    assert_eq!(carrier.slot_count(), 2, "Acc = (maximum key, tied payload sum)");
     assert!(carrier.rules.contains(&"extremum-filter"));
+    assert_eq!(carrier.primitive_monoid(0), Some(Monoid::Max));
+    assert!(matches!(
+        carrier.schema.components[1].construction,
+        ComponentConstruction::IndexedPayload
+    ));
+    assert_eq!(carrier.schema.components[1].dependencies, [0]);
+    assert_eq!(
+        carrier.stable_rebase_key(),
+        None,
+        "winner filtering is not exponential rebasing"
+    );
 
     let keys = [-1.0, 4.0, 2.0, 4.0, -1.0, 4.0, 3.0];
     let payloads = [10.0, 2.0, 20.0, 3.0, 30.0, 5.0, 40.0];
@@ -415,7 +449,7 @@ fn payloads_at_an_extremal_key_derive_generically() {
     );
     let max_at_minimum = reduce(at_minimum, 0usize, max_r());
     let carrier = derive(&max_at_minimum, stream).expect("minimum-key payloads are derivable");
-    assert_eq!(carrier.slots, 2, "Acc = (minimum key, tied payload max)");
+    assert_eq!(carrier.slot_count(), 2, "Acc = (minimum key, tied payload max)");
     assert!(carrier.rules.contains(&"extremum-filter"));
     check(&carrier, &items, &[30.0]);
 }
@@ -521,7 +555,7 @@ fn masked_scaled_attention_derives() {
     let out = matmul(softmax(sc, 1usize), v);
 
     let car = derive(&out, stream).expect("masked scaled attention derivable");
-    assert_eq!(car.slots, 3, "still (m, ℓ, o)");
+    assert_eq!(car.slot_count(), 3, "still (m, ℓ, o)");
     assert!(car.rules.contains(&"fused-map"), "scale+mask fused into the lift");
     assert!(car.rules.contains(&"rescale"));
     assert!(car.rules.contains(&"defer-div"));
@@ -555,7 +589,7 @@ fn computed_causal_mask_derives() {
     let out = matmul(softmax(masked, 1usize), v);
 
     let car = derive(&out, stream).expect("causally masked attention derivable");
-    assert_eq!(car.slots, 3);
+    assert_eq!(car.slot_count(), 3);
     assert!(car.rules.contains(&"fused-map"));
 
     // element = (score, query index, key index, value); the reference masks
@@ -581,7 +615,7 @@ fn tanh_fuses_into_a_reduction() {
     let stream = axis_refs(&x)[0];
     let sum = reduce(map(MapOp::Tanh, vec![x]), 0usize, Monoid::Add);
     let carrier = derive(&sum, stream).expect("tanh should ride the additive lift");
-    assert_eq!(carrier.slots, 1);
+    assert_eq!(carrier.slot_count(), 1);
     assert!(carrier.rules.contains(&"fused-map"));
 
     let mut rng = Lcg::new(0x7A4);
@@ -603,7 +637,7 @@ fn silu_fuses_into_a_contraction() {
     let down = reduce(map(MapOp::Mul, vec![act, w]), 0usize, add_r());
 
     let car = derive(&down, stream).expect("silu contraction derivable");
-    assert_eq!(car.slots, 1, "one running sum — the activation is in the lift");
+    assert_eq!(car.slot_count(), 1, "one running sum — the activation is in the lift");
     assert!(car.rules.contains(&"fused-map"));
 
     let mut rng = Lcg::new(808);
@@ -632,7 +666,7 @@ fn rmsnorm_fused_projection_carrier() {
     let proj = reduce(map(MapOp::Mul, vec![norm, w]), 0usize, Monoid::Add);
 
     let car = derive(&proj, stream).expect("norm-fused projection derivable");
-    assert_eq!(car.slots, 2, "Acc = (Σ x·g·w, Σx²)");
+    assert_eq!(car.slot_count(), 2, "Acc = (Σ x·g·w, Σx²)");
     assert!(car.rules.contains(&"defer-div"));
 
     let mut rng = Lcg::new(1234);
@@ -690,7 +724,7 @@ fn fold_through_a_flattened_view() {
     let out = reduce(map(MapOp::Mul, vec![flat, w]), 0usize, add_r());
 
     let car = derive(&out, stream).expect("folds over the flattened axis");
-    assert_eq!(car.slots, 1, "a plain contraction against the view");
+    assert_eq!(car.slot_count(), 1, "a plain contraction against the view");
 
     // element = (flattened value, weight) per flattened index
     let mut rng = Lcg::new(4242);
@@ -793,7 +827,7 @@ fn multi_value_attention_generalizes() {
     let total = map(MapOp::Add, vec![o1, o2]);
 
     let car = derive(&total, stream).expect("multi-value attention derivable");
-    assert_eq!(car.slots, 4, "Acc = (m, s, o1, o2) — one shared softmax");
+    assert_eq!(car.slot_count(), 4, "Acc = (m, s, o1, o2) — one shared softmax");
 
     let mut rng = Lcg::new(2027);
     let items: Vec<Vec<f64>> = (0..15)
@@ -832,7 +866,7 @@ fn ctc_logsumexp_carriers_match() {
         }
     }
     fn is_logsumexp_carrier(c: &Carrier) -> bool {
-        c.slots == 2
+        c.slot_count() == 2
             && c.identity[0] == f64::NEG_INFINITY
             && c.identity[1] == 0.0
             && matches!(&c.combine[0], Expr::Max(..)) // m = max
@@ -952,7 +986,7 @@ fn soft_attention_over_logspace_dp() {
     //    3 slots — h is NOT swallowed into the k-fold. ─────────────────────────
     assert_eq!(structure(&out, key_axis).level, Parallelism::Monoidal);
     let oc = derive(&out, key_axis).expect("k readout derivable");
-    assert_eq!(oc.slots, 3, "Acc = (m, s, o) — softmax merged, h not fused in");
+    assert_eq!(oc.slot_count(), 3, "Acc = (m, s, o) — softmax merged, h not fused in");
     assert!(oc.rules.contains(&"rescale"), "online-softmax coupling");
     assert!(oc.rules.contains(&"defer-div"), "deferred normalizer");
     assert_eq!(oc.identity, vec![f64::NEG_INFINITY, 0.0, 0.0]);
@@ -971,7 +1005,7 @@ fn soft_attention_over_logspace_dp() {
     //    log-space product (Wv + H) fused into `into`, plus the coupling. ─────
     assert_eq!(structure(&value, hidden_axis).level, Parallelism::Monoidal);
     let vc = derive(&value, hidden_axis).expect("logsumexp-matmul derivable");
-    assert_eq!(vc.slots, 2, "(max, Σexp)");
+    assert_eq!(vc.slot_count(), 2, "(max, Σexp)");
     assert!(
         vc.rules.contains(&"fused-map"),
         "the additive pre-map fused into the lift"
@@ -1156,7 +1190,7 @@ fn coupled_carrier_composes_through_free_axis_repeat() {
         ),
     ] {
         let carrier = derive(&node, stream).unwrap_or_else(|decline| panic!("{label} must derive, got: {decline}"));
-        assert_eq!(carrier.kinds.len(), 2, "{label}: the (max, Σexp) tuple");
+        assert_eq!(carrier.slot_count(), 2, "{label}: the (max, Σexp) tuple");
     }
 }
 

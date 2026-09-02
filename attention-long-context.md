@@ -127,7 +127,10 @@ narrower than it looks. It is not keyed on `exp` — it is keyed on SUBTRACTION:
 
 ```rust
 (Bin::Sub, S::Pe { .. }, S::Coll(Expr::F(i)))
-    if matches!(ctx.slots[i].kind, SlotKind::Plain(Monoid::Max)) => S::PeOff { .. }
+    if matches!(
+        ctx.slots[i].construction,
+        ComponentConstruction::Primitive { monoid: Monoid::Max }
+    ) => S::PeOff { .. }
 ```
 
 `x − max` is the online-softmax shift, and `exp` is its only consumer;
